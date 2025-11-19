@@ -3,57 +3,66 @@ set -e
 
 echo -n "TEST init... "
 
-# Cleanup any existing agent.db
-rm -f agent.db agent.db-shm agent.db-wal
+# Cleanup any existing .agentfs directory
+rm -rf .agentfs
 
-# Test: Run init command
-if ! output=$(cargo run -- init 2>&1); then
+TEST_AGENT_ID="test-agent"
+
+# Test: Run init command with specific ID
+if ! output=$(cargo run -- init "$TEST_AGENT_ID" 2>&1); then
     echo "FAILED: init command failed"
     echo "Output was: $output"
     exit 1
 fi
 
-# Check that agent.db was created
-if [ ! -f agent.db ]; then
-    echo "FAILED: agent.db was not created"
+# Check that .agentfs directory was created
+if [ ! -d .agentfs ]; then
+    echo "FAILED: .agentfs directory was not created"
     echo "Output was: $output"
     exit 1
 fi
 
-# Check that output contains success message
-echo "$output" | grep -q "Created agent filesystem: agent.db" || {
+# Check that the database file was created in .agentfs
+if [ ! -f ".agentfs/$TEST_AGENT_ID.db" ]; then
+    echo "FAILED: agent database was not created in .agentfs directory"
+    echo "Output was: $output"
+    exit 1
+fi
+
+# Check that output contains success message with .agentfs path
+echo "$output" | grep -q "Created agent filesystem: .agentfs/$TEST_AGENT_ID.db" || {
     echo "FAILED: Expected success message not found in output"
     echo "Output was: $output"
-    rm -f agent.db agent.db-shm agent.db-wal
+    rm -rf .agentfs
     exit 1
 }
 
 # Test: Running init again should fail without --force
-if cargo run -- init 2>&1 | grep -q "already exists"; then
+if cargo run -- init "$TEST_AGENT_ID" 2>&1 | grep -q "already exists"; then
     : # Expected behavior
 else
-    echo "FAILED: init should fail when agent.db already exists"
-    rm -f agent.db agent.db-shm agent.db-wal
+    echo "FAILED: init should fail when agent database already exists"
+    rm -rf .agentfs
     exit 1
 fi
 
 # Test: Running init with --force should succeed
-if ! output=$(cargo run -- init --force 2>&1); then
+if ! output=$(cargo run -- init "$TEST_AGENT_ID" --force 2>&1); then
     echo "FAILED: init --force command failed"
     echo "Output was: $output"
-    rm -f agent.db agent.db-shm agent.db-wal
+    rm -rf .agentfs
     exit 1
 fi
 
 # Check that output contains success message
-echo "$output" | grep -q "Created agent filesystem: agent.db" || {
+echo "$output" | grep -q "Created agent filesystem: .agentfs/$TEST_AGENT_ID.db" || {
     echo "FAILED: Expected success message not found in init --force output"
     echo "Output was: $output"
-    rm -f agent.db agent.db-shm agent.db-wal
+    rm -rf .agentfs
     exit 1
 }
 
 # Cleanup
-rm -f agent.db agent.db-shm agent.db-wal
+rm -rf .agentfs
 
 echo "OK"
