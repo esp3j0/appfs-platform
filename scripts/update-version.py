@@ -308,13 +308,15 @@ def main():
         print("\n❌ Some files failed to update", file=sys.stderr)
         sys.exit(1)
 
-    # Update cli/Cargo.lock again to pick up new versions of workspace dependencies
-    print("\nUpdating cli/Cargo.lock to pick up new dependency versions...")
-    if update_cargo_lock(root / 'cli'):
-        print("✓ Updated cli/Cargo.lock with new dependency versions")
-    else:
-        print("❌ Failed to update cli/Cargo.lock", file=sys.stderr)
-        sys.exit(1)
+    # Update Cargo.lock files again to pick up new versions of workspace dependencies
+    # (sandbox and cli both depend on sdk/rust which was updated after their initial lock update)
+    print("\nUpdating Cargo.lock files to pick up new dependency versions...")
+    for crate_name in ['sandbox', 'cli']:
+        if update_cargo_lock(root / crate_name):
+            print(f"✓ Updated {crate_name}/Cargo.lock with new dependency versions")
+        else:
+            print(f"❌ Failed to update {crate_name}/Cargo.lock", file=sys.stderr)
+            sys.exit(1)
 
     print("\n✅ All files and lock files updated successfully!")
 
