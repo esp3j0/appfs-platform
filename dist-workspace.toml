@@ -22,3 +22,4 @@ install-updater = true
 [dist.dependencies.apt]
 libunwind-dev = "*"
 liblzma-dev = "*"
+libfuse3-dev = "*"
