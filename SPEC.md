@@ -1,6 +1,6 @@
 # Agent Filesystem Specification
 
-**Version:** 0.0
+**Version:** 0.1
 
 ## Introduction
 
@@ -127,6 +127,35 @@ The virtual filesystem provides POSIX-like file operations for agent artifacts. 
 
 ### Schema
 
+#### Table: `fs_config`
+
+Stores filesystem-level configuration. This table is initialized once when the filesystem is created and MUST NOT be modified afterward.
+
+```sql
+CREATE TABLE fs_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+```
+
+**Fields:**
+
+- `key` - Configuration key
+- `value` - Configuration value (stored as text)
+
+**Required Configuration:**
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `chunk_size` | Size of data chunks in bytes | `4096` |
+
+**Notes:**
+
+- `chunk_size` determines the fixed size of data chunks in `fs_data`
+- All chunks except the last chunk of a file are exactly `chunk_size` bytes
+- Configuration is immutable after filesystem initialization
+- Implementations MAY define additional configuration keys
+
 #### Table: `fs_inode`
 
 Stores file and directory metadata.
@@ -213,33 +242,31 @@ CREATE INDEX idx_fs_dentry_parent ON fs_dentry(parent_ino, name)
 
 #### Table: `fs_data`
 
-Stores file content in chunks.
+Stores file content in fixed-size chunks. Chunk size is configured at filesystem level via `fs_config`.
 
 ```sql
 CREATE TABLE fs_data (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
   ino INTEGER NOT NULL,
-  offset INTEGER NOT NULL,
-  size INTEGER NOT NULL,
-  data BLOB NOT NULL
+  chunk_index INTEGER NOT NULL,
+  data BLOB NOT NULL,
+  PRIMARY KEY (ino, chunk_index)
 )
-
-CREATE INDEX idx_fs_data_ino_offset ON fs_data(ino, offset)
 ```
 
 **Fields:**
 
-- `id` - Internal chunk ID
 - `ino` - Inode number
-- `offset` - Byte offset in file where chunk starts
-- `size` - Chunk size in bytes
-- `data` - Binary content (BLOB)
+- `chunk_index` - Zero-based chunk index (chunk 0 contains bytes 0 to chunk_size-1)
+- `data` - Binary content (BLOB), exactly `chunk_size` bytes except for the last chunk
 
 **Notes:**
 
 - Directories MUST NOT have data chunks
-- Chunks MUST be ordered by offset when reading
-- Implementations MAY store files as single chunks or multiple chunks
+- Chunk size is determined by the `chunk_size` value in `fs_config`
+- All chunks except the last chunk of a file MUST be exactly `chunk_size` bytes
+- The last chunk MAY be smaller than `chunk_size`
+- Byte offset for a chunk = `chunk_index * chunk_size`
+- To read at byte offset `N`: `chunk_index = N / chunk_size`, `offset_in_chunk = N % chunk_size`
 
 #### Table: `fs_symlink`
 
@@ -274,23 +301,28 @@ To resolve a path to an inode:
 #### Creating a File
 
 1. Resolve parent directory path to inode
-2. Insert inode:
+2. Get chunk size from config:
+   ```sql
+   SELECT value FROM fs_config WHERE key = 'chunk_size'
+   ```
+3. Insert inode:
    ```sql
    INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
    VALUES (?, ?, ?, 0, ?, ?, ?)
    RETURNING ino
    ```
-3. Insert directory entry:
+4. Insert directory entry:
    ```sql
    INSERT INTO fs_dentry (name, parent_ino, ino)
    VALUES (?, ?, ?)
    ```
-4. Insert data:
+5. Split data into chunks and insert each:
    ```sql
-   INSERT INTO fs_data (ino, offset, size, data)
-   VALUES (?, 0, ?, ?)
+   INSERT INTO fs_data (ino, chunk_index, data)
+   VALUES (?, ?, ?)
    ```
-5. Update inode size:
+   Where `chunk_index` starts at 0 and increments for each chunk.
+6. Update inode size:
    ```sql
    UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?
    ```
@@ -298,15 +330,38 @@ To resolve a path to an inode:
 #### Reading a File
 
 1. Resolve path to inode
-2. Fetch all chunks:
+2. Fetch all chunks in order:
    ```sql
-   SELECT data FROM fs_data WHERE ino = ? ORDER BY offset ASC
+   SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index ASC
    ```
 3. Concatenate chunks in order
 4. Update access time:
    ```sql
    UPDATE fs_inode SET atime = ? WHERE ino = ?
    ```
+
+#### Reading a File at Offset
+
+To read `length` bytes starting at byte offset `offset`:
+
+1. Resolve path to inode
+2. Get chunk size from config:
+   ```sql
+   SELECT value FROM fs_config WHERE key = 'chunk_size'
+   ```
+3. Calculate chunk range:
+   - `start_chunk = offset / chunk_size`
+   - `end_chunk = (offset + length - 1) / chunk_size`
+4. Fetch required chunks:
+   ```sql
+   SELECT chunk_index, data FROM fs_data
+   WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
+   ORDER BY chunk_index ASC
+   ```
+5. Extract the requested byte range from the chunks:
+   - `offset_in_first_chunk = offset % chunk_size`
+   - Skip first `offset_in_first_chunk` bytes of first chunk
+   - Take `length` total bytes across chunks
 
 #### Listing a Directory
 
@@ -357,14 +412,20 @@ To resolve a path to an inode:
 
 ### Initialization
 
-When creating a new agent database, initialize the filesystem root directory:
+When creating a new agent database, initialize the filesystem configuration and root directory:
 
 ```sql
+-- Initialize filesystem configuration
+INSERT INTO fs_config (key, value) VALUES ('chunk_size', '4096');
+
+-- Initialize root directory
 INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
-VALUES (1, 16877, 0, 0, 0, unixepoch(), unixepoch(), unixepoch())
+VALUES (1, 16877, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
 ```
 
 Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
+
+**Note:** The `chunk_size` value can be customized at filesystem creation time but MUST NOT be changed afterward.
 
 ### Consistency Rules
 
@@ -481,3 +542,20 @@ Implementations MAY extend the key-value store schema with additional functional
 - Value size limits and quotas
 
 Such extensions SHOULD use separate tables to maintain referential integrity.
+
+## Revision History
+
+### Version 0.1
+
+- Added `fs_config` table for filesystem-level configuration
+- Changed `fs_data` table to use fixed-size chunks with `chunk_index` instead of variable-size chunks with `offset` and `size`
+- Added `chunk_size` configuration option (default: 4096 bytes)
+- Added "Reading a File at Offset" operation for efficient partial reads
+- Chunk-based storage enables efficient random access reads without loading entire files
+
+### Version 0.0
+
+- Initial specification
+- Tool call audit trail (`tool_calls` table)
+- Virtual filesystem (`fs_inode`, `fs_dentry`, `fs_data`, `fs_symlink` tables)
+- Key-value store (`kv_store` table)
