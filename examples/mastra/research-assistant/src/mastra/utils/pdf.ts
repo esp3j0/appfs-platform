@@ -53,7 +53,7 @@ export async function fetchPdfTextCached(cacheKey: string, pdfUrl: string, maxBy
   const txtPath = `/papers/${safeKey}.txt`;
   // Try text cache
   try {
-    const text = await fs.readFile(txtPath);
+    const text = (await fs.readFile(txtPath, 'utf8')) as string;
     if (text && text.length > 0) return text;
   } catch {
     // not cached

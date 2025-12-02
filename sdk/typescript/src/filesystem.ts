@@ -10,6 +10,8 @@ const S_IFLNK = 0o120000;  // Symbolic link
 const DEFAULT_FILE_MODE = S_IFREG | 0o644;  // Regular file, rw-r--r--
 const DEFAULT_DIR_MODE = S_IFDIR | 0o755;   // Directory, rwxr-xr-x
 
+const DEFAULT_CHUNK_SIZE = 4096;
+
 export interface Stats {
   ino: number;
   mode: number;
@@ -29,10 +31,18 @@ export class Filesystem {
   private db: Database;
   private initialized: Promise<void>;
   private rootIno: number = 1;
+  private chunkSize: number = DEFAULT_CHUNK_SIZE;
 
   constructor(db: Database) {
     this.db = db;
     this.initialized = this.initialize();
+  }
+
+  /**
+   * Get the configured chunk size
+   */
+  getChunkSize(): number {
+    return this.chunkSize;
   }
 
   private async initialize(): Promise<void> {
@@ -45,6 +55,14 @@ export class Filesystem {
         throw error;
       }
     }
+
+    // Create the config table
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS fs_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    `);
 
     // Create the inode table
     await this.db.exec(`
@@ -77,21 +95,14 @@ export class Filesystem {
       ON fs_dentry(parent_ino, name)
     `);
 
-    // Create the data blocks table
+    // Create the data chunks table
     await this.db.exec(`
       CREATE TABLE IF NOT EXISTS fs_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
         ino INTEGER NOT NULL,
-        offset INTEGER NOT NULL,
-        size INTEGER NOT NULL,
-        data BLOB NOT NULL
+        chunk_index INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (ino, chunk_index)
       )
-    `);
-
-    // Create index for efficient data block lookups
-    await this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_fs_data_ino_offset
-      ON fs_data(ino, offset)
     `);
 
     // Create the symlink table
@@ -102,14 +113,30 @@ export class Filesystem {
       )
     `);
 
-    // Create root directory if it doesn't exist
-    await this.ensureRoot();
+    // Initialize config and root directory, and get chunk_size
+    this.chunkSize = await this.ensureRoot();
   }
 
   /**
-   * Ensure root directory exists
+   * Ensure config and root directory exist, returns the chunk_size
    */
-  private async ensureRoot(): Promise<void> {
+  private async ensureRoot(): Promise<number> {
+    // Ensure chunk_size config exists and get its value
+    const configStmt = this.db.prepare("SELECT value FROM fs_config WHERE key = 'chunk_size'");
+    const config = await configStmt.get() as { value: string } | undefined;
+
+    let chunkSize: number;
+    if (!config) {
+      const insertConfigStmt = this.db.prepare(`
+        INSERT INTO fs_config (key, value) VALUES ('chunk_size', ?)
+      `);
+      await insertConfigStmt.run(DEFAULT_CHUNK_SIZE.toString());
+      chunkSize = DEFAULT_CHUNK_SIZE;
+    } else {
+      chunkSize = parseInt(config.value, 10) || DEFAULT_CHUNK_SIZE;
+    }
+
+    // Ensure root directory exists
     const stmt = this.db.prepare('SELECT ino FROM fs_inode WHERE ino = ?');
     const root = await stmt.get(this.rootIno);
 
@@ -121,6 +148,8 @@ export class Filesystem {
       `);
       await insertStmt.run(this.rootIno, DEFAULT_DIR_MODE, now, now, now);
     }
+
+    return chunkSize;
   }
 
   /**
@@ -299,16 +328,24 @@ export class Filesystem {
     const buffer = typeof content === 'string' ? Buffer.from(content, 'utf-8') : content;
     const now = Math.floor(Date.now() / 1000);
 
-    // Delete existing data blocks
+    // Delete existing data chunks
     const deleteStmt = this.db.prepare('DELETE FROM fs_data WHERE ino = ?');
     await deleteStmt.run(ino);
 
-    // Write data in chunks (for now, single chunk, but can be extended)
-    const stmt = this.db.prepare(`
-      INSERT INTO fs_data (ino, offset, size, data)
-      VALUES (?, ?, ?, ?)
-    `);
-    await stmt.run(ino, 0, buffer.length, buffer);
+    // Write data in chunks
+    if (buffer.length > 0) {
+      const stmt = this.db.prepare(`
+        INSERT INTO fs_data (ino, chunk_index, data)
+        VALUES (?, ?, ?)
+      `);
+
+      let chunkIndex = 0;
+      for (let offset = 0; offset < buffer.length; offset += this.chunkSize) {
+        const chunk = buffer.subarray(offset, Math.min(offset + this.chunkSize, buffer.length));
+        await stmt.run(ino, chunkIndex, chunk);
+        chunkIndex++;
+      }
+    }
 
     // Update inode size and mtime
     const updateStmt = this.db.prepare(`
@@ -319,7 +356,7 @@ export class Filesystem {
     await updateStmt.run(buffer.length, now, ino);
   }
 
-  async readFile(path: string): Promise<string> {
+  async readFile(path: string, encoding?: BufferEncoding): Promise<Buffer | string> {
     await this.initialized;
 
     const ino = await this.resolvePath(path);
@@ -327,28 +364,32 @@ export class Filesystem {
       throw new Error(`ENOENT: no such file or directory, open '${path}'`);
     }
 
-    // Get all data blocks
+    // Get all data chunks
     const stmt = this.db.prepare(`
       SELECT data FROM fs_data
       WHERE ino = ?
-      ORDER BY offset ASC
+      ORDER BY chunk_index ASC
     `);
     const rows = await stmt.all(ino) as { data: Buffer }[];
 
+    let combined: Buffer;
     if (rows.length === 0) {
-      return '';
+      combined = Buffer.alloc(0);
+    } else {
+      // Concatenate all chunks
+      const buffers = rows.map(row => row.data);
+      combined = Buffer.concat(buffers);
     }
-
-    // Concatenate all chunks
-    const buffers = rows.map(row => row.data);
-    const combined = Buffer.concat(buffers);
 
     // Update atime
     const now = Math.floor(Date.now() / 1000);
     const updateStmt = this.db.prepare('UPDATE fs_inode SET atime = ? WHERE ino = ?');
     await updateStmt.run(now, ino);
 
-    return combined.toString('utf-8');
+    if (encoding) {
+      return combined.toString(encoding);
+    }
+    return combined;
   }
 
   async readdir(path: string): Promise<string[]> {
@@ -393,9 +434,13 @@ export class Filesystem {
     // Check if this was the last link to the inode
     const linkCount = await this.getLinkCount(ino);
     if (linkCount === 0) {
-      // Delete the inode and all associated data (CASCADE will handle data blocks)
-      const deleteStmt = this.db.prepare('DELETE FROM fs_inode WHERE ino = ?');
-      await deleteStmt.run(ino);
+      // Delete the inode
+      const deleteInodeStmt = this.db.prepare('DELETE FROM fs_inode WHERE ino = ?');
+      await deleteInodeStmt.run(ino);
+
+      // Delete all data chunks
+      const deleteDataStmt = this.db.prepare('DELETE FROM fs_data WHERE ino = ?');
+      await deleteDataStmt.run(ino);
     }
   }
 
