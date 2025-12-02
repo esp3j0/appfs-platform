@@ -2,7 +2,60 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use turso::{Builder, Connection, Value};
+
+/// Filesystem-specific errors with errno semantics
+#[derive(Debug, Error)]
+pub enum FsError {
+    #[error("Path does not exist")]
+    NotFound,
+
+    #[error("Path already exists")]
+    AlreadyExists,
+
+    #[error("Directory not empty")]
+    NotEmpty,
+
+    #[error("Not a directory")]
+    NotADirectory,
+
+    #[error("Is a directory")]
+    IsADirectory,
+
+    #[error("Not a symbolic link")]
+    NotASymlink,
+
+    #[error("Invalid path")]
+    InvalidPath,
+
+    #[error("Cannot modify root directory")]
+    RootOperation,
+
+    #[error("Too many levels of symbolic links")]
+    SymlinkLoop,
+
+    #[error("Cannot rename directory into its own subdirectory")]
+    InvalidRename,
+}
+
+impl FsError {
+    /// Convert to libc errno code
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            FsError::NotFound => libc::ENOENT,
+            FsError::AlreadyExists => libc::EEXIST,
+            FsError::NotEmpty => libc::ENOTEMPTY,
+            FsError::NotADirectory => libc::ENOTDIR,
+            FsError::IsADirectory => libc::EISDIR,
+            FsError::NotASymlink => libc::EINVAL,
+            FsError::InvalidPath => libc::EINVAL,
+            FsError::RootOperation => libc::EPERM,
+            FsError::SymlinkLoop => libc::ELOOP,
+            FsError::InvalidRename => libc::EINVAL,
+        }
+    }
+}
 
 // File types for mode field
 const S_IFMT: u32 = 0o170000; // File type mask
@@ -29,6 +82,15 @@ pub struct Stats {
     pub atime: i64,
     pub mtime: i64,
     pub ctime: i64,
+}
+
+/// Filesystem statistics for statfs
+#[derive(Debug, Clone)]
+pub struct FilesystemStats {
+    /// Total number of inodes (files, directories, symlinks)
+    pub inodes: u64,
+    /// Total bytes used by file contents
+    pub bytes_used: u64,
 }
 
 impl Stats {
@@ -533,47 +595,49 @@ impl Filesystem {
 
         let name = components.last().unwrap();
 
-        // Check if file exists
-        let ino = if let Some(ino) = self.resolve_path(&path).await? {
-            // Delete existing data
-            self.conn
-                .execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
-                .await?;
-            ino
-        } else {
-            // Create new inode
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            self.conn
-                .execute(
-                    "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                    VALUES (?, 0, 0, ?, ?, ?, ?)",
-                    (DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now),
-                )
-                .await?;
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
-            let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-            let ino = if let Some(row) = rows.next().await? {
-                row.get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
+        let result: Result<()> = async {
+            // Check if file exists
+            let ino = if let Some(ino) = self.resolve_path(&path).await? {
+                // Delete existing data
+                self.conn
+                    .execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
+                    .await?;
+                ino
             } else {
-                anyhow::bail!("Failed to get inode");
+                // Create new inode
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                self.conn
+                    .execute(
+                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
+                        VALUES (?, 0, 0, ?, ?, ?, ?)",
+                        (DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now),
+                    )
+                    .await?;
+
+                let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
+                let ino = if let Some(row) = rows.next().await? {
+                    row.get_value(0)
+                        .ok()
+                        .and_then(|v| v.as_integer().copied())
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
+                } else {
+                    anyhow::bail!("Failed to get inode");
+                };
+
+                // Create directory entry
+                self.conn
+                    .execute(
+                        "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                        (name.as_str(), parent_ino, ino),
+                    )
+                    .await?;
+
+                ino
             };
 
-            // Create directory entry
-            self.conn
-                .execute(
-                    "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-                    (name.as_str(), parent_ino, ino),
-                )
-                .await?;
-
-            ino
-        };
-
-        // Write data in chunks
-        if !data.is_empty() {
+            // Write data in chunks
             for (chunk_index, chunk) in data.chunks(self.chunk_size).enumerate() {
                 self.conn
                     .execute(
@@ -582,18 +646,30 @@ impl Filesystem {
                     )
                     .await?;
             }
+
+            // Update size and mtime
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            self.conn
+                .execute(
+                    "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
+                    (data.len() as i64, now, ino),
+                )
+                .await?;
+
+            Ok(())
         }
+        .await;
 
-        // Update size and mtime
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        self.conn
-            .execute(
-                "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
-                (data.len() as i64, now, ino),
-            )
-            .await?;
-
-        Ok(())
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// Read data from a file
@@ -619,6 +695,415 @@ impl Filesystem {
         }
 
         Ok(Some(data))
+    }
+
+    /// Reads from a file at a given offset.
+    ///
+    /// Similar to POSIX `pread`, this reads up to `size` bytes from the file
+    /// starting at `offset`, without modifying any file cursor.
+    ///
+    /// Returns `Ok(None)` if the file does not exist.
+    pub async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>> {
+        let ino = match self.resolve_path(path).await? {
+            Some(ino) => ino,
+            None => return Ok(None),
+        };
+
+        // Calculate which chunks we need
+        let chunk_size = self.chunk_size as u64;
+        let start_chunk = offset / chunk_size;
+        let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index",
+                (ino, start_chunk as i64, end_chunk as i64),
+            )
+            .await?;
+
+        let mut result = Vec::with_capacity(size as usize);
+        let start_offset_in_chunk = (offset % chunk_size) as usize;
+
+        while let Some(row) = rows.next().await? {
+            if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
+                let skip = if result.is_empty() {
+                    start_offset_in_chunk
+                } else {
+                    0
+                };
+                if skip >= chunk_data.len() {
+                    continue;
+                }
+                let remaining = size as usize - result.len();
+                let take = std::cmp::min(chunk_data.len() - skip, remaining);
+                result.extend_from_slice(&chunk_data[skip..skip + take]);
+            }
+        }
+
+        Ok(Some(result))
+    }
+
+    /// Writes to a file at a given offset.
+    ///
+    /// Similar to POSIX `pwrite`, this writes `data` to the file starting at
+    /// `offset`, without modifying any file cursor.
+    ///
+    /// If the offset is beyond the current file size, the file is extended with zeros.
+    /// If the file does not exist, it will be created.
+    pub async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
+        let path = self.normalize_path(path);
+        let components = self.split_path(&path);
+
+        if components.is_empty() {
+            anyhow::bail!("Cannot write to root directory");
+        }
+
+        let parent_path = if components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!("/{}", components[..components.len() - 1].join("/"))
+        };
+
+        let parent_ino = self
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Parent directory does not exist"))?;
+
+        let name = components.last().unwrap();
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result: Result<()> = async {
+            // Get or create the inode
+            let (ino, current_size) = if let Some(ino) = self.resolve_path(&path).await? {
+                // Get current file size
+                let mut rows = self
+                    .conn
+                    .query("SELECT size FROM fs_inode WHERE ino = ?", (ino,))
+                    .await?;
+                let size = if let Some(row) = rows.next().await? {
+                    row.get_value(0)
+                        .ok()
+                        .and_then(|v| v.as_integer().copied())
+                        .unwrap_or(0) as u64
+                } else {
+                    0
+                };
+                (ino, size)
+            } else {
+                // Create new inode
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                self.conn
+                    .execute(
+                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
+                        VALUES (?, 0, 0, 0, ?, ?, ?)",
+                        (DEFAULT_FILE_MODE as i64, now, now, now),
+                    )
+                    .await?;
+
+                let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
+                let ino = if let Some(row) = rows.next().await? {
+                    row.get_value(0)
+                        .ok()
+                        .and_then(|v| v.as_integer().copied())
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
+                } else {
+                    anyhow::bail!("Failed to get inode");
+                };
+
+                // Create directory entry
+                self.conn
+                    .execute(
+                        "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                        (name.as_str(), parent_ino, ino),
+                    )
+                    .await?;
+
+                (ino, 0)
+            };
+
+            // Handle empty writes - just update mtime
+            if data.is_empty() {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                self.conn
+                    .execute("UPDATE fs_inode SET mtime = ? WHERE ino = ?", (now, ino))
+                    .await?;
+                return Ok(());
+            }
+
+            let chunk_size = self.chunk_size as u64;
+            let write_end = offset + data.len() as u64;
+
+            // Calculate affected chunk range
+            let start_chunk = offset / chunk_size;
+            let end_chunk = (write_end - 1) / chunk_size;
+
+            // Process each affected chunk
+            for chunk_idx in start_chunk..=end_chunk {
+                let chunk_start = chunk_idx * chunk_size;
+
+                // Calculate what part of data goes into this chunk
+                let data_start = if offset > chunk_start {
+                    (offset - chunk_start) as usize
+                } else {
+                    0
+                };
+                let data_end =
+                    std::cmp::min(chunk_size as usize, (write_end - chunk_start) as usize);
+
+                // Calculate what part of data to copy
+                let src_start = if chunk_start > offset {
+                    (chunk_start - offset) as usize
+                } else {
+                    0
+                };
+                let src_end = std::cmp::min(data.len(), src_start + (data_end - data_start));
+
+                // Read existing chunk if we need to preserve some data
+                let needs_read = data_start > 0 || data_end < chunk_size as usize;
+                let mut chunk_data = if needs_read {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                            (ino, chunk_idx as i64),
+                        )
+                        .await?;
+                    if let Some(row) = rows.next().await? {
+                        if let Ok(Value::Blob(data)) = row.get_value(0) {
+                            let mut v = data.clone();
+                            v.resize(chunk_size as usize, 0);
+                            v
+                        } else {
+                            vec![0u8; chunk_size as usize]
+                        }
+                    } else {
+                        vec![0u8; chunk_size as usize]
+                    }
+                } else {
+                    vec![0u8; chunk_size as usize]
+                };
+
+                // Copy the new data into the chunk
+                chunk_data[data_start..data_end].copy_from_slice(&data[src_start..src_end]);
+
+                // Trim trailing zeros for the last chunk
+                let actual_len = if chunk_idx == end_chunk {
+                    let file_end_in_chunk = (write_end - chunk_start) as usize;
+                    let old_end_in_chunk = if current_size > chunk_start {
+                        std::cmp::min((current_size - chunk_start) as usize, chunk_size as usize)
+                    } else {
+                        0
+                    };
+                    std::cmp::max(file_end_in_chunk, old_end_in_chunk)
+                } else {
+                    chunk_size as usize
+                };
+
+                // Write the chunk - delete existing then insert
+                self.conn
+                    .execute(
+                        "DELETE FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                        (ino, chunk_idx as i64),
+                    )
+                    .await?;
+                self.conn
+                    .execute(
+                        "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                        (ino, chunk_idx as i64, &chunk_data[..actual_len]),
+                    )
+                    .await?;
+            }
+
+            // Update size and mtime
+            let new_size = std::cmp::max(current_size, write_end);
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            self.conn
+                .execute(
+                    "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
+                    (new_size as i64, now, ino),
+                )
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Truncate a file to a specific size.
+    ///
+    /// This operates directly on chunks without loading the entire file into memory:
+    /// - Shrinking: deletes chunks beyond new size, truncates the last chunk if needed
+    /// - Extending: pads with zeros up to the new size
+    pub async fn truncate(&self, path: &str, new_size: u64) -> Result<()> {
+        let path = self.normalize_path(path);
+        let ino = self
+            .resolve_path(&path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("File not found"))?;
+
+        // Get current size
+        let mut rows = self
+            .conn
+            .query("SELECT size FROM fs_inode WHERE ino = ?", (ino,))
+            .await?;
+        let current_size = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        let chunk_size = self.chunk_size as u64;
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result: Result<()> = async {
+            if new_size == 0 {
+                // Special case: truncate to zero - just delete all chunks
+                self.conn
+                    .execute("DELETE FROM fs_data WHERE ino = ?", (ino,))
+                    .await?;
+            } else if new_size < current_size {
+                // Shrinking: delete excess chunks and truncate last chunk if needed
+                let last_chunk_idx = (new_size - 1) / chunk_size;
+
+                // Delete all chunks beyond the last one we need
+                self.conn
+                    .execute(
+                        "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
+                        (ino, last_chunk_idx as i64),
+                    )
+                    .await?;
+
+                // Calculate where in the last chunk the file should end
+                let end_in_last_chunk = ((new_size - 1) % chunk_size) + 1;
+
+                // If the last chunk needs to be truncated (not a full chunk),
+                // read it, truncate, and rewrite
+                if end_in_last_chunk < chunk_size {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                            (ino, last_chunk_idx as i64),
+                        )
+                        .await?;
+
+                    if let Some(row) = rows.next().await? {
+                        if let Ok(Value::Blob(chunk_data)) = row.get_value(0) {
+                            if chunk_data.len() > end_in_last_chunk as usize {
+                                let truncated = &chunk_data[..end_in_last_chunk as usize];
+                                self.conn
+                                    .execute(
+                                        "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
+                                        (truncated, ino, last_chunk_idx as i64),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                }
+            } else if new_size > current_size {
+                // Extending: pad last existing chunk and add zero chunks as needed
+                let last_existing_chunk = if current_size == 0 {
+                    None
+                } else {
+                    Some((current_size - 1) / chunk_size)
+                };
+                let last_new_chunk = (new_size - 1) / chunk_size;
+
+                // Pad the last existing chunk with zeros if it's not full
+                if let Some(last_idx) = last_existing_chunk {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                            (ino, last_idx as i64),
+                        )
+                        .await?;
+
+                    if let Some(row) = rows.next().await? {
+                        if let Ok(Value::Blob(chunk_data)) = row.get_value(0) {
+                            let current_chunk_len = chunk_data.len();
+                            let needed_len = if last_idx == last_new_chunk {
+                                // Last existing chunk is also the last new chunk
+                                ((new_size - 1) % chunk_size + 1) as usize
+                            } else {
+                                // Need to fill this chunk completely
+                                chunk_size as usize
+                            };
+
+                            if needed_len > current_chunk_len {
+                                let mut padded = chunk_data.clone();
+                                padded.resize(needed_len, 0);
+                                self.conn
+                                    .execute(
+                                        "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
+                                        (&padded[..], ino, last_idx as i64),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                }
+
+                // Add new zero-filled chunks if needed
+                let start_new_chunk = last_existing_chunk.map(|i| i + 1).unwrap_or(0);
+                for chunk_idx in start_new_chunk..=last_new_chunk {
+                    let chunk_len = if chunk_idx == last_new_chunk {
+                        ((new_size - 1) % chunk_size + 1) as usize
+                    } else {
+                        chunk_size as usize
+                    };
+                    let zeros = vec![0u8; chunk_len];
+                    self.conn
+                        .execute(
+                            "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                            (ino, chunk_idx as i64, &zeros[..]),
+                        )
+                        .await?;
+                }
+            }
+            // else: new_size == current_size, nothing to do for data
+
+            // Update size and mtime
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            self.conn
+                .execute(
+                    "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
+                    (new_size as i64, now, ino),
+                )
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// List directory contents
@@ -865,6 +1350,209 @@ impl Filesystem {
         }
 
         Ok(())
+    }
+
+    /// Rename/move a file or directory.
+    ///
+    /// This operation is atomic - either all changes succeed or none do.
+    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from_path = self.normalize_path(from);
+        let to_path = self.normalize_path(to);
+
+        // Cannot rename root
+        if from_path == "/" {
+            return Err(FsError::RootOperation.into());
+        }
+
+        // Get source inode
+        let src_ino = self
+            .resolve_path(&from_path)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        // Get source stats to check if it's a directory
+        let src_stats = self.stat(&from_path).await?.ok_or(FsError::NotFound)?;
+
+        // Prevent renaming a directory into its own subtree (would create a cycle)
+        if src_stats.is_directory() {
+            let from_prefix = format!("{}/", from_path);
+            if to_path.starts_with(&from_prefix) || to_path == from_path {
+                return Err(FsError::InvalidRename.into());
+            }
+        }
+
+        // Parse source path to get parent and name
+        let from_components = self.split_path(&from_path);
+        let src_name = from_components.last().ok_or(FsError::InvalidPath)?;
+        let src_parent_path = if from_components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!(
+                "/{}",
+                from_components[..from_components.len() - 1].join("/")
+            )
+        };
+        let src_parent_ino = self
+            .resolve_path(&src_parent_path)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        // Parse destination path to get parent and name
+        let to_components = self.split_path(&to_path);
+        if to_components.is_empty() {
+            return Err(FsError::RootOperation.into());
+        }
+        let dst_name = to_components.last().unwrap();
+        let dst_parent_path = if to_components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!("/{}", to_components[..to_components.len() - 1].join("/"))
+        };
+        let dst_parent_ino = self
+            .resolve_path(&dst_parent_path)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        // Clone strings for use inside the transaction closure
+        let src_name = src_name.clone();
+        let dst_name = dst_name.clone();
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result: Result<()> = async {
+            // Check if destination exists (inside transaction for atomicity)
+            if let Some(dst_ino) = self.resolve_path(&to_path).await? {
+                let dst_stats = self.stat(&to_path).await?.ok_or(FsError::NotFound)?;
+
+                // Can't replace directory with non-directory
+                if dst_stats.is_directory() && !src_stats.is_directory() {
+                    return Err(FsError::IsADirectory.into());
+                }
+
+                // Can't replace non-directory with directory
+                if !dst_stats.is_directory() && src_stats.is_directory() {
+                    return Err(FsError::NotADirectory.into());
+                }
+
+                // If destination is directory, it must be empty
+                if dst_stats.is_directory() {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?",
+                            (dst_ino,),
+                        )
+                        .await?;
+
+                    if let Some(row) = rows.next().await? {
+                        let count = row
+                            .get_value(0)
+                            .ok()
+                            .and_then(|v| v.as_integer().copied())
+                            .unwrap_or(0);
+                        if count > 0 {
+                            return Err(FsError::NotEmpty.into());
+                        }
+                    }
+                }
+
+                // Remove destination entry
+                self.conn
+                    .execute(
+                        "DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?",
+                        (dst_parent_ino, dst_name.as_str()),
+                    )
+                    .await?;
+
+                // Clean up destination inode if no more links
+                let link_count = self.get_link_count(dst_ino).await?;
+                if link_count == 0 {
+                    self.conn
+                        .execute("DELETE FROM fs_data WHERE ino = ?", (dst_ino,))
+                        .await?;
+                    self.conn
+                        .execute("DELETE FROM fs_symlink WHERE ino = ?", (dst_ino,))
+                        .await?;
+                    self.conn
+                        .execute("DELETE FROM fs_inode WHERE ino = ?", (dst_ino,))
+                        .await?;
+                }
+            }
+
+            // Update the dentry: change parent and/or name
+            self.conn
+                .execute(
+                    "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?",
+                    (
+                        dst_parent_ino,
+                        dst_name.as_str(),
+                        src_parent_ino,
+                        src_name.as_str(),
+                    ),
+                )
+                .await?;
+
+            // Update ctime of the inode
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            self.conn
+                .execute(
+                    "UPDATE fs_inode SET ctime = ? WHERE ino = ?",
+                    (now, src_ino),
+                )
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Get filesystem statistics
+    ///
+    /// Returns the total number of inodes and bytes used by file contents.
+    pub async fn statfs(&self) -> Result<FilesystemStats> {
+        // Count total inodes
+        let mut rows = self.conn.query("SELECT COUNT(*) FROM fs_inode", ()).await?;
+
+        let inodes = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        // Sum total bytes used (from file sizes in inodes)
+        let mut rows = self
+            .conn
+            .query("SELECT COALESCE(SUM(size), 0) FROM fs_inode", ())
+            .await?;
+
+        let bytes_used = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        Ok(FilesystemStats { inodes, bytes_used })
     }
 
     /// Get the number of chunks for a given inode (for testing)
@@ -1354,6 +2042,529 @@ mod tests {
                 path
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pread_basic() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Write a file with known content
+        let data: Vec<u8> = (0..100).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Read from the beginning
+        let result = fs.pread("/test.txt", 0, 10).await?.unwrap();
+        assert_eq!(result, &data[0..10]);
+
+        // Read from the middle
+        let result = fs.pread("/test.txt", 50, 20).await?.unwrap();
+        assert_eq!(result, &data[50..70]);
+
+        // Read from near the end
+        let result = fs.pread("/test.txt", 90, 10).await?.unwrap();
+        assert_eq!(result, &data[90..100]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pread_past_eof() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let data: Vec<u8> = (0..50).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Read starting past EOF should return empty
+        let result = fs.pread("/test.txt", 100, 10).await?.unwrap();
+        assert!(result.is_empty());
+
+        // Read that extends past EOF should return only available data
+        let result = fs.pread("/test.txt", 40, 20).await?.unwrap();
+        assert_eq!(result, &data[40..50]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pread_nonexistent_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let result = fs.pread("/nonexistent.txt", 0, 10).await?;
+        assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pread_across_chunks() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+
+        // Create data spanning multiple chunks
+        let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Read across chunk boundary
+        let start = chunk_size - 10;
+        let result = fs.pread("/test.txt", start as u64, 20).await?.unwrap();
+        assert_eq!(result, &data[start..start + 20]);
+
+        // Read spanning multiple chunks
+        let start = chunk_size / 2;
+        let size = chunk_size * 2;
+        let result = fs
+            .pread("/test.txt", start as u64, size as u64)
+            .await?
+            .unwrap();
+        assert_eq!(result, &data[start..start + size]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_basic() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Write initial data
+        let data: Vec<u8> = vec![0; 100];
+        fs.write_file("/test.txt", &data).await?;
+
+        // Overwrite in the middle
+        fs.pwrite("/test.txt", 50, &[1, 2, 3, 4, 5]).await?;
+
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), 100);
+        assert_eq!(&result[50..55], &[1, 2, 3, 4, 5]);
+        assert_eq!(&result[0..50], &vec![0u8; 50][..]);
+        assert_eq!(&result[55..100], &vec![0u8; 45][..]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_extend_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Write initial data
+        let data: Vec<u8> = vec![1; 50];
+        fs.write_file("/test.txt", &data).await?;
+
+        // Write past EOF - should extend with zeros
+        fs.pwrite("/test.txt", 100, &[2, 2, 2, 2, 2]).await?;
+
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), 105);
+        assert_eq!(&result[0..50], &vec![1u8; 50][..]);
+        assert_eq!(&result[50..100], &vec![0u8; 50][..]);
+        assert_eq!(&result[100..105], &[2, 2, 2, 2, 2]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_creates_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // pwrite to a non-existent file should create it
+        fs.pwrite("/new.txt", 0, &[1, 2, 3]).await?;
+
+        let result = fs.read_file("/new.txt").await?.unwrap();
+        assert_eq!(result, &[1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pwrite_across_chunks() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+
+        // Create initial data spanning multiple chunks
+        let data: Vec<u8> = vec![0; chunk_size * 3];
+        fs.write_file("/test.txt", &data).await?;
+
+        // Write across chunk boundary
+        let write_data: Vec<u8> = (0..20).collect();
+        let start = chunk_size - 10;
+        fs.pwrite("/test.txt", start as u64, &write_data).await?;
+
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(&result[start..start + 20], &write_data[..]);
+
+        // Verify surrounding data is unchanged
+        assert_eq!(&result[0..start], &vec![0u8; start][..]);
+        assert_eq!(
+            &result[start + 20..],
+            &vec![0u8; chunk_size * 3 - start - 20][..]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pread_pwrite_roundtrip() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+
+        // Create a file
+        let initial: Vec<u8> = (0..(chunk_size * 2)).map(|i| (i % 256) as u8).collect();
+        fs.write_file("/test.txt", &initial).await?;
+
+        // Write some data at various offsets
+        let patches = vec![
+            (0u64, vec![0xAAu8; 10]),
+            (chunk_size as u64 - 5, vec![0xBB; 10]),
+            (chunk_size as u64 * 2 - 1, vec![0xCC; 1]),
+        ];
+
+        for (offset, data) in &patches {
+            fs.pwrite("/test.txt", *offset, data).await?;
+        }
+
+        // Verify with pread
+        for (offset, expected) in &patches {
+            let result = fs
+                .pread("/test.txt", *offset, expected.len() as u64)
+                .await?
+                .unwrap();
+            assert_eq!(&result, expected);
+        }
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Truncate Tests
+    // ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_truncate_to_zero() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file with some data
+        let data: Vec<u8> = (0..100).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Truncate to zero
+        fs.truncate("/test.txt", 0).await?;
+
+        // Verify file is empty
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert!(result.is_empty());
+
+        // Verify stat shows size 0
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(stats.size, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_smaller_within_chunk() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file smaller than chunk size
+        let data: Vec<u8> = (0..100).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Truncate to 50 bytes
+        fs.truncate("/test.txt", 50).await?;
+
+        // Verify data is truncated correctly
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), 50);
+        assert_eq!(result, &data[..50]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_across_chunk_boundary() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+
+        // Create a file spanning multiple chunks
+        let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Truncate to middle of second chunk
+        let new_size = chunk_size + chunk_size / 2;
+        fs.truncate("/test.txt", new_size as u64).await?;
+
+        // Verify data
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), new_size);
+        assert_eq!(result, &data[..new_size]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_extend_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a small file
+        let data: Vec<u8> = (0..50).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Extend to 100 bytes
+        fs.truncate("/test.txt", 100).await?;
+
+        // Verify size increased
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(stats.size, 100);
+
+        // Original data should be preserved, rest should be zeros (sparse)
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), 100);
+        assert_eq!(&result[..50], &data[..]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_nonexistent_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Truncate non-existent file should fail
+        let result = fs.truncate("/nonexistent.txt", 100).await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate_at_chunk_boundary() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let chunk_size = fs.chunk_size();
+
+        // Create a file spanning multiple chunks
+        let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
+        fs.write_file("/test.txt", &data).await?;
+
+        // Truncate exactly at chunk boundary
+        fs.truncate("/test.txt", chunk_size as u64).await?;
+
+        // Verify
+        let result = fs.read_file("/test.txt").await?.unwrap();
+        assert_eq!(result.len(), chunk_size);
+        assert_eq!(result, &data[..chunk_size]);
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Rename Tests
+    // ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rename_file_same_directory() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file
+        let data = b"hello world";
+        fs.write_file("/old.txt", data).await?;
+
+        // Rename it
+        fs.rename("/old.txt", "/new.txt").await?;
+
+        // Old path should not exist
+        assert!(fs.stat("/old.txt").await?.is_none());
+
+        // New path should exist with same data
+        let result = fs.read_file("/new.txt").await?.unwrap();
+        assert_eq!(result, data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_to_different_directory() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create directory and file
+        fs.mkdir("/subdir").await?;
+        let data = b"test data";
+        fs.write_file("/file.txt", data).await?;
+
+        // Move file to subdirectory
+        fs.rename("/file.txt", "/subdir/file.txt").await?;
+
+        // Old path should not exist
+        assert!(fs.stat("/file.txt").await?.is_none());
+
+        // New path should exist
+        let result = fs.read_file("/subdir/file.txt").await?.unwrap();
+        assert_eq!(result, data);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_overwrite_existing_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create two files
+        fs.write_file("/src.txt", b"source").await?;
+        fs.write_file("/dst.txt", b"destination").await?;
+
+        // Rename src to dst (overwrites dst)
+        fs.rename("/src.txt", "/dst.txt").await?;
+
+        // Only dst should exist with src's content
+        assert!(fs.stat("/src.txt").await?.is_none());
+        let result = fs.read_file("/dst.txt").await?.unwrap();
+        assert_eq!(result, b"source");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create directory with a file inside
+        fs.mkdir("/olddir").await?;
+        fs.write_file("/olddir/file.txt", b"content").await?;
+
+        // Rename directory
+        fs.rename("/olddir", "/newdir").await?;
+
+        // Old path should not exist
+        assert!(fs.stat("/olddir").await?.is_none());
+
+        // New path should exist and contain the file
+        assert!(fs.stat("/newdir").await?.is_some());
+        let result = fs.read_file("/newdir/file.txt").await?.unwrap();
+        assert_eq!(result, b"content");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory_into_own_subtree_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create nested directories
+        fs.mkdir("/parent").await?;
+        fs.mkdir("/parent/child").await?;
+
+        // Try to rename parent into its child - should fail
+        let result = fs.rename("/parent", "/parent/child/parent").await;
+        assert!(result.is_err());
+
+        // Original structure should be intact
+        assert!(fs.stat("/parent").await?.is_some());
+        assert!(fs.stat("/parent/child").await?.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_root_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Try to rename root - should fail
+        let result = fs.rename("/", "/newroot").await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_to_root_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        fs.write_file("/file.txt", b"data").await?;
+
+        // Try to rename to root - should fail
+        let result = fs.rename("/file.txt", "/").await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_nonexistent_source_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Try to rename non-existent file
+        let result = fs.rename("/nonexistent.txt", "/new.txt").await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_overwrite_nonempty_directory_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create source directory and target directory with content
+        fs.mkdir("/src").await?;
+        fs.mkdir("/dst").await?;
+        fs.write_file("/dst/file.txt", b"content").await?;
+
+        // Try to rename src to dst (dst is not empty) - should fail
+        let result = fs.rename("/src", "/dst").await;
+        assert!(result.is_err());
+
+        // Both directories should still exist
+        assert!(fs.stat("/src").await?.is_some());
+        assert!(fs.stat("/dst").await?.is_some());
+        assert!(fs.stat("/dst/file.txt").await?.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_to_directory_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file and an empty directory
+        fs.write_file("/file.txt", b"data").await?;
+        fs.mkdir("/dir").await?;
+
+        // Try to rename file over directory - should fail
+        let result = fs.rename("/file.txt", "/dir").await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory_to_file_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a directory and a file
+        fs.mkdir("/dir").await?;
+        fs.write_file("/file.txt", b"data").await?;
+
+        // Try to rename directory over file - should fail
+        let result = fs.rename("/dir", "/file.txt").await;
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rename_updates_ctime() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file
+        fs.write_file("/old.txt", b"data").await?;
+        let stats_before = fs.stat("/old.txt").await?.unwrap();
+
+        // Small delay to ensure time changes
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Rename it
+        fs.rename("/old.txt", "/new.txt").await?;
+
+        // ctime should be updated
+        let stats_after = fs.stat("/new.txt").await?.unwrap();
+        assert!(stats_after.ctime >= stats_before.ctime);
 
         Ok(())
     }
