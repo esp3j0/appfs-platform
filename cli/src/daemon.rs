@@ -1,5 +1,11 @@
 use anyhow::Result;
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// Maximum length for error messages sent through the daemon pipe.
+const MAX_ERROR_MSG_LEN: usize = 4096;
 
 /// Daemonize the current process and run a function in the daemon.
 ///
@@ -41,15 +47,11 @@ where
 
             // Create new session (detach from terminal)
             if unsafe { libc::setsid() } == -1 {
-                let _ = signal_parent(write_fd, false);
+                let _ = signal_parent(write_fd, Err("Failed to create new session".to_string()));
                 std::process::exit(1);
             }
 
-            // Redirect stdin/stdout/stderr to /dev/null
-            redirect_stdio_to_devnull();
-
-            // Run the daemon function in a separate thread
-            let daemon_thread = std::thread::spawn(daemon_fn);
+            let (daemon_thread, error_msg) = start_daemon(daemon_fn);
 
             // Wait for readiness, but fail early if daemon thread exits
             let start = std::time::Instant::now();
@@ -66,8 +68,19 @@ where
                 std::thread::sleep(Duration::from_millis(50));
             };
 
-            // Signal parent
-            let _ = signal_parent(write_fd, ready);
+            // Signal parent with result
+            let signal_result = if ready {
+                Ok(())
+            } else {
+                // Try to get the error message from the daemon thread
+                let err_msg = error_msg
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .unwrap_or_else(|| "Daemon failed to start".to_string());
+                Err(err_msg)
+            };
+            let _ = signal_parent(write_fd, signal_result);
             unsafe { libc::close(write_fd) };
 
             if !ready {
@@ -85,68 +98,153 @@ where
             unsafe { libc::close(write_fd) };
 
             // Wait for child to signal readiness
-            let success = wait_for_signal(read_fd);
+            let result = wait_for_signal(read_fd);
             unsafe { libc::close(read_fd) };
 
-            if success {
-                Ok(())
-            } else {
-                anyhow::bail!("Daemon failed to start")
+            match result {
+                Ok(()) => Ok(()),
+                Err(msg) => anyhow::bail!("{}", msg),
             }
         }
     }
 }
 
-/// Signal parent process via pipe.
+/// Signal parent process via pipe with optional error message.
 ///
 /// Retries on EINTR to handle signal interruption during write.
-fn signal_parent(fd: libc::c_int, success: bool) -> Result<()> {
-    let buf = [if success { 0u8 } else { 1u8 }];
-    loop {
-        let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
-        if written == 1 {
-            return Ok(());
+fn signal_parent(fd: libc::c_int, result: Result<(), String>) -> Result<()> {
+    // Protocol: first byte is success (0) or failure (1)
+    // If failure, followed by 4-byte length (big-endian) and error message
+    let buf = match &result {
+        Ok(()) => vec![0u8],
+        Err(msg) => {
+            let msg_bytes = msg.as_bytes();
+            let len = msg_bytes.len().min(MAX_ERROR_MSG_LEN);
+            let mut buf = Vec::with_capacity(1 + 4 + len);
+            buf.push(1u8);
+            buf.extend_from_slice(&(len as u32).to_be_bytes());
+            buf.extend_from_slice(&msg_bytes[..len]);
+            buf
         }
-        if written == -1 {
+    };
+
+    let mut written_total = 0;
+    while written_total < buf.len() {
+        let written = unsafe {
+            libc::write(
+                fd,
+                buf[written_total..].as_ptr() as *const libc::c_void,
+                buf.len() - written_total,
+            )
+        };
+        if written > 0 {
+            written_total += written as usize;
+        } else if written == -1 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             anyhow::bail!("Failed to signal parent: {}", err);
+        } else {
+            anyhow::bail!("Unexpected write result: {}", written);
         }
-        anyhow::bail!("Unexpected write result: {}", written);
     }
+    Ok(())
 }
 
 /// Wait for signal from child process.
 ///
+/// Returns Ok(()) on success, Err with error message on failure.
 /// Retries on EINTR to handle signal interruption during read.
-fn wait_for_signal(fd: libc::c_int) -> bool {
-    let mut buf = [0u8; 1];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        if n == 1 {
-            return buf[0] == 0;
-        }
-        if n == 0 {
-            // EOF - child closed pipe without signaling (crash)
-            return false;
-        }
-        if n == -1 {
+fn wait_for_signal(fd: libc::c_int) -> Result<(), String> {
+    // Read first byte to determine success/failure
+    let status = match read_exact(fd, 1) {
+        Some(buf) => buf[0],
+        None => return Err("Daemon process terminated unexpectedly".to_string()),
+    };
+
+    if status == 0 {
+        return Ok(());
+    }
+
+    // Read 4-byte length
+    let len_bytes = match read_exact(fd, 4) {
+        Some(buf) => buf,
+        None => return Err("Daemon failed to start".to_string()),
+    };
+
+    let len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+    // Cap length to prevent allocation attacks from malformed messages
+    let len = len.min(MAX_ERROR_MSG_LEN);
+    if len == 0 {
+        return Err("Daemon failed to start".to_string());
+    }
+
+    // Read error message
+    match read_exact(fd, len) {
+        Some(buf) => Err(String::from_utf8_lossy(&buf).into_owned()),
+        None => Err("Daemon failed to start".to_string()),
+    }
+}
+
+/// Read exactly `n` bytes from fd, retrying on EINTR.
+fn read_exact(fd: libc::c_int, n: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut read_total = 0;
+
+    while read_total < n {
+        let result = unsafe {
+            libc::read(
+                fd,
+                buf[read_total..].as_mut_ptr() as *mut libc::c_void,
+                n - read_total,
+            )
+        };
+        if result > 0 {
+            read_total += result as usize;
+        } else if result == 0 {
+            // EOF
+            return None;
+        } else {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            // Other error - treat as failure
-            return false;
+            return None;
         }
-        // Unexpected return value
-        return false;
     }
+    Some(buf)
+}
+
+/// Start the daemon function in a separate thread, capturing any error message.
+fn start_daemon<F>(
+    daemon_fn: F,
+) -> (
+    std::thread::JoinHandle<Result<()>>,
+    Arc<Mutex<Option<String>>>,
+)
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    redirect_stdio();
+    let error_msg: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let daemon_thread = {
+        let error_msg = error_msg.clone();
+        std::thread::spawn(move || {
+            let result = daemon_fn();
+            if let Err(ref e) = result {
+                if let Ok(mut guard) = error_msg.lock() {
+                    *guard = Some(format!("{:#}", e));
+                }
+            }
+            result
+        })
+    };
+    (daemon_thread, error_msg)
 }
 
 /// Redirect stdio to /dev/null for daemon
-fn redirect_stdio_to_devnull() {
+fn redirect_stdio() {
     unsafe {
         let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if devnull >= 0 {
