@@ -5,8 +5,6 @@ members = ["cargo:cli"]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.2"
-# Use Zig as the linker for portable Linux binaries (targets glibc 2.17)
-build-backend = "zig"
 # Skip checking whether the specified configuration files are up to date
 allow-dirty = ["ci"]
 # CI backends to support
