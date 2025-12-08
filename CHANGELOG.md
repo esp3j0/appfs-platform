@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.2] - 2025-12-08
+
+### Added
+
+- Linux/arm64 support.
+
+### Documentation
+
+- Improved FUSE module documentation.
+
 ## [0.2.1] - 2025-12-04
 
 ### Fixed
