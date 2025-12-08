@@ -21,11 +21,11 @@ use turso::{Builder, Value};
 #[command(about = "The filesystem for agents", long_about = None)]
 struct Args {
     #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
+enum Command {
     /// Initialize a new agent filesystem
     Init {
         /// Agent identifier (if not provided, generates a unique one)
@@ -38,7 +38,7 @@ enum Commands {
     /// Filesystem operations
     Fs {
         #[command(subcommand)]
-        command: FsCommands,
+        command: FsCommand,
     },
     /// Run a command in the sandboxed environment (experimental).
     Run {
@@ -90,7 +90,7 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
-enum FsCommands {
+enum FsCommand {
     /// List files in the filesystem
     Ls {
         /// Agent ID or database path
@@ -350,17 +350,17 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Commands::Init { id, force } => {
+        Command::Init { id, force } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             if let Err(e) = rt.block_on(init_database(id, force)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        Commands::Fs { command } => {
+        Command::Fs { command } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             match command {
-                FsCommands::Ls {
+                FsCommand::Ls {
                     id_or_path,
                     fs_path,
                 } => {
@@ -369,7 +369,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                FsCommands::Cat {
+                FsCommand::Cat {
                     id_or_path,
                     file_path,
                 } => {
@@ -380,7 +380,7 @@ fn main() {
                 }
             }
         }
-        Commands::Run {
+        Command::Run {
             mounts,
             strace,
             command,
@@ -389,7 +389,7 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(cmd::handle_run_command(mounts, strace, command, args));
         }
-        Commands::Mount {
+        Command::Mount {
             id_or_path,
             mountpoint,
             auto_unmount,
