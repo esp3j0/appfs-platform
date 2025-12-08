@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MountArgs {
     /// The agent filesystem ID or path.
     pub id_or_path: String,

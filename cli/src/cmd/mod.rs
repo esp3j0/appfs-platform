@@ -1,3 +1,6 @@
+pub mod fs;
+pub mod init;
+
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(not(target_os = "linux"))]

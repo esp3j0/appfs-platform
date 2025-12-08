@@ -3,8 +3,7 @@ pub mod kvstore;
 pub mod toolcalls;
 
 use anyhow::Result;
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use turso::{Builder, Connection};
 
 pub use filesystem::{Filesystem, FilesystemStats, FsError, Stats};
