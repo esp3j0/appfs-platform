@@ -4,8 +4,7 @@ use agentfs_sandbox::{
 };
 use reverie_process::Command;
 use reverie_ptrace::TracerBuilder;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 pub async fn run_sandbox(
     mut mounts: Vec<MountConfig>,

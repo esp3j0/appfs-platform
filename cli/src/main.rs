@@ -10,8 +10,10 @@ use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
 use clap::{Parser, Subcommand};
 use cmd::MountConfig;
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 use turso::{Builder, Value};
 
 #[derive(Parser, Debug)]

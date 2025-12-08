@@ -1,7 +1,9 @@
 use anyhow::Result;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use turso::{Builder, Connection, Value};
 

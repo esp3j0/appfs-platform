@@ -9,8 +9,10 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
