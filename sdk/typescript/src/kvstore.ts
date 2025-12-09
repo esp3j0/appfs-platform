@@ -69,6 +69,15 @@ export class KvStore {
     return JSON.parse(row.value);
   }
 
+  async list(prefix: string): Promise<{ key: string, value: any }[]> {
+    await this.initialized;
+
+    const stmt = this.db.prepare(`SELECT key, value FROM kv_store WHERE key LIKE ? ESCAPE '\\'`);
+    const escaped = prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_');
+    const rows = await stmt.all(escaped + '%') as { key: string, value: string }[];
+    return rows.map(r => ({ key: r.key, value: JSON.parse(r.value) }));
+  }
+
   async delete(key: string): Promise<void> {
     await this.initialized;
 

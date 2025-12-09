@@ -62,6 +62,16 @@ describe('KvStore Integration Tests', () => {
       const value = await kvStore.get('array-key');
       expect(value).toEqual(testArray);
     });
+    it('should set and list values', async () => {
+      await kvStore.set('g1:k1', 1);
+      await kvStore.set('g1:k2', 2);
+      await kvStore.set('g2:k1', 3);
+      await kvStore.set('g2:k2', 4);
+      expect(await kvStore.list('g1:')).toEqual([{ key: 'g1:k1', value: 1 }, { key: 'g1:k2', value: 2 }]);
+      expect(await kvStore.list('g1:k1')).toEqual([{ key: 'g1:k1', value: 1 }]);
+      expect(await kvStore.list('g1:k3')).toEqual([]);
+      expect(await kvStore.list('g2:')).toEqual([{ key: 'g2:k1', value: 3 }, { key: 'g2:k2', value: 4 }]);
+    });
   });
 
   describe('Update Operations', () => {
