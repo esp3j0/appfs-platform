@@ -35,7 +35,7 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
 
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     echo "Installing dependencies for macOS..."
-    brew install macfuse
+    brew install --cask macfuse
     echo "macOS dependencies installed successfully"
 
 else
