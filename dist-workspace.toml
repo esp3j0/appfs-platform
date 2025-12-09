@@ -23,3 +23,6 @@ install-updater = true
 libunwind-dev = "*"
 liblzma-dev = "*"
 libfuse3-dev = "*"
+
+[dist.dependencies.homebrew]
+macfuse = "*"
