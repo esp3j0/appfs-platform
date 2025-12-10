@@ -126,10 +126,11 @@ await agent.tools.record(
 
 ### Examples
 
-AgentFS includes examples demonstrating integration with popular AI frameworks:
+This source repository also contains examples that demonstrate how to integrate AgentFS with some popular AI frameworks:
 
 - **[Mastra](examples/mastra/research-assistant)** - Research assistant using the Mastra AI framework
 - **[Claude Agent SDK](examples/claude-agent/research-assistant)** - Research assistant using Anthropic's Claude Agent SDK
+- **[OpenAI Agents](examples/openai-agents/research-assistant)** - Research assistant using OpenAI Agents SDK
 
 See the **[examples](examples)** directory for more details.
 
