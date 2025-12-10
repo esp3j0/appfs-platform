@@ -86,6 +86,12 @@ pub enum Command {
         #[arg(long)]
         gid: Option<u32>,
     },
+    /// Show differences between base filesystem and delta (overlay mode only)
+    Diff {
+        /// Agent ID or database path
+        #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -91,6 +91,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Diff { id_or_path } => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Completions { command } => handle_completions(command),
     }
 }
