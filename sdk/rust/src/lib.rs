@@ -6,7 +6,11 @@ use anyhow::Result;
 use std::{path::Path, sync::Arc};
 use turso::{Builder, Connection};
 
-pub use filesystem::{Filesystem, FilesystemStats, FsError, Stats};
+// Re-export filesystem types
+pub use filesystem::{
+    FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFDIR,
+    S_IFLNK, S_IFMT, S_IFREG,
+};
 pub use kvstore::KvStore;
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
@@ -101,7 +105,7 @@ impl AgentFSOptions {
 pub struct AgentFS {
     conn: Arc<Connection>,
     pub kv: KvStore,
-    pub fs: Filesystem,
+    pub fs: filesystem::AgentFS,
     pub tools: ToolCalls,
 }
 
@@ -154,7 +158,7 @@ impl AgentFS {
         let conn = Arc::new(conn);
 
         let kv = KvStore::from_connection(conn.clone()).await?;
-        let fs = Filesystem::from_connection(conn.clone()).await?;
+        let fs = filesystem::AgentFS::from_connection(conn.clone()).await?;
         let tools = ToolCalls::from_connection(conn.clone()).await?;
 
         Ok(Self {
@@ -179,7 +183,7 @@ impl AgentFS {
         let conn = Arc::new(conn);
 
         let kv = KvStore::from_connection(conn.clone()).await?;
-        let fs = Filesystem::from_connection(conn.clone()).await?;
+        let fs = filesystem::AgentFS::from_connection(conn.clone()).await?;
         let tools = ToolCalls::from_connection(conn.clone()).await?;
 
         Ok(Self {
