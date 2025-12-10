@@ -29,6 +29,10 @@ pub enum Command {
         /// Overwrite existing file if it exists
         #[arg(long)]
         force: bool,
+
+        /// Base directory for overlay filesystem (copy-on-write)
+        #[arg(long)]
+        base: Option<PathBuf>,
     },
     /// Filesystem operations
     Fs {
