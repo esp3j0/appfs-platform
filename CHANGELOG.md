@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.3] - 2025-12-10
+
+### Added
+
+- macFUSE support
+
 ## [0.2.2] - 2025-12-08
 
 ### Added
@@ -60,7 +66,10 @@
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
-[Unreleased]: https://github.com/tursodatabase/agentfs/compare/v0.1.2...HEAD
+[0.2.3]: https://github.com/tursodatabase/agentfs/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/tursodatabase/agentfs/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/tursodatabase/agentfs/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/tursodatabase/agentfs/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/tursodatabase/agentfs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/tursodatabase/agentfs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tursodatabase/agentfs/releases/tag/v0.1.0
