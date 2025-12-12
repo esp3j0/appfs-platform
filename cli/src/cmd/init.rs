@@ -1,7 +1,6 @@
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{AgentFS, AgentFSOptions};
+use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
 
 pub async fn init_database(id: Option<String>, force: bool) -> AnyhowResult<()> {
@@ -23,7 +22,7 @@ pub async fn init_database(id: Option<String>, force: bool) -> AnyhowResult<()> 
     }
 
     // Check if agent already exists
-    let db_path = Path::new(".agentfs").join(format!("{}.db", id));
+    let db_path = agentfs_dir().join(format!("{}.db", id));
     if db_path.exists() && !force {
         anyhow::bail!(
             "Agent '{}' already exists at '{}'. Use --force to overwrite.",
