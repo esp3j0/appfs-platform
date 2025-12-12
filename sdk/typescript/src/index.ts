@@ -92,17 +92,11 @@ export class AgentFS {
   }
 
   static async openWith(db: Database): Promise<AgentFS> {
-    // Create subsystems
-    const kv = new KvStore(db);
-    const fs = new Filesystem(db);
-    const tools = new ToolCalls(db);
-
-    // Wait for all subsystems to initialize
-    await kv.ready();
-    await fs.ready();
-    await tools.ready();
-
-    // Return fully initialized instance
+    const [kv, fs, tools] = await Promise.all([
+      KvStore.fromDatabase(db),
+      Filesystem.fromDatabase(db),
+      ToolCalls.fromDatabase(db),
+    ]);
     return new AgentFS(db, kv, fs, tools);
   }
 

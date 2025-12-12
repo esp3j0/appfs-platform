@@ -18,9 +18,8 @@ describe('Filesystem Integration Tests', () => {
 
     // Initialize database and Filesystem
     db = new Database(dbPath);
-    fs = new Filesystem(db);
-    // Wait for filesystem initialization to complete
-    await fs.ready();
+    await db.connect();
+    fs = await Filesystem.fromDatabase(db);
   });
 
   afterEach(async () => {
@@ -264,8 +263,7 @@ describe('Filesystem Integration Tests', () => {
     it('should work with in-memory database when no db provided', async () => {
       const standaloneDb = new Database(':memory:');
       await standaloneDb.connect();
-      const standaloneFs = new Filesystem(standaloneDb);
-      await standaloneFs.ready();
+      const standaloneFs = await Filesystem.fromDatabase(standaloneDb);
       await standaloneFs.writeFile('/test.txt', 'standalone content');
       const content = await standaloneFs.readFile('/test.txt', 'utf8');
       expect(content).toBe('standalone content');
@@ -275,13 +273,11 @@ describe('Filesystem Integration Tests', () => {
     it('should maintain isolation between instances', async () => {
       const db1 = new Database(':memory:');
       await db1.connect();
-      const fs1 = new Filesystem(db1);
-      await fs1.ready();
+      const fs1 = await Filesystem.fromDatabase(db1);
 
       const db2 = new Database(':memory:');
       await db2.connect();
-      const fs2 = new Filesystem(db2);
-      await fs2.ready();
+      const fs2 = await Filesystem.fromDatabase(db2);
 
       await fs1.writeFile('/test.txt', 'fs1 content');
       await fs2.writeFile('/test.txt', 'fs2 content');
@@ -297,8 +293,7 @@ describe('Filesystem Integration Tests', () => {
   describe('Persistence', () => {
     it('should persist data across Filesystem instances', async () => {
       await fs.writeFile('/persist.txt', 'persistent content');
-      const newFs = new Filesystem(db);
-      await newFs.ready();
+      const newFs = await Filesystem.fromDatabase(db);
       const content = await newFs.readFile('/persist.txt', 'utf8');
       expect(content).toBe('persistent content');
     });
@@ -640,9 +635,6 @@ describe('Filesystem Integration Tests', () => {
     });
 
     it('should persist chunk_size in fs_config table', async () => {
-      // Wait for filesystem initialization to ensure tables exist
-      await fs.ready();
-
       // Query fs_config table directly
       const stmt = db.prepare("SELECT value FROM fs_config WHERE key = 'chunk_size'");
       const result = await stmt.get() as { value: string } | undefined;

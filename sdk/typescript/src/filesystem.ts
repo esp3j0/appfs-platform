@@ -29,13 +29,20 @@ export interface Stats {
 
 export class Filesystem {
   private db: Database;
-  private initialized: Promise<void>;
   private rootIno: number = 1;
   private chunkSize: number = DEFAULT_CHUNK_SIZE;
 
-  constructor(db: Database) {
+  private constructor(db: Database) {
     this.db = db;
-    this.initialized = this.initialize();
+  }
+
+  /**
+   * Create a Filesystem from an existing database connection
+   */
+  static async fromDatabase(db: Database): Promise<Filesystem> {
+    const fs = new Filesystem(db);
+    await fs.initialize();
+    return fs;
   }
 
   /**
@@ -46,16 +53,6 @@ export class Filesystem {
   }
 
   private async initialize(): Promise<void> {
-    // Ensure database is connected
-    try {
-      await this.db.connect();
-    } catch (error: any) {
-      // Ignore "already connected" errors
-      if (!error.message?.includes('already')) {
-        throw error;
-      }
-    }
-
     // Create the config table
     await this.db.exec(`
       CREATE TABLE IF NOT EXISTS fs_config (
@@ -175,8 +172,6 @@ export class Filesystem {
    * Resolve a path to an inode number
    */
   private async resolvePath(path: string): Promise<number | null> {
-    await this.initialized;
-
     const normalized = this.normalizePath(path);
 
     // Root directory
@@ -295,8 +290,6 @@ export class Filesystem {
   }
 
   async writeFile(path: string, content: string | Buffer): Promise<void> {
-    await this.initialized;
-
     // Ensure parent directories exist
     await this.ensureParentDirs(path);
 
@@ -357,8 +350,6 @@ export class Filesystem {
   }
 
   async readFile(path: string, encoding?: BufferEncoding): Promise<Buffer | string> {
-    await this.initialized;
-
     const ino = await this.resolvePath(path);
     if (ino === null) {
       throw new Error(`ENOENT: no such file or directory, open '${path}'`);
@@ -393,8 +384,6 @@ export class Filesystem {
   }
 
   async readdir(path: string): Promise<string[]> {
-    await this.initialized;
-
     const ino = await this.resolvePath(path);
     if (ino === null) {
       throw new Error(`ENOENT: no such file or directory, scandir '${path}'`);
@@ -412,8 +401,6 @@ export class Filesystem {
   }
 
   async deleteFile(path: string): Promise<void> {
-    await this.initialized;
-
     const ino = await this.resolvePath(path);
     if (ino === null) {
       throw new Error(`ENOENT: no such file or directory, unlink '${path}'`);
@@ -445,8 +432,6 @@ export class Filesystem {
   }
 
   async stat(path: string): Promise<Stats> {
-    await this.initialized;
-
     const ino = await this.resolvePath(path);
     if (ino === null) {
       throw new Error(`ENOENT: no such file or directory, stat '${path}'`);
@@ -488,12 +473,5 @@ export class Filesystem {
       isDirectory: () => (row.mode & S_IFMT) === S_IFDIR,
       isSymbolicLink: () => (row.mode & S_IFMT) === S_IFLNK,
     };
-  }
-
-  /**
-   * Wait for initialization to complete
-   */
-  async ready(): Promise<void> {
-    await this.initialized;
   }
 }

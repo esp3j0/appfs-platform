@@ -18,7 +18,8 @@ describe('ToolCalls Integration Tests', () => {
 
     // Initialize database and ToolCalls
     db = new Database(dbPath);
-    toolCalls = new ToolCalls(db);
+    await db.connect();
+    toolCalls = await ToolCalls.fromDatabase(db);
   });
 
   afterEach(() => {
@@ -284,7 +285,7 @@ describe('ToolCalls Integration Tests', () => {
       await toolCalls.success(id, { result: 'ok' });
 
       // Create new ToolCalls instance with same database
-      const newToolCalls = new ToolCalls(db);
+      const newToolCalls = await ToolCalls.fromDatabase(db);
       const toolCall = await newToolCalls.get(id);
 
       expect(toolCall).toBeDefined();

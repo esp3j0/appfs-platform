@@ -2,24 +2,21 @@ import { Database } from '@tursodatabase/database';
 
 export class KvStore {
   private db: Database;
-  private initialized: Promise<void>;
 
-  constructor(db: Database) {
+  private constructor(db: Database) {
     this.db = db;
-    this.initialized = this.initialize();
+  }
+
+  /**
+   * Create a KvStore from an existing database connection
+   */
+  static async fromDatabase(db: Database): Promise<KvStore> {
+    const kv = new KvStore(db);
+    await kv.initialize();
+    return kv;
   }
 
   private async initialize(): Promise<void> {
-    // Ensure database is connected
-    try {
-      await this.db.connect();
-    } catch (error: any) {
-      // Ignore "already connected" errors
-      if (!error.message?.includes('already')) {
-        throw error;
-      }
-    }
-
     // Create the key-value store table if it doesn't exist
     await this.db.exec(`
       CREATE TABLE IF NOT EXISTS kv_store (
@@ -38,8 +35,6 @@ export class KvStore {
   }
 
   async set(key: string, value: any): Promise<void> {
-    await this.initialized;
-
     // Serialize the value to JSON
     const serializedValue = JSON.stringify(value);
 
@@ -56,8 +51,6 @@ export class KvStore {
   }
 
   async get(key: string): Promise<any> {
-    await this.initialized;
-
     const stmt = this.db.prepare(`SELECT value FROM kv_store WHERE key = ?`);
     const row = await stmt.get(key) as { value: string } | undefined;
 
@@ -70,8 +63,6 @@ export class KvStore {
   }
 
   async list(prefix: string): Promise<{ key: string, value: any }[]> {
-    await this.initialized;
-
     const stmt = this.db.prepare(`SELECT key, value FROM kv_store WHERE key LIKE ? ESCAPE '\\'`);
     const escaped = prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_');
     const rows = await stmt.all(escaped + '%') as { key: string, value: string }[];
@@ -79,16 +70,7 @@ export class KvStore {
   }
 
   async delete(key: string): Promise<void> {
-    await this.initialized;
-
     const stmt = this.db.prepare(`DELETE FROM kv_store WHERE key = ?`);
     await stmt.run(key);
-  }
-
-  /**
-   * Wait for initialization to complete
-   */
-  async ready(): Promise<void> {
-    await this.initialized;
   }
 }
