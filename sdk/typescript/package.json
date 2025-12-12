@@ -24,6 +24,10 @@
   ],
   "author": "",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/agentfs"
+  },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@vitest/ui": "^4.0.1",
