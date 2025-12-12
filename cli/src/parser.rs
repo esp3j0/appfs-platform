@@ -1,7 +1,10 @@
 use crate::cmd::{completions::Shell, MountConfig};
+use agentfs_sdk::agentfs_dir;
 use clap::{Parser, Subcommand};
-use clap_complete::{ArgValueCompleter, PathCompleter};
-use std::path::PathBuf;
+use clap_complete::{
+    engine::ValueCompleter, ArgValueCompleter, CompletionCandidate, PathCompleter,
+};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
@@ -52,7 +55,7 @@ pub enum Command {
     /// Mount an agent filesystem using FUSE
     Mount {
         /// Agent ID or database path
-        #[arg(value_name = "ID_OR_PATH")]
+        #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
         /// Mount point directory
@@ -86,6 +89,7 @@ pub enum FsCommand {
     /// List files in the filesystem
     Ls {
         /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
         /// Path to list (default: /)
@@ -95,6 +99,7 @@ pub enum FsCommand {
     /// Display file contents
     Cat {
         /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
         /// Path to the file in the filesystem
@@ -118,4 +123,52 @@ pub enum CompletionsCommand {
     },
     /// Print instructions for manual installation
     Show,
+}
+
+fn id_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let mut completions = vec![];
+    let Some(current) = current.to_str() else {
+        return completions;
+    };
+
+    let agentfs_dir = agentfs_dir();
+    let Ok(read_dir) = agentfs_dir.read_dir() else {
+        return completions;
+    };
+
+    let mut ids = read_dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let file_name = e.file_name();
+            let path = Path::new(&file_name);
+            let name = path.file_prefix()?.to_str()?;
+            if name.starts_with(current) {
+                Some(CompletionCandidate::new(name).help(Some("Agent ID".into())))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ids.sort();
+    ids.dedup();
+
+    completions.append(&mut ids);
+    completions
+}
+
+fn id_or_path_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let mut completions = vec![];
+
+    // TODO: maybe filter files by `.db`
+    let path_completer = PathCompleter::any();
+    let mut path_completions = path_completer.complete(current);
+
+    let mut ids = id_completer(current);
+
+    completions.append(&mut ids);
+
+    completions.append(&mut path_completions);
+
+    completions
 }
