@@ -1,5 +1,6 @@
 use crate::cmd::{completions::Shell, MountConfig};
 use clap::{Parser, Subcommand};
+use clap_complete::{ArgValueCompleter, PathCompleter};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -55,7 +56,7 @@ pub enum Command {
         id_or_path: String,
 
         /// Mount point directory
-        #[arg(value_name = "MOUNTPOINT")]
+        #[arg(value_name = "MOUNTPOINT", add = ArgValueCompleter::new(PathCompleter::dir()))]
         mountpoint: PathBuf,
 
         /// Automatically unmount on exit
