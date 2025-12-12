@@ -1,4 +1,4 @@
-use crate::cmd::MountConfig;
+use crate::cmd::{completions::Shell, MountConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -12,6 +12,11 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Manage shell completions
+    Completions {
+        #[command(subcommand)]
+        command: CompletionsCommand,
+    },
     /// Initialize a new agent filesystem
     Init {
         /// Agent identifier (if not provided, generates a unique one)
@@ -94,4 +99,17 @@ pub enum FsCommand {
         /// Path to the file in the filesystem
         file_path: String,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum CompletionsCommand {
+    /// Install shell completions to your shell rc file
+    Install {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Uninstall shell completions from your shell rc file
+    Uninstall,
+    /// Print instructions for manual installation
+    Show,
 }

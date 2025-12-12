@@ -7,13 +7,18 @@ mod daemon;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fuse;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
 
-use crate::parser::{Args, Command, FsCommand};
+use crate::{
+    cmd::completions::handle_completions,
+    parser::{Args, Command, FsCommand},
+};
 
 fn main() {
     reset_sigpipe();
 
+    CompleteEnv::with_factory(Args::command).complete();
     let args = Args::parse();
 
     match args.command {
@@ -78,6 +83,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Completions { command } => handle_completions(command),
     }
 }
 
