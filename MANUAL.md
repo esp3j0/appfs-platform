@@ -292,6 +292,107 @@ agentfs fs cat my-agent /artifacts/report.txt
 agentfs fs cat .agentfs/my-agent.db /artifacts/report.txt
 ```
 
+### `agentfs completions`
+
+Manage shell completions for the AgentFS CLI.
+
+**Usage:**
+```bash
+agentfs completions <COMMAND>
+```
+
+**Commands:**
+- `install` - Install shell completions to your shell config file
+- `uninstall` - Remove shell completions from your shell config file
+- `show` - Display completion configuration for all supported shells
+
+#### `agentfs completions install`
+
+Automatically install shell completions by appending the appropriate configuration to your shell's rc file.
+
+**Usage:**
+```bash
+agentfs completions install [SHELL]
+```
+
+**Arguments:**
+- `[SHELL]` - Shell to install completions for (defaults to current shell detected from `$SHELL`)
+  - Supported values: `bash`, `zsh`, `fish`, `elvish`, `powershell`
+
+**Examples:**
+```bash
+# Install for current shell (auto-detected)
+agentfs completions install
+
+# Install for a specific shell
+agentfs completions install zsh
+agentfs completions install bash
+```
+
+**What it does:**
+Appends the completion source line to your shell's configuration file. Paths are determined using the [`dirs`](https://docs.rs/dirs) crate and may vary by platform:
+- Bash: `$HOME/.bashrc`
+- Zsh: `$HOME/.zshrc`
+- Fish: `<config_dir>/fish/config.fish`
+- Elvish: `<config_dir>/elvish/rc.elv`
+- PowerShell: `<config_dir>/powershell/Microsoft.PowerShell_profile.ps1`
+
+Where `<config_dir>` is the platform-specific configuration directory (e.g., `~/.config` on Linux, `~/Library/Application Support` on macOS).
+
+After installation, restart your shell or source your config file:
+```bash
+source ~/.zshrc  # for zsh
+source ~/.bashrc # for bash
+```
+
+#### `agentfs completions uninstall`
+
+Remove shell completions from your shell's configuration file.
+
+**Usage:**
+```bash
+agentfs completions uninstall [SHELL]
+```
+
+**Arguments:**
+- `[SHELL]` - Shell to uninstall completions for (defaults to current shell)
+
+**Examples:**
+```bash
+# Uninstall from current shell
+agentfs completions uninstall
+
+# Uninstall from a specific shell
+agentfs completions uninstall zsh
+```
+
+#### `agentfs completions show`
+
+Display the completion configuration lines for all supported shells. Useful if you prefer to manually add completions to your shell configuration.
+
+**Usage:**
+```bash
+agentfs completions show
+```
+
+**Output:**
+```
+Bash (~/.bashrc):
+  source <(COMPLETE=bash agentfs)
+
+Zsh (~/.zshrc):
+  source <(COMPLETE=zsh agentfs)
+
+Fish (~/.config/fish/config.fish):
+  COMPLETE=fish agentfs | source
+
+Elvish (~/.config/elvish/rc.elv):
+  eval (COMPLETE=elvish agentfs | slurp)
+
+PowerShell (~/.config/powershell/Microsoft.PowerShell_profile.ps1):
+  $env:COMPLETE = "powershell"; agentfs | Out-String | Invoke-Expression; Remove-Item Env:\COMPLETE
+```
+
 ## AgentFS SDK
 
 The AgentFS SDK provides a TypeScript/JavaScript interface for building agents that use the agent filesystem. It offers three main APIs for working with the agent database:
