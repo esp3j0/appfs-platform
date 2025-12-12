@@ -22,24 +22,21 @@ export interface ToolCallStats {
 
 export class ToolCalls {
   private db: Database;
-  private initialized: Promise<void>;
 
-  constructor(db: Database) {
+  private constructor(db: Database) {
     this.db = db;
-    this.initialized = this.initialize();
+  }
+
+  /**
+   * Create a ToolCalls from an existing database connection
+   */
+  static async fromDatabase(db: Database): Promise<ToolCalls> {
+    const tools = new ToolCalls(db);
+    await tools.initialize();
+    return tools;
   }
 
   private async initialize(): Promise<void> {
-    // Ensure database is connected
-    try {
-      await this.db.connect();
-    } catch (error: any) {
-      // Ignore "already connected" errors
-      if (!error.message?.includes('already')) {
-        throw error;
-      }
-    }
-
     // Create the tool_calls table
     await this.db.exec(`
       CREATE TABLE IF NOT EXISTS tool_calls (
@@ -72,8 +69,6 @@ export class ToolCalls {
    * Returns the ID of the created tool call record
    */
   async start(name: string, parameters?: any): Promise<number> {
-    await this.initialized;
-
     const serializedParams = parameters !== undefined ? JSON.stringify(parameters) : null;
     const started_at = Math.floor(Date.now() / 1000);
 
@@ -90,8 +85,6 @@ export class ToolCalls {
    * Mark a tool call as successful
    */
   async success(id: number, result?: any): Promise<void> {
-    await this.initialized;
-
     const serializedResult = result !== undefined ? JSON.stringify(result) : null;
     const completed_at = Math.floor(Date.now() / 1000);
 
@@ -118,8 +111,6 @@ export class ToolCalls {
    * Mark a tool call as failed
    */
   async error(id: number, error: string): Promise<void> {
-    await this.initialized;
-
     const completed_at = Math.floor(Date.now() / 1000);
 
     // Get the started_at time to calculate duration
@@ -154,8 +145,6 @@ export class ToolCalls {
     result?: any,
     error?: string
   ): Promise<number> {
-    await this.initialized;
-
     const serializedParams = parameters !== undefined ? JSON.stringify(parameters) : null;
     const serializedResult = result !== undefined ? JSON.stringify(result) : null;
     const duration_ms = (completed_at - started_at) * 1000;
@@ -174,8 +163,6 @@ export class ToolCalls {
    * Get a specific tool call by ID
    */
   async get(id: number): Promise<ToolCall | undefined> {
-    await this.initialized;
-
     const stmt = this.db.prepare(`
       SELECT * FROM tool_calls WHERE id = ?
     `);
@@ -192,8 +179,6 @@ export class ToolCalls {
    * Query tool calls by name
    */
   async getByName(name: string, limit?: number): Promise<ToolCall[]> {
-    await this.initialized;
-
     const limitClause = limit !== undefined ? `LIMIT ${limit}` : '';
     const stmt = this.db.prepare(`
       SELECT * FROM tool_calls
@@ -210,8 +195,6 @@ export class ToolCalls {
    * Query recent tool calls
    */
   async getRecent(since: number, limit?: number): Promise<ToolCall[]> {
-    await this.initialized;
-
     const limitClause = limit !== undefined ? `LIMIT ${limit}` : '';
     const stmt = this.db.prepare(`
       SELECT * FROM tool_calls
@@ -229,8 +212,6 @@ export class ToolCalls {
    * Only includes completed calls (success or failed), not pending ones
    */
   async getStats(): Promise<ToolCallStats[]> {
-    await this.initialized;
-
     const stmt = this.db.prepare(`
       SELECT
         name,
@@ -269,12 +250,5 @@ export class ToolCalls {
       completed_at: row.completed_at !== null ? row.completed_at : undefined,
       duration_ms: row.duration_ms !== null ? row.duration_ms : undefined,
     };
-  }
-
-  /**
-   * Wait for initialization to complete
-   */
-  async ready(): Promise<void> {
-    await this.initialized;
   }
 }

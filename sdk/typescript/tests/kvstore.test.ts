@@ -18,7 +18,8 @@ describe('KvStore Integration Tests', () => {
 
     // Initialize database and KvStore
     db = new Database(dbPath);
-    kvStore = new KvStore(db);
+    await db.connect();
+    kvStore = await KvStore.fromDatabase(db);
   });
 
   afterEach(() => {
@@ -191,7 +192,7 @@ describe('KvStore Integration Tests', () => {
       await kvStore.set('persist-key', 'persist-value');
 
       // Create new KvStore instance with same database
-      const newKvStore = new KvStore(db);
+      const newKvStore = await KvStore.fromDatabase(db);
       const value = await newKvStore.get('persist-key');
       expect(value).toBe('persist-value');
     });
