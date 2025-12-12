@@ -349,7 +349,15 @@ export class Filesystem {
     await updateStmt.run(buffer.length, now, ino);
   }
 
-  async readFile(path: string, encoding?: BufferEncoding): Promise<Buffer | string> {
+  async readFile(
+    path: string,
+    options?: BufferEncoding | { encoding?: BufferEncoding }
+  ): Promise<Buffer | string> {
+    // Normalize options
+    const encoding = typeof options === 'string'
+      ? options
+      : options?.encoding;
+
     const ino = await this.resolvePath(path);
     if (ino === null) {
       throw new Error(`ENOENT: no such file or directory, open '${path}'`);
