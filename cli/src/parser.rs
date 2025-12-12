@@ -105,11 +105,16 @@ pub enum FsCommand {
 pub enum CompletionsCommand {
     /// Install shell completions to your shell rc file
     Install {
+        /// Shell to install completions for (defaults to current shell)
         #[arg(value_enum)]
-        shell: Shell,
+        shell: Option<Shell>,
     },
     /// Uninstall shell completions from your shell rc file
-    Uninstall,
+    Uninstall {
+        /// Shell to uninstall completions for (defaults to current shell)
+        #[arg(value_enum)]
+        shell: Option<Shell>,
+    },
     /// Print instructions for manual installation
     Show,
 }
