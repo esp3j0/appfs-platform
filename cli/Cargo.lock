@@ -77,6 +77,7 @@ dependencies = [
  "agentfs-sdk",
  "anyhow",
  "clap 4.5.53",
+ "clap_complete",
  "fuser",
  "libc",
  "parking_lot",
@@ -395,6 +396,18 @@ dependencies = [
  "anstyle",
  "clap_lex 0.7.6",
  "strsim 0.11.1",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.5.61"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39615915e2ece2550c0149addac32fb5bd312c657f43845bb9088cb9c8a7c992"
+dependencies = [
+ "clap 4.5.53",
+ "clap_lex 0.7.6",
+ "is_executable",
+ "shlex",
 ]
 
 [[package]]
@@ -1139,6 +1152,15 @@ dependencies = [
  "bitflags 2.10.0",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "is_executable"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baabb8b4867b26294d818bf3f651a454b6901431711abb96e296245888d6e8c4"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
