@@ -9,7 +9,11 @@ const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
-pub async fn ls_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> {
+pub async fn ls_filesystem(
+    stdout: &mut impl std::io::Write,
+    id_or_path: String,
+    path: &str,
+) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     let db_path = options.path.context("No database path resolved")?;
     eprintln!("Using agent: {}", id_or_path);
@@ -80,7 +84,9 @@ pub async fn ls_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> {
                 format!("{}/{}", prefix, name)
             };
 
-            println!("{} {}", type_char, full_path);
+            stdout
+                .write_fmt(format_args!("{} {}\n", type_char, full_path))
+                .context("Failed to write to stdout")?;
 
             if is_dir {
                 queue.push_back((ino, full_path));
@@ -91,7 +97,11 @@ pub async fn ls_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> {
     Ok(())
 }
 
-pub async fn cat_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> {
+pub async fn cat_filesystem(
+    stdout: &mut impl std::io::Write,
+    id_or_path: String,
+    path: &str,
+) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     let db_path = options.path.context("No database path resolved")?;
 
@@ -164,10 +174,6 @@ pub async fn cat_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> 
         .await
         .context("Failed to query file data")?;
 
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-
     while let Some(row) = rows.next().await.context("Failed to fetch row")? {
         let data: Vec<u8> = row
             .get_value(0)
@@ -183,7 +189,7 @@ pub async fn cat_filesystem(id_or_path: String, path: &str) -> AnyhowResult<()> 
             })
             .ok_or_else(|| anyhow::anyhow!("Invalid file data"))?;
 
-        handle
+        stdout
             .write_all(&data)
             .context("Failed to write to stdout")?;
     }
