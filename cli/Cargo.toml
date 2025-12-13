@@ -16,6 +16,8 @@ anyhow = "1.0"
 turso = "0.3.2"
 serde = { version = "1.0", features = ["derive"] }
 parking_lot = "0.12.5"
+clap_complete = { version = "=4.5.61", features = ["unstable-dynamic"] }
+dirs = "6"
 
 # Unix dependencies
 [target.'cfg(unix)'.dependencies]

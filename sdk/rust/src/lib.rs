@@ -10,6 +10,11 @@ pub use filesystem::{Filesystem, FilesystemStats, FsError, Stats};
 pub use kvstore::KvStore;
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
+/// Directory containing agentfs databases
+pub fn agentfs_dir() -> &'static std::path::Path {
+    std::path::Path::new(".agentfs")
+}
+
 /// Configuration options for opening an AgentFS instance
 #[derive(Debug, Clone, Default)]
 pub struct AgentFSOptions {
@@ -74,7 +79,7 @@ impl AgentFSOptions {
                 );
             }
 
-            let db_path = Path::new(".agentfs").join(format!("{}.db", id_or_path));
+            let db_path = agentfs_dir().join(format!("{}.db", id_or_path));
             if !db_path.exists() {
                 anyhow::bail!(
                     "Agent '{}' not found at '{}'",
@@ -134,11 +139,11 @@ impl AgentFS {
             }
 
             // Ensure .agentfs directory exists
-            let agentfs_dir = Path::new(".agentfs");
+            let agentfs_dir = agentfs_dir();
             if !agentfs_dir.exists() {
                 std::fs::create_dir_all(agentfs_dir)?;
             }
-            format!(".agentfs/{}.db", id)
+            format!("{}/{}.db", agentfs_dir.display(), id)
         } else {
             // No id or path = ephemeral in-memory database
             ":memory:".to_string()
@@ -220,9 +225,11 @@ mod tests {
         let _conn = agentfs.get_connection();
 
         // Cleanup
-        let _ = std::fs::remove_file(".agentfs/test-agent.db");
-        let _ = std::fs::remove_file(".agentfs/test-agent.db-shm");
-        let _ = std::fs::remove_file(".agentfs/test-agent.db-wal");
+        let agentfs_dir = agentfs_dir();
+        let file_names = ["test-agent.db", "test-agent.db-shm", "test-agent.db-wal"];
+        for file_name in file_names {
+            let _ = std::fs::remove_file(agentfs_dir.join(file_name));
+        }
     }
 
     #[tokio::test]
@@ -332,8 +339,9 @@ mod tests {
     #[test]
     fn test_resolve_valid_agent_id_with_existing_db() {
         // Setup: create .agentfs directory and a test database
-        let _ = std::fs::create_dir_all(".agentfs");
-        let db_path = std::path::Path::new(".agentfs").join("test-resolve-agent.db");
+        let agentfs_dir = agentfs_dir();
+        let _ = std::fs::create_dir_all(agentfs_dir);
+        let db_path = agentfs_dir.join("test-resolve-agent.db");
         std::fs::write(&db_path, b"test").unwrap();
 
         let opts = AgentFSOptions::resolve("test-resolve-agent").unwrap();
@@ -370,13 +378,14 @@ mod tests {
     #[test]
     fn test_resolve_valid_agent_id_formats() {
         // Setup: create .agentfs directory and test databases
-        let _ = std::fs::create_dir_all(".agentfs");
+        let agentfs_dir = agentfs_dir();
+        let _ = std::fs::create_dir_all(agentfs_dir);
 
         // Test various valid ID formats
         let valid_ids = ["my-agent", "my_agent", "MyAgent123", "agent-123_test"];
 
         for id in valid_ids {
-            let db_path = std::path::Path::new(".agentfs").join(format!("{}.db", id));
+            let db_path = agentfs_dir.join(format!("{}.db", id));
             std::fs::write(&db_path, b"test").unwrap();
 
             let opts = AgentFSOptions::resolve(id).unwrap();
