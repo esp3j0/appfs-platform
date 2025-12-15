@@ -1,13 +1,5 @@
 ---
-allowed-tools:
-  - Bash(git commit:*)
-  - Bash(git add:*)
-  - Bash(git status:*)
-  - Bash(mkdir:*)
-  - Bash(uv:*)
-  - Read
-  - Edit
-  - Write
+allowed-tools: Bash(git commit:*), Bash(git add:*), Bash(git status:*), Bash(mkdir:*), Bash(uv:*), Read, Edit(sdk/python/**), Write(sdk/python/**)
 argument-hint: [ts-change-sha-commit]
 description: Generate Python SDK for agentfs based on the Typescript SDK
 ---
@@ -15,7 +7,8 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 ## Context
 
 - You must generate Python SDK with the API similar to the current Typescript SDK located at ../../sdk/typescript
-- Last time, python sdk was updated based on the comment $1 (if value is "unspecified" then regenerate SDK from scratch; if value is set - focus on the diff between the current state and specified commit hash)
+- You must transfer all tests from Typescript SDK to the Python
+- Last time, python sdk was updated based on the comment $1 (if value is "unspecified" then regenerate SDK from scratch; if value is set - focus on the diff between the current state and specified commit hash; note that prompt in .claude directory also can change)
 - Use `turso.aio` python package which provide API similar to `aiosqlite`
 - Use simple setup with builtin uv ruff formatter
 - Use pytest for testing
