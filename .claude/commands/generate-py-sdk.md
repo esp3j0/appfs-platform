@@ -16,7 +16,11 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 
 - You must generate Python SDK with the API similar to the current Typescript SDK located at ../../sdk/typescript
 - You must transfer all tests from Typescript SDK to the Python
-- Last time, python sdk was updated based on the comment $1 (if value is "unspecified" then regenerate SDK from scratch; if value is set - focus on the diff between the current state and specified commit hash; note that prompt in .claude directory also can change)
+- Last time, python sdk was updated based on the comment $1
+  - If value is "unspecified" then regenerate SDK from scratch
+  - If value is set - FOCUS on the diff between the current state and specified commit hash
+    - The primary changes are in the Typescript SDK but changes outside of it also can contribute to the process
+    - For example, command prompt in .claude directory influence process heavily
 - Use `turso.aio` python package which provide API similar to `aiosqlite`
 - Use simple setup with builtin uv ruff formatter
 - Use pytest for testing
@@ -50,5 +54,6 @@ class Cursor:
     async def __aenter__(self) -> "Cursor":
     async def __aexit__(self, exc_type, exc, tb) -> None:
 
+# as Connection is awaitable - caller can use await connect(...)
 def connect(database: str) -> Connection:
 ```
