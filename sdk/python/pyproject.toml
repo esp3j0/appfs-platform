@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+build-.buibackend = "setuptoolsld_meta"
 
 [project]
 name = "agentfs"
@@ -11,12 +11,15 @@ requires-python = ">=3.12"
 license = {text = "MIT"}
 keywords = ["ai", "agent", "turso", "sqlite", "key-value", "filesystem"]
 authors = [
-    {name = "Turso", email = "support@turso.tech"}
+    {name = "Turso"}
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    'Operating System :: POSIX :: Linux',
+    'Operating System :: Microsoft :: Windows',
+    'Operating System :: MacOS',
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -36,7 +39,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/tursodatabase/agentfs"
-Documentation = "https://github.com/tursodatabase/agentfs/tree/main/sdk/python"
+Source = "https://github.com/tursodatabase/agentfs"
 Repository = "https://github.com/tursodatabase/agentfs"
 Issues = "https://github.com/tursodatabase/agentfs/issues"
 
