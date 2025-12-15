@@ -1,10 +1,11 @@
 """Key-Value Store implementation"""
 
 import json
-from typing import Any, List, Dict, Optional, TypeVar
-from pyturso.aio import Connection
+from typing import Any, Dict, List, Optional, TypeVar
 
-T = TypeVar('T')
+from turso.aio import Connection
+
+T = TypeVar("T")
 
 
 class KvStore:
@@ -70,7 +71,7 @@ class KvStore:
                 value = excluded.value,
                 updated_at = unixepoch()
             """,
-            (key, serialized_value)
+            (key, serialized_value),
         )
         await self._db.commit()
 
@@ -89,10 +90,7 @@ class KvStore:
             >>> if user:
             >>>     print(user['name'])
         """
-        cursor = await self._db.execute(
-            "SELECT value FROM kv_store WHERE key = ?",
-            (key,)
-        )
+        cursor = await self._db.execute("SELECT value FROM kv_store WHERE key = ?", (key,))
         row = await cursor.fetchone()
 
         if not row:
@@ -116,18 +114,14 @@ class KvStore:
             >>>     print(f"{item['key']}: {item['value']}")
         """
         # Escape special characters for LIKE query
-        escaped = prefix.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         cursor = await self._db.execute(
-            "SELECT key, value FROM kv_store WHERE key LIKE ? ESCAPE '\\\\'",
-            (escaped + '%',)
+            "SELECT key, value FROM kv_store WHERE key LIKE ? ESCAPE '\\\\'", (escaped + "%",)
         )
         rows = await cursor.fetchall()
 
-        return [
-            {'key': row[0], 'value': json.loads(row[1])}
-            for row in rows
-        ]
+        return [{"key": row[0], "value": json.loads(row[1])} for row in rows]
 
     async def delete(self, key: str) -> None:
         """Delete a key-value pair
@@ -138,8 +132,5 @@ class KvStore:
         Example:
             >>> await kv.delete('user:123')
         """
-        await self._db.execute(
-            "DELETE FROM kv_store WHERE key = ?",
-            (key,)
-        )
+        await self._db.execute("DELETE FROM kv_store WHERE key = ?", (key,))
         await self._db.commit()

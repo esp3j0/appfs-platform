@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+
 from agentfs import AgentFS, AgentFSOptions
 
 
@@ -31,7 +32,7 @@ async def main():
                 {"title": "LLM Best Practices", "url": "https://example.com/2"},
             ],
             "count": 2,
-        }
+        },
     )
     print(f"   Recorded tool call with ID: {search_id}\n")
 
@@ -47,7 +48,7 @@ async def main():
         start_time2,
         end_time2,
         parameters={"endpoint": "/users", "method": "GET"},
-        error="Connection timeout after 30s"
+        error="Connection timeout after 30s",
     )
     print(f"   Recorded failed call with ID: {api_id}\n")
 
@@ -63,7 +64,7 @@ async def main():
             start,
             end,
             parameters={"sql": f"SELECT * FROM users WHERE id = {i + 1}"},
-            result={"rows": 1}
+            result={"rows": 1},
         )
     print("   Created 3 database query records\n")
 

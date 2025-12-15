@@ -1,19 +1,20 @@
 """Filesystem implementation"""
 
 import time
-from typing import List, Optional, Union
 from dataclasses import dataclass
-from pyturso.aio import Connection
+from typing import List, Optional, Union
+
+from turso.aio import Connection
 
 # File types for mode field
-S_IFMT = 0o170000    # File type mask
-S_IFREG = 0o100000   # Regular file
-S_IFDIR = 0o040000   # Directory
-S_IFLNK = 0o120000   # Symbolic link
+S_IFMT = 0o170000  # File type mask
+S_IFREG = 0o100000  # Regular file
+S_IFDIR = 0o040000  # Directory
+S_IFLNK = 0o120000  # Symbolic link
 
 # Default permissions
 DEFAULT_FILE_MODE = S_IFREG | 0o644  # Regular file, rw-r--r--
-DEFAULT_DIR_MODE = S_IFDIR | 0o755   # Directory, rwxr-xr-x
+DEFAULT_DIR_MODE = S_IFDIR | 0o755  # Directory, rwxr-xr-x
 
 DEFAULT_CHUNK_SIZE = 4096
 
@@ -33,6 +34,7 @@ class Stats:
         mtime: Modification time (Unix timestamp)
         ctime: Change time (Unix timestamp)
     """
+
     ino: int
     mode: int
     nlink: int
@@ -138,15 +140,13 @@ class Filesystem:
     async def _ensure_root(self) -> int:
         """Ensure config and root directory exist, returns the chunk_size"""
         # Ensure chunk_size config exists and get its value
-        cursor = await self._db.execute(
-            "SELECT value FROM fs_config WHERE key = 'chunk_size'"
-        )
+        cursor = await self._db.execute("SELECT value FROM fs_config WHERE key = 'chunk_size'")
         config = await cursor.fetchone()
 
         if not config:
             await self._db.execute(
                 "INSERT INTO fs_config (key, value) VALUES ('chunk_size', ?)",
-                (str(DEFAULT_CHUNK_SIZE),)
+                (str(DEFAULT_CHUNK_SIZE),),
             )
             await self._db.commit()
             chunk_size = DEFAULT_CHUNK_SIZE
@@ -154,10 +154,7 @@ class Filesystem:
             chunk_size = int(config[0]) if config[0] else DEFAULT_CHUNK_SIZE
 
         # Ensure root directory exists
-        cursor = await self._db.execute(
-            "SELECT ino FROM fs_inode WHERE ino = ?",
-            (self._root_ino,)
-        )
+        cursor = await self._db.execute("SELECT ino FROM fs_inode WHERE ino = ?", (self._root_ino,))
         root = await cursor.fetchone()
 
         if not root:
@@ -167,7 +164,7 @@ class Filesystem:
                 INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
                 VALUES (?, ?, 0, 0, 0, ?, ?, ?)
                 """,
-                (self._root_ino, DEFAULT_DIR_MODE, now, now, now)
+                (self._root_ino, DEFAULT_DIR_MODE, now, now, now),
             )
             await self._db.commit()
 
@@ -176,23 +173,23 @@ class Filesystem:
     def _normalize_path(self, path: str) -> str:
         """Normalize a path"""
         # Remove trailing slashes except for root
-        normalized = path.rstrip('/') or '/'
+        normalized = path.rstrip("/") or "/"
         # Ensure leading slash
-        return normalized if normalized.startswith('/') else '/' + normalized
+        return normalized if normalized.startswith("/") else "/" + normalized
 
     def _split_path(self, path: str) -> List[str]:
         """Split path into components"""
         normalized = self._normalize_path(path)
-        if normalized == '/':
+        if normalized == "/":
             return []
-        return [p for p in normalized.split('/') if p]
+        return [p for p in normalized.split("/") if p]
 
     async def _resolve_path(self, path: str) -> Optional[int]:
         """Resolve a path to an inode number"""
         normalized = self._normalize_path(path)
 
         # Root directory
-        if normalized == '/':
+        if normalized == "/":
             return self._root_ino
 
         parts = self._split_path(normalized)
@@ -205,7 +202,7 @@ class Filesystem:
                 SELECT ino FROM fs_dentry
                 WHERE parent_ino = ? AND name = ?
                 """,
-                (current_ino, name)
+                (current_ino, name),
             )
             result = await cursor.fetchone()
 
@@ -220,12 +217,12 @@ class Filesystem:
         """Get parent directory inode and basename from path"""
         normalized = self._normalize_path(path)
 
-        if normalized == '/':
+        if normalized == "/":
             return None  # Root has no parent
 
         parts = self._split_path(normalized)
         name = parts[-1]
-        parent_path = '/' if len(parts) == 1 else '/' + '/'.join(parts[:-1])
+        parent_path = "/" if len(parts) == 1 else "/" + "/".join(parts[:-1])
 
         parent_ino = await self._resolve_path(parent_path)
 
@@ -242,7 +239,7 @@ class Filesystem:
             INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
             VALUES (?, ?, ?, 0, ?, ?, ?)
             """,
-            (mode, uid, gid, now, now, now)
+            (mode, uid, gid, now, now, now),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -254,7 +251,7 @@ class Filesystem:
             INSERT INTO fs_dentry (name, parent_ino, ino)
             VALUES (?, ?, ?)
             """,
-            (name, parent_ino, ino)
+            (name, parent_ino, ino),
         )
         await self._db.commit()
 
@@ -266,10 +263,10 @@ class Filesystem:
         parts = parts[:-1]
 
         current_ino = self._root_ino
-        current_path = ''
+        current_path = ""
 
         for name in parts:
-            current_path += '/' + name
+            current_path += "/" + name
 
             # Check if this directory exists
             cursor = await self._db.execute(
@@ -277,7 +274,7 @@ class Filesystem:
                 SELECT ino FROM fs_dentry
                 WHERE parent_ino = ? AND name = ?
                 """,
-                (current_ino, name)
+                (current_ino, name),
             )
             result = await cursor.fetchone()
 
@@ -291,10 +288,7 @@ class Filesystem:
 
     async def _get_link_count(self, ino: int) -> int:
         """Get link count for an inode"""
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM fs_dentry WHERE ino = ?",
-            (ino,)
-        )
+        cursor = await self._db.execute("SELECT COUNT(*) FROM fs_dentry WHERE ino = ?", (ino,))
         result = await cursor.fetchone()
         return result[0] if result else 0
 
@@ -336,7 +330,7 @@ class Filesystem:
 
     async def _update_file_content(self, ino: int, content: Union[str, bytes]) -> None:
         """Update file content"""
-        buffer = content.encode('utf-8') if isinstance(content, str) else content
+        buffer = content.encode("utf-8") if isinstance(content, str) else content
         now = int(time.time())
 
         # Delete existing data chunks
@@ -346,13 +340,13 @@ class Filesystem:
         if len(buffer) > 0:
             chunk_index = 0
             for offset in range(0, len(buffer), self._chunk_size):
-                chunk = buffer[offset:min(offset + self._chunk_size, len(buffer))]
+                chunk = buffer[offset : min(offset + self._chunk_size, len(buffer))]
                 await self._db.execute(
                     """
                     INSERT INTO fs_data (ino, chunk_index, data)
                     VALUES (?, ?, ?)
                     """,
-                    (ino, chunk_index, chunk)
+                    (ino, chunk_index, chunk),
                 )
                 chunk_index += 1
 
@@ -363,11 +357,11 @@ class Filesystem:
             SET size = ?, mtime = ?
             WHERE ino = ?
             """,
-            (len(buffer), now, ino)
+            (len(buffer), now, ino),
         )
         await self._db.commit()
 
-    async def read_file(self, path: str, encoding: Optional[str] = 'utf-8') -> Union[bytes, str]:
+    async def read_file(self, path: str, encoding: Optional[str] = "utf-8") -> Union[bytes, str]:
         """Read content from a file
 
         Args:
@@ -392,22 +386,19 @@ class Filesystem:
             WHERE ino = ?
             ORDER BY chunk_index ASC
             """,
-            (ino,)
+            (ino,),
         )
         rows = await cursor.fetchall()
 
         if not rows:
-            combined = b''
+            combined = b""
         else:
             # Concatenate all chunks
-            combined = b''.join(row[0] for row in rows)
+            combined = b"".join(row[0] for row in rows)
 
         # Update atime
         now = int(time.time())
-        await self._db.execute(
-            "UPDATE fs_inode SET atime = ? WHERE ino = ?",
-            (now, ino)
-        )
+        await self._db.execute("UPDATE fs_inode SET atime = ? WHERE ino = ?", (now, ino))
         await self._db.commit()
 
         if encoding:
@@ -439,7 +430,7 @@ class Filesystem:
             WHERE parent_ino = ?
             ORDER BY name ASC
             """,
-            (ino,)
+            (ino,),
         )
         rows = await cursor.fetchall()
 
@@ -470,7 +461,7 @@ class Filesystem:
             DELETE FROM fs_dentry
             WHERE parent_ino = ? AND name = ?
             """,
-            (parent_ino, name)
+            (parent_ino, name),
         )
 
         # Check if this was the last link to the inode
@@ -508,7 +499,7 @@ class Filesystem:
             FROM fs_inode
             WHERE ino = ?
             """,
-            (ino,)
+            (ino,),
         )
         row = await cursor.fetchone()
 

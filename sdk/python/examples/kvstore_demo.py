@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+
 from agentfs import AgentFS, AgentFSOptions
 
 
@@ -32,10 +33,7 @@ async def main():
         "id": 1,
         "name": "Alice Johnson",
         "email": "alice@example.com",
-        "preferences": {
-            "theme": "dark",
-            "notifications": True
-        }
+        "preferences": {"theme": "dark", "notifications": True},
     }
 
     await agentfs.kv.set("user:1", user)
@@ -70,24 +68,25 @@ async def main():
     print("7. AI Agent use cases:")
 
     # Session state
-    await agentfs.kv.set("session:current", {
-        "conversationId": "conv-123",
-        "userId": "user-456",
-        "startTime": int(time.time() * 1000)
-    })
+    await agentfs.kv.set(
+        "session:current",
+        {"conversationId": "conv-123", "userId": "user-456", "startTime": int(time.time() * 1000)},
+    )
 
     # Agent memory
-    await agentfs.kv.set("memory:user-preferences", {
-        "language": "en",
-        "responseStyle": "concise",
-        "expertise": "intermediate"
-    })
+    await agentfs.kv.set(
+        "memory:user-preferences",
+        {"language": "en", "responseStyle": "concise", "expertise": "intermediate"},
+    )
 
     # Task queue
-    await agentfs.kv.set("tasks:pending", [
-        {"id": 1, "task": "Process document", "priority": "high"},
-        {"id": 2, "task": "Send notification", "priority": "low"}
-    ])
+    await agentfs.kv.set(
+        "tasks:pending",
+        [
+            {"id": 1, "task": "Process document", "priority": "high"},
+            {"id": 2, "task": "Send notification", "priority": "low"},
+        ],
+    )
 
     print(f"  Session: {json.dumps(await agentfs.kv.get('session:current'), indent=2)}")
     print(f"  Memory: {json.dumps(await agentfs.kv.get('memory:user-preferences'), indent=2)}")

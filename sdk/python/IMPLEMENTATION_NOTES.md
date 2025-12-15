@@ -2,7 +2,7 @@
 
 ## Overview
 
-This Python SDK is a complete port of the TypeScript AgentFS SDK, providing the same API and functionality using `pyturso.aio` for async SQLite operations.
+This Python SDK is a complete port of the TypeScript AgentFS SDK, providing the same API and functionality using `turso.aio` for async SQLite operations.
 
 ## Architecture
 
@@ -47,9 +47,9 @@ The Python SDK uses the same database schema as the TypeScript SDK:
 
 ## Key Design Decisions
 
-### 1. pyturso.aio Integration
+### 1. turso.aio Integration
 
-The SDK uses `pyturso.aio` which provides an aiosqlite-like API:
+The SDK uses `turso.aio` (from the `pyturso` package) which provides an aiosqlite-like API:
 
 ```python
 # Connection
@@ -162,7 +162,7 @@ The SDK includes basic tests in `tests/test_basic.py`:
 Run tests with:
 
 ```bash
-pytest
+uv run pytest
 ```
 
 ## Examples
@@ -191,7 +191,7 @@ pip install -e .
 With development dependencies:
 
 ```bash
-pip install -e ".[dev]"
+uv sync --group dev
 ```
 
 ## Publishing
@@ -220,8 +220,8 @@ Potential improvements:
 
 ## Compatibility
 
-- Python 3.8+
-- Requires `pyturso.aio` package
+- Python 3.12+
+- Requires `pyturso` package (imports from `turso.aio`)
 - Compatible with asyncio event loop
 - Works on Linux, macOS, and Windows
 

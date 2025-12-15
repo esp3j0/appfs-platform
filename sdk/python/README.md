@@ -1,6 +1,6 @@
 # AgentFS Python SDK
 
-A filesystem and key-value store for AI agents, powered by SQLite and [pyturso.aio](https://pypi.org/project/pyturso.aio/).
+A filesystem and key-value store for AI agents, powered by SQLite and [pyturso](https://pypi.org/project/pyturso/).
 
 ## Installation
 
@@ -166,16 +166,16 @@ async with await AgentFS.open(AgentFSOptions(id='my-agent')) as agent:
 
 ```bash
 # Install dependencies
-pip install -e ".[dev]"
+uv sync --group dev
 
 # Run tests
-pytest
+uv run pytest
 
 # Format code
-black agentfs tests
+uv run ruff format agentfs tests
 
-# Type checking
-mypy agentfs
+# Check code
+uv run ruff check agentfs tests
 ```
 
 ## License
@@ -186,4 +186,4 @@ MIT License - see LICENSE file for details.
 
 - [GitHub Repository](https://github.com/tursodatabase/agentfs)
 - [TypeScript SDK](https://github.com/tursodatabase/agentfs/tree/main/sdk/typescript)
-- [pyturso.aio](https://pypi.org/project/pyturso.aio/)
+- [pyturso](https://pypi.org/project/pyturso/)

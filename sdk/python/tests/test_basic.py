@@ -1,8 +1,10 @@
 """Basic tests for AgentFS Python SDK"""
 
-import pytest
 import os
 import tempfile
+
+import pytest
+
 from agentfs import AgentFS, AgentFSOptions
 
 
@@ -105,15 +107,12 @@ async def test_toolcalls_basic():
 
         # Record a tool call
         import time
+
         start = int(time.time())
         end = start + 1
 
         call_id = await agentfs.tools.record(
-            "test_tool",
-            start,
-            end,
-            parameters={"param": "value"},
-            result={"result": "success"}
+            "test_tool", start, end, parameters={"param": "value"}, result={"result": "success"}
         )
 
         assert call_id > 0

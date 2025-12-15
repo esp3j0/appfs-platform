@@ -2,12 +2,13 @@
 
 import os
 import re
-from typing import Optional
 from dataclasses import dataclass
-from pyturso.aio import connect, Connection
+from typing import Optional
 
-from .kvstore import KvStore
+from turso.aio import Connection, connect
+
 from .filesystem import Filesystem
+from .kvstore import KvStore
 from .toolcalls import ToolCalls
 
 
@@ -23,6 +24,7 @@ class AgentFSOptions:
             - If provided: Uses the specified path directly
             - Can be combined with `id`
     """
+
     id: Optional[str] = None
     path: Optional[str] = None
 
@@ -70,9 +72,9 @@ class AgentFS:
             raise ValueError("AgentFS.open() requires at least 'id' or 'path'.")
 
         # Validate agent ID if provided
-        if options.id and not re.match(r'^[a-zA-Z0-9_-]+$', options.id):
+        if options.id and not re.match(r"^[a-zA-Z0-9_-]+$", options.id):
             raise ValueError(
-                'Agent ID must contain only alphanumeric characters, hyphens, and underscores'
+                "Agent ID must contain only alphanumeric characters, hyphens, and underscores"
             )
 
         # Determine database path: explicit path takes precedence, otherwise use id-based path
@@ -80,10 +82,10 @@ class AgentFS:
             db_path = options.path
         else:
             # id is guaranteed to be defined here (we checked not id and not path above)
-            directory = '.agentfs'
+            directory = ".agentfs"
             if not os.path.exists(directory):
                 os.makedirs(directory, exist_ok=True)
-            db_path = f'{directory}/{options.id}.db'
+            db_path = f"{directory}/{options.id}.db"
 
         db = connect(db_path)
 

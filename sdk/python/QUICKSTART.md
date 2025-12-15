@@ -46,13 +46,13 @@ asyncio.run(main())
 cd sdk/python
 
 # Key-Value Store example
-python examples/kvstore_demo.py
+uv run python examples/kvstore_demo.py
 
 # Filesystem example
-python examples/filesystem_demo.py
+uv run python examples/filesystem_demo.py
 
 # Tool Calls tracking example
-python examples/toolcalls_demo.py
+uv run python examples/toolcalls_demo.py
 ```
 
 ## Development
@@ -60,25 +60,25 @@ python examples/toolcalls_demo.py
 ### Install development dependencies
 
 ```bash
-pip install -e ".[dev]"
+uv sync --group dev
 ```
 
 ### Run tests
 
 ```bash
-pytest
+uv run pytest
 ```
 
 ### Format code
 
 ```bash
-black agentfs tests
+uv run ruff format agentfs tests
 ```
 
-### Type checking
+### Check code
 
 ```bash
-mypy agentfs
+uv run ruff check agentfs tests
 ```
 
 ## Key Differences from TypeScript SDK

@@ -2,9 +2,10 @@
 
 import json
 import time
-from typing import Any, List, Optional, Literal
 from dataclasses import dataclass
-from pyturso.aio import Connection
+from typing import Any, List, Literal, Optional
+
+from turso.aio import Connection
 
 
 @dataclass
@@ -22,12 +23,13 @@ class ToolCall:
         completed_at: Unix timestamp when the call completed (optional)
         duration_ms: Duration in milliseconds (optional)
     """
+
     id: int
     name: str
     parameters: Optional[Any] = None
     result: Optional[Any] = None
     error: Optional[str] = None
-    status: Literal['pending', 'success', 'error'] = 'pending'
+    status: Literal["pending", "success", "error"] = "pending"
     started_at: int = 0
     completed_at: Optional[int] = None
     duration_ms: Optional[int] = None
@@ -44,6 +46,7 @@ class ToolCallStats:
         failed: Number of failed calls
         avg_duration_ms: Average duration in milliseconds
     """
+
     name: str
     total_calls: int
     successful: int
@@ -120,7 +123,7 @@ class ToolCalls:
             INSERT INTO tool_calls (name, parameters, status, started_at)
             VALUES (?, ?, 'pending', ?)
             """,
-            (name, serialized_params, started_at)
+            (name, serialized_params, started_at),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -140,8 +143,7 @@ class ToolCalls:
 
         # Get the started_at time to calculate duration
         cursor = await self._db.execute(
-            "SELECT started_at FROM tool_calls WHERE id = ?",
-            (call_id,)
+            "SELECT started_at FROM tool_calls WHERE id = ?", (call_id,)
         )
         row = await cursor.fetchone()
 
@@ -156,7 +158,7 @@ class ToolCalls:
             SET status = 'success', result = ?, completed_at = ?, duration_ms = ?
             WHERE id = ?
             """,
-            (serialized_result, completed_at, duration_ms, call_id)
+            (serialized_result, completed_at, duration_ms, call_id),
         )
         await self._db.commit()
 
@@ -174,8 +176,7 @@ class ToolCalls:
 
         # Get the started_at time to calculate duration
         cursor = await self._db.execute(
-            "SELECT started_at FROM tool_calls WHERE id = ?",
-            (call_id,)
+            "SELECT started_at FROM tool_calls WHERE id = ?", (call_id,)
         )
         row = await cursor.fetchone()
 
@@ -190,7 +191,7 @@ class ToolCalls:
             SET status = 'error', error = ?, completed_at = ?, duration_ms = ?
             WHERE id = ?
             """,
-            (error, completed_at, duration_ms, call_id)
+            (error, completed_at, duration_ms, call_id),
         )
         await self._db.commit()
 
@@ -230,14 +231,26 @@ class ToolCalls:
         serialized_params = json.dumps(parameters) if parameters is not None else None
         serialized_result = json.dumps(result) if result is not None else None
         duration_ms = (completed_at - started_at) * 1000
-        status = 'error' if error else 'success'
+        status = "error" if error else "success"
 
         cursor = await self._db.execute(
             """
-            INSERT INTO tool_calls (name, parameters, result, error, status, started_at, completed_at, duration_ms)
+            INSERT INTO tool_calls (
+                name, parameters, result, error, status,
+                started_at, completed_at, duration_ms
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, serialized_params, serialized_result, error, status, started_at, completed_at, duration_ms)
+            (
+                name,
+                serialized_params,
+                serialized_result,
+                error,
+                status,
+                started_at,
+                completed_at,
+                duration_ms,
+            ),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -256,10 +269,7 @@ class ToolCalls:
             >>> if call:
             >>>     print(f"Tool: {call.name}, Status: {call.status}")
         """
-        cursor = await self._db.execute(
-            "SELECT * FROM tool_calls WHERE id = ?",
-            (call_id,)
-        )
+        cursor = await self._db.execute("SELECT * FROM tool_calls WHERE id = ?", (call_id,))
         row = await cursor.fetchone()
 
         if not row:
@@ -291,7 +301,7 @@ class ToolCalls:
             ORDER BY started_at DESC
             {limit_clause}
             """,
-            (name,)
+            (name,),
         )
         rows = await cursor.fetchall()
 
@@ -321,7 +331,7 @@ class ToolCalls:
             ORDER BY started_at DESC
             {limit_clause}
             """,
-            (since,)
+            (since,),
         )
         rows = await cursor.fetchall()
 
