@@ -4,6 +4,14 @@ argument-hint: [ts-change-sha-commit]
 description: Generate Python SDK for agentfs based on the Typescript SDK
 ---
 
+## Dev rules
+
+- COMMIT your changes in the end with detailed message with the motivation of changes and traces of your actions
+- USE `uv` with `--directory sdk/python` command in order to avoid `cd` to the subdirectory
+- ALWAYS USE pathes relative to the project root
+- DO NOT EVER `cd` into the directories - tool permissions will not be validated properly
+- USE ONLY SIMPLE "ls", "grep", "find", "cat" Bash commands and native Claude Code tools - otherwise permission will be blocked
+
 ## Context
 
 - You must generate Python SDK with the API similar to the current Typescript SDK located at ../../sdk/typescript
@@ -12,7 +20,7 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - Use `turso.aio` python package which provide API similar to `aiosqlite`
 - Use simple setup with builtin uv ruff formatter
 - Use pytest for testing
-- Commit your changes in the end with detailed message with the motivation of changes and traces of your actions
+- Use ty for type checking
 - Maintain CI for linting and checking at .github/workflows/python.yml similar to the TS workflow at .github/workflows/typescript.yml
 
 ```py
