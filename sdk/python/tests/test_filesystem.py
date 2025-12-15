@@ -17,8 +17,7 @@ class TestFilesystemWriteOperations:
         """Should write and read a simple text file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/test.txt", "Hello, World!")
@@ -30,8 +29,7 @@ class TestFilesystemWriteOperations:
         """Should write and read files in subdirectories"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/subdir/file.txt", "nested content")
@@ -43,8 +41,7 @@ class TestFilesystemWriteOperations:
         """Should overwrite existing file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/overwrite.txt", "original content")
@@ -57,8 +54,7 @@ class TestFilesystemWriteOperations:
         """Should handle empty file content"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/empty.txt", "")
@@ -70,8 +66,7 @@ class TestFilesystemWriteOperations:
         """Should handle large file content"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             large_content = "x" * 100000
@@ -84,8 +79,7 @@ class TestFilesystemWriteOperations:
         """Should handle files with special characters in content"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             special_content = "Special chars: \n\t\r\"'\\"
@@ -103,8 +97,7 @@ class TestFilesystemReadOperations:
         """Should throw error when reading non-existent file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError):
@@ -115,8 +108,7 @@ class TestFilesystemReadOperations:
         """Should read multiple different files"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/file1.txt", "content 1")
@@ -137,8 +129,7 @@ class TestFilesystemDirectoryOperations:
         """Should list files in root directory"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/file1.txt", "content 1")
@@ -156,8 +147,7 @@ class TestFilesystemDirectoryOperations:
         """Should list files in subdirectory"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file1.txt", "content 1")
@@ -175,8 +165,7 @@ class TestFilesystemDirectoryOperations:
         """Should distinguish between files in different directories"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir1/file.txt", "content 1")
@@ -195,8 +184,7 @@ class TestFilesystemDirectoryOperations:
         """Should list subdirectories within a directory"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/parent/child1/file.txt", "content")
@@ -213,8 +201,7 @@ class TestFilesystemDirectoryOperations:
         """Should handle nested directory structures"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/a/b/c/d/file.txt", "deep content")
@@ -231,8 +218,7 @@ class TestFilesystemDeleteOperations:
         """Should delete an existing file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/delete-me.txt", "content")
@@ -245,8 +231,7 @@ class TestFilesystemDeleteOperations:
         """Should handle deleting non-existent file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError, match="ENOENT"):
@@ -257,8 +242,7 @@ class TestFilesystemDeleteOperations:
         """Should delete file and update directory listing"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file1.txt", "content 1")
@@ -276,8 +260,7 @@ class TestFilesystemDeleteOperations:
         """Should allow recreating deleted file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/recreate.txt", "original")
@@ -296,8 +279,7 @@ class TestFilesystemPathHandling:
         """Should handle paths with trailing slashes"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
@@ -310,8 +292,7 @@ class TestFilesystemPathHandling:
         """Should handle paths with special characters"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             special_path = "/dir-with-dash/file_with_underscore.txt"
@@ -329,8 +310,7 @@ class TestFilesystemIntegrity:
         """Should maintain file hierarchy integrity"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/root.txt", "root")
@@ -353,8 +333,7 @@ class TestFilesystemIntegrity:
         """Should support multiple files with same name in different directories"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir1/config.json", '{"version": 1}')
@@ -371,8 +350,7 @@ class TestFilesystemStandaloneUsage:
 
     async def test_work_with_in_memory_database(self):
         """Should work with in-memory database"""
-        db = connect(":memory:")
-        await db
+        db = await connect(":memory:")
         fs = await Filesystem.from_database(db)
 
         await fs.write_file("/test.txt", "standalone content")
@@ -382,12 +360,10 @@ class TestFilesystemStandaloneUsage:
 
     async def test_maintain_isolation_between_instances(self):
         """Should maintain isolation between instances"""
-        db1 = connect(":memory:")
-        await db1
+        db1 = await connect(":memory:")
         fs1 = await Filesystem.from_database(db1)
 
-        db2 = connect(":memory:")
-        await db2
+        db2 = await connect(":memory:")
         fs2 = await Filesystem.from_database(db2)
 
         await fs1.write_file("/test.txt", "fs1 content")
@@ -408,8 +384,7 @@ class TestFilesystemPersistence:
         """Should persist data across Filesystem instances"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/persist.txt", "persistent content")
@@ -428,8 +403,7 @@ class TestFilesystemChunkSize:
         """Should have default chunk size of 4096"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             assert fs.get_chunk_size() == 4096
@@ -439,8 +413,7 @@ class TestFilesystemChunkSize:
         """Should write file smaller than chunk size"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             # Write a file smaller than chunk_size (100 bytes)
@@ -457,8 +430,7 @@ class TestFilesystemChunkSize:
         """Should write file exactly chunk size"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -475,8 +447,7 @@ class TestFilesystemChunkSize:
         """Should write file one byte over chunk size"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -493,8 +464,7 @@ class TestFilesystemChunkSize:
         """Should write file spanning multiple chunks"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -517,8 +487,7 @@ class TestFilesystemDataIntegrity:
         """Should roundtrip data byte-for-byte"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -537,8 +506,7 @@ class TestFilesystemDataIntegrity:
         """Should handle binary data with null bytes"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -566,8 +534,7 @@ class TestFilesystemDataIntegrity:
         """Should preserve chunk ordering"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -592,8 +559,7 @@ class TestFilesystemEdgeCases:
         """Should handle empty file with zero chunks"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             # Write empty file
@@ -612,8 +578,7 @@ class TestFilesystemEdgeCases:
         """Should overwrite large file with smaller file and clean up chunks"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -639,8 +604,7 @@ class TestFilesystemEdgeCases:
         """Should overwrite small file with larger file"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -662,8 +626,7 @@ class TestFilesystemEdgeCases:
         """Should handle very large file (1MB)"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             # Write 1MB file
@@ -684,8 +647,7 @@ class TestFilesystemStats:
         """Should get file statistics"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             content = "Hello, World!"
@@ -702,8 +664,7 @@ class TestFilesystemStats:
         """Should get directory statistics"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
@@ -717,8 +678,7 @@ class TestFilesystemStats:
         """Should throw error for non-existent path"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError, match="ENOENT"):

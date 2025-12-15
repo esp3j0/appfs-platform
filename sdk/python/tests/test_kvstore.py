@@ -17,8 +17,7 @@ class TestKvStoreBasicOperations:
         """Should set and get a string value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("test-key", "test-value")
@@ -30,8 +29,7 @@ class TestKvStoreBasicOperations:
         """Should set and get an object value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             test_object = {"name": "test", "count": 42, "nested": {"value": True}}
@@ -44,8 +42,7 @@ class TestKvStoreBasicOperations:
         """Should set and get a number value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("number-key", 12345)
@@ -57,8 +54,7 @@ class TestKvStoreBasicOperations:
         """Should set and get a boolean value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("bool-key", True)
@@ -70,8 +66,7 @@ class TestKvStoreBasicOperations:
         """Should set and get an array value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             test_array = [1, 2, "three", {"four": 4}]
@@ -84,8 +79,7 @@ class TestKvStoreBasicOperations:
         """Should set and list values"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("g1:k1", 1)
@@ -116,8 +110,7 @@ class TestKvStoreUpdateOperations:
         """Should update an existing value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("update-key", "initial-value")
@@ -130,8 +123,7 @@ class TestKvStoreUpdateOperations:
         """Should update value type"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("type-key", "string-value")
@@ -149,8 +141,7 @@ class TestKvStoreDeleteOperations:
         """Should delete an existing key"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("delete-key", "value-to-delete")
@@ -163,8 +154,7 @@ class TestKvStoreDeleteOperations:
         """Should handle deleting non-existent key"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             # Should not throw an error when deleting a non-existent key
@@ -180,8 +170,7 @@ class TestKvStoreEdgeCases:
         """Should return None for non-existent key"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             value = await kv.get("non-existent-key")
@@ -192,8 +181,7 @@ class TestKvStoreEdgeCases:
         """Should return default value for non-existent key"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             value = await kv.get("non-existent-key", default="default-value")
@@ -204,8 +192,7 @@ class TestKvStoreEdgeCases:
         """Should handle null values"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("null-key", None)
@@ -217,8 +204,7 @@ class TestKvStoreEdgeCases:
         """Should handle empty string"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("empty-key", "")
@@ -230,8 +216,7 @@ class TestKvStoreEdgeCases:
         """Should handle zero value"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("zero-key", 0)
@@ -243,8 +228,7 @@ class TestKvStoreEdgeCases:
         """Should handle keys with special characters"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             special_key = "key:with/special.chars@123"
@@ -262,8 +246,7 @@ class TestKvStoreLargeData:
         """Should handle large string values"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             large_string = "x" * 10000
@@ -276,8 +259,7 @@ class TestKvStoreLargeData:
         """Should handle large object values"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             large_object = {
@@ -300,8 +282,7 @@ class TestKvStorePersistence:
         """Should persist data across KvStore instances"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             kv = await KvStore.from_database(db)
 
             await kv.set("persist-key", "persist-value")

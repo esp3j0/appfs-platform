@@ -19,8 +19,7 @@ class TestToolCallsBasicOperations:
         """Should start a tool call and return an ID"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"arg1": "value1"})
@@ -31,8 +30,7 @@ class TestToolCallsBasicOperations:
         """Should start a tool call without parameters"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("simple_tool")
@@ -49,8 +47,7 @@ class TestToolCallsBasicOperations:
         """Should mark a tool call as successful"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -68,8 +65,7 @@ class TestToolCallsBasicOperations:
         """Should mark a tool call as successful without result"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -85,8 +81,7 @@ class TestToolCallsBasicOperations:
         """Should mark a tool call as failed"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -104,8 +99,7 @@ class TestToolCallsBasicOperations:
         """Should get a tool call by ID"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"arg": "value"})
@@ -123,8 +117,7 @@ class TestToolCallsBasicOperations:
         """Should return None for non-existent ID"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             tool_call = await tools.get(99999)
@@ -140,8 +133,7 @@ class TestToolCallsQueryOperations:
         """Should get tool calls by name"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -157,8 +149,7 @@ class TestToolCallsQueryOperations:
         """Should limit results when querying by name"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -173,8 +164,7 @@ class TestToolCallsQueryOperations:
         """Should get recent tool calls"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_old")
@@ -193,8 +183,7 @@ class TestToolCallsQueryOperations:
         """Should limit recent tool calls"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             now = int(time.time())
@@ -211,8 +200,7 @@ class TestToolCallsQueryOperations:
         """Should return empty array when no matching tool calls by name"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             results = await tools.get_by_name("non_existent_tool")
@@ -228,8 +216,7 @@ class TestToolCallsStatistics:
         """Should calculate tool call statistics"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             # Create some tool calls
@@ -267,8 +254,7 @@ class TestToolCallsStatistics:
         """Should exclude pending calls from statistics"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             id1 = await tools.start("tool_a", {"test": 1})
@@ -288,8 +274,7 @@ class TestToolCallsStatistics:
         """Should return empty array when no completed calls"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -306,8 +291,7 @@ class TestToolCallsComplexData:
         """Should handle complex nested parameters"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             complex_params = {
@@ -327,8 +311,7 @@ class TestToolCallsComplexData:
         """Should handle complex nested results"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             complex_result = {
@@ -348,8 +331,7 @@ class TestToolCallsComplexData:
         """Should handle large parameters"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             large_params = {"items": [{"id": i, "data": f"Data for item {i}"} for i in range(100)]}
@@ -370,8 +352,7 @@ class TestToolCallsPersistence:
         """Should persist tool calls across instances"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("persist_tool", {"test": "value"})
@@ -395,8 +376,7 @@ class TestToolCallsOrdering:
         """Should return tool calls ordered by started_at desc"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_first")
@@ -422,8 +402,7 @@ class TestToolCallsRecord:
         """Should record a completed tool call"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             start = int(time.time())
@@ -452,8 +431,7 @@ class TestToolCallsRecord:
         """Should record a failed tool call"""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            db = connect(db_path)
-            await db
+            db = await connect(db_path)
             tools = await ToolCalls.from_database(db)
 
             start = int(time.time())

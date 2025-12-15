@@ -87,10 +87,8 @@ class AgentFS:
                 os.makedirs(directory, exist_ok=True)
             db_path = f"{directory}/{options.id}.db"
 
-        db = connect(db_path)
-
         # Connect to the database to ensure it's created
-        await db
+        db = await connect(db_path)
 
         return await AgentFS.open_with(db)
 
