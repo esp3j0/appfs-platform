@@ -1,5 +1,5 @@
 ---
-allowed-tools: Bash(git commit:*), Bash(git add:*), Bash(git status:*), Bash(mkdir:*), Bash(uv:*), Read, Edit(sdk/python/**), Write(sdk/python/**), Edit(.github/workflows/python.yml), Write(.github/workflows/python.yml)
+allowed-tools: Bash(git commit:*), Bash(git add:*), Bash(git status:*), Bash(mkdir:*), Bash(uv:*), Read, Edit(sdk/python/**), Write(sdk/python/**), Edit(.github/workflows/python.yml), Write(.github/workflows/python.yml), Write(.github/workflows/release.yml), Edit(.github/workflows/release.yml)
 argument-hint: [ts-change-sha-commit]
 description: Generate Python SDK for agentfs based on the Typescript SDK
 ---
@@ -22,6 +22,8 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - Use pytest for testing
 - Use ty for type checking
 - Maintain CI for linting and checking at .github/workflows/python.yml similar to the TS workflow at .github/workflows/typescript.yml
+- Maintain CI for publishing the Python package to the PyPI in the .github/workflows/release.yml
+  - Use `PYPI_API_TOKEN` secret
 
 ```py
 class Connection:
