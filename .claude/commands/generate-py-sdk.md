@@ -1,5 +1,5 @@
 ---
-allowed-tools: Bash(git commit:*), Bash(git add:*), Bash(git status:*), Bash(mkdir:*), Bash(uv:*), Read, Edit(sdk/python/**), Write(sdk/python/**)
+allowed-tools: Bash(git commit:*), Bash(git add:*), Bash(git status:*), Bash(mkdir:*), Bash(uv:*), Read, Edit(sdk/python/**), Write(sdk/python/**), Edit(.github/workflows/python.yml), Write(.github/workflows/python.yml)
 argument-hint: [ts-change-sha-commit]
 description: Generate Python SDK for agentfs based on the Typescript SDK
 ---
@@ -13,6 +13,7 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - Use simple setup with builtin uv ruff formatter
 - Use pytest for testing
 - Commit your changes in the end with detailed message with the motivation of changes and traces of your actions
+- Maintain CI for linting and checking at .github/workflows/python.yml similar to the TS workflow at .github/workflows/typescript.yml
 
 ```py
 class Connection:
