@@ -242,6 +242,7 @@ class Filesystem:
             (mode, uid, gid, now, now, now),
         )
         await self._db.commit()
+        assert cursor.lastrowid is not None
         return cursor.lastrowid
 
     async def _create_dentry(self, parent_ino: int, name: str, ino: int) -> None:

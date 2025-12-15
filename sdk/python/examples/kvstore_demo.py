@@ -45,6 +45,7 @@ async def main():
     tags = ["python", "database", "ai", "agent"]
     await agentfs.kv.set("tags", tags)
     retrieved_tags = await agentfs.kv.get("tags")
+    assert isinstance(retrieved_tags, list)
     print(f"  Tags: {', '.join(retrieved_tags)}\n")
 
     # Example 4: Update existing values

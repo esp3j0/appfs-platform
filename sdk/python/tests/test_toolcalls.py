@@ -60,8 +60,8 @@ class TestToolCallsBasicOperations:
             assert tool_call is not None
             assert tool_call.status == "success"
             assert tool_call.result == {"output": "result"}
-            assert tool_call.completed_at > 0
-            assert tool_call.duration_ms >= 0
+            assert tool_call.completed_at is not None and tool_call.completed_at > 0
+            assert tool_call.duration_ms is not None and tool_call.duration_ms >= 0
             await db.close()
 
     async def test_mark_successful_without_result(self):
@@ -96,8 +96,8 @@ class TestToolCallsBasicOperations:
             assert tool_call is not None
             assert tool_call.status == "error"
             assert tool_call.error == "Something went wrong"
-            assert tool_call.completed_at > 0
-            assert tool_call.duration_ms >= 0
+            assert tool_call.completed_at is not None and tool_call.completed_at > 0
+            assert tool_call.duration_ms is not None and tool_call.duration_ms >= 0
             await db.close()
 
     async def test_get_tool_call_by_id(self):
@@ -319,6 +319,7 @@ class TestToolCallsComplexData:
             call_id = await tools.start("complex_tool", complex_params)
             tool_call = await tools.get(call_id)
 
+            assert tool_call is not None
             assert tool_call.parameters == complex_params
             await db.close()
 
@@ -339,6 +340,7 @@ class TestToolCallsComplexData:
             await tools.success(call_id, complex_result)
             tool_call = await tools.get(call_id)
 
+            assert tool_call is not None
             assert tool_call.result == complex_result
             await db.close()
 
@@ -355,6 +357,7 @@ class TestToolCallsComplexData:
             call_id = await tools.start("large_tool", large_params)
             tool_call = await tools.get(call_id)
 
+            assert tool_call is not None
             assert tool_call.parameters == large_params
             await db.close()
 

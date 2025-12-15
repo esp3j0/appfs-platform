@@ -126,6 +126,7 @@ class ToolCalls:
             (name, serialized_params, started_at),
         )
         await self._db.commit()
+        assert cursor.lastrowid is not None
         return cursor.lastrowid
 
     async def success(self, call_id: int, result: Optional[Any] = None) -> None:
@@ -253,6 +254,7 @@ class ToolCalls:
             ),
         )
         await self._db.commit()
+        assert cursor.lastrowid is not None
         return cursor.lastrowid
 
     async def get(self, call_id: int) -> Optional[ToolCall]:
