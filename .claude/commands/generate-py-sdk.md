@@ -7,8 +7,10 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 ## Context
 
 - You must generate Python SDK with the API similar to the current Typescript SDK located at ../../sdk/typescript
-- Last time, python sdk was updated based on the comment $1 (if value is "unspecified" then regenerate SDK from scratch)
+- Last time, python sdk was updated based on the comment $1 (if value is "unspecified" then regenerate SDK from scratch; if value is set - focus on the diff between the current state and specified commit hash)
 - Use `pyturso.aio` python package which provide API similar to `aiosqlite`
+- Use simple setup with builtin uv ruff formatter
+- Use pytest for testing
 
 ```py
 class Connection:
