@@ -546,23 +546,22 @@ impl Filesystem {
 
         // Create inode
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        self.conn
-            .execute(
+        let mut stmt = self
+            .conn
+            .prepare(
                 "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                VALUES (?, 0, 0, 0, ?, ?, ?)",
-                (DEFAULT_DIR_MODE as i64, now, now, now),
+                VALUES (?, 0, 0, 0, ?, ?, ?) RETURNING ino",
             )
             .await?;
+        let row = stmt
+            .query_row((DEFAULT_DIR_MODE as i64, now, now, now))
+            .await?;
 
-        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-        let ino = if let Some(row) = rows.next().await? {
-            row.get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
-        } else {
-            anyhow::bail!("Failed to get inode");
-        };
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?;
 
         // Create directory entry
         self.conn
@@ -610,23 +609,22 @@ impl Filesystem {
             } else {
                 // Create new inode
                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-                self.conn
-                    .execute(
+                let mut stmt = self
+                    .conn
+                    .prepare(
                         "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                        VALUES (?, 0, 0, ?, ?, ?, ?)",
-                        (DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now),
+                        VALUES (?, 0, 0, ?, ?, ?, ?) RETURNING ino",
                     )
                     .await?;
+                let row = stmt
+                    .query_row((DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now))
+                    .await?;
 
-                let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-                let ino = if let Some(row) = rows.next().await? {
-                    row.get_value(0)
-                        .ok()
-                        .and_then(|v| v.as_integer().copied())
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
-                } else {
-                    anyhow::bail!("Failed to get inode");
-                };
+                let ino = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?;
 
                 // Create directory entry
                 self.conn
@@ -796,23 +794,22 @@ impl Filesystem {
             } else {
                 // Create new inode
                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-                self.conn
-                    .execute(
+                let mut stmt = self
+                    .conn
+                    .prepare(
                         "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                        VALUES (?, 0, 0, 0, ?, ?, ?)",
-                        (DEFAULT_FILE_MODE as i64, now, now, now),
+                        VALUES (?, 0, 0, 0, ?, ?, ?) RETURNING ino",
                     )
                     .await?;
+                let row = stmt
+                    .query_row((DEFAULT_FILE_MODE as i64, now, now, now))
+                    .await?;
 
-                let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-                let ino = if let Some(row) = rows.next().await? {
-                    row.get_value(0)
-                        .ok()
-                        .and_then(|v| v.as_integer().copied())
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?
-                } else {
-                    anyhow::bail!("Failed to get inode");
-                };
+                let ino = row
+                    .get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?;
 
                 // Create directory entry
                 self.conn
@@ -1181,25 +1178,21 @@ impl Filesystem {
         let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
         let size = target.len() as i64;
 
-        self.conn
-            .execute(
+        let mut stmt = self
+            .conn
+            .prepare(
                 "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                 VALUES (?, 0, 0, ?, ?, ?, ?)",
-                (mode, size, now, now, now),
+                 VALUES (?, 0, 0, ?, ?, ?, ?) RETURNING ino",
             )
             .await?;
+        let row = stmt.query_row((mode, size, now, now, now)).await?;
 
         // Get the newly created inode
-        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-
-        let ino = if let Some(row) = rows.next().await? {
-            row.get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0)
-        } else {
-            anyhow::bail!("Failed to get new inode");
-        };
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .unwrap_or(0);
 
         // Store symlink target
         self.conn

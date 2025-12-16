@@ -134,25 +134,23 @@ impl ToolCalls {
         let serialized_params = parameters.map(|p| serde_json::to_string(&p)).transpose()?;
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
-        self.conn
-            .execute(
+        let mut stmt = self
+            .conn
+            .prepare(
                 "INSERT INTO tool_calls (name, parameters, status, started_at)
-                VALUES (?, ?, 'pending', ?)",
-                (name, serialized_params.as_deref().unwrap_or(""), started_at),
+                VALUES (?, ?, 'pending', ?) RETURNING id",
             )
             .await?;
+        let row = stmt
+            .query_row((name, serialized_params.as_deref().unwrap_or(""), started_at))
+            .await?;
 
-        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-        if let Some(row) = rows.next().await? {
-            let id = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
-            Ok(id)
-        } else {
-            anyhow::bail!("Failed to get tool call ID");
-        }
+        let id = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
+        Ok(id)
     }
 
     /// Mark a tool call as successful
@@ -211,34 +209,31 @@ impl ToolCalls {
         let duration_ms = (completed_at - started_at) * 1000;
         let status = if error.is_some() { "error" } else { "success" };
 
-        self.conn
-            .execute(
+        let mut stmt = self.conn
+            .prepare(
                 "INSERT INTO tool_calls (name, parameters, result, error, status, started_at, completed_at, duration_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    name,
-                    serialized_params.as_deref().unwrap_or(""),
-                    serialized_result.as_deref().unwrap_or(""),
-                    error.unwrap_or(""),
-                    status,
-                    started_at,
-                    completed_at,
-                    duration_ms,
-                ),
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
             )
             .await?;
 
-        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
-        if let Some(row) = rows.next().await? {
-            let id = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
-            Ok(id)
-        } else {
-            anyhow::bail!("Failed to get tool call ID");
-        }
+        let row = stmt
+            .query_row((
+                name,
+                serialized_params.as_deref().unwrap_or(""),
+                serialized_result.as_deref().unwrap_or(""),
+                error.unwrap_or(""),
+                status,
+                started_at,
+                completed_at,
+                duration_ms,
+            ))
+            .await?;
+        let id = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
+        Ok(id)
     }
 
     /// Mark a tool call as failed
