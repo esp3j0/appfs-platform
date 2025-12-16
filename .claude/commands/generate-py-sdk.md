@@ -15,6 +15,7 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 ## Context
 
 - You must generate Python SDK with the API similar to the current Typescript SDK located at ../../sdk/typescript
+- The package name is `agentfs-sdk` and import path must be `agentfs_sdk`
 - You must transfer all tests from Typescript SDK to the Python
 - Last time, python sdk was updated based on the comment $1
   - If value is "unspecified" then regenerate SDK from scratch
