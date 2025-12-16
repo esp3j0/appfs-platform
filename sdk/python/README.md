@@ -172,10 +172,10 @@ uv sync --group dev
 uv run pytest
 
 # Format code
-uv run ruff format agentfs tests
+uv run ruff format agentfs_sdk tests
 
 # Check code
-uv run ruff check agentfs tests
+uv run ruff check agentfs_sdk tests
 ```
 
 ## License
