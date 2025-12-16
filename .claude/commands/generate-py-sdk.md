@@ -31,6 +31,8 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - Maintain CI for publishing the Python package to the PyPI in the .github/workflows/release.yml
   - Use `PYPI_API_TOKEN` secret
 - In the agetnfs-sdk implementation always explicitly close cursor or use it as context manager
+- The SDK must work properly when CDC is enabled for tursodb: cover this scenario with additional test suite
+  - Execute `PRAGMA unstable_capture_data_changes_conn('full')` pragma to enable CDC for connection
 
 ```py
 class Connection:
