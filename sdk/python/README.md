@@ -5,14 +5,14 @@ A filesystem and key-value store for AI agents, powered by SQLite and [pyturso](
 ## Installation
 
 ```bash
-pip install agentfs
+pip install agentfs-sdk
 ```
 
 ## Quick Start
 
 ```python
 import asyncio
-from agentfs import AgentFS, AgentFSOptions
+from agentfs_sdk import AgentFS, AgentFSOptions
 
 async def main():
     # Open an agent filesystem
