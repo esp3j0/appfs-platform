@@ -112,6 +112,36 @@ def update_pyproject_toml(file_path: Path, new_version: str) -> bool:
         print(f"Error updating {file_path}: {e}", file=sys.stderr)
         return False
 
+def update_py_init(file_path: Path, new_version: str) -> bool:
+    """Update version in a __init__.py file."""
+    try:
+        content = file_path.read_text()
+
+        # Find and replace the version line under [project]
+        # Match version = "..." with proper spacing
+        pattern = r'__version__ = "[^"]+"'
+        replacement = rf'__version__ = "{new_version}"'
+
+        new_content = re.sub(
+            pattern,
+            replacement,
+            content,
+            count=1,
+            flags=re.MULTILINE | re.DOTALL
+        )
+
+        if new_content == content:
+            print(f"Warning: No version field found in {file_path}")
+            return False
+
+        file_path.write_text(new_content)
+        print(f" Updated {file_path.relative_to(file_path.parents[3])}")
+        return True
+
+    except Exception as e:
+        print(f"Error updating {file_path}: {e}", file=sys.stderr)
+        return False
+
 
 def update_cargo_lock(crate_dir: Path) -> bool:
     """Update Cargo.lock by regenerating it in the crate directory."""
@@ -324,12 +354,20 @@ def main():
             'lock_func': update_package_lock,
             'name': 'sdk/typescript'
         },
-        # Python SDK
+        # Python SDK: pyproject.toml
         {
             'version_file': root / 'sdk' / 'python' / 'pyproject.toml',
             'version_func': update_pyproject_toml,
             'lock_dir': root / 'sdk' / 'python',
             'lock_func': update_uv_lock,
+            'name': 'sdk/python'
+        },
+        # Python SDK: __init__.py
+        {
+            'version_file': root / 'sdk' / 'python' / 'agentfs_sdk' / '__init__.py',
+            'version_func': update_py_init,
+            'lock_dir': root / 'sdk' / 'python',
+            'lock_func': lambda _: True,
             'name': 'sdk/python'
         },
     ]
