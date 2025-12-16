@@ -338,6 +338,8 @@ jobs:
       - host
     if: ${{ needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
+    env:
+      UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -354,7 +356,7 @@ jobs:
       - name: Build package
         run: uv build --directory sdk/python
       - name: Publish to PyPI
-        run: uv publish --directory sdk/python --token ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish --directory sdk/python
 
   announce:
     needs:
