@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from agentfs import AgentFS, AgentFSOptions
+from agentfs_sdk import AgentFS, AgentFSOptions
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ import time
 import pytest
 from turso.aio import connect
 
-from agentfs import ToolCalls
+from agentfs_sdk import ToolCalls
 
 
 @pytest.mark.asyncio

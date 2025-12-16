@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentfs"
+name = "agentfs-sdk"
 version = "0.3.0"
 description = "AgentFS Python SDK - A filesystem and key-value store for AI agents"
 readme = "README.md"
@@ -44,7 +44,7 @@ Repository = "https://github.com/tursodatabase/agentfs"
 Issues = "https://github.com/tursodatabase/agentfs/issues"
 
 [tool.setuptools.packages.find]
-include = ["agentfs*"]
+include = ["agentfs_sdk*"]
 
 [tool.ruff]
 line-length = 100

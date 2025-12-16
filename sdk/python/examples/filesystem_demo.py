@@ -3,7 +3,7 @@
 import asyncio
 from datetime import datetime
 
-from agentfs import AgentFS, AgentFSOptions
+from agentfs_sdk import AgentFS, AgentFSOptions
 
 
 async def main():

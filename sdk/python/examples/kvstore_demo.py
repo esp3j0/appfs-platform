@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 
-from agentfs import AgentFS, AgentFSOptions
+from agentfs_sdk import AgentFS, AgentFSOptions
 
 
 async def main():

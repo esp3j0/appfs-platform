@@ -6,7 +6,7 @@ import tempfile
 import pytest
 from turso.aio import connect
 
-from agentfs import KvStore
+from agentfs_sdk import KvStore
 
 
 @pytest.mark.asyncio
