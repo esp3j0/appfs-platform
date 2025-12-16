@@ -20,6 +20,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"arg1": "value1"})
@@ -31,6 +32,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("simple_tool")
@@ -48,6 +50,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -66,6 +69,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -82,6 +86,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"input": "test"})
@@ -100,6 +105,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("test_tool", {"arg": "value"})
@@ -118,6 +124,7 @@ class TestToolCallsBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             tool_call = await tools.get(99999)
@@ -134,6 +141,7 @@ class TestToolCallsQueryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -150,6 +158,7 @@ class TestToolCallsQueryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -165,6 +174,7 @@ class TestToolCallsQueryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_old")
@@ -184,6 +194,7 @@ class TestToolCallsQueryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             now = int(time.time())
@@ -201,6 +212,7 @@ class TestToolCallsQueryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             results = await tools.get_by_name("non_existent_tool")
@@ -217,6 +229,7 @@ class TestToolCallsStatistics:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             # Create some tool calls
@@ -255,6 +268,7 @@ class TestToolCallsStatistics:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             id1 = await tools.start("tool_a", {"test": 1})
@@ -275,6 +289,7 @@ class TestToolCallsStatistics:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_a", {"test": 1})
@@ -292,6 +307,7 @@ class TestToolCallsComplexData:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             complex_params = {
@@ -312,6 +328,7 @@ class TestToolCallsComplexData:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             complex_result = {
@@ -332,6 +349,7 @@ class TestToolCallsComplexData:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             large_params = {"items": [{"id": i, "data": f"Data for item {i}"} for i in range(100)]}
@@ -353,6 +371,7 @@ class TestToolCallsPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             call_id = await tools.start("persist_tool", {"test": "value"})
@@ -377,6 +396,7 @@ class TestToolCallsOrdering:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             await tools.start("tool_first")
@@ -403,6 +423,7 @@ class TestToolCallsRecord:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             start = int(time.time())
@@ -432,6 +453,7 @@ class TestToolCallsRecord:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             tools = await ToolCalls.from_database(db)
 
             start = int(time.time())

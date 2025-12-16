@@ -11,6 +11,7 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - ALWAYS USE pathes relative to the project root
 - DO NOT EVER `cd` into the directories - tool permissions will not be validated properly
 - USE ONLY SIMPLE "ls", "grep", "find", "cat" Bash commands and native Claude Code tools - otherwise permission will be blocked
+- DOCUMENT tricky and hacky moments in the code
 
 ## Context
 
@@ -29,6 +30,9 @@ description: Generate Python SDK for agentfs based on the Typescript SDK
 - Maintain CI for linting and checking at .github/workflows/python.yml similar to the TS workflow at .github/workflows/typescript.yml
 - Maintain CI for publishing the Python package to the PyPI in the .github/workflows/release.yml
   - Use `PYPI_API_TOKEN` secret
+- In the agetnfs-sdk implementation always explicitly close cursor or use it as context manager
+- The SDK must work properly when CDC is enabled for tursodb: cover this scenario with additional test suite
+  - Execute `PRAGMA unstable_capture_data_changes_conn('full')` pragma to enable CDC for connection
 
 ```py
 class Connection:

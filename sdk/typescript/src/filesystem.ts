@@ -231,9 +231,10 @@ export class Filesystem {
     const stmt = this.db.prepare(`
       INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
       VALUES (?, ?, ?, 0, ?, ?, ?)
+      RETURNING ino
     `);
-    const result = await stmt.run(mode, uid, gid, now, now, now);
-    return Number(result.lastInsertRowid);
+    const { ino } = await stmt.get(mode, uid, gid, now, now, now);
+    return Number(ino);
   }
 
   /**

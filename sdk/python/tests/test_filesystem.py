@@ -18,6 +18,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/test.txt", "Hello, World!")
@@ -30,6 +31,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/subdir/file.txt", "nested content")
@@ -42,6 +44,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/overwrite.txt", "original content")
@@ -55,6 +58,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/empty.txt", "")
@@ -67,6 +71,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             large_content = "x" * 100000
@@ -80,6 +85,7 @@ class TestFilesystemWriteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             special_content = "Special chars: \n\t\r\"'\\"
@@ -98,6 +104,7 @@ class TestFilesystemReadOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError):
@@ -109,6 +116,7 @@ class TestFilesystemReadOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/file1.txt", "content 1")
@@ -130,6 +138,7 @@ class TestFilesystemDirectoryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/file1.txt", "content 1")
@@ -148,6 +157,7 @@ class TestFilesystemDirectoryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file1.txt", "content 1")
@@ -166,6 +176,7 @@ class TestFilesystemDirectoryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir1/file.txt", "content 1")
@@ -185,6 +196,7 @@ class TestFilesystemDirectoryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/parent/child1/file.txt", "content")
@@ -202,6 +214,7 @@ class TestFilesystemDirectoryOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/a/b/c/d/file.txt", "deep content")
@@ -219,6 +232,7 @@ class TestFilesystemDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/delete-me.txt", "content")
@@ -232,6 +246,7 @@ class TestFilesystemDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError, match="ENOENT"):
@@ -243,6 +258,7 @@ class TestFilesystemDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file1.txt", "content 1")
@@ -261,6 +277,7 @@ class TestFilesystemDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/recreate.txt", "original")
@@ -280,6 +297,7 @@ class TestFilesystemPathHandling:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
@@ -293,6 +311,7 @@ class TestFilesystemPathHandling:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             special_path = "/dir-with-dash/file_with_underscore.txt"
@@ -311,6 +330,7 @@ class TestFilesystemIntegrity:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/root.txt", "root")
@@ -334,6 +354,7 @@ class TestFilesystemIntegrity:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir1/config.json", '{"version": 1}')
@@ -351,6 +372,7 @@ class TestFilesystemStandaloneUsage:
     async def test_work_with_in_memory_database(self):
         """Should work with in-memory database"""
         db = await connect(":memory:")
+        await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         fs = await Filesystem.from_database(db)
 
         await fs.write_file("/test.txt", "standalone content")
@@ -361,9 +383,11 @@ class TestFilesystemStandaloneUsage:
     async def test_maintain_isolation_between_instances(self):
         """Should maintain isolation between instances"""
         db1 = await connect(":memory:")
+        await db1.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         fs1 = await Filesystem.from_database(db1)
 
         db2 = await connect(":memory:")
+        await db2.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         fs2 = await Filesystem.from_database(db2)
 
         await fs1.write_file("/test.txt", "fs1 content")
@@ -385,6 +409,7 @@ class TestFilesystemPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/persist.txt", "persistent content")
@@ -404,6 +429,7 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             assert fs.get_chunk_size() == 4096
@@ -414,6 +440,7 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             # Write a file smaller than chunk_size (100 bytes)
@@ -431,6 +458,7 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -448,6 +476,7 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -465,6 +494,7 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -488,6 +518,7 @@ class TestFilesystemDataIntegrity:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -507,6 +538,7 @@ class TestFilesystemDataIntegrity:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -535,6 +567,7 @@ class TestFilesystemDataIntegrity:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -560,6 +593,7 @@ class TestFilesystemEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             # Write empty file
@@ -579,6 +613,7 @@ class TestFilesystemEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -605,6 +640,7 @@ class TestFilesystemEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             chunk_size = fs.get_chunk_size()
@@ -627,6 +663,7 @@ class TestFilesystemEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             # Write 1MB file
@@ -648,6 +685,7 @@ class TestFilesystemStats:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             content = "Hello, World!"
@@ -665,6 +703,7 @@ class TestFilesystemStats:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
@@ -679,6 +718,7 @@ class TestFilesystemStats:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
             with pytest.raises(FileNotFoundError, match="ENOENT"):
