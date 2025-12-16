@@ -18,6 +18,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("test-key", "test-value")
@@ -30,6 +31,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             test_object = {"name": "test", "count": 42, "nested": {"value": True}}
@@ -43,6 +45,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("number-key", 12345)
@@ -55,6 +58,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("bool-key", True)
@@ -67,6 +71,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             test_array = [1, 2, "three", {"four": 4}]
@@ -80,6 +85,7 @@ class TestKvStoreBasicOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("g1:k1", 1)
@@ -111,6 +117,7 @@ class TestKvStoreUpdateOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("update-key", "initial-value")
@@ -124,6 +131,7 @@ class TestKvStoreUpdateOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("type-key", "string-value")
@@ -142,6 +150,7 @@ class TestKvStoreDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("delete-key", "value-to-delete")
@@ -155,6 +164,7 @@ class TestKvStoreDeleteOperations:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             # Should not throw an error when deleting a non-existent key
@@ -171,6 +181,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             value = await kv.get("non-existent-key")
@@ -182,6 +193,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             value = await kv.get("non-existent-key", default="default-value")
@@ -193,6 +205,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("null-key", None)
@@ -205,6 +218,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("empty-key", "")
@@ -217,6 +231,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("zero-key", 0)
@@ -229,6 +244,7 @@ class TestKvStoreEdgeCases:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             special_key = "key:with/special.chars@123"
@@ -247,6 +263,7 @@ class TestKvStoreLargeData:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             large_string = "x" * 10000
@@ -260,6 +277,7 @@ class TestKvStoreLargeData:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             large_object = {
@@ -283,6 +301,7 @@ class TestKvStorePersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             kv = await KvStore.from_database(db)
 
             await kv.set("persist-key", "persist-value")
