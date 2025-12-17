@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agentfs"
-version = "0.3.0-pre.7"
+version = "0.3.0-pre.8"
 dependencies = [
  "agentfs-sandbox",
  "agentfs-sdk",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "agentfs-sandbox"
-version = "0.3.0-pre.7"
+version = "0.3.0-pre.8"
 dependencies = [
  "agentfs-sdk",
  "anyhow",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "agentfs-sdk"
-version = "0.3.0-pre.7"
+version = "0.3.0-pre.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -280,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.19.0"
+version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
+checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
 name = "bytemuck"
@@ -2199,9 +2199,9 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simsimd"
-version = "6.5.5"
+version = "6.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35185e4ac5ccaa9b8550d0dbdfaca87a6cabd68d5fe2db81ad270692f827bdb1"
+checksum = "3abafc51ef11985d289cd86462cc105f5b23025f186ea49a3f5a3370ccac9b28"
 dependencies = [
  "cc",
 ]
