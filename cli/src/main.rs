@@ -1,5 +1,6 @@
 mod cmd;
 mod parser;
+mod sandbox;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod daemon;
@@ -61,13 +62,21 @@ fn main() {
             }
         }
         Command::Run {
-            mounts,
+            experimental_sandbox,
             strace,
             command,
             args,
         } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(cmd::handle_run_command(mounts, strace, command, args));
+            if let Err(e) = rt.block_on(cmd::handle_run_command(
+                experimental_sandbox,
+                strace,
+                command,
+                args,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
         }
         Command::Mount {
             id_or_path,

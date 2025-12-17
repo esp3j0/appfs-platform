@@ -1,4 +1,4 @@
-use crate::cmd::{completions::Shell, MountConfig};
+use crate::cmd::completions::Shell;
 use agentfs_sdk::agentfs_dir;
 use clap::{Parser, Subcommand};
 use clap_complete::{
@@ -39,13 +39,18 @@ pub enum Command {
         #[command(subcommand)]
         command: FsCommand,
     },
-    /// Run a command in the sandboxed environment (experimental).
+    /// Run a command in the sandboxed environment.
+    ///
+    /// By default, uses FUSE+overlay with unshare/pivot_root for isolation.
+    /// The overlay uses the host filesystem as a read-only base and stores
+    /// all changes in an AgentFS-backed delta layer.
     Run {
-        /// Mount configuration (format: type=bind,src=<host_path>,dst=<sandbox_path>)
-        #[arg(long = "mount", value_name = "MOUNT_SPEC")]
-        mounts: Vec<MountConfig>,
+        /// Use experimental ptrace-based syscall interception sandbox
+        #[arg(long = "experimental-sandbox")]
+        experimental_sandbox: bool,
 
         /// Enable strace-like output for system calls
+        /// Only used with --experimental-sandbox
         #[arg(long = "strace")]
         strace: bool,
 

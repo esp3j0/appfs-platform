@@ -196,7 +196,9 @@ To unmount, use `fusermount -u ./my-agent-mount`.
 
 ### `agentfs run`
 
-Execute a program in the sandboxed environment.
+Execute a program in a sandboxed environment with copy-on-write filesystem isolation.
+
+By default, uses FUSE+overlay with user namespaces for isolation. The current working directory becomes copy-on-write (changes are stored in an AgentFS database), while the rest of the filesystem is read-only.
 
 **Usage:**
 ```bash
@@ -208,8 +210,8 @@ agentfs run [OPTIONS] <COMMAND> [ARGS]...
 - `[ARGS]...` - Arguments for the command
 
 **Options:**
-- `--mount <MOUNT_SPEC>` - Mount configuration (format: `type=bind,src=<host_path>,dst=<sandbox_path>`)
-- `--strace` - Enable strace-like output for system calls
+- `--experimental-sandbox` - Use experimental ptrace-based syscall interception sandbox
+- `--strace` - Enable strace-like output for system calls (only with `--experimental-sandbox`)
 - `-h, --help` - Print help
 
 **Examples:**
@@ -224,14 +226,9 @@ Run a Python script:
 agentfs run python3 agent.py
 ```
 
-Run with custom mount points:
+Use experimental ptrace sandbox with strace output:
 ```bash
-agentfs run --mount type=bind,src=/tmp/data,dst=/data /bin/bash
-```
-
-Debug system calls with strace output:
-```bash
-agentfs run --strace python3 agent.py
+agentfs run --experimental-sandbox --strace python3 agent.py
 ```
 
 ### `agentfs fs`
@@ -863,25 +860,21 @@ sqlite3 .agentfs/agent-workspace.db "SELECT name FROM fs_dentry"
 sqlite3 .agentfs/agent-workspace.db "SELECT path FROM fs_whiteout"
 ```
 
-### Multiple Mount Points
+### Copy-on-Write Isolation
 
-You can mount both host directories and agent databases:
+When you run `agentfs run`, the current working directory becomes a copy-on-write overlay:
 
-```bash
-# Mount agent database at /agent and host directory at /data
-agentfs run \
-  --mount type=bind,src=./data,dst=/data \
-  /bin/bash
-```
+- **Base layer**: Your actual filesystem (read-only access via HostFS)
+- **Delta layer**: An AgentFS database that captures all changes
 
-The agent database is mounted at `/agent` (you can specify which agent filesystem to use via the CLI).
+Any modifications (new files, edits, deletions) are stored in the delta database, leaving your actual filesystem untouched. When you exit, changes are discarded unless you explicitly export them using `agentfs diff`.
 
 ### Debugging with Strace
 
-Use `--strace` to see all intercepted system calls:
+Use `--strace` with the experimental ptrace sandbox to see all intercepted system calls:
 
 ```bash
-agentfs run --strace python3 script.py
+agentfs run --experimental-sandbox --strace python3 script.py
 ```
 
 This shows detailed information about every filesystem operation, useful for debugging and understanding agent behavior.

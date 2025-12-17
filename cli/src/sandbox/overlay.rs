@@ -1,0 +1,718 @@
+//! Overlay sandbox using FUSE and Linux namespaces.
+//!
+//! This module provides a sandboxed execution environment where the current
+//! working directory becomes a copy-on-write overlay, and the rest of the
+//! filesystem is read-only. All modifications are captured in an AgentFS
+//! database, leaving the original files untouched.
+//!
+//! The implementation mounts a FUSE filesystem on a hidden temporary directory,
+//! then uses a child process with its own mount namespace to bind-mount the
+//! overlay onto the working directory. This isolation ensures the overlay is
+//! only visible to the sandboxed process and its children.
+//!
+//! To avoid a circular reference (FUSE serving from a directory it's mounted
+//! on), we open a file descriptor to the working directory before mounting.
+//! The HostFS base layer then accesses files through `/proc/self/fd/N`,
+//! bypassing the FUSE mount entirely.
+
+use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use anyhow::{bail, Context, Result};
+use std::{
+    cmp::Reverse,
+    ffi::CString,
+    io::BufRead,
+    os::unix::ffi::OsStrExt,
+    os::unix::io::AsRawFd,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use crate::fuse::FuseMountOptions;
+
+/// Exit code returned when exec fails (standard shell convention for "command not found")
+const EXIT_COMMAND_NOT_FOUND: i32 = 127;
+
+/// Timeout for waiting for FUSE mount to become ready
+const FUSE_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Virtual filesystems that must remain writable for system operation.
+/// These are skipped when remounting the filesystem hierarchy as read-only.
+const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev"];
+
+/// Field index for mount point in /proc/self/mountinfo.
+/// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
+const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
+
+/// Commands to try for FUSE unmounting, in order of preference.
+/// fusermount3 is from fuse3 package; fusermount is the legacy fallback.
+const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
+
+/// Run a command in an overlay sandbox.
+pub async fn run_cmd(command: PathBuf, args: Vec<String>) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+
+    print_welcome_banner(&cwd);
+
+    // Open the directory BEFORE mounting FUSE on top of it.
+    // This fd lets us access the underlying directory through /proc/self/fd/N,
+    // bypassing the FUSE mount that will be placed on top.
+    let cwd_fd = std::fs::File::open(&cwd).context("Failed to open current directory")?;
+    let fd_num = cwd_fd.as_raw_fd();
+    let fd_path = format!("/proc/self/fd/{}", fd_num);
+
+    let session = setup_run_directory()?;
+
+    let db_path_str = session
+        .db_path
+        .to_str()
+        .context("Database path contains non-UTF8 characters")?;
+    let agentfs = AgentFS::open(AgentFSOptions::with_path(db_path_str))
+        .await
+        .context("Failed to create delta AgentFS")?;
+
+    let base = Arc::new(HostFS::new(&fd_path).context("Failed to create HostFS")?);
+    let overlay = OverlayFS::new(base, agentfs.fs);
+
+    overlay
+        .init()
+        .await
+        .context("Failed to initialize overlay")?;
+
+    let overlay: Arc<dyn FileSystem> = Arc::new(overlay);
+
+    // Set up FUSE mount options - mount at hidden temp directory
+    // SAFETY: getuid/getgid are always safe, they simply return the current user/group IDs
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    let fuse_opts = FuseMountOptions {
+        mountpoint: session.fuse_mountpoint.clone(),
+        auto_unmount: false,
+        allow_root: false,
+        fsname: format!("agentfs:{}", session.run_id),
+        uid: Some(uid),
+        gid: Some(gid),
+    };
+
+    // Start FUSE in a separate thread
+    let fuse_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        crate::fuse::mount(overlay, fuse_opts, rt)
+    });
+
+    // Wait for FUSE mount to be ready
+    if !wait_for_mount(&session.fuse_mountpoint, FUSE_MOUNT_TIMEOUT) {
+        bail!(
+            "FUSE mount did not become ready within {:?}",
+            FUSE_MOUNT_TIMEOUT
+        );
+    }
+
+    // Create pipes for parent-child coordination.
+    // The parent needs to write uid_map/gid_map for the child after unshare.
+    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
+
+    // SAFETY: fork() is safe when called from a single-threaded context before
+    // the child performs any async-signal-unsafe operations. Our child immediately
+    // closes unused fds and calls exec after namespace setup.
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        bail!("Failed to fork: {}", std::io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // SAFETY: Closing unused pipe ends in child; these fds are valid from pipe()
+        unsafe {
+            libc::close(pipe_to_child[1]); // Close write end
+            libc::close(pipe_to_parent[0]); // Close read end
+        }
+
+        // Close the fd in child - we don't need it (parent keeps it for FUSE)
+        drop(cwd_fd);
+        run_child(
+            &cwd,
+            &session.fuse_mountpoint,
+            command,
+            args,
+            pipe_to_child[0],
+            pipe_to_parent[1],
+        );
+    } else {
+        // SAFETY: Closing unused pipe ends in parent; these fds are valid from pipe()
+        unsafe {
+            libc::close(pipe_to_child[0]); // Close read end
+            libc::close(pipe_to_parent[1]); // Close write end
+        }
+
+        // Wait for child to signal it has called unshare
+        if !wait_for_pipe_signal(pipe_to_parent[0]) {
+            eprintln!("Error: Failed to read sync signal from child process");
+            abort_child(pipe_to_child[1], child_pid);
+        }
+
+        // Configure user namespace mappings for the child
+        write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+
+        // Signal child that mappings are done
+        // SAFETY: Writing to and closing valid pipe fds
+        unsafe {
+            libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+
+        // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread
+        run_parent(
+            child_pid,
+            cwd_fd,
+            &session.fuse_mountpoint,
+            fuse_handle,
+            &session.run_dir,
+        );
+    }
+}
+
+/// Print the welcome banner showing sandbox configuration.
+fn print_welcome_banner(cwd: &Path) {
+    eprintln!("Welcome to AgentFS!");
+    eprintln!();
+    eprintln!("  {} (copy-on-write)", cwd.display());
+    eprintln!("  Everything else is read-only.");
+    eprintln!();
+}
+
+/// Configuration for a sandbox run session.
+struct RunSession {
+    /// Unique identifier for this run.
+    run_id: String,
+    /// Directory containing session artifacts (database, mountpoint).
+    run_dir: PathBuf,
+    /// Path to the delta database.
+    db_path: PathBuf,
+    /// Path where FUSE filesystem will be mounted.
+    fuse_mountpoint: PathBuf,
+}
+
+/// Create a unique run directory with database and mountpoint paths.
+fn setup_run_directory() -> Result<RunSession> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+    let run_dir = home_dir.join(".agentfs").join("run").join(&run_id);
+    std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
+
+    let db_path = run_dir.join("delta.db");
+    let fuse_mountpoint = run_dir.join("mnt");
+    std::fs::create_dir_all(&fuse_mountpoint).context("Failed to create FUSE mountpoint")?;
+
+    Ok(RunSession {
+        run_id,
+        run_dir,
+        db_path,
+        fuse_mountpoint,
+    })
+}
+
+/// Create a pair of pipes for parent-child synchronization.
+///
+/// Returns (child_pipe, parent_pipe) where each is [read_fd, write_fd].
+fn create_sync_pipes() -> Result<([libc::c_int; 2], [libc::c_int; 2])> {
+    let mut child_pipe: [libc::c_int; 2] = [0; 2];
+    let mut parent_pipe: [libc::c_int; 2] = [0; 2];
+
+    if unsafe { libc::pipe(child_pipe.as_mut_ptr()) } != 0 {
+        bail!("Failed to create pipe: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::pipe(parent_pipe.as_mut_ptr()) } != 0 {
+        // Clean up first pipe on failure
+        unsafe {
+            libc::close(child_pipe[0]);
+            libc::close(child_pipe[1]);
+        }
+        bail!("Failed to create pipe: {}", std::io::Error::last_os_error());
+    }
+
+    Ok((child_pipe, parent_pipe))
+}
+
+/// Wait for a single-byte synchronization signal on a pipe.
+///
+/// Returns true if signal received, false on error or pipe closed.
+fn wait_for_pipe_signal(fd: libc::c_int) -> bool {
+    let mut buf = [0u8; 1];
+    // SAFETY: Reading into valid buffer from valid fd
+    let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+    result > 0
+}
+
+/// Terminate child process coordination and exit with failure.
+///
+/// Closes the pipe to signal the child, waits for it to exit, then exits.
+fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) -> ! {
+    // SAFETY: Closing valid fd and waiting for valid child pid
+    unsafe {
+        libc::close(pipe_write_fd);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(child_pid, &mut status, 0);
+    }
+    std::process::exit(1)
+}
+
+/// Write uid_map, gid_map, and setgroups for a child's user namespace.
+///
+/// Maps uid/gid 0 in the namespace to the real uid/gid outside.
+/// On failure, aborts the child and exits.
+fn write_namespace_mappings(
+    child_pid: libc::pid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    pipe_write_fd: libc::c_int,
+) {
+    let uid_map_path = format!("/proc/{}/uid_map", child_pid);
+    let gid_map_path = format!("/proc/{}/gid_map", child_pid);
+    let setgroups_path = format!("/proc/{}/setgroups", child_pid);
+
+    if let Err(e) = std::fs::write(&uid_map_path, format!("0 {} 1\n", uid)) {
+        eprintln!("Error: Could not write uid_map: {}", e);
+        eprintln!("This may indicate missing unprivileged user namespace support.");
+        abort_child(pipe_write_fd, child_pid);
+    }
+
+    // Disable setgroups (required before writing gid_map on unprivileged systems)
+    if let Err(e) = std::fs::write(&setgroups_path, "deny") {
+        eprintln!("Error: Could not write setgroups: {}", e);
+        abort_child(pipe_write_fd, child_pid);
+    }
+
+    if let Err(e) = std::fs::write(&gid_map_path, format!("0 {} 1\n", gid)) {
+        eprintln!("Error: Could not write gid_map: {}", e);
+        abort_child(pipe_write_fd, child_pid);
+    }
+}
+
+/// Convert a path to a CString, exiting the child process on failure.
+///
+/// Used in the child process context where we cannot return errors normally.
+fn path_to_cstring(path: &Path, description: &str) -> CString {
+    match CString::new(path.as_os_str().as_bytes()) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!(
+                "Invalid {} (contains NUL byte): {}",
+                description,
+                path.display()
+            );
+            // SAFETY: In forked child, must use _exit() to avoid running atexit
+            // handlers and flushing stdio buffers that belong to the parent.
+            unsafe { libc::_exit(1) }
+        }
+    }
+}
+
+/// Exit the child process with an error message and exit code.
+///
+/// Uses _exit() instead of exit() to avoid running atexit handlers in the
+/// forked child, which could corrupt parent state.
+fn child_exit_with_code(msg: &str, code: i32) -> ! {
+    eprintln!("{}", msg);
+    // SAFETY: In forked child, _exit() is the correct way to terminate.
+    unsafe { libc::_exit(code) }
+}
+
+/// Exit the child process with an error message (exit code 1).
+fn child_exit(msg: &str) -> ! {
+    child_exit_with_code(msg, 1)
+}
+
+/// Child process: set up namespace isolation and execute the command.
+fn run_child(
+    cwd: &Path,
+    fuse_mountpoint: &Path,
+    command: PathBuf,
+    args: Vec<String>,
+    pipe_from_parent: libc::c_int,
+    pipe_to_parent: libc::c_int,
+) -> ! {
+    // Step 1: Create new user + mount namespaces for unprivileged isolation.
+    // User namespace gives us CAP_SYS_ADMIN within the namespace to manipulate mounts.
+    // SAFETY: unshare() with valid flags is safe; we handle the error case.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+        child_exit(&format!(
+            "Failed to unshare namespaces: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Step 2: Signal parent that unshare is complete so it can write uid_map/gid_map.
+    // SAFETY: Writing to and closing valid pipe fd from create_sync_pipes().
+    unsafe {
+        libc::write(pipe_to_parent, b"x".as_ptr() as *const libc::c_void, 1);
+        libc::close(pipe_to_parent);
+    }
+
+    // Step 3: Wait for parent to finish writing namespace mappings.
+    if !wait_for_pipe_signal(pipe_from_parent) {
+        child_exit("Failed to read sync signal from parent: pipe closed unexpectedly");
+    }
+    // SAFETY: Closing valid pipe fd.
+    unsafe { libc::close(pipe_from_parent) };
+
+    // Step 4: Make all mounts private to prevent propagation to parent namespace.
+    let root = CString::new("/").unwrap();
+    // SAFETY: mount() with MS_PRIVATE on "/" is safe; changes only affect this namespace.
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        child_exit(&format!(
+            "Failed to make mounts private: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Step 5: Bind mount the FUSE overlay from temp dir onto cwd.
+    // This is only visible in this namespace, not to other processes.
+    let fuse_cstr = path_to_cstring(fuse_mountpoint, "FUSE mountpoint path");
+    let cwd_cstr = path_to_cstring(cwd, "working directory path");
+
+    // SAFETY: mount() with MS_BIND and valid paths is safe.
+    if unsafe {
+        libc::mount(
+            fuse_cstr.as_ptr(),
+            cwd_cstr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        child_exit(&format!(
+            "Failed to bind mount FUSE overlay: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Step 6: Change to cwd to ensure we're using the overlay.
+    if std::env::set_current_dir(cwd).is_err() {
+        child_exit("Failed to change to working directory");
+    }
+
+    // Step 7: Remount all other filesystems as read-only.
+    if let Err(e) = remount_all_readonly_except(cwd) {
+        child_exit(&format!("Failed to remount filesystems read-only: {}", e));
+    }
+
+    // Step 8: Execute the command (does not return).
+    exec_command(command, args);
+}
+
+/// Remount all filesystems as read-only, except for the specified path.
+///
+/// This parses /proc/self/mountinfo to find all mount points and remounts
+/// each one as read-only, skipping the specified writable path (our FUSE overlay).
+fn remount_all_readonly_except(writable_path: &Path) -> std::io::Result<()> {
+    let mountinfo = std::fs::File::open("/proc/self/mountinfo")?;
+    let reader = std::io::BufReader::new(mountinfo);
+
+    // Collect all mount points
+    let mut mounts: Vec<PathBuf> = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() > MOUNTINFO_MOUNT_POINT_FIELD {
+            let mount_point = unescape_mountinfo(fields[MOUNTINFO_MOUNT_POINT_FIELD]);
+            mounts.push(PathBuf::from(mount_point));
+        }
+    }
+
+    // Sort by path length (longest first) to handle nested mounts correctly
+    mounts.sort_by_key(|b| Reverse(b.as_os_str().len()));
+
+    // Canonicalize the writable path for comparison
+    let writable_canonical = writable_path
+        .canonicalize()
+        .unwrap_or_else(|_| writable_path.to_path_buf());
+
+    for mount_point in &mounts {
+        // Skip the writable path (our FUSE overlay)
+        let mount_canonical = mount_point
+            .canonicalize()
+            .unwrap_or_else(|_| mount_point.clone());
+        if mount_canonical == writable_canonical {
+            continue;
+        }
+
+        // Skip virtual filesystems that shouldn't be remounted
+        if skip_mount(mount_point) {
+            continue;
+        }
+
+        // Try to remount as read-only (bind + remount + rdonly)
+        let mount_cstr = match CString::new(mount_point.as_os_str().as_bytes()) {
+            Ok(s) => s,
+            Err(_) => continue, // Path contains NUL byte, skip it
+        };
+
+        // First bind mount on itself to create a distinct mount point.
+        // SAFETY: mount() with valid CString path; failures are expected and handled.
+        let bind_result = unsafe {
+            libc::mount(
+                mount_cstr.as_ptr(),
+                mount_cstr.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            )
+        };
+
+        if bind_result != 0 {
+            // Some mounts can't be bind-mounted (e.g., already bind mounts), skip them
+            continue;
+        }
+
+        // Remount the bind mount as read-only.
+        // SAFETY: mount() with valid path; failures silently ignored as some
+        // filesystems (e.g., tmpfs with running processes) cannot be remounted.
+        let _ = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                mount_cstr.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                std::ptr::null(),
+            )
+        };
+    }
+
+    Ok(())
+}
+
+/// Check if a mount point should be skipped during read-only remounting.
+///
+/// Virtual filesystems like /proc, /sys, and /dev must remain writable
+/// for the system to function correctly.
+fn skip_mount(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    SKIP_MOUNT_PREFIXES
+        .iter()
+        .any(|prefix| path_str.starts_with(prefix))
+}
+
+/// Unescape mount point from mountinfo format.
+/// Spaces are encoded as \040, tabs as \011, etc.
+fn unescape_mountinfo(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Try to read octal escape sequence (digits 0-7 only)
+            let mut octal = String::new();
+            for _ in 0..3 {
+                if let Some(&next) = chars.peek() {
+                    if ('0'..='7').contains(&next) {
+                        octal.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if octal.len() == 3 {
+                // Use u32 to handle values > 255 (max octal 777 = 511)
+                if let Ok(code) = u32::from_str_radix(&octal, 8) {
+                    if code <= 255 {
+                        result.push(code as u8 as char);
+                        continue;
+                    }
+                }
+            }
+            // Not a valid escape, keep the backslash and octal chars
+            result.push(c);
+            result.push_str(&octal);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Attempt to unmount a FUSE filesystem using fusermount.
+///
+/// Tries commands from FUSERMOUNT_COMMANDS in order until one succeeds.
+/// Uses lazy unmount (-uz) to handle lingering references from the FUSE thread.
+///
+/// Returns true if unmount succeeded or mount was already gone.
+fn unmount_fuse(mountpoint: &Path) -> bool {
+    for cmd in FUSERMOUNT_COMMANDS {
+        let success = std::process::Command::new(cmd)
+            .args(["-uz"])
+            .arg(mountpoint.as_os_str())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if success {
+            return true;
+        }
+    }
+
+    // Check if it's actually still mounted
+    !is_mountpoint(mountpoint)
+}
+
+/// Parent process: wait for child to exit, then clean up.
+///
+/// The FUSE thread handle is intentionally dropped without joining. We perform
+/// a lazy unmount (fusermount -uz) which safely detaches the filesystem even
+/// while the FUSE thread may still be processing requests. The thread will
+/// terminate naturally when the mount is gone.
+fn run_parent(
+    child_pid: i32,
+    cwd_fd: std::fs::File,
+    fuse_mountpoint: &Path,
+    _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
+    run_dir: &Path,
+) -> ! {
+    // Wait for child process to exit
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(child_pid, &mut status, 0) };
+    let exit_code = wait_status_to_exit_code(status);
+
+    // Move away from mountpoint before unmounting to avoid EBUSY
+    let _ = std::env::set_current_dir("/");
+
+    // Release the underlying directory fd (was kept alive for HostFS)
+    drop(cwd_fd);
+
+    // Unmount the FUSE filesystem
+    if !unmount_fuse(fuse_mountpoint) {
+        eprintln!(
+            "Warning: Failed to unmount FUSE filesystem at {}",
+            fuse_mountpoint.display()
+        );
+        eprintln!(
+            "You may need to manually unmount with: fusermount -uz {}",
+            fuse_mountpoint.display()
+        );
+        std::process::exit(exit_code);
+    }
+
+    // Clean up run directory
+    if let Err(e) = std::fs::remove_dir_all(run_dir) {
+        eprintln!(
+            "Warning: Failed to clean up run directory {}: {}",
+            run_dir.display(),
+            e
+        );
+    }
+
+    std::process::exit(exit_code);
+}
+
+/// Wait for a path to become a mountpoint
+fn wait_for_mount(path: &Path, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let interval = std::time::Duration::from_millis(50);
+
+    while start.elapsed() < timeout {
+        if is_mountpoint(path) {
+            return true;
+        }
+        std::thread::sleep(interval);
+    }
+    false
+}
+
+/// Check if a path is a mountpoint by comparing device IDs with parent.
+fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("/"),
+    };
+
+    let parent_meta = match std::fs::metadata(parent) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    path_meta.dev() != parent_meta.dev()
+}
+
+/// Execute the command, replacing the current process.
+fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
+    setup_env_vars();
+
+    let cmd_cstr = match CString::new(command.as_os_str().as_bytes()) {
+        Ok(s) => s,
+        Err(_) => {
+            child_exit_with_code(
+                &format!("Invalid command (contains NUL byte): {}", command.display()),
+                EXIT_COMMAND_NOT_FOUND,
+            );
+        }
+    };
+
+    let mut argv: Vec<CString> = vec![cmd_cstr.clone()];
+    for arg in &args {
+        match CString::new(arg.as_str()) {
+            Ok(s) => argv.push(s),
+            Err(_) => {
+                child_exit_with_code(
+                    &format!("Invalid argument (contains NUL byte): {}", arg),
+                    EXIT_COMMAND_NOT_FOUND,
+                );
+            }
+        }
+    }
+
+    let argv_ptrs: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
+    unsafe {
+        libc::execvp(cmd_cstr.as_ptr(), argv_ptrs.as_ptr());
+    }
+
+    child_exit_with_code(
+        &format!(
+            "Failed to execute {}: {}",
+            command.display(),
+            std::io::Error::last_os_error()
+        ),
+        EXIT_COMMAND_NOT_FOUND,
+    );
+}
+
+/// Setup environment variables for the sandbox.
+fn setup_env_vars() {
+    std::env::set_var("AGENTFS", "1");
+    std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
+}
+
+/// Extract exit code from wait status.
+fn wait_status_to_exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    }
+}

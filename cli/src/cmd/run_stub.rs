@@ -1,39 +1,16 @@
-use serde::{Deserialize, Serialize};
+//! Stub implementations for non-Linux platforms.
+
+use anyhow::Result;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MountType {
-    Bind { src: PathBuf },
-    Sqlite { src: PathBuf },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MountConfig {
-    pub mount_type: MountType,
-    pub dst: PathBuf,
-}
-
-impl std::str::FromStr for MountConfig {
-    type Err = String;
-
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Err("Mount configuration is only supported on Linux".to_string())
-    }
-}
-
-pub async fn run_sandbox(
-    mounts: Vec<MountConfig>,
-    strace: bool,
-    command: PathBuf,
-    args: Vec<String>,
-) {
-    // Suppress unused variable warnings when sandbox feature is disabled
-    let _ = (mounts, strace, command, args);
-
-    eprintln!("Error: Sandbox is not available on this platform.");
-    eprintln!();
-    eprintln!("The 'run' command uses ptrace-based system call interception,");
-    eprintln!("which is only supported on Linux x86_64.");
+/// Handle the `run` command - stub for non-Linux platforms.
+pub async fn handle_run_command(
+    _experimental_sandbox: bool,
+    _strace: bool,
+    _command: PathBuf,
+    _args: Vec<String>,
+) -> Result<()> {
+    eprintln!("Error: The 'run' command is only available on Linux x86_64.");
     eprintln!();
     eprintln!("However, you can still use the other AgentFS commands:");
     eprintln!("  - 'agentfs init' to create a new agent filesystem");

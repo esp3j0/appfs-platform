@@ -89,6 +89,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "turso",
+ "uuid",
 ]
 
 [[package]]
