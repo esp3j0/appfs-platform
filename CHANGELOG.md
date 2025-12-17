@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.3.0] - 2025-12-17
+
+### Added
+
+- Python SDK for AgentFS.
+- Web browser support for TypeScript SDK.
+- Dynamic CLI completions with `completion` command (install/uninstall).
+
+### Changed
+
+- TypeScript SDK: Remove `ready()` method from the API.
+- TypeScript SDK: Improve `KvStore.get()` API.
+- TypeScript SDK: Improve `FileSystem.readFile()` compatibility.
+- TypeScript SDK: Use `RETURNING` clause instead of `lastInsertRowid`.
+- TypeScript SDK: Switch to proper Turso dependency versioning.
+- Python SDK: Use `RETURNING` clause instead of `lastInsertRowid`.
+- Rust SDK: Use `RETURNING` clause instead of `lastInsertRowid`.
+
+### Fixed
+
+- CLI `cat` command bug.
+- macFUSE: pass full path to open dynamic libs.
+
+### Documentation
+
+- Add FAQ entry for Docker Sandbox.
+
 ## [0.2.3] - 2025-12-10
 
 ### Added
@@ -66,6 +93,7 @@
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.3.0]: https://github.com/tursodatabase/agentfs/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/tursodatabase/agentfs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/tursodatabase/agentfs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/tursodatabase/agentfs/compare/v0.2.0...v0.2.1
