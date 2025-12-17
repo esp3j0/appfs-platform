@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentfs-sdk"
-version = "0.3.0-pre.7"
+version = "0.3.0-pre.8"
 description = "AgentFS Python SDK - A filesystem and key-value store for AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,7 +26,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pyturso==0.4.0rc16",
+    "pyturso==0.4.0rc17",
 ]
 
 [dependency-groups]
