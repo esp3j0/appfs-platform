@@ -137,15 +137,9 @@ See the **[examples](examples)** directory for more details.
 
 ## 💡 Why AgentFS?
 
-**Auditability**: Every file operation, tool call, and state change is recorded in SQLite. Query your agent's complete history with SQL to debug issues, analyze behavior, or meet compliance requirements.
-
-**Reproducibility**: Snapshot an agent's state at any point with `cp agent.db snapshot.db`. Restore it later to reproduce exact execution states, test what-if scenarios, or roll back mistakes.
-
-**Portability**: The entire agent runtime—files, state, history —is stored in a single SQLite file. Move it between machines, check it into version control, or deploy it to any system where Turso runs.
-
-**Simplicity**: No configuration files, no database servers, no distributed systems. Just a single file and a simple API.
-
-**Sandboxing**: Run agents in an isolated Linux environment where filesystem access is controlled and monitored. Perfect for testing untrusted code or enforcing security policies.
+* **Auditability**: Every file operation, tool call, and state change is recorded in a SQLite database file. Query your agent's complete history with SQL to debug issues, analyze behavior, or meet compliance requirements.
+* **Reproducibility**: Snapshot an agent's state at any point with cp agent.db snapshot.db. Restore it later to reproduce exact execution states, test what-if scenarios, or roll back mistakes.
+* **Portability**: The entire agent runtime—files, state, history —is stored in a single SQLite file. Move it between machines, check it into version control, or deploy it to any system where Turso runs.
 
 ## 🔧 How AgentFS Works?
 
