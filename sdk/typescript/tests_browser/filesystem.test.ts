@@ -1,42 +1,21 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Database } from "@tursodatabase/database";
+import { describe, it, expect, beforeEach } from "vitest";
+import { Database } from "@tursodatabase/database-wasm/vite";
 import { Filesystem } from "../src/filesystem.js";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+
+import { Buffer } from "buffer";
+globalThis.Buffer = Buffer;
 
 describe("Filesystem Integration Tests", () => {
   let db: Database;
   let fs: Filesystem;
-  let tempDir: string;
-  let dbPath: string;
 
   beforeEach(async () => {
-    // Create temporary directory for test database
-    tempDir = mkdtempSync(join(tmpdir(), "agentfs-test-"));
-    dbPath = join(tempDir, "test.db");
-
     // Initialize database and Filesystem
-    db = new Database(dbPath);
+    db = new Database(":memory:");
     await db.connect();
     // sync uses CDC so we must ensure that AgentFS components works properly with this extra setup
     await db.exec("PRAGMA unstable_capture_data_changes_conn('full')");
     fs = await Filesystem.fromDatabase(db);
-  });
-
-  afterEach(async () => {
-    // Close database before cleaning up
-    try {
-      await db.close();
-    } catch {
-      // Ignore close errors
-    }
-    // Clean up temporary directories
-    try {
-      rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
   });
 
   describe("File Write Operations", () => {

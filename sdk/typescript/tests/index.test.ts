@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { AgentFS } from "../src/index";
+import { AgentFS } from "../src/index_node.js";
 import { existsSync, rmSync } from "fs";
 
 describe("AgentFS Integration Tests", () => {

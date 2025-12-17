@@ -1,36 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Database } from "@tursodatabase/database";
+import { describe, it, expect, beforeEach } from "vitest";
+import { Database } from "@tursodatabase/database-wasm/vite";
 import { ToolCalls } from "../src/toolcalls.js";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
 
 describe("ToolCalls Integration Tests", () => {
   let db: Database;
   let toolCalls: ToolCalls;
-  let tempDir: string;
-  let dbPath: string;
 
   beforeEach(async () => {
-    // Create temporary directory for test database
-    tempDir = mkdtempSync(join(tmpdir(), "agent-datakit-test-"));
-    dbPath = join(tempDir, "test.db");
-
-    // Initialize database and ToolCalls
-    db = new Database(dbPath);
+    db = new Database(":memory:");
     await db.connect();
     // sync uses CDC so we must ensure that AgentFS components works properly with this extra setup
     await db.exec("PRAGMA unstable_capture_data_changes_conn('full')");
     toolCalls = await ToolCalls.fromDatabase(db);
-  });
-
-  afterEach(() => {
-    // Clean up temporary directories
-    try {
-      rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
   });
 
   describe("Basic Operations", () => {

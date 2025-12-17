@@ -1,4 +1,4 @@
-import { Database } from '@tursodatabase/database';
+import type { DatabasePromise } from '@tursodatabase/database-common';
 
 // File types for mode field
 const S_IFMT = 0o170000;   // File type mask
@@ -28,19 +28,21 @@ export interface Stats {
 }
 
 export class Filesystem {
-  private db: Database;
+  private db: DatabasePromise;
+  private bufferCtor: BufferConstructor;
   private rootIno: number = 1;
   private chunkSize: number = DEFAULT_CHUNK_SIZE;
 
-  private constructor(db: Database) {
+  private constructor(db: DatabasePromise, b: BufferConstructor) {
     this.db = db;
+    this.bufferCtor = b;
   }
 
   /**
    * Create a Filesystem from an existing database connection
    */
-  static async fromDatabase(db: Database): Promise<Filesystem> {
-    const fs = new Filesystem(db);
+  static async fromDatabase(db: DatabasePromise, b?: BufferConstructor): Promise<Filesystem> {
+    const fs = new Filesystem(db, b ?? Buffer);
     await fs.initialize();
     return fs;
   }
@@ -319,7 +321,7 @@ export class Filesystem {
   }
 
   private async updateFileContent(ino: number, content: string | Buffer): Promise<void> {
-    const buffer = typeof content === 'string' ? Buffer.from(content, 'utf-8') : content;
+    const buffer = typeof content === 'string' ? this.bufferCtor.from(content, 'utf-8') : content;
     const now = Math.floor(Date.now() / 1000);
 
     // Delete existing data chunks
@@ -374,11 +376,11 @@ export class Filesystem {
 
     let combined: Buffer;
     if (rows.length === 0) {
-      combined = Buffer.alloc(0);
+      combined = this.bufferCtor.alloc(0);
     } else {
       // Concatenate all chunks
       const buffers = rows.map(row => row.data);
-      combined = Buffer.concat(buffers);
+      combined = this.bufferCtor.concat(buffers);
     }
 
     // Update atime

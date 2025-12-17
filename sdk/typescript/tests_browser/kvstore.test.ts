@@ -1,9 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Database } from "@tursodatabase/database";
+import { describe, it, expect, beforeEach } from "vitest";
+import { Database } from "@tursodatabase/database-wasm/vite";
 import { KvStore } from "../src/kvstore.js";
-import { mkdtempSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
 
 describe("KvStore Integration Tests", () => {
   let db: Database;
@@ -13,24 +10,11 @@ describe("KvStore Integration Tests", () => {
 
   beforeEach(async () => {
     // Create temporary directory for test database
-    tempDir = mkdtempSync(join(tmpdir(), "agentfs-test-"));
-    dbPath = join(tempDir, "test.db");
-
-    // Initialize database and KvStore
-    db = new Database(dbPath);
+    db = new Database(":memory:");
     await db.connect();
     // sync uses CDC so we must ensure that AgentFS components works properly with this extra setup
     await db.exec("PRAGMA unstable_capture_data_changes_conn('full')");
     kvStore = await KvStore.fromDatabase(db);
-  });
-
-  afterEach(() => {
-    // Clean up temporary directories
-    try {
-      rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
   });
 
   describe("Basic Operations", () => {
