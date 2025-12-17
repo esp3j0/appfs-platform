@@ -1,6 +1,10 @@
 import { Database } from "@tursodatabase/database";
 import { existsSync, mkdirSync } from "fs";
 import { AgentFSCore, AgentFSOptions } from "./agentfs.js";
+import { DatabasePromise } from "@tursodatabase/database-common";
+import { KvStore } from "./kvstore.js";
+import { Filesystem } from "./filesystem.js";
+import { ToolCalls } from "./toolcalls.js";
 
 export class AgentFS extends AgentFSCore {
     /**
@@ -52,7 +56,16 @@ export class AgentFS extends AgentFSCore {
         // Connect to the database to ensure it's created
         await db.connect();
 
-        return await AgentFSCore.openWith(db);
+        return await this.openWith(db);
+    }
+
+    static async openWith(db: DatabasePromise): Promise<AgentFSCore> {
+        const [kv, fs, tools] = await Promise.all([
+            KvStore.fromDatabase(db),
+            Filesystem.fromDatabase(db),
+            ToolCalls.fromDatabase(db),
+        ]);
+        return new AgentFS(db, kv, fs, tools);
     }
 }
 

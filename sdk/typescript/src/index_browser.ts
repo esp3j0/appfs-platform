@@ -1,4 +1,22 @@
-export { AgentFSOptions, AgentFSCore as AgentFS } from './agentfs.js';
+import { Database } from "@tursodatabase/database";
+import { AgentFSCore, AgentFSOptions } from "./agentfs.js";
+import { DatabasePromise } from "@tursodatabase/database-common";
+import { KvStore } from "./kvstore.js";
+import { Filesystem } from "./filesystem.js";
+import { ToolCalls } from "./toolcalls.js";
+
+export class AgentFS extends AgentFSCore {
+    static async openWith(db: DatabasePromise): Promise<AgentFSCore> {
+        const [kv, fs, tools] = await Promise.all([
+            KvStore.fromDatabase(db),
+            Filesystem.fromDatabase(db),
+            ToolCalls.fromDatabase(db),
+        ]);
+        return new AgentFS(db, kv, fs, tools);
+    }
+}
+
+export { AgentFSOptions } from './agentfs.js';
 export { KvStore } from './kvstore.js';
 export { Filesystem } from './filesystem.js';
 export type { Stats } from './filesystem.js';

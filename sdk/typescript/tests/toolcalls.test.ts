@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Database } from "@tursodatabase/database";
-import { ToolCalls } from "../src/toolcalls";
+import { ToolCalls } from "../src/toolcalls.js";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";

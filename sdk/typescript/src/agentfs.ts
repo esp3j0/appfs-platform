@@ -38,15 +38,6 @@ export class AgentFSCore {
     this.tools = tools;
   }
 
-  static async openWith(db: DatabasePromise): Promise<AgentFSCore> {
-    const [kv, fs, tools] = await Promise.all([
-      KvStore.fromDatabase(db),
-      Filesystem.fromDatabase(db),
-      ToolCalls.fromDatabase(db),
-    ]);
-    return new AgentFSCore(db, kv, fs, tools);
-  }
-
   /**
    * Get the underlying Database instance
    */
