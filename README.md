@@ -25,15 +25,24 @@
 
 AgentFS is a filesystem explicitly designed for AI agents. Just as traditional filesystems provide file and directory abstractions for applications, AgentFS provides the storage abstractions that AI agents need.
 
-AgentFS provides the following components:
+The AgentFS repository consists of the following:
 
-* **SDK** - [TypeScript](sdk/typescript) and [Rust](sdk/rust) libraries for programmatic filesystem access
-* **[CLI](MANUAL.md)** - Command-line interface for managing agent filesystems
-* **[Specification](SPEC.md)** - SQLite-based agent filesystem specification
-* **FUSE Mount** - Mount agent filesystems on the host using FUSE
-* **Sandbox** - Linux-compatible execution environment with agent filesystem support (_experimental_)
+* **SDK** - [TypeScript](sdk/typescript), [Python](sdk/python), and [Rust](sdk/rust) libraries for programmatic filesystem access.
+* **[CLI](MANUAL.md)** - Command-line interface for managing agent filesystems:
+  - Mount AgentFS on host filesystem with FUSE on Linux and macFUSE on macOS.
+  - Access AgentFS files with a command line tool.
+* **[AgentFS Specification](SPEC.md)** - SQLite-based agent filesystem specification.
+
+## 💡 Why AgentFS?
+
+AgentFS provides the following benefits for agent state management:
+
+* **Auditability**: Every file operation, tool call, and state change is recorded in a SQLite database file. Query your agent's complete history with SQL to debug issues, analyze behavior, or meet compliance requirements.
+* **Reproducibility**: Snapshot an agent's state at any point with cp agent.db snapshot.db. Restore it later to reproduce exact execution states, test what-if scenarios, or roll back mistakes.
+* **Portability**: The entire agent runtime—files, state, history —is stored in a single SQLite file. Move it between machines, check it into version control, or deploy it to any system where Turso runs.
 
 Read more about the motivation for AgentFS in the announcement [blog post](https://turso.tech/blog/agentfs).
+
 ## 🧑‍💻 Getting Started
 
 ### Using the CLI
@@ -134,12 +143,6 @@ This source repository also contains examples that demonstrate how to integrate 
 - **[OpenAI Agents](examples/openai-agents/research-assistant)** - Research assistant using OpenAI Agents SDK
 
 See the **[examples](examples)** directory for more details.
-
-## 💡 Why AgentFS?
-
-* **Auditability**: Every file operation, tool call, and state change is recorded in a SQLite database file. Query your agent's complete history with SQL to debug issues, analyze behavior, or meet compliance requirements.
-* **Reproducibility**: Snapshot an agent's state at any point with cp agent.db snapshot.db. Restore it later to reproduce exact execution states, test what-if scenarios, or roll back mistakes.
-* **Portability**: The entire agent runtime—files, state, history —is stored in a single SQLite file. Move it between machines, check it into version control, or deploy it to any system where Turso runs.
 
 ## 🔧 How AgentFS Works?
 
