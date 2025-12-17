@@ -166,6 +166,12 @@ At the heart of AgentFS is the [agent filesystem](SPEC.md), a complete SQLite-ba
 - **[SDK Examples](examples/)** - Working code examples using AgentFS
 - **[Turso database](https://github.com/tursodatabase/turso)** - an in-process SQL database, compatible with SQLite.
 
+### Blog Posts
+
+- **[Introducing AgentFS](https://turso.tech/blog/agentfs)** - The motivation behind AgentFS
+- **[AgentFS with FUSE](https://turso.tech/blog/agentfs-fuse)** - Mounting agent filesystems using FUSE
+- **[Making Coding Agents Safe Using LlamaIndex](https://www.llamaindex.ai/blog/making-coding-agents-safe-using-llamaindex)** - Using AgentFS with LlamaIndex
+
 ## 📝 License
 
 MIT
