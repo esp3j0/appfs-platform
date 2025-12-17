@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2025-12-17
+
+- This is the exact same version as 0.3.0, but had to bump version number
+  to work around a previous accidental publish on PyPI.
+
 ## [0.3.0] - 2025-12-17
 
 ### Added
