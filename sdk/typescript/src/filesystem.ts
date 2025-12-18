@@ -1,10 +1,23 @@
 import type { DatabasePromise } from '@tursodatabase/database-common';
+import { createFsError } from './errors.js';
+import {
+  assertInodeIsDirectory,
+  assertNotRoot,
+  assertNotSymlinkMode,
+  assertReadableExistingInode,
+  assertReaddirTargetInode,
+  assertUnlinkTargetInode,
+  assertWritableExistingInode,
+  getInodeModeOrThrow,
+  normalizeRmOptions,
+  throwENOENTUnlessForce,
+} from './guards.js';
 
 // File types for mode field
-const S_IFMT = 0o170000;   // File type mask
-const S_IFREG = 0o100000;  // Regular file
-const S_IFDIR = 0o040000;  // Directory
-const S_IFLNK = 0o120000;  // Symbolic link
+export const S_IFMT = 0o170000;   // File type mask
+export const S_IFREG = 0o100000;  // Regular file
+export const S_IFDIR = 0o040000;  // Directory
+export const S_IFLNK = 0o120000;  // Symbolic link
 
 // Default permissions
 const DEFAULT_FILE_MODE = S_IFREG | 0o644;  // Regular file, rw-r--r--
@@ -170,6 +183,23 @@ export class Filesystem {
     return normalized.split('/').filter(p => p);
   }
 
+  private async resolvePathOrThrow(
+    path: string,
+    syscall: string
+  ): Promise<{ normalizedPath: string; ino: number }> {
+    const normalizedPath = this.normalizePath(path);
+    const ino = await this.resolvePath(normalizedPath);
+    if (ino === null) {
+      throw createFsError({
+        code: 'ENOENT',
+        syscall,
+        path: normalizedPath,
+        message: 'no such file or directory',
+      });
+    }
+    return { normalizedPath, ino };
+  }
+
   /**
    * Resolve a path to an inode number
    */
@@ -260,11 +290,8 @@ export class Filesystem {
     parts.pop();
 
     let currentIno = this.rootIno;
-    let currentPath = '';
 
     for (const name of parts) {
-      currentPath += '/' + name;
-
       // Check if this directory exists
       const stmt = this.db.prepare(`
         SELECT ino FROM fs_dentry
@@ -278,6 +305,8 @@ export class Filesystem {
         await this.createDentry(currentIno, name, dirIno);
         currentIno = dirIno;
       } else {
+        // Ensure existing path component is actually a directory
+        await assertInodeIsDirectory(this.db, result.ino, 'open', this.normalizePath(path));
         currentIno = result.ino;
       }
     }
@@ -292,22 +321,46 @@ export class Filesystem {
     return result.count;
   }
 
-  async writeFile(path: string, content: string | Buffer): Promise<void> {
+  private async getInodeMode(ino: number): Promise<number | null> {
+    const stmt = this.db.prepare('SELECT mode FROM fs_inode WHERE ino = ?');
+    const row = await stmt.get(ino) as { mode: number } | undefined;
+    return row?.mode ?? null;
+  }
+
+  async writeFile(
+    path: string,
+    content: string | Buffer,
+    options?: BufferEncoding | { encoding?: BufferEncoding }
+  ): Promise<void> {
     // Ensure parent directories exist
     await this.ensureParentDirs(path);
 
     // Check if file already exists
     const ino = await this.resolvePath(path);
 
+    const encoding = typeof options === 'string'
+      ? options
+      : options?.encoding;
+
+    const normalizedPath = this.normalizePath(path);
     if (ino !== null) {
+      await assertWritableExistingInode(this.db, ino, 'open', normalizedPath);
       // Update existing file
-      await this.updateFileContent(ino, content);
+      await this.updateFileContent(ino, content, encoding);
     } else {
       // Create new file
       const parent = await this.resolveParent(path);
       if (!parent) {
-        throw new Error(`ENOENT: parent directory does not exist: ${path}`);
+        throw createFsError({
+          code: 'ENOENT',
+          syscall: 'open',
+          path: normalizedPath,
+          message: 'no such file or directory',
+        });
       }
+
+      // Ensure parent is a directory
+      await assertInodeIsDirectory(this.db, parent.parentIno, 'open', normalizedPath);
 
       // Create inode
       const fileIno = await this.createInode(DEFAULT_FILE_MODE);
@@ -316,12 +369,18 @@ export class Filesystem {
       await this.createDentry(parent.parentIno, parent.name, fileIno);
 
       // Write content
-      await this.updateFileContent(fileIno, content);
+      await this.updateFileContent(fileIno, content, encoding);
     }
   }
 
-  private async updateFileContent(ino: number, content: string | Buffer): Promise<void> {
-    const buffer = typeof content === 'string' ? this.bufferCtor.from(content, 'utf-8') : content;
+  private async updateFileContent(
+    ino: number,
+    content: string | Buffer,
+    encoding?: BufferEncoding
+  ): Promise<void> {
+    const buffer = typeof content === 'string'
+      ? this.bufferCtor.from(content, encoding ?? 'utf8')
+      : content;
     const now = Math.floor(Date.now() / 1000);
 
     // Delete existing data chunks
@@ -361,10 +420,9 @@ export class Filesystem {
       ? options
       : options?.encoding;
 
-    const ino = await this.resolvePath(path);
-    if (ino === null) {
-      throw new Error(`ENOENT: no such file or directory, open '${path}'`);
-    }
+    const { normalizedPath, ino } = await this.resolvePathOrThrow(path, 'open');
+
+    await assertReadableExistingInode(this.db, ino, 'open', normalizedPath);
 
     // Get all data chunks
     const stmt = this.db.prepare(`
@@ -395,10 +453,9 @@ export class Filesystem {
   }
 
   async readdir(path: string): Promise<string[]> {
-    const ino = await this.resolvePath(path);
-    if (ino === null) {
-      throw new Error(`ENOENT: no such file or directory, scandir '${path}'`);
-    }
+    const { normalizedPath, ino } = await this.resolvePathOrThrow(path, 'scandir');
+
+    await assertReaddirTargetInode(this.db, ino, normalizedPath);
 
     // Get all directory entries
     const stmt = this.db.prepare(`
@@ -411,16 +468,15 @@ export class Filesystem {
     return rows.map(row => row.name);
   }
 
-  async deleteFile(path: string): Promise<void> {
-    const ino = await this.resolvePath(path);
-    if (ino === null) {
-      throw new Error(`ENOENT: no such file or directory, unlink '${path}'`);
-    }
+  async unlink(path: string): Promise<void> {
+    const normalizedPath = this.normalizePath(path);
+    assertNotRoot(normalizedPath, 'unlink');
+    const { ino } = await this.resolvePathOrThrow(normalizedPath, 'unlink');
 
-    const parent = await this.resolveParent(path);
-    if (!parent) {
-      throw new Error(`Cannot delete root directory`);
-    }
+    await assertUnlinkTargetInode(this.db, ino, normalizedPath);
+
+    const parent = (await this.resolveParent(normalizedPath))!;
+    // parent is guaranteed to exist here since normalizedPath !== '/'
 
     // Delete the directory entry
     const stmt = this.db.prepare(`
@@ -442,11 +498,13 @@ export class Filesystem {
     }
   }
 
+  // Backwards-compatible alias
+  async deleteFile(path: string): Promise<void> {
+    return await this.unlink(path);
+  }
+
   async stat(path: string): Promise<Stats> {
-    const ino = await this.resolvePath(path);
-    if (ino === null) {
-      throw new Error(`ENOENT: no such file or directory, stat '${path}'`);
-    }
+    const { normalizedPath, ino } = await this.resolvePathOrThrow(path, 'stat');
 
     const stmt = this.db.prepare(`
       SELECT ino, mode, uid, gid, size, atime, mtime, ctime
@@ -465,7 +523,12 @@ export class Filesystem {
     } | undefined;
 
     if (!row) {
-      throw new Error(`Inode not found: ${ino}`);
+      throw createFsError({
+        code: 'ENOENT',
+        syscall: 'stat',
+        path: normalizedPath,
+        message: 'no such file or directory',
+      });
     }
 
     const nlink = await this.getLinkCount(ino);
@@ -484,5 +547,138 @@ export class Filesystem {
       isDirectory: () => (row.mode & S_IFMT) === S_IFDIR,
       isSymbolicLink: () => (row.mode & S_IFMT) === S_IFLNK,
     };
+  }
+
+  /**
+   * Create a directory (non-recursive, no options yet)
+   */
+    async mkdir(path: string): Promise<void> {
+      const normalizedPath = this.normalizePath(path);
+  
+      const existing = await this.resolvePath(normalizedPath);
+      if (existing !== null) {
+        throw createFsError({
+          code: 'EEXIST',
+          syscall: 'mkdir',
+          path: normalizedPath,
+          message: 'file already exists',
+        });
+      }
+  
+      const parent = await this.resolveParent(normalizedPath);
+      if (!parent) {
+        throw createFsError({
+          code: 'ENOENT',
+          syscall: 'mkdir',
+          path: normalizedPath,
+          message: 'no such file or directory',
+        });
+      }
+  
+      await assertInodeIsDirectory(this.db, parent.parentIno, 'mkdir', normalizedPath);
+  
+      const dirIno = await this.createInode(DEFAULT_DIR_MODE);
+      try {
+        await this.createDentry(parent.parentIno, parent.name, dirIno);
+      } catch {
+        throw createFsError({
+          code: 'EEXIST',
+          syscall: 'mkdir',
+          path: normalizedPath,
+          message: 'file already exists',
+        });
+      }
+    }
+
+  /**
+   * Remove a file or directory
+   */
+  async rm(
+    path: string,
+    options?: { force?: boolean; recursive?: boolean }
+  ): Promise<void> {
+    const normalizedPath = this.normalizePath(path);
+    const { force, recursive } = normalizeRmOptions(options);
+    assertNotRoot(normalizedPath, 'rm');
+
+    const ino = await this.resolvePath(normalizedPath);
+    if (ino === null) {
+      throwENOENTUnlessForce(normalizedPath, 'rm', force);
+      return;
+    }
+
+    const mode = await getInodeModeOrThrow(this.db, ino, 'rm', normalizedPath);
+    assertNotSymlinkMode(mode, 'rm', normalizedPath);
+
+    const parent = await this.resolveParent(normalizedPath);
+    if (!parent) {
+      throw createFsError({
+        code: 'EPERM',
+        syscall: 'rm',
+        path: normalizedPath,
+        message: 'operation not permitted',
+      });
+    }
+
+    if ((mode & S_IFMT) === S_IFDIR) {
+      if (!recursive) {
+        throw createFsError({
+          code: 'EISDIR',
+          syscall: 'rm',
+          path: normalizedPath,
+          message: 'illegal operation on a directory',
+        });
+      }
+
+      await this.rmDirContentsRecursive(ino);
+      await this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino);
+      return;
+    }
+
+    // Regular file
+    await this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino);
+  }
+
+  private async rmDirContentsRecursive(dirIno: number): Promise<void> {
+    const stmt = this.db.prepare(`
+      SELECT name, ino FROM fs_dentry
+      WHERE parent_ino = ?
+      ORDER BY name ASC
+    `);
+    const children = await stmt.all(dirIno) as { name: string; ino: number }[];
+
+    for (const child of children) {
+      const mode = await this.getInodeMode(child.ino);
+      if (mode === null) {
+        // DB inconsistency; treat as already gone
+        continue;
+      }
+
+      if ((mode & S_IFMT) === S_IFDIR) {
+        await this.rmDirContentsRecursive(child.ino);
+        await this.removeDentryAndMaybeInode(dirIno, child.name, child.ino);
+      } else {
+        // Not supported yet (symlinks)
+        assertNotSymlinkMode(mode, 'rm', '<symlink>');
+        await this.removeDentryAndMaybeInode(dirIno, child.name, child.ino);
+      }
+    }
+  }
+
+  private async removeDentryAndMaybeInode(parentIno: number, name: string, ino: number): Promise<void> {
+    const stmt = this.db.prepare(`
+      DELETE FROM fs_dentry
+      WHERE parent_ino = ? AND name = ?
+    `);
+    await stmt.run(parentIno, name);
+
+    const linkCount = await this.getLinkCount(ino);
+    if (linkCount === 0) {
+      const deleteInodeStmt = this.db.prepare('DELETE FROM fs_inode WHERE ino = ?');
+      await deleteInodeStmt.run(ino);
+
+      const deleteDataStmt = this.db.prepare('DELETE FROM fs_data WHERE ino = ?');
+      await deleteDataStmt.run(ino);
+    }
   }
 }
