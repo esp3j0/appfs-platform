@@ -160,6 +160,8 @@ At the heart of AgentFS is the [agent filesystem](SPEC.md), a complete SQLite-ba
 
 ### How is AgentFS different from _X_?
 
+[Bubblewrap](https://github.com/containers/bubblewrap) provides filesystem isolation using Linux namespaces and overlays. While you could achieve similar isolation with a `bwrap` call that mounts `/` read-only and uses `--tmp-overlay` on the working directory, the key difference is persistence and queryability: with AgentFS, the upper filesystem is stored in a single SQLite database file, which you can query, snapshot, and move to another machine. Read more about the motivation in the announcement [blog post](https://turso.tech/blog/agentfs).
+
 [Docker Sandbox](https://www.docker.com/blog/docker-sandboxes-a-new-approach-for-coding-agent-safety/) and AgentFS are complementary rather than competing. AgentFS answers "what happened and what's the state?" while Docker Sandboxes answer "how do I run this safely?" You could use both together: run an agent inside a Docker Sandbox for security, while using AgentFS inside that sandbox for structured state management and audit trails.
 
 ## 📚 Learn More
