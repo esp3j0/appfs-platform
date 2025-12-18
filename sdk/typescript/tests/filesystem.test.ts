@@ -266,6 +266,94 @@ describe("Filesystem Integration Tests", () => {
     });
   });
 
+  describe("rmdir() Operations", () => {
+    it("should remove an empty directory", async () => {
+      await fs.mkdir("/emptydir");
+      await fs.rmdir("/emptydir");
+      await expect(fs.readdir("/emptydir")).rejects.toMatchObject({ code: "ENOENT" });
+      const root = await fs.readdir("/");
+      expect(root).not.toContain("emptydir");
+    });
+
+    it("should throw ENOTEMPTY when directory is not empty", async () => {
+      await fs.writeFile("/nonempty/file.txt", "content");
+      await expect(fs.rmdir("/nonempty")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+    });
+
+    it("should throw ENOTDIR when path is a file", async () => {
+      await fs.writeFile("/afile", "content");
+      await expect(fs.rmdir("/afile")).rejects.toMatchObject({ code: "ENOTDIR" });
+    });
+
+    it("should throw EPERM when attempting to remove root", async () => {
+      await expect(fs.rmdir("/")).rejects.toMatchObject({ code: "EPERM" });
+    });
+  });
+
+  describe("rename() Operations", () => {
+    it("should rename a file", async () => {
+      await fs.writeFile("/a.txt", "hello");
+      await fs.rename("/a.txt", "/b.txt");
+      await expect(fs.readFile("/a.txt")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/b.txt", "utf8");
+      expect(content).toBe("hello");
+    });
+
+    it("should rename a directory and preserve its contents", async () => {
+      await fs.writeFile("/olddir/sub/file.txt", "content");
+      await fs.rename("/olddir", "/newdir");
+      await expect(fs.readdir("/olddir")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/newdir/sub/file.txt", "utf8");
+      expect(content).toBe("content");
+    });
+
+    it("should overwrite destination file if it exists", async () => {
+      await fs.writeFile("/src.txt", "src");
+      await fs.writeFile("/dst.txt", "dst");
+      await fs.rename("/src.txt", "/dst.txt");
+      await expect(fs.readFile("/src.txt")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/dst.txt", "utf8");
+      expect(content).toBe("src");
+    });
+
+    it("should throw EISDIR when renaming a file onto a directory", async () => {
+      await fs.writeFile("/dir/file.txt", "content");
+      await fs.writeFile("/file.txt", "content");
+      await expect(fs.rename("/file.txt", "/dir")).rejects.toMatchObject({ code: "EISDIR" });
+    });
+
+    it("should throw ENOTDIR when renaming a directory onto a file", async () => {
+      await fs.mkdir("/somedir");
+      await fs.writeFile("/somefile", "content");
+      await expect(fs.rename("/somedir", "/somefile")).rejects.toMatchObject({ code: "ENOTDIR" });
+    });
+
+    it("should replace an existing empty directory", async () => {
+      await fs.mkdir("/fromdir");
+      await fs.mkdir("/todir");
+      await fs.rename("/fromdir", "/todir");
+      const root = await fs.readdir("/");
+      expect(root).toContain("todir");
+      expect(root).not.toContain("fromdir");
+      await expect(fs.readdir("/fromdir")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should throw ENOTEMPTY when replacing a non-empty directory", async () => {
+      await fs.mkdir("/fromdir");
+      await fs.writeFile("/todir/file.txt", "content");
+      await expect(fs.rename("/fromdir", "/todir")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+    });
+
+    it("should throw EPERM when attempting to rename root", async () => {
+      await expect(fs.rename("/", "/x")).rejects.toMatchObject({ code: "EPERM" });
+    });
+
+    it("should throw EINVAL when renaming a directory into its own subdirectory", async () => {
+      await fs.writeFile("/cycle/sub/file.txt", "content");
+      await expect(fs.rename("/cycle", "/cycle/sub/moved")).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+
   describe("Path Handling", () => {
     it("should handle paths with trailing slashes", async () => {
       await fs.writeFile("/dir/file.txt", "content");

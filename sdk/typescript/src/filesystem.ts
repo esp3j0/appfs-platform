@@ -681,4 +681,185 @@ export class Filesystem {
       await deleteDataStmt.run(ino);
     }
   }
+
+    /**
+   * Remove an empty directory
+   */
+    async rmdir(path: string): Promise<void> {
+      const normalizedPath = this.normalizePath(path);
+      assertNotRoot(normalizedPath, 'rmdir');
+  
+      const { ino } = await this.resolvePathOrThrow(normalizedPath, 'rmdir');
+  
+      const mode = await getInodeModeOrThrow(this.db, ino, 'rmdir', normalizedPath);
+      assertNotSymlinkMode(mode, 'rmdir', normalizedPath);
+      if ((mode & S_IFMT) !== S_IFDIR) {
+        throw createFsError({
+          code: 'ENOTDIR',
+          syscall: 'rmdir',
+          path: normalizedPath,
+          message: 'not a directory',
+        });
+      }
+  
+      const stmt = this.db.prepare(`
+        SELECT 1 as one FROM fs_dentry
+        WHERE parent_ino = ?
+        LIMIT 1
+      `);
+      const child = await stmt.get(ino) as { one: number } | undefined;
+      if (child) {
+        throw createFsError({
+          code: 'ENOTEMPTY',
+          syscall: 'rmdir',
+          path: normalizedPath,
+          message: 'directory not empty',
+        });
+      }
+  
+      const parent = await this.resolveParent(normalizedPath);
+      if (!parent) {
+        throw createFsError({
+          code: 'EPERM',
+          syscall: 'rmdir',
+          path: normalizedPath,
+          message: 'operation not permitted',
+        });
+      }
+  
+      await this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino);
+    }
+
+    /**
+   * Rename (move) a file or directory
+   */
+    async rename(oldPath: string, newPath: string): Promise<void> {
+      const oldNormalized = this.normalizePath(oldPath);
+      const newNormalized = this.normalizePath(newPath);
+
+      // No-op
+      if (oldNormalized === newNormalized) return;
+
+      assertNotRoot(oldNormalized, 'rename');
+      assertNotRoot(newNormalized, 'rename');
+
+      const oldParent = await this.resolveParent(oldNormalized);
+      if (!oldParent) {
+        throw createFsError({
+          code: 'EPERM',
+          syscall: 'rename',
+          path: oldNormalized,
+          message: 'operation not permitted',
+        });
+      }
+
+      const newParent = await this.resolveParent(newNormalized);
+      if (!newParent) {
+        throw createFsError({
+          code: 'ENOENT',
+          syscall: 'rename',
+          path: newNormalized,
+          message: 'no such file or directory',
+        });
+      }
+
+      // Ensure destination parent exists and is a directory
+      await assertInodeIsDirectory(this.db, newParent.parentIno, 'rename', newNormalized);
+
+      await this.db.exec('BEGIN');
+      try {
+        const oldResolved = await this.resolvePathOrThrow(oldNormalized, 'rename');
+        const oldIno = oldResolved.ino;
+        const oldMode = await getInodeModeOrThrow(this.db, oldIno, 'rename', oldNormalized);
+        assertNotSymlinkMode(oldMode, 'rename', oldNormalized);
+        const oldIsDir = (oldMode & S_IFMT) === S_IFDIR;
+
+        // Prevent renaming a directory into its own subtree (would create cycles).
+        if (oldIsDir && newNormalized.startsWith(oldNormalized + '/')) {
+          throw createFsError({
+            code: 'EINVAL',
+            syscall: 'rename',
+            path: newNormalized,
+            message: 'invalid argument',
+          });
+        }
+
+        const newIno = await this.resolvePath(newNormalized);
+        if (newIno !== null) {
+          const newMode = await getInodeModeOrThrow(this.db, newIno, 'rename', newNormalized);
+          assertNotSymlinkMode(newMode, 'rename', newNormalized);
+          const newIsDir = (newMode & S_IFMT) === S_IFDIR;
+
+          if (newIsDir && !oldIsDir) {
+            throw createFsError({
+              code: 'EISDIR',
+              syscall: 'rename',
+              path: newNormalized,
+              message: 'illegal operation on a directory',
+            });
+          }
+          if (!newIsDir && oldIsDir) {
+            throw createFsError({
+              code: 'ENOTDIR',
+              syscall: 'rename',
+              path: newNormalized,
+              message: 'not a directory',
+            });
+          }
+
+          // If replacing a directory, it must be empty.
+          if (newIsDir) {
+            const stmt = this.db.prepare(`
+              SELECT 1 as one FROM fs_dentry
+              WHERE parent_ino = ?
+              LIMIT 1
+            `);
+            const child = await stmt.get(newIno) as { one: number } | undefined;
+            if (child) {
+              throw createFsError({
+                code: 'ENOTEMPTY',
+                syscall: 'rename',
+                path: newNormalized,
+                message: 'directory not empty',
+              });
+            }
+          }
+
+          // Remove the destination entry (and inode if this was the last link)
+          await this.removeDentryAndMaybeInode(newParent.parentIno, newParent.name, newIno);
+        }
+
+        // Move the directory entry
+        const stmt = this.db.prepare(`
+          UPDATE fs_dentry
+          SET parent_ino = ?, name = ?
+          WHERE parent_ino = ? AND name = ?
+        `);
+        await stmt.run(newParent.parentIno, newParent.name, oldParent.parentIno, oldParent.name);
+
+        // Update timestamps
+        const now = Math.floor(Date.now() / 1000);
+        const updateInodeCtimeStmt = this.db.prepare(`
+          UPDATE fs_inode
+          SET ctime = ?
+          WHERE ino = ?
+        `);
+        await updateInodeCtimeStmt.run(now, oldIno);
+
+        const updateDirTimesStmt = this.db.prepare(`
+          UPDATE fs_inode
+          SET mtime = ?, ctime = ?
+          WHERE ino = ?
+        `);
+        await updateDirTimesStmt.run(now, now, oldParent.parentIno);
+        if (newParent.parentIno !== oldParent.parentIno) {
+          await updateDirTimesStmt.run(now, now, newParent.parentIno);
+        }
+
+        await this.db.exec('COMMIT');
+      } catch (e) {
+        await this.db.exec('ROLLBACK');
+        throw e;
+      }
+    }
 }
