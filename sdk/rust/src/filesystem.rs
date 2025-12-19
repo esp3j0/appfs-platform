@@ -650,12 +650,12 @@ impl Filesystem {
                     .await?;
             }
 
-            // Update size and mtime
+            // Update mode (to regular file), size and mtime
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
             self.conn
                 .execute(
-                    "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
-                    (data.len() as i64, now, ino),
+                    "UPDATE fs_inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?",
+                    (DEFAULT_FILE_MODE as i64, data.len() as i64, now, ino),
                 )
                 .await?;
 
@@ -2578,6 +2578,38 @@ mod tests {
         // ctime should be updated
         let stats_after = fs.stat("/new.txt").await?.unwrap();
         assert!(stats_after.ctime >= stats_before.ctime);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_file_updates_mode_to_regular_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a target file for the symlink
+        fs.write_file("/target.txt", b"target content").await?;
+
+        // Create a symlink
+        fs.symlink("/target.txt", "/link.txt").await?;
+
+        // Verify it's a symlink
+        let stats = fs.lstat("/link.txt").await?.unwrap();
+        assert!(stats.is_symlink(), "Should be a symlink before write_file");
+
+        // Overwrite the symlink with write_file
+        fs.write_file("/link.txt", b"new content").await?;
+
+        // Verify it's now a regular file with DEFAULT_FILE_MODE
+        let stats = fs.lstat("/link.txt").await?.unwrap();
+        assert!(stats.is_file(), "Should be a regular file after write_file");
+        assert_eq!(
+            stats.mode, DEFAULT_FILE_MODE,
+            "Mode should be DEFAULT_FILE_MODE after write_file"
+        );
+
+        // Verify the content
+        let content = fs.read_file("/link.txt").await?.unwrap();
+        assert_eq!(content, b"new content");
 
         Ok(())
     }
