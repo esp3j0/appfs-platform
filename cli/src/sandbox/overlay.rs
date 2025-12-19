@@ -44,6 +44,7 @@ const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev"];
 const DEFAULT_ALLOWED_DIRS: &[&str] = &[
     ".claude",      // Claude Code config
     ".claude.json", // Claude Code config file
+    ".local",       // Local data directory
 ];
 
 /// Field index for mount point in /proc/self/mountinfo.
