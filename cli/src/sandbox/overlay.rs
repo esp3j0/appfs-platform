@@ -39,6 +39,13 @@ const FUSE_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// These are skipped when remounting the filesystem hierarchy as read-only.
 const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev"];
 
+/// Default directories that are allowed to be writable.
+/// These are common application config/cache directories that many programs need.
+const DEFAULT_ALLOWED_DIRS: &[&str] = &[
+    ".claude",      // Claude Code config
+    ".claude.json", // Claude Code config file
+];
+
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
 const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
@@ -48,10 +55,18 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
 
 /// Run a command in an overlay sandbox.
-pub async fn run_cmd(command: PathBuf, args: Vec<String>) -> Result<()> {
+pub async fn run_cmd(
+    allow: Vec<PathBuf>,
+    no_default_allows: bool,
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
 
-    print_welcome_banner(&cwd);
+    // Build the list of allowed writable paths
+    let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
+
+    print_welcome_banner(&cwd, &allowed_paths);
 
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
@@ -133,6 +148,7 @@ pub async fn run_cmd(command: PathBuf, args: Vec<String>) -> Result<()> {
         run_child(
             &cwd,
             &session.fuse_mountpoint,
+            &allowed_paths,
             command,
             args,
             pipe_to_child[0],
@@ -174,11 +190,19 @@ pub async fn run_cmd(command: PathBuf, args: Vec<String>) -> Result<()> {
 }
 
 /// Print the welcome banner showing sandbox configuration.
-fn print_welcome_banner(cwd: &Path) {
+fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf]) {
     eprintln!("Welcome to AgentFS!");
     eprintln!();
     eprintln!("  {} (copy-on-write)", cwd.display());
-    eprintln!("  Everything else is read-only.");
+    if allowed_paths.is_empty() {
+        eprintln!("  Everything else is read-only.");
+    } else {
+        eprintln!("  The following directories are also writable:");
+        for path in allowed_paths {
+            eprintln!("    - {}", path.display());
+        }
+        eprintln!("  Everything else is read-only.");
+    }
     eprintln!();
 }
 
@@ -260,7 +284,8 @@ fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) -> ! {
 
 /// Write uid_map, gid_map, and setgroups for a child's user namespace.
 ///
-/// Maps uid/gid 0 in the namespace to the real uid/gid outside.
+/// Maps the real uid/gid to itself inside the namespace, so the user appears
+/// as themselves (not root) inside the sandbox.
 /// On failure, aborts the child and exits.
 fn write_namespace_mappings(
     child_pid: libc::pid_t,
@@ -272,7 +297,8 @@ fn write_namespace_mappings(
     let gid_map_path = format!("/proc/{}/gid_map", child_pid);
     let setgroups_path = format!("/proc/{}/setgroups", child_pid);
 
-    if let Err(e) = std::fs::write(&uid_map_path, format!("0 {} 1\n", uid)) {
+    // Map the user's UID to itself (inside_uid outside_uid count)
+    if let Err(e) = std::fs::write(&uid_map_path, format!("{} {} 1\n", uid, uid)) {
         eprintln!("Error: Could not write uid_map: {}", e);
         eprintln!("This may indicate missing unprivileged user namespace support.");
         abort_child(pipe_write_fd, child_pid);
@@ -284,7 +310,8 @@ fn write_namespace_mappings(
         abort_child(pipe_write_fd, child_pid);
     }
 
-    if let Err(e) = std::fs::write(&gid_map_path, format!("0 {} 1\n", gid)) {
+    // Map the user's GID to itself (inside_gid outside_gid count)
+    if let Err(e) = std::fs::write(&gid_map_path, format!("{} {} 1\n", gid, gid)) {
         eprintln!("Error: Could not write gid_map: {}", e);
         abort_child(pipe_write_fd, child_pid);
     }
@@ -328,6 +355,7 @@ fn child_exit(msg: &str) -> ! {
 fn run_child(
     cwd: &Path,
     fuse_mountpoint: &Path,
+    allowed_paths: &[PathBuf],
     command: PathBuf,
     args: Vec<String>,
     pipe_from_parent: libc::c_int,
@@ -404,7 +432,7 @@ fn run_child(
     }
 
     // Step 7: Remount all other filesystems as read-only.
-    if let Err(e) = remount_all_readonly_except(cwd) {
+    if let Err(e) = remount_all_readonly_except(cwd, allowed_paths) {
         child_exit(&format!("Failed to remount filesystems read-only: {}", e));
     }
 
@@ -412,11 +440,55 @@ fn run_child(
     exec_command(command, args);
 }
 
-/// Remount all filesystems as read-only, except for the specified path.
+/// Remount all filesystems as read-only, except for the specified paths.
 ///
-/// This parses /proc/self/mountinfo to find all mount points and remounts
-/// each one as read-only, skipping the specified writable path (our FUSE overlay).
-fn remount_all_readonly_except(writable_path: &Path) -> std::io::Result<()> {
+/// The correct sequence to keep allowed paths writable:
+/// 1. Bind-mount each allowed path to itself (creates new mountpoint)
+/// 2. Remount each with explicit rw,bind to lock in the rw flag
+/// 3. THEN remount / and other mounts as read-only
+///
+/// This works because bind mounts established before the ro remount
+/// retain their own mount options.
+fn remount_all_readonly_except(
+    writable_path: &Path,
+    allowed_paths: &[PathBuf],
+) -> std::io::Result<()> {
+    // Step 1: Bind-mount allowed paths to themselves FIRST
+    // This creates independent mountpoints that will survive the ro remount
+    for allowed in allowed_paths {
+        let path_cstr = match CString::new(allowed.as_os_str().as_bytes()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Bind mount to itself to establish new mountpoint (inherits rw)
+        // SAFETY: mount() with valid paths
+        let bind_result = unsafe {
+            libc::mount(
+                path_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+
+        if bind_result == 0 {
+            // Step 2: Explicitly remount with rw,bind to lock in the rw flag
+            // SAFETY: mount() with valid path
+            let _ = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    path_cstr.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REMOUNT,
+                    std::ptr::null(),
+                )
+            };
+        }
+    }
+
+    // Step 3: Now remount everything else as read-only
     let mountinfo = std::fs::File::open("/proc/self/mountinfo")?;
     let reader = std::io::BufReader::new(mountinfo);
 
@@ -440,12 +512,24 @@ fn remount_all_readonly_except(writable_path: &Path) -> std::io::Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| writable_path.to_path_buf());
 
+    // Canonicalize allowed paths for comparison
+    let allowed_canonical: Vec<PathBuf> = allowed_paths
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+
     for mount_point in &mounts {
-        // Skip the writable path (our FUSE overlay)
         let mount_canonical = mount_point
             .canonicalize()
             .unwrap_or_else(|_| mount_point.clone());
+
+        // Skip the writable path (our FUSE overlay)
         if mount_canonical == writable_canonical {
+            continue;
+        }
+
+        // Skip allowed paths (they're already bind-mounted as rw)
+        if allowed_canonical.contains(&mount_canonical) {
             continue;
         }
 
@@ -503,6 +587,38 @@ fn skip_mount(path: &Path) -> bool {
     SKIP_MOUNT_PREFIXES
         .iter()
         .any(|prefix| path_str.starts_with(prefix))
+}
+
+/// Build the list of allowed writable paths from user input and defaults.
+fn build_allowed_paths(user_allowed: &[PathBuf], no_default_allows: bool) -> Result<Vec<PathBuf>> {
+    let mut allowed = Vec::new();
+
+    // Add default allowed directories unless disabled
+    if !no_default_allows {
+        if let Some(home) = dirs::home_dir() {
+            for dir in DEFAULT_ALLOWED_DIRS {
+                let path = home.join(dir);
+                // Only add if the path exists
+                if path.exists() {
+                    allowed.push(path);
+                }
+            }
+        }
+    }
+
+    // Add user-specified paths
+    for path in user_allowed {
+        // Canonicalize user paths to resolve symlinks and relative paths
+        let canonical = path.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize allowed path '{}'. Does it exist?",
+                path.display()
+            )
+        })?;
+        allowed.push(canonical);
+    }
+
+    Ok(allowed)
 }
 
 /// Unescape mount point from mountinfo format.

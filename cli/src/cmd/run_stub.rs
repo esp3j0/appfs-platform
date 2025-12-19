@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 /// Handle the `run` command - stub for non-Linux platforms.
 pub async fn handle_run_command(
+    _allow: Vec<PathBuf>,
+    _no_default_allows: bool,
     _experimental_sandbox: bool,
     _strace: bool,
     _command: PathBuf,

@@ -8,18 +8,23 @@ use std::path::PathBuf;
 
 /// Handle the `run` command, dispatching to the appropriate sandbox implementation.
 pub async fn handle_run_command(
+    allow: Vec<PathBuf>,
+    no_default_allows: bool,
     experimental_sandbox: bool,
     strace: bool,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
     if experimental_sandbox {
+        if !allow.is_empty() || no_default_allows {
+            eprintln!("Warning: --allow and --no-default-allows are not supported with --experimental-sandbox, ignoring");
+        }
         crate::sandbox::ptrace::run_cmd(strace, command, args).await;
     } else {
         if strace {
             eprintln!("Warning: --strace is only supported with --experimental-sandbox, ignoring");
         }
-        crate::sandbox::overlay::run_cmd(command, args).await?;
+        crate::sandbox::overlay::run_cmd(allow, no_default_allows, command, args).await?;
     }
     Ok(())
 }

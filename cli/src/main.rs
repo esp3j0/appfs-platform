@@ -62,6 +62,8 @@ fn main() {
             }
         }
         Command::Run {
+            allow,
+            no_default_allows,
             experimental_sandbox,
             strace,
             command,
@@ -69,6 +71,8 @@ fn main() {
         } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             if let Err(e) = rt.block_on(cmd::handle_run_command(
+                allow,
+                no_default_allows,
                 experimental_sandbox,
                 strace,
                 command,
