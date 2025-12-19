@@ -10,7 +10,8 @@ AgentFS provides the following components:
 2. CLI - Command-line interface for managing agent filesystems
 3. Specification - SQLite-based agent filesystem specification
 4. FUSE Mount - Mount agent filesystems on the host using FUSE
-5. Sandbox - Linux-compatible execution environment with agent filesystem support (experimental)
+5. Overlay Filesystem - Copy-on-write filesystem layer over host directories
+6. Sandbox - Linux-compatible execution environment with agent filesystem support (experimental)
 
 ## Quick Start
 
@@ -115,6 +116,7 @@ agentfs init [OPTIONS] [ID]
 
 **Options:**
 - `--force` - Overwrite existing agent filesystem if it exists
+- `--base <PATH>` - Base directory for overlay filesystem (copy-on-write)
 - `-h, --help` - Print help
 
 **Examples:**
@@ -127,6 +129,9 @@ agentfs init production-agent
 
 # Overwrite existing agent filesystem
 agentfs init my-agent --force
+
+# Create overlay filesystem with host directory as base
+agentfs init my-agent --base /path/to/project
 ```
 
 **What it does:**
@@ -135,6 +140,10 @@ Creates a new SQLite database in the `.agentfs/` directory with the [Agent Files
 - File metadata tables (`fs_inode`, `fs_dentry`, `fs_data`, `fs_symlink`)
 - Key-value store table (`kv_store`)
 - Tool call tracking table (`tool_calls`)
+
+When `--base` is specified, additional overlay tables are created:
+- `fs_whiteout` - Tracks deleted files from the base layer
+- `fs_overlay_config` - Stores overlay configuration (base type and path)
 
 The `.agentfs/` directory is automatically created if it doesn't exist.
 
@@ -187,7 +196,9 @@ To unmount, use `fusermount -u ./my-agent-mount`.
 
 ### `agentfs run`
 
-Execute a program in the sandboxed environment.
+Execute a program in a sandboxed environment with copy-on-write filesystem isolation.
+
+By default, uses FUSE+overlay with user namespaces for isolation. The current working directory becomes copy-on-write (changes are stored in an AgentFS database), while the rest of the filesystem is read-only.
 
 **Usage:**
 ```bash
@@ -199,8 +210,8 @@ agentfs run [OPTIONS] <COMMAND> [ARGS]...
 - `[ARGS]...` - Arguments for the command
 
 **Options:**
-- `--mount <MOUNT_SPEC>` - Mount configuration (format: `type=bind,src=<host_path>,dst=<sandbox_path>`)
-- `--strace` - Enable strace-like output for system calls
+- `--experimental-sandbox` - Use experimental ptrace-based syscall interception sandbox
+- `--strace` - Enable strace-like output for system calls (only with `--experimental-sandbox`)
 - `-h, --help` - Print help
 
 **Examples:**
@@ -215,14 +226,9 @@ Run a Python script:
 agentfs run python3 agent.py
 ```
 
-Run with custom mount points:
+Use experimental ptrace sandbox with strace output:
 ```bash
-agentfs run --mount type=bind,src=/tmp/data,dst=/data /bin/bash
-```
-
-Debug system calls with strace output:
-```bash
-agentfs run --strace python3 agent.py
+agentfs run --experimental-sandbox --strace python3 agent.py
 ```
 
 ### `agentfs fs`
@@ -791,25 +797,84 @@ See the [Turso documentation](https://docs.turso.tech) for more details on remot
 
 ## Advanced Usage
 
-### Multiple Mount Points
+### Overlay Filesystem (Copy-on-Write)
 
-You can mount both host directories and agent databases:
+The overlay filesystem feature allows agents to work on a copy-on-write view of an existing directory. This is useful for:
+
+- **Safe experimentation**: Let agents modify files without affecting the original project
+- **Reproducible workspaces**: Reset agent changes by simply deleting the delta database
+- **Efficient storage**: Only modified files are stored in the database, not the entire directory
+
+#### How It Works
+
+An overlay filesystem combines two layers:
+1. **Base layer (read-only)**: The original host directory
+2. **Delta layer (writable)**: An AgentFS database storing modifications
+
+When reading files:
+- Files in the delta layer take precedence
+- If not in delta, reads fall through to the base layer
+- Deleted files are tracked via "whiteouts" to hide base layer entries
+
+When writing files:
+- New files go directly to the delta layer
+- Modifying base files triggers copy-on-write (file is copied to delta first)
+- All changes are isolated in the database
+
+#### Example: Agent Working on a Project
 
 ```bash
-# Mount agent database at /agent and host directory at /data
-agentfs run \
-  --mount type=bind,src=./data,dst=/data \
-  /bin/bash
+# Initialize an overlay filesystem with your project as the base
+agentfs init agent-workspace --base /home/user/myproject
+
+# Mount the overlay filesystem
+mkdir /tmp/workspace
+agentfs mount agent-workspace /tmp/workspace
+
+# The agent can now freely modify files in /tmp/workspace
+# All changes are stored in .agentfs/agent-workspace.db
+# The original /home/user/myproject remains untouched
 ```
 
-The agent database is mounted at `/agent` (you can specify which agent filesystem to use via the CLI).
+#### Resetting Changes
+
+To discard all agent changes and start fresh:
+
+```bash
+# Remove the delta database
+rm .agentfs/agent-workspace.db
+
+# Re-initialize
+agentfs init agent-workspace --base /home/user/myproject
+```
+
+#### Inspecting Changes
+
+Since all modifications are stored in SQLite, you can inspect what the agent changed:
+
+```bash
+# See modified/created files
+sqlite3 .agentfs/agent-workspace.db "SELECT name FROM fs_dentry"
+
+# See deleted files (whiteouts)
+sqlite3 .agentfs/agent-workspace.db "SELECT path FROM fs_whiteout"
+```
+
+### Copy-on-Write Isolation
+
+When you run `agentfs run`, the current working directory becomes a copy-on-write overlay:
+
+- **Base layer**: Your actual filesystem (read-only access via HostFS)
+- **Delta layer**: An AgentFS database that captures all changes
+
+Any modifications (new files, edits, deletions) are stored in the delta database, leaving your actual filesystem untouched. When you exit, changes are discarded unless you explicitly export them using `agentfs diff`.
 
 ### Debugging with Strace
 
-Use `--strace` to see all intercepted system calls:
+Use `--strace` with the experimental ptrace sandbox to see all intercepted system calls:
 
 ```bash
-agentfs run --strace python3 script.py
+agentfs run --experimental-sandbox --strace python3 script.py
 ```
 
 This shows detailed information about every filesystem operation, useful for debugging and understanding agent behavior.

@@ -1,0 +1,11 @@
+//! Sandbox implementations for running commands in isolated environments.
+//!
+//! This module provides two sandbox approaches:
+//! - `overlay`: FUSE + namespace-based sandbox with copy-on-write filesystem
+//! - `ptrace`: ptrace-based syscall interception sandbox (experimental)
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod overlay;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod ptrace;

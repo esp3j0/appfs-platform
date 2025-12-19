@@ -26,6 +26,7 @@ libc = "0.2"
 # Linux-only dependencies for FUSE functionality
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15", default-features = false, features = ["abi-7-23"] }
+uuid = { version = "1", features = ["v4"] }
 
 # macOS dependencies for FUSE functionality (requires macFUSE)
 [target.'cfg(target_os = "macos")'.dependencies]

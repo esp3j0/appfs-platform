@@ -1,5 +1,6 @@
 mod cmd;
 mod parser;
+mod sandbox;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod daemon;
@@ -22,9 +23,9 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Init { id, force } => {
+        Command::Init { id, force, base } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, force)) {
+            if let Err(e) = rt.block_on(cmd::init::init_database(id, force, base)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -61,13 +62,21 @@ fn main() {
             }
         }
         Command::Run {
-            mounts,
+            experimental_sandbox,
             strace,
             command,
             args,
         } => {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(cmd::handle_run_command(mounts, strace, command, args));
+            if let Err(e) = rt.block_on(cmd::handle_run_command(
+                experimental_sandbox,
+                strace,
+                command,
+                args,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
         }
         Command::Mount {
             id_or_path,
@@ -87,6 +96,13 @@ fn main() {
                 uid,
                 gid,
             }) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Command::Diff { id_or_path } => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

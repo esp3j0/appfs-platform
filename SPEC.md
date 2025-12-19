@@ -460,6 +460,90 @@ Implementations MAY extend the filesystem schema with additional functionality:
 
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
+## Overlay Filesystem
+
+The overlay filesystem provides copy-on-write semantics by layering a writable delta filesystem on top of a read-only base filesystem. Changes are written to the delta layer while the base layer remains unmodified. This enables sandboxed execution where modifications can be discarded or committed independently.
+
+### Whiteouts
+
+When a file is deleted from an overlay filesystem, the deletion must be recorded so that lookups do not fall through to the base layer. This is accomplished using "whiteouts" - markers that indicate a path has been explicitly deleted.
+
+#### Table: `fs_whiteout`
+
+Tracks deleted paths in the overlay to prevent base layer visibility.
+
+```sql
+CREATE TABLE fs_whiteout (
+  path TEXT PRIMARY KEY,
+  parent_path TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)
+
+CREATE INDEX idx_fs_whiteout_parent ON fs_whiteout(parent_path)
+```
+
+**Fields:**
+
+- `path` - Normalized absolute path that has been deleted
+- `parent_path` - Parent directory path (for efficient child lookups)
+- `created_at` - Deletion timestamp (Unix timestamp, seconds)
+
+**Notes:**
+
+- The `parent_path` column enables O(1) lookups of whiteouts within a directory, avoiding expensive `LIKE` pattern matching
+- For the root directory `/`, `parent_path` is `/`
+- For other paths, `parent_path` is the path with the final component removed (e.g., `/foo/bar` has parent `/foo`)
+
+### Operations
+
+#### Create Whiteout
+
+When deleting a file that exists in the base layer:
+
+```sql
+INSERT INTO fs_whiteout (path, parent_path, created_at)
+VALUES (?, ?, ?)
+ON CONFLICT(path) DO UPDATE SET created_at = excluded.created_at
+```
+
+#### Check for Whiteout
+
+Before falling through to the base layer during lookup:
+
+```sql
+SELECT 1 FROM fs_whiteout WHERE path = ?
+```
+
+#### Remove Whiteout
+
+When creating a file at a previously deleted path:
+
+```sql
+DELETE FROM fs_whiteout WHERE path = ?
+```
+
+#### List Child Whiteouts
+
+When listing a directory, get whiteouts to exclude from base layer results:
+
+```sql
+SELECT path FROM fs_whiteout WHERE parent_path = ?
+```
+
+### Overlay Lookup Semantics
+
+1. Check if path exists in delta layer → return delta entry
+2. Check if path has a whiteout → return "not found"
+3. Check if path exists in base layer → return base entry
+4. Return "not found"
+
+### Consistency Rules
+
+1. A whiteout MUST be removed when a new file is created at that path
+2. A whiteout MUST be created when deleting a file that exists in the base layer
+3. The `parent_path` MUST be correctly derived from `path`
+4. Whiteouts only affect overlay lookups, not the underlying base filesystem
+
 ## Key-Value Data
 
 The key-value store provides simple get/set operations for agent context and state.
@@ -544,6 +628,11 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Version 0.2
+
+- Added Overlay Filesystem section with `fs_whiteout` table for copy-on-write semantics
+- Whiteout table includes `parent_path` column with index for efficient O(1) child lookups
 
 ### Version 0.1
 
