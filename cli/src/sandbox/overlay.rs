@@ -284,7 +284,8 @@ fn abort_child(pipe_write_fd: libc::c_int, child_pid: libc::pid_t) -> ! {
 
 /// Write uid_map, gid_map, and setgroups for a child's user namespace.
 ///
-/// Maps uid/gid 0 in the namespace to the real uid/gid outside.
+/// Maps the real uid/gid to itself inside the namespace, so the user appears
+/// as themselves (not root) inside the sandbox.
 /// On failure, aborts the child and exits.
 fn write_namespace_mappings(
     child_pid: libc::pid_t,
@@ -296,7 +297,8 @@ fn write_namespace_mappings(
     let gid_map_path = format!("/proc/{}/gid_map", child_pid);
     let setgroups_path = format!("/proc/{}/setgroups", child_pid);
 
-    if let Err(e) = std::fs::write(&uid_map_path, format!("0 {} 1\n", uid)) {
+    // Map the user's UID to itself (inside_uid outside_uid count)
+    if let Err(e) = std::fs::write(&uid_map_path, format!("{} {} 1\n", uid, uid)) {
         eprintln!("Error: Could not write uid_map: {}", e);
         eprintln!("This may indicate missing unprivileged user namespace support.");
         abort_child(pipe_write_fd, child_pid);
@@ -308,7 +310,8 @@ fn write_namespace_mappings(
         abort_child(pipe_write_fd, child_pid);
     }
 
-    if let Err(e) = std::fs::write(&gid_map_path, format!("0 {} 1\n", gid)) {
+    // Map the user's GID to itself (inside_gid outside_gid count)
+    if let Err(e) = std::fs::write(&gid_map_path, format!("{} {} 1\n", gid, gid)) {
         eprintln!("Error: Could not write gid_map: {}", e);
         abort_child(pipe_write_fd, child_pid);
     }
