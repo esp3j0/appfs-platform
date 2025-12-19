@@ -976,4 +976,21 @@ export class Filesystem {
       throw e;
     }
   }
+
+   /**
+   * Test a user's permissions for the file or directory specified by path.
+   * Currently supports existence checks only (F_OK semantics).
+   */
+   async access(path: string): Promise<void> {
+     const normalizedPath = this.normalizePath(path);
+     const ino = await this.resolvePath(normalizedPath);
+     if (ino === null) {
+       throw createFsError({
+         code: 'ENOENT',
+         syscall: 'access',
+         path: normalizedPath,
+         message: 'no such file or directory',
+       });
+     }
+   }
 }

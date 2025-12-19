@@ -398,6 +398,22 @@ describe("Filesystem Integration Tests", () => {
     });
   });
 
+  describe("access() Operations", () => {
+    it("should resolve when a file exists", async () => {
+      await fs.writeFile("/exists.txt", "content");
+      await expect(fs.access("/exists.txt")).resolves.toBeUndefined();
+    });
+
+    it("should resolve when a directory exists", async () => {
+      await fs.mkdir("/existsdir");
+      await expect(fs.access("/existsdir")).resolves.toBeUndefined();
+    });
+
+    it("should throw ENOENT when path does not exist", async () => {
+      await expect(fs.access("/does-not-exist")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
   describe("Path Handling", () => {
     it("should handle paths with trailing slashes", async () => {
       await fs.writeFile("/dir/file.txt", "content");
