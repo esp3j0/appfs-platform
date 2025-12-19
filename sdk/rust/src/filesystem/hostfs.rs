@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[cfg(unix)]
 use libc;
 
-use super::{FileSystem, FilesystemStats, Stats};
+use super::{DirEntry, FileSystem, FilesystemStats, Stats};
 
 /// A filesystem backed by a host directory (passthrough)
 #[derive(Clone)]
@@ -159,6 +159,41 @@ impl FileSystem for HostFS {
             }
         }
         entries.sort();
+        Ok(Some(entries))
+    }
+
+    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
+        let full_path = self.resolve_path(path);
+        let mut entries = Vec::new();
+
+        let mut dir = match fs::read_dir(&full_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        while let Some(entry) = dir.next_entry().await? {
+            if let Some(name) = entry.file_name().to_str() {
+                // Build the virtual path for this entry
+                let entry_path = if path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", path.trim_end_matches('/'), name)
+                };
+
+                // Get metadata for the entry
+                if let Ok(metadata) = entry.metadata().await {
+                    let stats = Self::metadata_to_stats(&metadata, &entry_path);
+                    entries.push(DirEntry {
+                        name: name.to_string(),
+                        stats,
+                    });
+                }
+            }
+        }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Some(entries))
     }
 

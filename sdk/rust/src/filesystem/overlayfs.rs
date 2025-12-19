@@ -7,7 +7,7 @@ use std::{
 };
 use turso::Value;
 
-use super::{agentfs::AgentFS, FileSystem, FilesystemStats, FsError, Stats};
+use super::{agentfs::AgentFS, DirEntry, FileSystem, FilesystemStats, FsError, Stats};
 
 /// A copy-on-write overlay filesystem.
 ///
@@ -461,6 +461,50 @@ impl FileSystem for OverlayFS {
 
         let mut result: Vec<_> = entries.into_iter().collect();
         result.sort();
+        Ok(Some(result))
+    }
+
+    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
+        let normalized = self.normalize_path(path);
+
+        // Check for whiteout on directory itself
+        if self.is_whiteout(&normalized).await? {
+            return Ok(None);
+        }
+
+        // Get whiteouts for children
+        let child_whiteouts = self.get_child_whiteouts(&normalized).await?;
+
+        // Use a HashMap to merge entries, with delta taking precedence
+        let mut entries_map = std::collections::HashMap::new();
+
+        // Get entries from delta first (these take precedence)
+        if let Some(delta_entries) = self.delta.readdir_plus(&normalized).await? {
+            for entry in delta_entries {
+                entries_map.insert(entry.name.clone(), entry);
+            }
+        }
+
+        // Get entries from base (only if not in delta and not whiteout)
+        if let Some(base_entries) = self.base.readdir_plus(&normalized).await? {
+            for entry in base_entries {
+                if !child_whiteouts.contains(&entry.name) && !entries_map.contains_key(&entry.name)
+                {
+                    entries_map.insert(entry.name.clone(), entry);
+                }
+            }
+        }
+
+        // Check if directory exists in either layer
+        let delta_exists = self.delta.stat(&normalized).await?.is_some();
+        let base_exists = self.base.stat(&normalized).await?.is_some();
+
+        if !delta_exists && !base_exists {
+            return Ok(None);
+        }
+
+        let mut result: Vec<_> = entries_map.into_values().collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Some(result))
     }
 

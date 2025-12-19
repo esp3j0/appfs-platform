@@ -1,8 +1,8 @@
 use agentfs_sdk::{FileSystem, FsError, Stats};
 use fuser::{
     consts::FUSE_WRITEBACK_CACHE, FileAttr, FileType, Filesystem, KernelConfig, MountOption,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use parking_lot::Mutex;
 use std::{
@@ -187,6 +187,9 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Returns "." and ".." entries followed by the directory contents.
     /// Each entry's inode is cached for subsequent lookups.
+    ///
+    /// Uses readdir_plus to fetch entries with stats in a single query,
+    /// avoiding N+1 database queries.
     fn readdir(
         &mut self,
         _req: &Request,
@@ -202,7 +205,7 @@ impl Filesystem for AgentFSFuse {
 
         let fs = self.fs.clone();
         let (entries_result, path) = self.runtime.block_on(async move {
-            let result = fs.readdir(&path).await;
+            let result = fs.readdir_plus(&path).await;
             (result, path)
         });
 
@@ -253,31 +256,24 @@ impl Filesystem for AgentFSFuse {
             (parent_ino, FileType::Directory, ".."),
         ];
 
-        for entry_name in &entries {
+        // Process entries with stats already available (no N+1 queries!)
+        for entry in &entries {
             let entry_path = if path == "/" {
-                format!("/{}", entry_name)
+                format!("/{}", entry.name)
             } else {
-                format!("{}/{}", path, entry_name)
+                format!("{}/{}", path, entry.name)
             };
 
-            let fs = self.fs.clone();
-            let (stats_result, entry_path) = self.runtime.block_on(async move {
-                let result = fs.stat(&entry_path).await;
-                (result, entry_path)
-            });
+            let kind = if entry.stats.is_directory() {
+                FileType::Directory
+            } else if entry.stats.is_symlink() {
+                FileType::Symlink
+            } else {
+                FileType::RegularFile
+            };
 
-            if let Ok(Some(stats)) = stats_result {
-                let kind = if stats.is_directory() {
-                    FileType::Directory
-                } else if stats.is_symlink() {
-                    FileType::Symlink
-                } else {
-                    FileType::RegularFile
-                };
-
-                self.add_path(stats.ino as u64, entry_path);
-                all_entries.push((stats.ino as u64, kind, entry_name.as_str()));
-            }
+            self.add_path(entry.stats.ino as u64, entry_path);
+            all_entries.push((entry.stats.ino as u64, kind, entry.name.as_str()));
         }
 
         for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
@@ -285,6 +281,147 @@ impl Filesystem for AgentFSFuse {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    /// Reads directory entries with full attributes for the given inode.
+    ///
+    /// This is an optimized version that returns both directory entries and
+    /// their attributes in a single call, reducing kernel/userspace round trips.
+    /// Uses readdir_plus to fetch entries with stats in a single database query.
+    fn readdirplus(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let Some(path) = self.get_path(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let fs = self.fs.clone();
+        let (entries_result, path) = self.runtime.block_on(async move {
+            let result = fs.readdir_plus(&path).await;
+            (result, path)
+        });
+
+        let entries = match entries_result {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+
+        // Get current directory stats for "."
+        let fs = self.fs.clone();
+        let path_for_stat = path.clone();
+        let dir_stats = self
+            .runtime
+            .block_on(async move { fs.stat(&path_for_stat).await })
+            .ok()
+            .flatten();
+
+        // Determine parent inode and stats for ".." entry
+        let (parent_ino, parent_stats) = if ino == 1 {
+            (1u64, dir_stats.clone()) // Root's parent is itself
+        } else {
+            let parent_path = Path::new(&path)
+                .parent()
+                .map(|p| {
+                    let s = p.to_string_lossy().to_string();
+                    if s.is_empty() {
+                        "/".to_string()
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_else(|| "/".to_string());
+
+            if parent_path == "/" {
+                let fs = self.fs.clone();
+                let parent_stats = self
+                    .runtime
+                    .block_on(async move { fs.stat(&parent_path).await })
+                    .ok()
+                    .flatten();
+                (1u64, parent_stats)
+            } else {
+                let fs = self.fs.clone();
+                let parent_stats = self
+                    .runtime
+                    .block_on(async move { fs.stat(&parent_path).await })
+                    .ok()
+                    .flatten();
+                let parent_ino = parent_stats.as_ref().map(|s| s.ino as u64).unwrap_or(1);
+                (parent_ino, parent_stats)
+            }
+        };
+
+        // Build the entries list with full attributes
+        let uid = self.uid;
+        let gid = self.gid;
+
+        let mut offset_counter = 0i64;
+
+        // Add "." entry
+        if offset <= offset_counter {
+            if let Some(ref stats) = dir_stats {
+                let attr = fillattr(stats, uid, gid);
+                if reply.add(ino, offset_counter + 1, ".", &TTL, &attr, 0) {
+                    reply.ok();
+                    return;
+                }
+            }
+        }
+        offset_counter += 1;
+
+        // Add ".." entry
+        if offset <= offset_counter {
+            if let Some(ref stats) = parent_stats {
+                let attr = fillattr(stats, uid, gid);
+                if reply.add(parent_ino, offset_counter + 1, "..", &TTL, &attr, 0) {
+                    reply.ok();
+                    return;
+                }
+            }
+        }
+        offset_counter += 1;
+
+        // Add directory entries with their attributes
+        for entry in &entries {
+            if offset <= offset_counter {
+                let entry_path = if path == "/" {
+                    format!("/{}", entry.name)
+                } else {
+                    format!("{}/{}", path, entry.name)
+                };
+
+                let attr = fillattr(&entry.stats, uid, gid);
+                self.add_path(entry.stats.ino as u64, entry_path);
+
+                if reply.add(
+                    entry.stats.ino as u64,
+                    offset_counter + 1,
+                    &entry.name,
+                    &TTL,
+                    &attr,
+                    0,
+                ) {
+                    reply.ok();
+                    return;
+                }
+            }
+            offset_counter += 1;
+        }
+
         reply.ok();
     }
 
