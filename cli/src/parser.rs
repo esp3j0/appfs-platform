@@ -45,6 +45,14 @@ pub enum Command {
     /// The overlay uses the host filesystem as a read-only base and stores
     /// all changes in an AgentFS-backed delta layer.
     Run {
+        /// Allow write access to additional directories (can be specified multiple times)
+        #[arg(long = "allow", value_name = "PATH")]
+        allow: Vec<PathBuf>,
+
+        /// Disable default allowed directories (~/.config, ~/.cache, ~/.local, ~/.claude, etc.)
+        #[arg(long = "no-default-allows")]
+        no_default_allows: bool,
+
         /// Use experimental ptrace-based syscall interception sandbox
         #[arg(long = "experimental-sandbox")]
         experimental_sandbox: bool,
