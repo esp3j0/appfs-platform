@@ -8,7 +8,7 @@ from .filesystem import Filesystem, Stats
 from .kvstore import KvStore
 from .toolcalls import ToolCall, ToolCalls, ToolCallStats
 
-__version__ = "0.4.0-pre.1"
+__version__ = "0.4.0-pre.2"
 
 __all__ = [
     "AgentFS",
