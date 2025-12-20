@@ -30,7 +30,10 @@ fn bench_remove_file(c: &mut Criterion) {
                         .expect("Failed to create AgentFS");
 
                     let overlay = OverlayFS::new(base, delta);
-                    overlay.init().await.expect("Failed to init overlay");
+                    overlay
+                        .init(base_dir.path().to_str().unwrap())
+                        .await
+                        .expect("Failed to init overlay");
 
                     (overlay, base_dir, delta_dir)
                 })

@@ -89,8 +89,11 @@ pub async fn run_cmd(
     let base = Arc::new(HostFS::new(&fd_path).context("Failed to create HostFS")?);
     let overlay = OverlayFS::new(base, agentfs.fs);
 
+    let cwd_str = cwd
+        .to_str()
+        .context("Current directory path contains non-UTF8 characters")?;
     overlay
-        .init()
+        .init(cwd_str)
         .await
         .context("Failed to initialize overlay")?;
 
@@ -185,7 +188,7 @@ pub async fn run_cmd(
             cwd_fd,
             &session.fuse_mountpoint,
             fuse_handle,
-            &session.run_dir,
+            &session.db_path,
         );
     }
 }
@@ -211,8 +214,6 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf]) {
 struct RunSession {
     /// Unique identifier for this run.
     run_id: String,
-    /// Directory containing session artifacts (database, mountpoint).
-    run_dir: PathBuf,
     /// Path to the delta database.
     db_path: PathBuf,
     /// Path where FUSE filesystem will be mounted.
@@ -232,7 +233,6 @@ fn setup_run_directory() -> Result<RunSession> {
 
     Ok(RunSession {
         run_id,
-        run_dir,
         db_path,
         fuse_mountpoint,
     })
@@ -696,7 +696,7 @@ fn run_parent(
     cwd_fd: std::fs::File,
     fuse_mountpoint: &Path,
     _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
-    run_dir: &Path,
+    db_path: &Path,
 ) -> ! {
     // Wait for child process to exit
     let mut status: libc::c_int = 0;
@@ -722,14 +722,21 @@ fn run_parent(
         std::process::exit(exit_code);
     }
 
-    // Clean up run directory
-    if let Err(e) = std::fs::remove_dir_all(run_dir) {
+    // Clean up the FUSE mountpoint directory (but keep the delta database)
+    if let Err(e) = std::fs::remove_dir_all(fuse_mountpoint) {
         eprintln!(
-            "Warning: Failed to clean up run directory {}: {}",
-            run_dir.display(),
+            "Warning: Failed to clean up mountpoint {}: {}",
+            fuse_mountpoint.display(),
             e
         );
     }
+
+    // Print the location of the delta layer for the user
+    eprintln!();
+    eprintln!("Delta layer saved to: {}", db_path.display());
+    eprintln!();
+    eprintln!("To see what changed:");
+    eprintln!("  agentfs diff {}", db_path.display());
 
     std::process::exit(exit_code);
 }
