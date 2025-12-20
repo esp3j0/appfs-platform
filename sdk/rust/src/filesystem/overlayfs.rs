@@ -42,7 +42,11 @@ impl OverlayFS {
     ///
     /// This must be called before using the overlay filesystem to ensure
     /// the whiteout tracking table exists in the delta layer.
-    pub async fn init(&self) -> Result<()> {
+    ///
+    /// The `base_path` parameter specifies the actual filesystem path that the
+    /// base layer represents. This is stored in the delta database so that
+    /// tools like `agentfs diff` can determine what files were modified.
+    pub async fn init(&self, base_path: &str) -> Result<()> {
         let conn = self.delta.get_connection();
         conn.execute(
             "CREATE TABLE IF NOT EXISTS fs_whiteout (
@@ -57,6 +61,20 @@ impl OverlayFS {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_whiteout_parent ON fs_whiteout(parent_path)",
             (),
+        )
+        .await?;
+        // Store overlay configuration so tools can identify this as an overlay database
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS fs_overlay_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES ('base_path', ?1)",
+            [Value::Text(base_path.to_string())],
         )
         .await?;
         Ok(())
@@ -650,7 +668,7 @@ mod tests {
         let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
 
         let overlay = OverlayFS::new(base, delta);
-        overlay.init().await?;
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
 
         Ok((overlay, base_dir, delta_dir))
     }
@@ -1039,7 +1057,7 @@ mod prop_tests {
         let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
 
         let overlay = OverlayFS::new(base, delta);
-        overlay.init().await?;
+        overlay.init(base_dir.path().to_str().unwrap()).await?;
 
         Ok((overlay, base_dir, delta_dir))
     }
@@ -1416,7 +1434,10 @@ mod prop_tests {
         let db_path = delta_dir.path().join("delta.db");
         let delta = AgentFS::new(db_path.to_str().unwrap()).await.unwrap();
         let overlay = OverlayFS::new(base, delta);
-        overlay.init().await.unwrap();
+        overlay
+            .init(base_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
 
         // Create /subdir/nested.txt
         overlay
