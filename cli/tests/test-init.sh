@@ -62,6 +62,24 @@ echo "$output" | grep -q "Created agent filesystem: .agentfs/$TEST_AGENT_ID.db" 
     exit 1
 }
 
+# Test: Verify --force actually recreates the file (inode should change)
+inode_before=$(stat -c %i ".agentfs/${TEST_AGENT_ID}.db")
+echo "inode before --force: $inode_before"
+if ! output=$(cargo run -- init "$TEST_AGENT_ID" --force 2>&1); then
+    echo "FAILED: init --force command failed (inode test)"
+    echo "Output was: $output"
+    rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
+    exit 1
+fi
+inode_after=$(stat -c %i ".agentfs/${TEST_AGENT_ID}.db")
+echo "inode after --force: $inode_after"
+if [ "$inode_before" = "$inode_after" ]; then
+    echo "FAILED: init --force did not recreate the database file (inode unchanged)"
+    echo "inode before: $inode_before, inode after: $inode_after"
+    rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
+    exit 1
+fi
+
 # Cleanup test database only
 rm -f ".agentfs/${TEST_AGENT_ID}.db" ".agentfs/${TEST_AGENT_ID}.db-shm" ".agentfs/${TEST_AGENT_ID}.db-wal"
 
