@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use turso::{Builder, Connection, Value};
 
 use super::{
-    FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFLNK,
-    S_IFMT,
+    DirEntry, FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
+    S_IFLNK, S_IFMT,
 };
 
 const ROOT_INO: i64 = 1;
@@ -1053,6 +1053,105 @@ impl AgentFS {
         Ok(Some(entries))
     }
 
+    /// List directory contents with full statistics (optimized batch query)
+    ///
+    /// Returns entries with their stats in a single JOIN query, avoiding N+1 queries.
+    pub async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
+        let ino = match self.resolve_path(path).await? {
+            Some(ino) => ino,
+            None => return Ok(None),
+        };
+
+        // Single JOIN query to get all entry names and their stats (including link count)
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT d.name, i.ino, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime,
+                        (SELECT COUNT(*) FROM fs_dentry WHERE ino = i.ino) as nlink
+                 FROM fs_dentry d
+                 JOIN fs_inode i ON d.ino = i.ino
+                 WHERE d.parent_ino = ?
+                 ORDER BY d.name",
+                (ino,),
+            )
+            .await?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            let entry_ino = row
+                .get_value(1)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+
+            let nlink = row
+                .get_value(9)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(1) as u32;
+
+            let stats = Stats {
+                ino: entry_ino,
+                mode: row
+                    .get_value(2)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                nlink,
+                uid: row
+                    .get_value(3)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                gid: row
+                    .get_value(4)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                size: row
+                    .get_value(5)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                atime: row
+                    .get_value(6)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                mtime: row
+                    .get_value(7)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                ctime: row
+                    .get_value(8)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+            };
+
+            entries.push(DirEntry { name, stats });
+        }
+
+        Ok(Some(entries))
+    }
+
     /// Create a symbolic link
     pub async fn symlink(&self, target: &str, linkpath: &str) -> Result<()> {
         let linkpath = self.normalize_path(linkpath);
@@ -1529,6 +1628,10 @@ impl FileSystem for AgentFS {
 
     async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
         AgentFS::readdir(self, path).await
+    }
+
+    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
+        AgentFS::readdir_plus(self, path).await
     }
 
     async fn mkdir(&self, path: &str) -> Result<()> {

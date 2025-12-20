@@ -98,6 +98,15 @@ pub struct FilesystemStats {
     pub bytes_used: u64,
 }
 
+/// Directory entry with full statistics
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    /// Entry name (without path)
+    pub name: String,
+    /// Full statistics for this entry
+    pub stats: Stats,
+}
+
 impl Stats {
     pub fn is_file(&self) -> bool {
         (self.mode & S_IFMT) == S_IFREG
@@ -147,6 +156,14 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns `Ok(None)` if the directory does not exist.
     async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>>;
+
+    /// List directory contents with full statistics for each entry
+    ///
+    /// This is an optimized version of readdir that returns both entry names
+    /// and their statistics in a single call, avoiding N+1 queries.
+    ///
+    /// Returns `Ok(None)` if the directory does not exist.
+    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>>;
 
     /// Create a directory
     async fn mkdir(&self, path: &str) -> Result<()>;
