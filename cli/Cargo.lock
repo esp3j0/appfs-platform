@@ -73,6 +73,7 @@ dependencies = [
 name = "agentfs"
 version = "0.4.0-pre.2"
 dependencies = [
+ "aegis",
  "agentfs-sandbox",
  "agentfs-sdk",
  "anyhow",
@@ -105,6 +106,7 @@ dependencies = [
  "reverie-ptrace",
  "reverie-util",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -112,6 +114,7 @@ dependencies = [
 name = "agentfs-sdk"
 version = "0.4.0-pre.2"
 dependencies = [
+ "aegis",
  "anyhow",
  "async-trait",
  "libc",
