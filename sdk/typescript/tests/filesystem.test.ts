@@ -46,10 +46,26 @@ describe("Filesystem Integration Tests", () => {
       expect(content).toBe("Hello, World!");
     });
 
-    it("should write and read files in subdirectories", async () => {
-      await fs.writeFile("/dir/subdir/file.txt", "nested content");
-      const content = await fs.readFile("/dir/subdir/file.txt", "utf8");
-      expect(content).toBe("nested content");
+    it('should respect encoding option when writing string data', async () => {
+      await fs.writeFile('/enc.txt', 'hello', { encoding: 'utf16le' });
+      const data = await fs.readFile('/enc.txt') as Buffer;
+      expect(data.equals(Buffer.from('hello', 'utf16le'))).toBe(true);
+    });
+
+    it('should throw EISDIR when attempting to write to a directory path', async () => {
+      await fs.writeFile('/dir/file.txt', 'content'); // create directory
+      await expect(fs.writeFile('/dir', 'nope')).rejects.toMatchObject({ code: 'EISDIR' });
+    });
+
+    it('should throw ENOTDIR when a parent path component is a file', async () => {
+      await fs.writeFile('/a', 'file-content'); // create file
+      await expect(fs.writeFile('/a/b.txt', 'child')).rejects.toMatchObject({ code: 'ENOTDIR' });
+    });
+
+    it('should write and read files in subdirectories', async () => {
+      await fs.writeFile('/dir/subdir/file.txt', 'nested content');
+      const content = await fs.readFile('/dir/subdir/file.txt', 'utf8');
+      expect(content).toBe('nested content');
     });
 
     it("should overwrite existing file", async () => {
@@ -80,9 +96,14 @@ describe("Filesystem Integration Tests", () => {
     });
   });
 
-  describe("File Read Operations", () => {
-    it("should throw error when reading non-existent file", async () => {
-      await expect(fs.readFile("/non-existent.txt")).rejects.toThrow();
+  describe('File Read Operations', () => {
+    it('should throw error when reading non-existent file', async () => {
+      await expect(fs.readFile('/non-existent.txt')).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('should throw EISDIR when attempting to read a directory path', async () => {
+      await fs.writeFile('/dir/file.txt', 'content');
+      await expect(fs.readFile('/dir')).rejects.toMatchObject({ code: 'EISDIR' });
     });
 
     it("should read multiple different files", async () => {
@@ -97,6 +118,21 @@ describe("Filesystem Integration Tests", () => {
   });
 
   describe("Directory Operations", () => {
+    it("should create a directory with mkdir()", async () => {
+      await fs.mkdir("/newdir");
+      const entries = await fs.readdir("/");
+      expect(entries).toContain("newdir");
+    });
+
+    it("should throw EEXIST when mkdir() is called on an existing directory", async () => {
+      await fs.mkdir("/exists");
+      await expect(fs.mkdir("/exists")).rejects.toMatchObject({ code: "EEXIST" });
+    });
+
+    it("should throw ENOENT when parent directory does not exist", async () => {
+      await expect(fs.mkdir("/missing-parent/child")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
     it("should list files in root directory", async () => {
       await fs.writeFile("/file1.txt", "content 1");
       await fs.writeFile("/file2.txt", "content 2");
@@ -157,26 +193,29 @@ describe("Filesystem Integration Tests", () => {
       const files = await fs.readdir("/a/b/c/d");
       expect(files).toContain("file.txt");
     });
+
+    it('should throw ENOTDIR when attempting to readdir a file path', async () => {
+      await fs.writeFile('/notadir.txt', 'content');
+      await expect(fs.readdir('/notadir.txt')).rejects.toMatchObject({ code: 'ENOTDIR' });
+    });
   });
 
-  describe("File Delete Operations", () => {
-    it("should delete an existing file", async () => {
-      await fs.writeFile("/delete-me.txt", "content");
-      await fs.deleteFile("/delete-me.txt");
-      await expect(fs.readFile("/delete-me.txt")).rejects.toThrow();
+  describe('File Delete Operations', () => {
+    it('should delete an existing file', async () => {
+      await fs.writeFile('/delete-me.txt', 'content');
+      await fs.unlink('/delete-me.txt');
+      await expect(fs.readFile('/delete-me.txt')).rejects.toThrow();
     });
 
-    it("should handle deleting non-existent file", async () => {
-      await expect(fs.deleteFile("/non-existent.txt")).rejects.toThrow(
-        "ENOENT"
-      );
+    it('should handle deleting non-existent file', async () => {
+      await expect(fs.unlink('/non-existent.txt')).rejects.toThrow('ENOENT');
     });
 
     it("should delete file and update directory listing", async () => {
       await fs.writeFile("/dir/file1.txt", "content 1");
       await fs.writeFile("/dir/file2.txt", "content 2");
 
-      await fs.deleteFile("/dir/file1.txt");
+      await fs.unlink('/dir/file1.txt');
 
       const files = await fs.readdir("/dir");
       expect(files).not.toContain("file1.txt");
@@ -184,12 +223,194 @@ describe("Filesystem Integration Tests", () => {
       expect(files).toHaveLength(1);
     });
 
-    it("should allow recreating deleted file", async () => {
-      await fs.writeFile("/recreate.txt", "original");
-      await fs.deleteFile("/recreate.txt");
-      await fs.writeFile("/recreate.txt", "new content");
-      const content = await fs.readFile("/recreate.txt", "utf8");
-      expect(content).toBe("new content");
+    it('should allow recreating deleted file', async () => {
+      await fs.writeFile('/recreate.txt', 'original');
+      await fs.unlink('/recreate.txt');
+      await fs.writeFile('/recreate.txt', 'new content');
+      const content = await fs.readFile('/recreate.txt', 'utf8');
+      expect(content).toBe('new content');
+    });
+
+    it('should throw EISDIR when attempting to unlink a directory', async () => {
+      await fs.writeFile('/adir/file.txt', 'content');
+      await expect(fs.unlink('/adir')).rejects.toMatchObject({ code: 'EISDIR' });
+    });
+  });
+
+  describe("rm() Operations", () => {
+    it("should remove a file", async () => {
+      await fs.writeFile("/rmfile.txt", "content");
+      await fs.rm("/rmfile.txt");
+      await expect(fs.readFile("/rmfile.txt")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should not throw when force=true and path does not exist", async () => {
+      await expect(fs.rm("/does-not-exist", { force: true })).resolves.toBeUndefined();
+    });
+
+    it("should throw ENOENT when force=false and path does not exist", async () => {
+      await expect(fs.rm("/does-not-exist")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should throw EISDIR when trying to rm a directory without recursive", async () => {
+      await fs.mkdir("/rmdir");
+      await expect(fs.rm("/rmdir")).rejects.toMatchObject({ code: "EISDIR" });
+    });
+
+    it("should remove a directory recursively", async () => {
+      await fs.writeFile("/tree/a/b/c.txt", "content");
+      await fs.rm("/tree", { recursive: true });
+      await expect(fs.readdir("/tree")).rejects.toMatchObject({ code: "ENOENT" });
+      const root = await fs.readdir("/");
+      expect(root).not.toContain("tree");
+    });
+  });
+
+  describe("rmdir() Operations", () => {
+    it("should remove an empty directory", async () => {
+      await fs.mkdir("/emptydir");
+      await fs.rmdir("/emptydir");
+      await expect(fs.readdir("/emptydir")).rejects.toMatchObject({ code: "ENOENT" });
+      const root = await fs.readdir("/");
+      expect(root).not.toContain("emptydir");
+    });
+
+    it("should throw ENOTEMPTY when directory is not empty", async () => {
+      await fs.writeFile("/nonempty/file.txt", "content");
+      await expect(fs.rmdir("/nonempty")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+    });
+
+    it("should throw ENOTDIR when path is a file", async () => {
+      await fs.writeFile("/afile", "content");
+      await expect(fs.rmdir("/afile")).rejects.toMatchObject({ code: "ENOTDIR" });
+    });
+
+    it("should throw EPERM when attempting to remove root", async () => {
+      await expect(fs.rmdir("/")).rejects.toMatchObject({ code: "EPERM" });
+    });
+  });
+
+  describe("rename() Operations", () => {
+    it("should rename a file", async () => {
+      await fs.writeFile("/a.txt", "hello");
+      await fs.rename("/a.txt", "/b.txt");
+      await expect(fs.readFile("/a.txt")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/b.txt", "utf8");
+      expect(content).toBe("hello");
+    });
+
+    it("should rename a directory and preserve its contents", async () => {
+      await fs.writeFile("/olddir/sub/file.txt", "content");
+      await fs.rename("/olddir", "/newdir");
+      await expect(fs.readdir("/olddir")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/newdir/sub/file.txt", "utf8");
+      expect(content).toBe("content");
+    });
+
+    it("should overwrite destination file if it exists", async () => {
+      await fs.writeFile("/src.txt", "src");
+      await fs.writeFile("/dst.txt", "dst");
+      await fs.rename("/src.txt", "/dst.txt");
+      await expect(fs.readFile("/src.txt")).rejects.toMatchObject({ code: "ENOENT" });
+      const content = await fs.readFile("/dst.txt", "utf8");
+      expect(content).toBe("src");
+    });
+
+    it("should throw EISDIR when renaming a file onto a directory", async () => {
+      await fs.writeFile("/dir/file.txt", "content");
+      await fs.writeFile("/file.txt", "content");
+      await expect(fs.rename("/file.txt", "/dir")).rejects.toMatchObject({ code: "EISDIR" });
+    });
+
+    it("should throw ENOTDIR when renaming a directory onto a file", async () => {
+      await fs.mkdir("/somedir");
+      await fs.writeFile("/somefile", "content");
+      await expect(fs.rename("/somedir", "/somefile")).rejects.toMatchObject({ code: "ENOTDIR" });
+    });
+
+    it("should replace an existing empty directory", async () => {
+      await fs.mkdir("/fromdir");
+      await fs.mkdir("/todir");
+      await fs.rename("/fromdir", "/todir");
+      const root = await fs.readdir("/");
+      expect(root).toContain("todir");
+      expect(root).not.toContain("fromdir");
+      await expect(fs.readdir("/fromdir")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should throw ENOTEMPTY when replacing a non-empty directory", async () => {
+      await fs.mkdir("/fromdir");
+      await fs.writeFile("/todir/file.txt", "content");
+      await expect(fs.rename("/fromdir", "/todir")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+    });
+
+    it("should throw EPERM when attempting to rename root", async () => {
+      await expect(fs.rename("/", "/x")).rejects.toMatchObject({ code: "EPERM" });
+    });
+
+    it("should throw EINVAL when renaming a directory into its own subdirectory", async () => {
+      await fs.writeFile("/cycle/sub/file.txt", "content");
+      await expect(fs.rename("/cycle", "/cycle/sub/moved")).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+
+  describe("copyFile() Operations", () => {
+    it("should copy a file", async () => {
+      await fs.writeFile("/src.txt", "hello");
+      await fs.copyFile("/src.txt", "/dst.txt");
+      const srcContent = await fs.readFile("/src.txt", "utf8");
+      const dstContent = await fs.readFile("/dst.txt", "utf8");
+      expect(srcContent).toBe("hello");
+      expect(dstContent).toBe("hello");
+    });
+
+    it("should overwrite destination if it exists", async () => {
+      await fs.writeFile("/src.txt", "src");
+      await fs.writeFile("/dst.txt", "dst");
+      await fs.copyFile("/src.txt", "/dst.txt");
+      const dstContent = await fs.readFile("/dst.txt", "utf8");
+      expect(dstContent).toBe("src");
+    });
+
+    it("should throw ENOENT when source does not exist", async () => {
+      await expect(fs.copyFile("/nope.txt", "/out.txt")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should throw ENOENT when destination parent does not exist", async () => {
+      await fs.writeFile("/src3.txt", "content");
+      await expect(fs.copyFile("/src3.txt", "/missing/child.txt")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("should throw EISDIR when source is a directory", async () => {
+      await fs.mkdir("/asrcdir");
+      await expect(fs.copyFile("/asrcdir", "/out2.txt")).rejects.toMatchObject({ code: "EISDIR" });
+    });
+
+    it("should throw EISDIR when destination is a directory", async () => {
+      await fs.writeFile("/src4.txt", "content");
+      await fs.mkdir("/adstdir");
+      await expect(fs.copyFile("/src4.txt", "/adstdir")).rejects.toMatchObject({ code: "EISDIR" });
+    });
+
+    it("should throw EINVAL when source and destination are the same", async () => {
+      await fs.writeFile("/same.txt", "content");
+      await expect(fs.copyFile("/same.txt", "/same.txt")).rejects.toMatchObject({ code: "EINVAL" });
+    });
+  });
+
+  describe("access() Operations", () => {
+    it("should resolve when a file exists", async () => {
+      await fs.writeFile("/exists.txt", "content");
+      await expect(fs.access("/exists.txt")).resolves.toBeUndefined();
+    });
+
+    it("should resolve when a directory exists", async () => {
+      await fs.mkdir("/existsdir");
+      await expect(fs.access("/existsdir")).resolves.toBeUndefined();
+    });
+
+    it("should throw ENOENT when path does not exist", async () => {
+      await expect(fs.access("/does-not-exist")).rejects.toMatchObject({ code: "ENOENT" });
     });
   });
 
@@ -752,7 +973,7 @@ describe("Filesystem Integration Tests", () => {
       expect(beforeResult.count).toBe(4);
 
       // Delete the file
-      await fs.deleteFile("/deleteme.txt");
+      await fs.unlink('/deleteme.txt');
 
       // Verify all chunks are gone
       const afterResult = (await countStmt.get(ino)) as { count: number };
