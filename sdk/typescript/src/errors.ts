@@ -1,12 +1,41 @@
+/**
+ * POSIX-style error codes for filesystem operations.
+ */
+export type FsErrorCode =
+  | 'ENOENT'    // No such file or directory
+  | 'EEXIST'    // File already exists
+  | 'EISDIR'    // Is a directory (when file expected)
+  | 'ENOTDIR'   // Not a directory (when directory expected)
+  | 'ENOTEMPTY' // Directory not empty
+  | 'EPERM'     // Operation not permitted
+  | 'EINVAL'    // Invalid argument
+  | 'ENOSYS';   // Function not implemented (use for symlinks)
+
+/**
+ * Filesystem syscall names for error reporting.
+ * rm, scandir and copyFile are not actual syscall but used for convenience
+ */
+export type FsSyscall =
+  | 'open'
+  | 'stat'
+  | 'mkdir'
+  | 'rmdir'
+  | 'rm'
+  | 'unlink'
+  | 'rename'
+  | 'scandir'
+  | 'copyfile'
+  | 'access';
+
 export interface ErrnoException extends Error {
-  code?: string;
-  syscall?: string;
+  code?: FsErrorCode;
+  syscall?: FsSyscall;
   path?: string;
 }
 
 export function createFsError(params: {
-  code: string;
-  syscall: string;
+  code: FsErrorCode;
+  syscall: FsSyscall;
   path?: string;
   message?: string;
 }): ErrnoException {

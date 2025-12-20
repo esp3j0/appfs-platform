@@ -1,5 +1,5 @@
 import type { DatabasePromise } from '@tursodatabase/database-common';
-import { createFsError } from './errors.js';
+import { createFsError, type FsSyscall } from './errors.js';
 import {
   assertInodeIsDirectory,
   assertNotRoot,
@@ -185,7 +185,7 @@ export class Filesystem {
 
   private async resolvePathOrThrow(
     path: string,
-    syscall: string
+    syscall: FsSyscall
   ): Promise<{ normalizedPath: string; ino: number }> {
     const normalizedPath = this.normalizePath(path);
     const ino = await this.resolvePath(normalizedPath);

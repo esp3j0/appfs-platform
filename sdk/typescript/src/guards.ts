@@ -1,5 +1,5 @@
 import type { DatabasePromise } from '@tursodatabase/database-common';
-import { createFsError } from './errors.js';
+import { createFsError, type FsSyscall } from './errors.js';
 import { S_IFDIR, S_IFLNK, S_IFMT } from './filesystem.js';
 
 async function getInodeMode(db: DatabasePromise, ino: number): Promise<number | null> {
@@ -15,7 +15,7 @@ function isDirMode(mode: number): boolean {
 export async function getInodeModeOrThrow(
   db: DatabasePromise,
   ino: number,
-  syscall: string,
+  syscall: FsSyscall,
   path: string
 ): Promise<number> {
   const mode = await getInodeMode(db, ino);
@@ -30,7 +30,7 @@ export async function getInodeModeOrThrow(
   return mode;
 }
 
-export function assertNotRoot(path: string, syscall: string): void {
+export function assertNotRoot(path: string, syscall: FsSyscall): void {
   if (path === '/') {
     throw createFsError({
       code: 'EPERM',
@@ -51,7 +51,7 @@ export function normalizeRmOptions(options?: { force?: boolean; recursive?: bool
   };
 }
 
-export function throwENOENTUnlessForce(path: string, syscall: string, force: boolean): void {
+export function throwENOENTUnlessForce(path: string, syscall: FsSyscall, force: boolean): void {
   if (force) return;
   throw createFsError({
     code: 'ENOENT',
@@ -61,7 +61,7 @@ export function throwENOENTUnlessForce(path: string, syscall: string, force: boo
   });
 }
 
-export function assertNotSymlinkMode(mode: number, syscall: string, path: string): void {
+export function assertNotSymlinkMode(mode: number, syscall: FsSyscall, path: string): void {
   if ((mode & S_IFMT) === S_IFLNK) {
     throw createFsError({
       code: 'ENOSYS',
@@ -75,7 +75,7 @@ export function assertNotSymlinkMode(mode: number, syscall: string, path: string
 async function assertExistingNonDirNonSymlinkInode(
   db: DatabasePromise,
   ino: number,
-  syscall: string,
+  syscall: FsSyscall,
   fullPathForError: string
 ): Promise<void> {
   const mode = await getInodeMode(db, ino);
@@ -101,7 +101,7 @@ async function assertExistingNonDirNonSymlinkInode(
 export async function assertInodeIsDirectory(
   db: DatabasePromise,
   ino: number,
-  syscall: string,
+  syscall: FsSyscall,
   fullPathForError: string
 ): Promise<void> {
   const mode = await getInodeMode(db, ino);
@@ -126,7 +126,7 @@ export async function assertInodeIsDirectory(
 export async function assertWritableExistingInode(
   db: DatabasePromise,
   ino: number,
-  syscall: string,
+  syscall: FsSyscall,
   fullPathForError: string
 ): Promise<void> {
   await assertExistingNonDirNonSymlinkInode(db, ino, syscall, fullPathForError);
@@ -135,7 +135,7 @@ export async function assertWritableExistingInode(
 export async function assertReadableExistingInode(
   db: DatabasePromise,
   ino: number,
-  syscall: string,
+  syscall: FsSyscall,
   fullPathForError: string
 ): Promise<void> {
   await assertExistingNonDirNonSymlinkInode(db, ino, syscall, fullPathForError);
