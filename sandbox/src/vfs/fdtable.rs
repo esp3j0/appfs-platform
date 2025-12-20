@@ -188,15 +188,15 @@ impl FdTable {
 
         // Update next_vfd if we allocated beyond it
         if vfd >= inner.next_vfd {
-            // // We just "skipped over" the range [next_vfd, vfd). Those FDs are now
-            // // valid, unused, and must be eligible for `allocate()` (lowest-available).
-            // let mut fd = inner.next_vfd;
-            // while fd < vfd {
-            //     if fd >= FIRST_USER_FD && !inner.entries.contains_key(&fd) {
-            //         inner.free_fds.push(std::cmp::Reverse(fd));
-            //     }
-            //     fd = fd.checked_add(1).expect("fd overflow");
-            // }
+            // We just "skipped over" the range [next_vfd, vfd). Those FDs are now
+            // valid, unused, and must be eligible for `allocate()` (lowest-available).
+            let mut fd = inner.next_vfd;
+            while fd < vfd {
+                if fd >= FIRST_USER_FD && !inner.entries.contains_key(&fd) {
+                    inner.free_fds.push(std::cmp::Reverse(fd));
+                }
+                fd = fd.checked_add(1).expect("fd overflow");
+            }
             inner.next_vfd = vfd + 1;
         }
 
@@ -233,15 +233,15 @@ impl FdTable {
 
         // Update next_vfd if necessary
         if vfd >= inner.next_vfd {
-            // // Like `allocate_min`, allocating at a far FD creates gaps that must remain
-            // // available for subsequent `allocate()` calls.
-            // let mut fd = inner.next_vfd;
-            // while fd < vfd {
-            //     if fd >= FIRST_USER_FD && !inner.entries.contains_key(&fd) {
-            //         inner.free_fds.push(std::cmp::Reverse(fd));
-            //     }
-            //     fd = fd.checked_add(1).expect("fd overflow");
-            // }
+            // Like `allocate_min`, allocating at a far FD creates gaps that must remain
+            // available for subsequent `allocate()` calls.
+            let mut fd = inner.next_vfd;
+            while fd < vfd {
+                if fd >= FIRST_USER_FD && !inner.entries.contains_key(&fd) {
+                    inner.free_fds.push(std::cmp::Reverse(fd));
+                }
+                fd = fd.checked_add(1).expect("fd overflow");
+            }
             inner.next_vfd = vfd + 1;
         }
 
