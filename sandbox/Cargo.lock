@@ -83,7 +83,6 @@ dependencies = [
  "reverie-ptrace",
  "reverie-util",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
 ]
