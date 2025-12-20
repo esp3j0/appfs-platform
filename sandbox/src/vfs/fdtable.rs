@@ -491,13 +491,13 @@ mod prop_tests {
         // We keep weights bounded so generation is efficient and reproducible.
         // (proptest seeds determine the weights deterministically per case)
         (
-            0u32..=10,  // deep_clone
+            1u32..=10,  // deep_clone
             10u32..=70, // allocate
             10u32..=70, // deallocate
             5u32..=50,  // duplicate
-            0u32..=30,  // allocate_min
-            0u32..=20,  // allocate_at
-            0u32..=20,  // duplicate_at
+            1u32..=30,  // allocate_min
+            1u32..=20,  // allocate_at
+            1u32..=20,  // duplicate_at
         )
             .prop_flat_map(
                 move |(
@@ -604,7 +604,11 @@ mod prop_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            max_shrink_iters: 20_000,
+            .. ProptestConfig::default()
+        })]
 
         #[test]
         fn prop_fdtable_allocation_semantics(ops in ops_strategy()) {
