@@ -37,13 +37,24 @@ pub async fn init_database(
     }
 
     // Check if agent already exists
-    let db_path = agentfs_dir().join(format!("{}.db", id));
-    if db_path.exists() && !force {
-        anyhow::bail!(
-            "Agent '{}' already exists at '{}'. Use --force to overwrite.",
-            id,
-            db_path.display()
-        );
+    let db_path = agentfs_dir().join(format!("{}.db", &id));
+    if db_path.exists() {
+        if force {
+            for entry in std::fs::read_dir(agentfs_dir())? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                if file_name.to_string_lossy().starts_with(&id) {
+                    std::fs::remove_file(entry.path())
+                        .context("Failed to remove existing database file(s)")?;
+                }
+            }
+        } else {
+            anyhow::bail!(
+                "Agent '{}' already exists at '{}'. Use --force to overwrite.",
+                id,
+                db_path.display()
+            );
+        }
     }
 
     // Use the SDK to initialize the database - this ensures consistency
