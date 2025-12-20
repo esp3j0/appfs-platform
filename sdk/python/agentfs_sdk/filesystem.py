@@ -101,6 +101,7 @@ class Filesystem:
             CREATE TABLE IF NOT EXISTS fs_inode (
                 ino INTEGER PRIMARY KEY AUTOINCREMENT,
                 mode INTEGER NOT NULL,
+                nlink INTEGER NOT NULL DEFAULT 0,
                 uid INTEGER NOT NULL DEFAULT 0,
                 gid INTEGER NOT NULL DEFAULT 0,
                 size INTEGER NOT NULL DEFAULT 0,
@@ -161,8 +162,8 @@ class Filesystem:
             now = int(time.time())
             await self._db.execute(
                 """
-                INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
-                VALUES (?, ?, 0, 0, 0, ?, ?, ?)
+                INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
+                VALUES (?, ?, 1, 0, 0, 0, ?, ?, ?)
                 """,
                 (self._root_ino, DEFAULT_DIR_MODE, now, now, now),
             )
@@ -266,6 +267,11 @@ class Filesystem:
             """,
             (name, parent_ino, ino),
         )
+        # Increment link count
+        await self._db.execute(
+            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+            (ino,),
+        )
         await self._db.commit()
 
     async def _ensure_parent_dirs(self, path: str) -> None:
@@ -301,7 +307,7 @@ class Filesystem:
 
     async def _get_link_count(self, ino: int) -> int:
         """Get link count for an inode"""
-        cursor = await self._db.execute("SELECT COUNT(*) FROM fs_dentry WHERE ino = ?", (ino,))
+        cursor = await self._db.execute("SELECT nlink FROM fs_inode WHERE ino = ?", (ino,))
         result = await cursor.fetchone()
         return result[0] if result else 0
 
@@ -477,6 +483,12 @@ class Filesystem:
             (parent_ino, name),
         )
 
+        # Decrement link count
+        await self._db.execute(
+            "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?",
+            (ino,),
+        )
+
         # Check if this was the last link to the inode
         link_count = await self._get_link_count(ino)
         if link_count == 0:
@@ -508,7 +520,7 @@ class Filesystem:
 
         cursor = await self._db.execute(
             """
-            SELECT ino, mode, uid, gid, size, atime, mtime, ctime
+            SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime
             FROM fs_inode
             WHERE ino = ?
             """,
@@ -519,16 +531,14 @@ class Filesystem:
         if not row:
             raise ValueError(f"Inode not found: {ino}")
 
-        nlink = await self._get_link_count(ino)
-
         return Stats(
             ino=row[0],
             mode=row[1],
-            nlink=nlink,
-            uid=row[2],
-            gid=row[3],
-            size=row[4],
-            atime=row[5],
-            mtime=row[6],
-            ctime=row[7],
+            nlink=row[2],
+            uid=row[3],
+            gid=row[4],
+            size=row[5],
+            atime=row[6],
+            mtime=row[7],
+            ctime=row[8],
         )

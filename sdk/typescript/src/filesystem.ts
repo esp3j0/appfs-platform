@@ -81,6 +81,7 @@ export class Filesystem {
       CREATE TABLE IF NOT EXISTS fs_inode (
         ino INTEGER PRIMARY KEY AUTOINCREMENT,
         mode INTEGER NOT NULL,
+        nlink INTEGER NOT NULL DEFAULT 0,
         uid INTEGER NOT NULL DEFAULT 0,
         gid INTEGER NOT NULL DEFAULT 0,
         size INTEGER NOT NULL DEFAULT 0,
@@ -155,8 +156,8 @@ export class Filesystem {
     if (!root) {
       const now = Math.floor(Date.now() / 1000);
       const insertStmt = this.db.prepare(`
-        INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
-        VALUES (?, ?, 0, 0, 0, ?, ?, ?)
+        INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
+        VALUES (?, ?, 1, 0, 0, 0, ?, ?, ?)
       `);
       await insertStmt.run(this.rootIno, DEFAULT_DIR_MODE, now, now, now);
     }
@@ -278,6 +279,10 @@ export class Filesystem {
       VALUES (?, ?, ?)
     `);
     await stmt.run(name, parentIno, ino);
+
+    // Increment link count
+    const updateStmt = this.db.prepare('UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?');
+    await updateStmt.run(ino);
   }
 
   /**
@@ -316,9 +321,9 @@ export class Filesystem {
    * Get link count for an inode
    */
   private async getLinkCount(ino: number): Promise<number> {
-    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM fs_dentry WHERE ino = ?');
-    const result = await stmt.get(ino) as { count: number };
-    return result.count;
+    const stmt = this.db.prepare('SELECT nlink FROM fs_inode WHERE ino = ?');
+    const result = await stmt.get(ino) as { nlink: number } | undefined;
+    return result?.nlink ?? 0;
   }
 
   private async getInodeMode(ino: number): Promise<number | null> {
@@ -485,6 +490,10 @@ export class Filesystem {
     `);
     await stmt.run(parent.parentIno, parent.name);
 
+    // Decrement link count
+    const decrementStmt = this.db.prepare('UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?');
+    await decrementStmt.run(ino);
+
     // Check if this was the last link to the inode
     const linkCount = await this.getLinkCount(ino);
     if (linkCount === 0) {
@@ -507,13 +516,14 @@ export class Filesystem {
     const { normalizedPath, ino } = await this.resolvePathOrThrow(path, 'stat');
 
     const stmt = this.db.prepare(`
-      SELECT ino, mode, uid, gid, size, atime, mtime, ctime
+      SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime
       FROM fs_inode
       WHERE ino = ?
     `);
     const row = await stmt.get(ino) as {
       ino: number;
       mode: number;
+      nlink: number;
       uid: number;
       gid: number;
       size: number;
@@ -531,12 +541,10 @@ export class Filesystem {
       });
     }
 
-    const nlink = await this.getLinkCount(ino);
-
     return {
       ino: row.ino,
       mode: row.mode,
-      nlink: nlink,
+      nlink: row.nlink,
       uid: row.uid,
       gid: row.gid,
       size: row.size,
@@ -671,6 +679,10 @@ export class Filesystem {
       WHERE parent_ino = ? AND name = ?
     `);
     await stmt.run(parentIno, name);
+
+    // Decrement link count
+    const decrementStmt = this.db.prepare('UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?');
+    await decrementStmt.run(ino);
 
     const linkCount = await this.getLinkCount(ino);
     if (linkCount === 0) {
