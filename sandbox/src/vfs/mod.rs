@@ -2,6 +2,7 @@ pub mod bind;
 pub mod fdtable;
 pub mod file;
 pub mod mount;
+#[cfg(target_os = "linux")]
 pub mod sqlite;
 
 use async_trait::async_trait;
