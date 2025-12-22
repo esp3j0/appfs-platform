@@ -51,6 +51,7 @@ dependencies = [
 name = "agentfs-sdk"
 version = "0.4.0-pre.2"
 dependencies = [
+ "aegis",
  "anyhow",
  "async-trait",
  "criterion",
