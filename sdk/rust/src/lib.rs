@@ -64,11 +64,12 @@ impl AgentFSOptions {
 
     /// Resolve an id-or-path string to AgentFSOptions
     ///
-    /// - `:memory:` -> ephemeral in-memory database
-    /// - Existing file path -> uses that path directly
-    /// - Otherwise -> treats as agent ID, looks for `.agentfs/{id}.db`
+    /// Resolution order (first match wins):
+    /// 1. `:memory:` -> ephemeral in-memory database
+    /// 2. Valid agent ID with existing `.agentfs/{id}.db` -> uses that agent
+    /// 3. Existing file path -> uses that path directly
     ///
-    /// Returns an error if the agent ID is invalid or the database doesn't exist.
+    /// Returns an error if neither an agent nor a file exists.
     pub fn resolve(id_or_path: impl Into<String>) -> Result<Self> {
         let id_or_path = id_or_path.into();
 
@@ -76,30 +77,34 @@ impl AgentFSOptions {
             return Ok(Self::ephemeral());
         }
 
-        let path = Path::new(&id_or_path);
+        // First, check if it's a valid agent ID with an existing database in .agentfs/
+        if AgentFS::validate_agent_id(&id_or_path) {
+            let db_path = agentfs_dir().join(format!("{}.db", id_or_path));
+            if db_path.exists() {
+                return Ok(Self::with_path(db_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("Database path '{}' is not valid UTF-8", db_path.display())
+                })?));
+            }
+        }
 
-        if path.exists() {
+        // Fall back to treating as a direct file path
+        let path = Path::new(&id_or_path);
+        if path.is_file() {
             Ok(Self::with_path(id_or_path))
         } else {
-            // Treat as an agent ID - validate for safety
-            if !AgentFS::validate_agent_id(&id_or_path) {
+            // Not a valid agent and not an existing file
+            if AgentFS::validate_agent_id(&id_or_path) {
+                anyhow::bail!(
+                    "Agent '{}' not found at '{}'",
+                    id_or_path,
+                    agentfs_dir().join(format!("{}.db", id_or_path)).display()
+                );
+            } else {
                 anyhow::bail!(
                     "Invalid agent ID '{}'. Agent IDs must contain only alphanumeric characters, hyphens, and underscores.",
                     id_or_path
                 );
             }
-
-            let db_path = agentfs_dir().join(format!("{}.db", id_or_path));
-            if !db_path.exists() {
-                anyhow::bail!(
-                    "Agent '{}' not found at '{}'",
-                    id_or_path,
-                    db_path.display()
-                );
-            }
-            Ok(Self::with_path(db_path.to_str().ok_or_else(|| {
-                anyhow::anyhow!("Database path '{}' is not valid UTF-8", db_path.display())
-            })?))
         }
     }
 }
