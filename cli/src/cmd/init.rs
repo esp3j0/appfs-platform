@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions};
+use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
 use anyhow::{Context, Result as AnyhowResult};
 
 pub async fn init_database(
@@ -63,52 +63,18 @@ pub async fn init_database(
         .await
         .context("Failed to initialize database")?;
 
-    // If base is provided, store the overlay configuration
+    // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
-        let conn = agent.get_connection();
-
-        // Create whiteout table for overlay support
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_whiteout (
-                path TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await
-        .context("Failed to create whiteout table")?;
-
-        // Create overlay config table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_overlay_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            (),
-        )
-        .await
-        .context("Failed to create overlay config table")?;
-
-        // Store base path configuration
         let base_path_str = base_path
             .canonicalize()
             .context("Failed to canonicalize base path")?
             .to_string_lossy()
             .to_string();
 
-        conn.execute(
-            "INSERT INTO fs_overlay_config (key, value) VALUES ('base_type', 'hostfs')",
-            (),
-        )
-        .await
-        .context("Failed to store base type")?;
-
-        conn.execute(
-            "INSERT INTO fs_overlay_config (key, value) VALUES ('base_path', ?)",
-            (base_path_str.as_str(),),
-        )
-        .await
-        .context("Failed to store base path")?;
+        // Use SDK's OverlayFS::init_schema to ensure schema consistency
+        OverlayFS::init_schema(&agent.get_connection(), &base_path_str)
+            .await
+            .context("Failed to initialize overlay schema")?;
 
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
