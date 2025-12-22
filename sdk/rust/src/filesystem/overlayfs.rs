@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use turso::Value;
+use turso::{Connection, Value};
 
 use super::{agentfs::AgentFS, DirEntry, FileSystem, FilesystemStats, FsError, Stats};
 
@@ -38,16 +38,15 @@ impl OverlayFS {
         Self { base, delta }
     }
 
-    /// Initialize the overlay filesystem schema (creates whiteout table)
+    /// Initialize the overlay filesystem schema in a database.
     ///
-    /// This must be called before using the overlay filesystem to ensure
-    /// the whiteout tracking table exists in the delta layer.
+    /// This is a static method that can be called without creating an OverlayFS
+    /// instance, useful for CLI tools that need to initialize an overlay database.
     ///
     /// The `base_path` parameter specifies the actual filesystem path that the
     /// base layer represents. This is stored in the delta database so that
     /// tools like `agentfs diff` can determine what files were modified.
-    pub async fn init(&self, base_path: &str) -> Result<()> {
-        let conn = self.delta.get_connection();
+    pub async fn init_schema(conn: &Connection, base_path: &str) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS fs_whiteout (
                 path TEXT PRIMARY KEY,
@@ -78,6 +77,18 @@ impl OverlayFS {
         )
         .await?;
         Ok(())
+    }
+
+    /// Initialize the overlay filesystem schema (creates whiteout table)
+    ///
+    /// This must be called before using the overlay filesystem to ensure
+    /// the whiteout tracking table exists in the delta layer.
+    ///
+    /// The `base_path` parameter specifies the actual filesystem path that the
+    /// base layer represents. This is stored in the delta database so that
+    /// tools like `agentfs diff` can determine what files were modified.
+    pub async fn init(&self, base_path: &str) -> Result<()> {
+        Self::init_schema(&self.delta.get_connection(), base_path).await
     }
 
     /// Extract the parent path from a normalized path
