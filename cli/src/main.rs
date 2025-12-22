@@ -8,6 +8,9 @@ mod daemon;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fuse;
 
+#[cfg(target_os = "macos")]
+mod nfs;
+
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 

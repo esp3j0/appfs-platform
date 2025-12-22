@@ -28,12 +28,17 @@ libc = "0.2"
 fuser = { version = "0.15", default-features = false, features = ["abi-7-23"] }
 uuid = { version = "1", features = ["v4"] }
 
-# macOS dependencies for FUSE functionality (requires macFUSE)
+# macOS dependencies for FUSE and NFS functionality
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { version = "0.15", default-features = false, features = [
     "abi-7-23",
     "libfuse",
 ] }
+# NFS server for userspace filesystem without FUSE (used by `agentfs run`)
+nfsserve = "0.10"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Ensure transitive `aegis` (pulled in by `turso`) builds on macOS arm64 by
 # forcing the `pure-rust` feature, which skips the C/NEON backend that fails
 # with Apple clang (`veor3q_u8` in `aegis128l_neon_sha3.c`).
