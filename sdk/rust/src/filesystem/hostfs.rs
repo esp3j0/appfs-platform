@@ -131,6 +131,7 @@ impl FileSystem for HostFS {
 
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.write_all(data).await?;
+        file.flush().await?;
         Ok(())
     }
 
