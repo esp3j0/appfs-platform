@@ -70,6 +70,7 @@ impl AgentFS {
             "CREATE TABLE IF NOT EXISTS fs_inode (
                 ino INTEGER PRIMARY KEY AUTOINCREMENT,
                 mode INTEGER NOT NULL,
+                nlink INTEGER NOT NULL DEFAULT 0,
                 uid INTEGER NOT NULL DEFAULT 0,
                 gid INTEGER NOT NULL DEFAULT 0,
                 size INTEGER NOT NULL DEFAULT 0,
@@ -145,8 +146,8 @@ impl AgentFS {
         if rows.next().await?.is_none() {
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
             conn.execute(
-                "INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
-                VALUES (?, ?, 0, 0, 0, ?, ?, ?)",
+                "INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
+                VALUES (?, ?, 1, 0, 0, 0, ?, ?, ?)",
                 (ROOT_INO, DEFAULT_DIR_MODE as i64, now, now, now),
             )
             .await?;
@@ -234,19 +235,16 @@ impl AgentFS {
     async fn get_link_count(&self, ino: i64) -> Result<u32> {
         let mut rows = self
             .conn
-            .query(
-                "SELECT COUNT(*) as count FROM fs_dentry WHERE ino = ?",
-                (ino,),
-            )
+            .query("SELECT nlink FROM fs_inode WHERE ino = ?", (ino,))
             .await?;
 
         if let Some(row) = rows.next().await? {
-            let count = row
+            let nlink = row
                 .get_value(0)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0);
-            Ok(count as u32)
+            Ok(nlink as u32)
         } else {
             Ok(0)
         }
@@ -255,44 +253,51 @@ impl AgentFS {
     /// Build a Stats object from a database row
     ///
     /// The row should contain columns in this order:
-    /// ino, mode, uid, gid, size, atime, mtime, ctime
-    async fn build_stats_from_row(&self, row: &turso::Row, ino: i64) -> Result<Stats> {
-        let nlink = self.get_link_count(ino).await?;
+    /// ino, mode, nlink, uid, gid, size, atime, mtime, ctime
+    fn build_stats_from_row(row: &turso::Row) -> Result<Stats> {
         Ok(Stats {
-            ino,
+            ino: row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0),
             mode: row
                 .get_value(1)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0) as u32,
-            nlink,
-            uid: row
+            nlink: row
                 .get_value(2)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32,
-            gid: row
+                .unwrap_or(1) as u32,
+            uid: row
                 .get_value(3)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0) as u32,
-            size: row
+            gid: row
                 .get_value(4)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0),
-            atime: row
+                .unwrap_or(0) as u32,
+            size: row
                 .get_value(5)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0),
-            mtime: row
+            atime: row
                 .get_value(6)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0),
-            ctime: row
+            mtime: row
                 .get_value(7)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0),
+            ctime: row
+                .get_value(8)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(0),
@@ -341,19 +346,13 @@ impl AgentFS {
         let mut rows = self
             .conn
             .query(
-                "SELECT ino, mode, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
+                "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
                 (ino,),
             )
             .await?;
 
         if let Some(row) = rows.next().await? {
-            let ino_val = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-
-            let stats = self.build_stats_from_row(&row, ino_val).await?;
+            let stats = Self::build_stats_from_row(&row)?;
             Ok(Some(stats))
         } else {
             Ok(None)
@@ -377,18 +376,12 @@ impl AgentFS {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT ino, mode, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
+                    "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
                     (ino,),
                 )
                 .await?;
 
             if let Some(row) = rows.next().await? {
-                let ino_val = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0);
-
                 let mode = row
                     .get_value(1)
                     .ok()
@@ -418,7 +411,7 @@ impl AgentFS {
                 }
 
                 // Not a symlink, return the stats
-                let stats = self.build_stats_from_row(&row, ino_val).await?;
+                let stats = Self::build_stats_from_row(&row)?;
                 return Ok(Some(stats));
             } else {
                 return Ok(None);
@@ -483,6 +476,14 @@ impl AgentFS {
             )
             .await?;
 
+        // Increment link count
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                (ino,),
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -543,6 +544,14 @@ impl AgentFS {
                     .execute(
                         "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
                         (name.as_str(), parent_ino, ino),
+                    )
+                    .await?;
+
+                // Increment link count
+                self.conn
+                    .execute(
+                        "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                        (ino,),
                     )
                     .await?;
 
@@ -728,6 +737,14 @@ impl AgentFS {
                     .execute(
                         "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
                         (name.as_str(), parent_ino, ino),
+                    )
+                    .await?;
+
+                // Increment link count
+                self.conn
+                    .execute(
+                        "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                        (ino,),
                     )
                     .await?;
 
@@ -1066,8 +1083,7 @@ impl AgentFS {
         let mut rows = self
             .conn
             .query(
-                "SELECT d.name, i.ino, i.mode, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime,
-                        (SELECT COUNT(*) FROM fs_dentry WHERE ino = i.ino) as nlink
+                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime
                  FROM fs_dentry d
                  JOIN fs_inode i ON d.ino = i.ino
                  WHERE d.parent_ino = ?
@@ -1101,7 +1117,7 @@ impl AgentFS {
                 .unwrap_or(0);
 
             let nlink = row
-                .get_value(9)
+                .get_value(3)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
                 .unwrap_or(1) as u32;
@@ -1115,32 +1131,32 @@ impl AgentFS {
                     .unwrap_or(0) as u32,
                 nlink,
                 uid: row
-                    .get_value(3)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32,
-                gid: row
                     .get_value(4)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
                     .unwrap_or(0) as u32,
-                size: row
+                gid: row
                     .get_value(5)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0),
-                atime: row
+                    .unwrap_or(0) as u32,
+                size: row
                     .get_value(6)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
                     .unwrap_or(0),
-                mtime: row
+                atime: row
                     .get_value(7)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
                     .unwrap_or(0),
-                ctime: row
+                mtime: row
                     .get_value(8)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                ctime: row
+                    .get_value(9)
                     .ok()
                     .and_then(|v| v.as_integer().copied())
                     .unwrap_or(0),
@@ -1218,6 +1234,14 @@ impl AgentFS {
             .execute(
                 "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
                 (name.as_str(), parent_ino, ino),
+            )
+            .await?;
+
+        // Increment link count
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                (ino,),
             )
             .await?;
 
@@ -1332,6 +1356,14 @@ impl AgentFS {
             .execute(
                 "DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?",
                 (parent_ino, name.as_str()),
+            )
+            .await?;
+
+        // Decrement link count
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?",
+                (ino,),
             )
             .await?;
 
@@ -1467,6 +1499,14 @@ impl AgentFS {
                     .execute(
                         "DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?",
                         (dst_parent_ino, dst_name.as_str()),
+                    )
+                    .await?;
+
+                // Decrement link count
+                self.conn
+                    .execute(
+                        "UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?",
+                        (dst_ino,),
                     )
                     .await?;
 

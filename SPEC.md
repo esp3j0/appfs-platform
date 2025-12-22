@@ -1,6 +1,6 @@
 # Agent Filesystem Specification
 
-**Version:** 0.1
+**Version:** 0.2
 
 ## Introduction
 
@@ -164,6 +164,7 @@ Stores file and directory metadata.
 CREATE TABLE fs_inode (
   ino INTEGER PRIMARY KEY AUTOINCREMENT,
   mode INTEGER NOT NULL,
+  nlink INTEGER NOT NULL DEFAULT 0,
   uid INTEGER NOT NULL DEFAULT 0,
   gid INTEGER NOT NULL DEFAULT 0,
   size INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +178,7 @@ CREATE TABLE fs_inode (
 
 - `ino` - Inode number (unique identifier)
 - `mode` - File type and permissions (Unix mode bits)
+- `nlink` - Number of hard links pointing to this inode
 - `uid` - Owner user ID
 - `gid` - Owner group ID
 - `size` - Total file size in bytes
@@ -238,7 +240,7 @@ CREATE INDEX idx_fs_dentry_parent ON fs_dentry(parent_ino, name)
 
 - Root directory (ino=1) has no dentry (no parent)
 - Multiple dentries MAY point to the same inode (hard links)
-- Link count = `SELECT COUNT(*) FROM fs_dentry WHERE ino = ?`
+- Link count is stored in `fs_inode.nlink` and must be incremented/decremented when dentries are added/removed
 
 #### Table: `fs_data`
 
@@ -316,13 +318,17 @@ To resolve a path to an inode:
    INSERT INTO fs_dentry (name, parent_ino, ino)
    VALUES (?, ?, ?)
    ```
-5. Split data into chunks and insert each:
+5. Increment link count:
+   ```sql
+   UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?
+   ```
+6. Split data into chunks and insert each:
    ```sql
    INSERT INTO fs_data (ino, chunk_index, data)
    VALUES (?, ?, ?)
    ```
    Where `chunk_index` starts at 0 and increments for each chunk.
-6. Update inode size:
+7. Update inode size:
    ```sql
    UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?
    ```
@@ -378,13 +384,18 @@ To read `length` bytes starting at byte offset `offset`:
    ```sql
    DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?
    ```
-3. Check if last link:
+3. Decrement link count:
    ```sql
-   SELECT COUNT(*) FROM fs_dentry WHERE ino = ?
+   UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?
    ```
-4. If count = 0, delete inode (CASCADE deletes data):
+4. Check if last link:
+   ```sql
+   SELECT nlink FROM fs_inode WHERE ino = ?
+   ```
+5. If nlink = 0, delete inode and data:
    ```sql
    DELETE FROM fs_inode WHERE ino = ?
+   DELETE FROM fs_data WHERE ino = ?
    ```
 
 #### Creating a Hard Link
@@ -396,18 +407,18 @@ To read `length` bytes starting at byte offset `offset`:
    INSERT INTO fs_dentry (name, parent_ino, ino)
    VALUES (?, ?, ?)
    ```
+4. Increment link count:
+   ```sql
+   UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?
+   ```
 
 #### Reading File Metadata (stat)
 
 1. Resolve path to inode
-2. Query inode:
+2. Query inode (includes link count):
    ```sql
-   SELECT ino, mode, uid, gid, size, atime, mtime, ctime
+   SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime
    FROM fs_inode WHERE ino = ?
-   ```
-3. Count links:
-   ```sql
-   SELECT COUNT(*) as nlink FROM fs_dentry WHERE ino = ?
    ```
 
 ### Initialization
@@ -419,13 +430,13 @@ When creating a new agent database, initialize the filesystem configuration and 
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '4096');
 
 -- Initialize root directory
-INSERT INTO fs_inode (ino, mode, uid, gid, size, atime, mtime, ctime)
-VALUES (1, 16877, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
+INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime)
+VALUES (1, 16877, 1, 0, 0, 0, unixepoch(), unixepoch(), unixepoch());
 ```
 
 Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 
-**Note:** The `chunk_size` value can be customized at filesystem creation time but MUST NOT be changed afterward.
+**Note:** The `chunk_size` value can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory has `nlink=1` as it has no parent directory entry.
 
 ### Consistency Rules
 
@@ -633,6 +644,8 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 
 - Added Overlay Filesystem section with `fs_whiteout` table for copy-on-write semantics
 - Whiteout table includes `parent_path` column with index for efficient O(1) child lookups
+- Added `nlink` column to `fs_inode` table to store link count directly
+- Link count is now maintained in the inode rather than computed via COUNT(*) on `fs_dentry`
 
 ### Version 0.1
 
