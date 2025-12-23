@@ -1,8 +1,12 @@
 use agentfs_sdk::{BoxedFile, FileSystem, FsError, Stats};
 use fuser::{
-    consts::FUSE_WRITEBACK_CACHE, FileAttr, FileType, Filesystem, KernelConfig, MountOption,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    consts::{
+        FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
+        FUSE_WRITEBACK_CACHE,
+    },
+    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    Request,
 };
 use parking_lot::Mutex;
 use std::{
@@ -59,12 +63,26 @@ struct AgentFSFuse {
 }
 
 impl Filesystem for AgentFSFuse {
-    /// Initialize the filesystem and enable writeback caching.
+    /// Initialize the filesystem and enable performance optimizations.
     ///
-    /// Writeback caching allows the kernel to buffer writes and flush them
-    /// later, significantly improving write performance for small writes.
+    /// - Async read: allows the kernel to issue multiple read requests in parallel,
+    ///   improving throughput for concurrent file access.
+    /// - Writeback caching: allows the kernel to buffer writes and flush them
+    ///   later, significantly improving write performance for small writes.
+    /// - Parallel dirops: allows concurrent lookup() and readdir() on the same
+    ///   directory, improving performance for parallel file access patterns.
+    /// - Cache symlinks: caches readlink responses, avoiding repeated round-trips
+    ///   for symlink resolution.
+    /// - No opendir support: skips opendir/releasedir calls since we don't track
+    ///   directory handles, reducing round-trips for directory operations.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
-        let _ = config.add_capabilities(FUSE_WRITEBACK_CACHE);
+        let _ = config.add_capabilities(
+            FUSE_ASYNC_READ
+                | FUSE_WRITEBACK_CACHE
+                | FUSE_PARALLEL_DIROPS
+                | FUSE_CACHE_SYMLINKS
+                | FUSE_NO_OPENDIR_SUPPORT,
+        );
         Ok(())
     }
 
