@@ -7,7 +7,9 @@ use std::{
 };
 use turso::{Connection, Value};
 
-use super::{agentfs::AgentFS, DirEntry, FileSystem, FilesystemStats, FsError, Stats};
+use super::{
+    agentfs::AgentFS, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats,
+};
 
 /// A copy-on-write overlay filesystem.
 ///
@@ -30,6 +32,123 @@ pub struct OverlayFS {
     base: Arc<dyn FileSystem>,
     /// Writable delta layer (must be AgentFS for whiteout storage)
     delta: AgentFS,
+}
+
+/// An open file handle for OverlayFS.
+///
+/// Tracks which layer(s) the file exists in so that operations like fsync
+/// only operate on the relevant layer(s).
+pub struct OverlayFile {
+    /// File handle for the delta layer (if file exists there).
+    delta_file: Option<BoxedFile>,
+    /// File handle for the base layer (if file exists there).
+    base_file: Option<BoxedFile>,
+    /// Reference to delta for copy-on-write operations.
+    delta: AgentFS,
+    /// The normalized path for copy-on-write operations.
+    path: String,
+    /// Track if we've done copy-on-write (to avoid re-copying).
+    copied_to_delta: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl File for OverlayFile {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        // Prefer delta if available
+        if let Some(ref file) = self.delta_file {
+            return file.pread(offset, size).await;
+        }
+        // Fall back to base
+        if let Some(ref file) = self.base_file {
+            return file.pread(offset, size).await;
+        }
+        // File doesn't exist in either layer
+        Ok(Vec::new())
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        // If we already have a delta file handle, use it directly
+        if let Some(ref delta_file) = self.delta_file {
+            return delta_file.pwrite(offset, data).await;
+        }
+
+        // Copy-on-write if needed
+        if !self
+            .copied_to_delta
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(ref base_file) = self.base_file {
+                let stats = base_file.fstat().await?;
+                let base_data = base_file.pread(0, stats.size as u64).await?;
+                self.delta.write_file(&self.path, &base_data).await?;
+            } else {
+                self.delta.write_file(&self.path, &[]).await?;
+            }
+            self.copied_to_delta
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // Open file in delta and write using the file handle
+        let delta_file = self.delta.open(&self.path).await?;
+        delta_file.pwrite(offset, data).await
+    }
+
+    async fn truncate(&self, size: u64) -> Result<()> {
+        // If we already have a delta file handle, use it directly
+        if let Some(ref delta_file) = self.delta_file {
+            return delta_file.truncate(size).await;
+        }
+
+        // Copy-on-write if needed
+        if !self
+            .copied_to_delta
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(ref base_file) = self.base_file {
+                let stats = base_file.fstat().await?;
+                let base_data = base_file.pread(0, stats.size as u64).await?;
+                self.delta.write_file(&self.path, &base_data).await?;
+            } else {
+                self.delta.write_file(&self.path, &[]).await?;
+            }
+            self.copied_to_delta
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // Open file in delta and truncate using the file handle
+        let delta_file = self.delta.open(&self.path).await?;
+        delta_file.truncate(size).await
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        // If we have a delta file handle, use it
+        if let Some(ref delta_file) = self.delta_file {
+            return delta_file.fsync().await;
+        }
+
+        // If we did copy-on-write, open and sync
+        if self
+            .copied_to_delta
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let delta_file = self.delta.open(&self.path).await?;
+            return delta_file.fsync().await;
+        }
+
+        // File only exists in base (read-only), nothing to sync
+        Ok(())
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        // Prefer delta stats if available
+        if let Some(ref file) = self.delta_file {
+            return file.fstat().await;
+        }
+        if let Some(ref file) = self.base_file {
+            return file.fstat().await;
+        }
+        anyhow::bail!("File not found")
+    }
 }
 
 impl OverlayFS {
@@ -381,60 +500,6 @@ impl FileSystem for OverlayFS {
         self.delta.write_file(&normalized, data).await
     }
 
-    async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>> {
-        let normalized = self.normalize_path(path);
-
-        if self.is_whiteout(&normalized).await? {
-            return Ok(None);
-        }
-
-        // Check if file exists in delta
-        if self.exists_in_delta(&normalized).await? {
-            return self.delta.pread(&normalized, offset, size).await;
-        }
-
-        // Read from base
-        self.base.pread(&normalized, offset, size).await
-    }
-
-    async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
-        let normalized = self.normalize_path(path);
-
-        // Copy-on-write: if file exists in base but not delta, copy it first
-        if !self.exists_in_delta(&normalized).await? {
-            if let Some(base_data) = self.base.read_file(&normalized).await? {
-                self.ensure_parent_dirs(&normalized).await?;
-                self.delta.write_file(&normalized, &base_data).await?;
-            }
-        }
-
-        // Remove any whiteout
-        self.remove_whiteout(&normalized).await?;
-
-        // Ensure parent directories exist
-        self.ensure_parent_dirs(&normalized).await?;
-
-        // Write to delta
-        self.delta.pwrite(&normalized, offset, data).await
-    }
-
-    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
-        let normalized = self.normalize_path(path);
-
-        // Copy-on-write: if file exists in base but not delta, copy it first
-        if !self.exists_in_delta(&normalized).await? {
-            if let Some(base_data) = self.base.read_file(&normalized).await? {
-                self.ensure_parent_dirs(&normalized).await?;
-                self.delta.write_file(&normalized, &base_data).await?;
-            } else {
-                return Err(FsError::NotFound.into());
-            }
-        }
-
-        // Truncate in delta
-        self.delta.truncate(&normalized, size).await
-    }
-
     async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
         let normalized = self.normalize_path(path);
 
@@ -676,9 +741,36 @@ impl FileSystem for OverlayFS {
         self.delta.statfs().await
     }
 
-    async fn fsync(&self, path: &str) -> Result<()> {
-        self.base.fsync(path).await?;
-        self.delta.fsync(path).await
+    async fn open(&self, path: &str) -> Result<BoxedFile> {
+        let normalized = self.normalize_path(path);
+
+        // Check for whiteout
+        if self.is_whiteout(&normalized).await? {
+            anyhow::bail!("File not found (whiteout): {}", path);
+        }
+
+        // Try to open from delta
+        let delta_file = if self.exists_in_delta(&normalized).await? {
+            Some(self.delta.open(&normalized).await?)
+        } else {
+            None
+        };
+
+        // Try to open from base
+        let base_file = self.base.open(&normalized).await.ok();
+
+        // Must exist in at least one layer
+        if delta_file.is_none() && base_file.is_none() {
+            anyhow::bail!("File not found: {}", path);
+        }
+
+        Ok(Arc::new(OverlayFile {
+            delta_file,
+            base_file,
+            delta: self.delta.clone(),
+            path: normalized,
+            copied_to_delta: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 }
 
@@ -767,8 +859,9 @@ mod tests {
     async fn test_overlay_copy_on_write() -> Result<()> {
         let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
 
-        // Modify base file via pwrite (should copy to delta first)
-        overlay.pwrite("/base.txt", 0, b"modified").await?;
+        // Open file handle and modify base file via pwrite (should copy to delta first)
+        let file = overlay.open("/base.txt").await?;
+        file.pwrite(0, b"modified").await?;
 
         // Read should show modified content
         let data = overlay.read_file("/base.txt").await?.unwrap();
@@ -999,9 +1092,17 @@ mod prop_tests {
                     overlay.write_file(path, contents).await
                 }
                 FsOperation::PWrite { path, offset, data } => {
-                    overlay.pwrite(path, *offset, data).await
+                    // Create file if it doesn't exist, then use file handle
+                    if overlay.stat(path).await?.is_none() {
+                        overlay.write_file(path, &[]).await?;
+                    }
+                    let file = overlay.open(path).await?;
+                    file.pwrite(*offset, data).await
                 }
-                FsOperation::Truncate { path, size } => overlay.truncate(path, *size).await,
+                FsOperation::Truncate { path, size } => {
+                    let file = overlay.open(path).await?;
+                    file.truncate(*size).await
+                }
                 FsOperation::Mkdir { path } => overlay.mkdir(path).await,
                 FsOperation::Remove { path } => overlay.remove(path).await,
                 FsOperation::Rename { from, to } => overlay.rename(from, to).await,

@@ -231,7 +231,8 @@ impl NFSFileSystem for AgentNFS {
         // Handle size change (truncate)
         if let nfsserve::nfs::set_size3::size(size) = setattr.size {
             let fs = self.fs.lock().await;
-            fs.truncate(&path, size)
+            let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            file.truncate(size)
                 .await
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
@@ -249,18 +250,14 @@ impl NFSFileSystem for AgentNFS {
         let path = self.get_path(id).await?;
         let fs = self.fs.lock().await;
 
-        let data = fs
-            .pread(&path, offset, count as u64)
+        let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let data = file
+            .pread(offset, count as u64)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
         // Check if we've reached EOF
-        let stats = fs
-            .lstat(&path)
-            .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        let stats = file.fstat().await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
         let eof = offset + data.len() as u64 >= stats.size as u64;
         Ok((data, eof))
@@ -271,7 +268,8 @@ impl NFSFileSystem for AgentNFS {
 
         {
             let fs = self.fs.lock().await;
-            fs.pwrite(&path, offset, data)
+            let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            file.pwrite(offset, data)
                 .await
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }

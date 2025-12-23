@@ -5,6 +5,7 @@ pub mod overlayfs;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use thiserror::Error;
 
 // Re-export implementations
@@ -121,6 +122,32 @@ impl Stats {
     }
 }
 
+/// An open file handle for performing I/O operations.
+///
+/// This trait represents an open file, similar to a file descriptor in POSIX.
+/// Operations on this handle don't require path lookups since the file was
+/// already resolved at open time.
+#[async_trait]
+pub trait File: Send + Sync {
+    /// Read from the file at the given offset (like POSIX pread).
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>>;
+
+    /// Write to the file at the given offset (like POSIX pwrite).
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Truncate the file to the specified size.
+    async fn truncate(&self, size: u64) -> Result<()>;
+
+    /// Synchronize file data to persistent storage.
+    async fn fsync(&self) -> Result<()>;
+
+    /// Get file statistics.
+    async fn fstat(&self) -> Result<Stats>;
+}
+
+/// A boxed File trait object for dynamic dispatch.
+pub type BoxedFile = Arc<dyn File>;
+
 /// A trait defining filesystem operations.
 #[async_trait]
 pub trait FileSystem: Send + Sync {
@@ -137,20 +164,6 @@ pub trait FileSystem: Send + Sync {
 
     /// Write data to a file (creates or overwrites)
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<()>;
-
-    /// Read from a file at a given offset (like POSIX pread)
-    ///
-    /// Returns `Ok(None)` if the file does not exist.
-    async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>>;
-
-    /// Write to a file at a given offset (like POSIX pwrite)
-    ///
-    /// If the file does not exist, it will be created.
-    /// If the offset is beyond the current file size, the file is extended with zeros.
-    async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()>;
-
-    /// Truncate a file to a specific size
-    async fn truncate(&self, path: &str, size: u64) -> Result<()>;
 
     /// List directory contents
     ///
@@ -185,9 +198,9 @@ pub trait FileSystem: Send + Sync {
     /// Get filesystem statistics
     async fn statfs(&self) -> Result<FilesystemStats>;
 
-    /// Synchronize file data to persistent storage
+    /// Open a file and return a file handle for I/O operations.
     ///
-    /// Note: The path parameter may be ignored by implementations that use
-    /// a single backing store.
-    async fn fsync(&self, path: &str) -> Result<()>;
+    /// The returned file handle can be used for efficient read/write/fsync
+    /// operations without requiring path lookups on each operation.
+    async fn open(&self, path: &str) -> Result<BoxedFile>;
 }

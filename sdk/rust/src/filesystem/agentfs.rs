@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use turso::{Builder, Connection, Value};
 
 use super::{
-    DirEntry, FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE,
-    S_IFLNK, S_IFMT,
+    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE,
+    DEFAULT_FILE_MODE, S_IFLNK, S_IFMT,
 };
 
 const ROOT_INO: i64 = 1;
@@ -18,6 +18,271 @@ const DEFAULT_CHUNK_SIZE: usize = 4096;
 pub struct AgentFS {
     conn: Arc<Connection>,
     chunk_size: usize,
+}
+
+/// An open file handle for AgentFS.
+///
+/// This struct holds the inode number resolved at open time, allowing
+/// efficient read/write/fsync operations without path lookups.
+pub struct AgentFSFile {
+    conn: Arc<Connection>,
+    ino: i64,
+    chunk_size: usize,
+}
+
+#[async_trait]
+impl File for AgentFSFile {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let chunk_size = self.chunk_size as u64;
+        let start_chunk = offset / chunk_size;
+        let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT chunk_index, data FROM fs_data WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ? ORDER BY chunk_index",
+                (self.ino, start_chunk as i64, end_chunk as i64),
+            )
+            .await?;
+
+        let mut result = Vec::with_capacity(size as usize);
+        let start_offset_in_chunk = (offset % chunk_size) as usize;
+
+        while let Some(row) = rows.next().await? {
+            if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
+                let skip = if result.is_empty() {
+                    start_offset_in_chunk
+                } else {
+                    0
+                };
+                if skip >= chunk_data.len() {
+                    continue;
+                }
+                let remaining = size as usize - result.len();
+                let take = std::cmp::min(chunk_data.len() - skip, remaining);
+                result.extend_from_slice(&chunk_data[skip..skip + take]);
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        // Get current file size
+        let mut rows = self
+            .conn
+            .query("SELECT size FROM fs_inode WHERE ino = ?", (self.ino,))
+            .await?;
+        let current_size = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        // If writing beyond current size, extend with zeros first
+        if offset > current_size {
+            let zeros = vec![0u8; (offset - current_size) as usize];
+            self.write_data_at_offset(current_size, &zeros).await?;
+        }
+
+        // Write the actual data
+        self.write_data_at_offset(offset, data).await?;
+
+        // Update file size and mtime
+        let new_size = std::cmp::max(current_size, offset + data.len() as u64);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
+                (new_size as i64, now, self.ino),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn truncate(&self, new_size: u64) -> Result<()> {
+        // Get current size
+        let mut rows = self
+            .conn
+            .query("SELECT size FROM fs_inode WHERE ino = ?", (self.ino,))
+            .await?;
+        let current_size = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        let chunk_size = self.chunk_size as u64;
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result: Result<()> = async {
+            if new_size == 0 {
+                // Special case: truncate to zero - just delete all chunks
+                self.conn
+                    .execute("DELETE FROM fs_data WHERE ino = ?", (self.ino,))
+                    .await?;
+            } else if new_size < current_size {
+                // Shrinking: delete excess chunks and truncate last chunk if needed
+                let last_chunk_idx = (new_size - 1) / chunk_size;
+
+                // Delete all chunks beyond the last one we need
+                self.conn
+                    .execute(
+                        "DELETE FROM fs_data WHERE ino = ? AND chunk_index > ?",
+                        (self.ino, last_chunk_idx as i64),
+                    )
+                    .await?;
+
+                // Truncate the last chunk if needed
+                let offset_in_chunk = (new_size % chunk_size) as usize;
+                if offset_in_chunk > 0 {
+                    let mut rows = self
+                        .conn
+                        .query(
+                            "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                            (self.ino, last_chunk_idx as i64),
+                        )
+                        .await?;
+
+                    if let Some(row) = rows.next().await? {
+                        if let Ok(Value::Blob(mut chunk_data)) = row.get_value(0) {
+                            if chunk_data.len() > offset_in_chunk {
+                                chunk_data.truncate(offset_in_chunk);
+                                self.conn
+                                    .execute(
+                                        "UPDATE fs_data SET data = ? WHERE ino = ? AND chunk_index = ?",
+                                        (Value::Blob(chunk_data), self.ino, last_chunk_idx as i64),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                }
+            }
+            // For extending (new_size > current_size), we just update the size
+            // The sparse regions will be handled by pread returning zeros
+
+            // Update the inode size and mtime
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            self.conn
+                .execute(
+                    "UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?",
+                    (new_size as i64, now, self.ino),
+                )
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+            return result;
+        }
+
+        self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        self.conn.execute("PRAGMA synchronous = FULL", ()).await?;
+        self.conn.execute("BEGIN", ()).await?;
+        self.conn.execute("COMMIT", ()).await?;
+        self.conn.execute("PRAGMA synchronous = OFF", ()).await?;
+        Ok(())
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
+                (self.ino,),
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            AgentFS::build_stats_from_row(&row)
+        } else {
+            anyhow::bail!("File not found")
+        }
+    }
+}
+
+impl AgentFSFile {
+    /// Write data at a specific offset, handling chunk boundaries.
+    async fn write_data_at_offset(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let chunk_size = self.chunk_size as u64;
+        let mut written = 0usize;
+
+        while written < data.len() {
+            let current_offset = offset + written as u64;
+            let chunk_index = (current_offset / chunk_size) as i64;
+            let offset_in_chunk = (current_offset % chunk_size) as usize;
+
+            // How much can we write in this chunk?
+            let remaining_in_chunk = self.chunk_size - offset_in_chunk;
+            let remaining_data = data.len() - written;
+            let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
+
+            // Get existing chunk data (if any)
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?",
+                    (self.ino, chunk_index),
+                )
+                .await?;
+
+            let mut chunk_data = if let Some(row) = rows.next().await? {
+                row.get_value(0)
+                    .ok()
+                    .and_then(|v| {
+                        if let Value::Blob(b) = v {
+                            Some(b.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            // Extend chunk if needed
+            if chunk_data.len() < offset_in_chunk + to_write {
+                chunk_data.resize(offset_in_chunk + to_write, 0);
+            }
+
+            // Write data into chunk
+            chunk_data[offset_in_chunk..offset_in_chunk + to_write]
+                .copy_from_slice(&data[written..written + to_write]);
+
+            // Save chunk
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                    (self.ino, chunk_index, Value::Blob(chunk_data)),
+                )
+                .await?;
+
+            written += to_write;
+        }
+
+        Ok(())
+    }
 }
 
 impl AgentFS {
@@ -1616,6 +1881,24 @@ impl AgentFS {
         Ok(())
     }
 
+    /// Open a file and return a file handle.
+    ///
+    /// The returned handle can be used for efficient read/write/fsync operations
+    /// without requiring path lookups on each operation.
+    pub async fn open(&self, path: &str) -> Result<BoxedFile> {
+        let path = self.normalize_path(path);
+        let ino = self
+            .resolve_path(&path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("File not found: {}", path))?;
+
+        Ok(Arc::new(AgentFSFile {
+            conn: self.conn.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+        }))
+    }
+
     /// Get the number of chunks for a given inode (for testing)
     #[cfg(test)]
     async fn get_chunk_count(&self, ino: i64) -> Result<i64> {
@@ -1654,18 +1937,6 @@ impl FileSystem for AgentFS {
         AgentFS::write_file(self, path, data).await
     }
 
-    async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>> {
-        AgentFS::pread(self, path, offset, size).await
-    }
-
-    async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
-        AgentFS::pwrite(self, path, offset, data).await
-    }
-
-    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
-        AgentFS::truncate(self, path, size).await
-    }
-
     async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
         AgentFS::readdir(self, path).await
     }
@@ -1698,8 +1969,8 @@ impl FileSystem for AgentFS {
         AgentFS::statfs(self).await
     }
 
-    async fn fsync(&self, path: &str) -> Result<()> {
-        AgentFS::fsync(self, path).await
+    async fn open(&self, path: &str) -> Result<BoxedFile> {
+        AgentFS::open(self, path).await
     }
 }
 
