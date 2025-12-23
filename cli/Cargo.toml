@@ -29,13 +29,13 @@ libc = "0.2"
 
 # Linux-only dependencies for FUSE functionality
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.15", default-features = false, features = ["abi-7-23"] }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-25"] }
 uuid = { version = "1", features = ["v4"] }
 
 # macOS dependencies for FUSE and NFS functionality
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { version = "0.15", default-features = false, features = [
-    "abi-7-23",
+    "abi-7-25",
     "libfuse",
 ] }
 # NFS server for userspace filesystem without FUSE (used by `agentfs run`)
