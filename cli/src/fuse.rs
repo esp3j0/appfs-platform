@@ -1,4 +1,4 @@
-use agentfs_sdk::{FileSystem, FsError, Stats};
+use agentfs_sdk::{BoxedFile, FileSystem, FsError, Stats};
 use fuser::{
     consts::FUSE_WRITEBACK_CACHE, FileAttr, FileType, Filesystem, KernelConfig, MountOption,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
@@ -40,7 +40,8 @@ pub struct FuseMountOptions {
 
 /// Tracks an open file handle
 struct OpenFile {
-    path: String,
+    /// The file handle from the filesystem layer.
+    file: BoxedFile,
 }
 
 struct AgentFSFuse {
@@ -162,24 +163,33 @@ impl Filesystem for AgentFSFuse {
     ) {
         // Handle truncate
         if let Some(new_size) = size {
-            let path = if let Some(fh) = fh {
-                // Get path from file handle
-                let open_files = self.open_files.lock();
-                open_files.get(&fh).map(|f| f.path.clone())
+            let result = if let Some(fh) = fh {
+                // Use file handle if available (ftruncate)
+                let file = {
+                    let open_files = self.open_files.lock();
+                    open_files.get(&fh).map(|f| f.file.clone())
+                };
+
+                if let Some(file) = file {
+                    self.runtime
+                        .block_on(async move { file.truncate(new_size).await })
+                } else {
+                    reply.error(libc::EBADF);
+                    return;
+                }
             } else {
-                // Get path from inode cache
-                self.path_cache.lock().get(&ino).cloned()
-            };
+                // Open file and truncate via file handle
+                let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
+                    reply.error(libc::ENOENT);
+                    return;
+                };
 
-            let Some(path) = path else {
-                reply.error(libc::ENOENT);
-                return;
+                let fs = self.fs.clone();
+                self.runtime.block_on(async move {
+                    let file = fs.open(&path).await?;
+                    file.truncate(new_size).await
+                })
             };
-
-            let fs = self.fs.clone();
-            let result = self
-                .runtime
-                .block_on(async move { fs.truncate(&path, new_size).await });
 
             if result.is_err() {
                 reply.error(libc::EIO);
@@ -624,8 +634,23 @@ impl Filesystem for AgentFSFuse {
             }
         };
 
+        // Open the file to get a file handle
+        let fs = self.fs.clone();
+        let path_clone = path.clone();
+        let open_result = self
+            .runtime
+            .block_on(async move { fs.open(&path_clone).await });
+
+        let file = match open_result {
+            Ok(file) => file,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+
         let fh = self.alloc_fh();
-        self.open_files.lock().insert(fh, OpenFile { path });
+        self.open_files.lock().insert(fh, OpenFile { file });
 
         reply.created(&TTL, &attr, 0, fh, 0);
     }
@@ -755,20 +780,30 @@ impl Filesystem for AgentFSFuse {
 
     /// Opens a file for reading or writing.
     ///
-    /// Allocates a file handle. Reads and writes go directly to the database.
+    /// Allocates a file handle and opens the file in the filesystem layer.
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
 
-        let fh = self.alloc_fh();
-        self.open_files.lock().insert(fh, OpenFile { path });
+        let fs = self.fs.clone();
+        let path_clone = path.clone();
+        let result = self
+            .runtime
+            .block_on(async move { fs.open(&path_clone).await });
 
-        reply.opened(fh, 0);
+        match result {
+            Ok(file) => {
+                let fh = self.alloc_fh();
+                self.open_files.lock().insert(fh, OpenFile { file });
+                reply.opened(fh, 0);
+            }
+            Err(_) => reply.error(libc::EIO),
+        }
     }
 
-    /// Reads data directly from the database.
+    /// Reads data using the file handle.
     fn read(
         &mut self,
         _req: &Request,
@@ -780,28 +815,26 @@ impl Filesystem for AgentFSFuse {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = {
+        let file = {
             let open_files = self.open_files.lock();
-            let Some(file) = open_files.get(&fh) else {
+            let Some(open_file) = open_files.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            file.path.clone()
+            open_file.file.clone()
         };
 
-        let fs = self.fs.clone();
         let result = self
             .runtime
-            .block_on(async move { fs.pread(&path, offset as u64, size as u64).await });
+            .block_on(async move { file.pread(offset as u64, size as u64).await });
 
         match result {
-            Ok(Some(data)) => reply.data(&data),
-            Ok(None) => reply.data(&[]),
+            Ok(data) => reply.data(&data),
             Err(_) => reply.error(libc::EIO),
         }
     }
 
-    /// Writes data directly to the database.
+    /// Writes data using the file handle.
     fn write(
         &mut self,
         _req: &Request,
@@ -814,21 +847,20 @@ impl Filesystem for AgentFSFuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let path = {
+        let file = {
             let open_files = self.open_files.lock();
-            let Some(file) = open_files.get(&fh) else {
+            let Some(open_file) = open_files.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            file.path.clone()
+            open_file.file.clone()
         };
 
-        let fs = self.fs.clone();
         let data_len = data.len();
         let data_vec = data.to_vec();
         let result = self
             .runtime
-            .block_on(async move { fs.pwrite(&path, offset as u64, &data_vec).await });
+            .block_on(async move { file.pwrite(offset as u64, &data_vec).await });
 
         match result {
             Ok(()) => reply.written(data_len as u32),
@@ -848,15 +880,15 @@ impl Filesystem for AgentFSFuse {
         }
     }
 
-    /// Synchronizes file data to persistent storage.
+    /// Synchronizes file data to persistent storage using the file handle.
     ///
-    /// Ensures all pending writes are durably committed by temporarily
-    /// enabling FULL synchronous mode in SQLite.
+    /// This now uses the file handle's fsync which knows which layer(s) the
+    /// file exists in, avoiding errors when a file only exists in one layer.
     fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        let path = {
+        let file = {
             let open_files = self.open_files.lock();
             match open_files.get(&fh) {
-                Some(file) => file.path.clone(),
+                Some(open_file) => open_file.file.clone(),
                 None => {
                     reply.error(libc::EBADF);
                     return;
@@ -864,8 +896,7 @@ impl Filesystem for AgentFSFuse {
             }
         };
 
-        let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move { fs.fsync(&path).await });
+        let result = self.runtime.block_on(async move { file.fsync().await });
 
         match result {
             Ok(()) => reply.ok(),

@@ -8,12 +8,70 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[cfg(unix)]
 use libc;
 
-use super::{DirEntry, FileSystem, FilesystemStats, Stats};
+use super::{BoxedFile, DirEntry, File, FileSystem, FilesystemStats, Stats};
+use std::sync::Arc;
 
 /// A filesystem backed by a host directory (passthrough)
 #[derive(Clone)]
 pub struct HostFS {
     root: PathBuf,
+}
+
+/// An open file handle for HostFS.
+pub struct HostFSFile {
+    /// The resolved full path on the host filesystem.
+    full_path: PathBuf,
+    /// The virtual path (for generating consistent inode numbers in fstat).
+    virtual_path: String,
+}
+
+#[async_trait]
+impl File for HostFSFile {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let mut file = fs::File::open(&self.full_path).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut buf = vec![0u8; size as usize];
+        let n = file.read(&mut buf).await?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.full_path)
+            .await?;
+
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn truncate(&self, size: u64) -> Result<()> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.full_path)
+            .await?;
+        file.set_len(size).await?;
+        Ok(())
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.full_path)
+            .await?;
+        file.sync_all().await?;
+        Ok(())
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        let metadata = fs::metadata(&self.full_path).await?;
+        Ok(HostFS::metadata_to_stats(&metadata, &self.virtual_path))
+    }
 }
 
 impl HostFS {
@@ -100,45 +158,6 @@ impl FileSystem for HostFS {
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<()> {
         let full_path = self.resolve_path(path);
         fs::write(&full_path, data).await?;
-        Ok(())
-    }
-
-    async fn pread(&self, path: &str, offset: u64, size: u64) -> Result<Option<Vec<u8>>> {
-        let full_path = self.resolve_path(path);
-        let mut file = match fs::File::open(&full_path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut buf = vec![0u8; size as usize];
-        let n = file.read(&mut buf).await?;
-        buf.truncate(n);
-        Ok(Some(buf))
-    }
-
-    async fn pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
-        let full_path = self.resolve_path(path);
-
-        // Open file for writing, create if doesn't exist
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&full_path)
-            .await?;
-
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        file.write_all(data).await?;
-        file.flush().await?;
-        Ok(())
-    }
-
-    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
-        let full_path = self.resolve_path(path);
-        let file = fs::File::open(&full_path).await?;
-        file.set_len(size).await?;
         Ok(())
     }
 
@@ -268,11 +287,16 @@ impl FileSystem for HostFS {
         Ok(FilesystemStats { inodes, bytes_used })
     }
 
-    async fn fsync(&self, path: &str) -> Result<()> {
+    async fn open(&self, path: &str) -> Result<BoxedFile> {
         let full_path = self.resolve_path(path);
-        let file = fs::File::open(&full_path).await?;
-        file.sync_all().await?;
-        Ok(())
+        // Verify the file exists
+        if !full_path.exists() {
+            anyhow::bail!("File not found: {}", path);
+        }
+        Ok(Arc::new(HostFSFile {
+            full_path,
+            virtual_path: path.to_string(),
+        }))
     }
 }
 
@@ -328,12 +352,15 @@ mod tests {
         // Write initial data
         fs.write_file("/test.txt", b"hello world").await?;
 
-        // pread
-        let data = fs.pread("/test.txt", 6, 5).await?.unwrap();
+        // Open file handle
+        let file = fs.open("/test.txt").await?;
+
+        // pread via file handle
+        let data = file.pread(6, 5).await?;
         assert_eq!(data, b"world");
 
-        // pwrite
-        fs.pwrite("/test.txt", 6, b"rust!").await?;
+        // pwrite via file handle
+        file.pwrite(6, b"rust!").await?;
         let data = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(data, b"hello rust!");
 
