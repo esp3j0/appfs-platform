@@ -14,7 +14,6 @@ pub enum Shell {
     Zsh,
     Fish,
     Elvish,
-    #[expect(clippy::enum_variant_names)]
     PowerShell,
 }
 
