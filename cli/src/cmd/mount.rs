@@ -62,7 +62,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
     };
 
     let mount = move || {
-        let rt = tokio::runtime::Runtime::new()?;
+        let rt = crate::get_runtime();
         let agentfs = rt.block_on(AgentFS::open(opts))?;
 
         // Check for overlay configuration
