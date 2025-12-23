@@ -33,37 +33,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Fs { command } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            match command {
-                FsCommand::Ls {
-                    id_or_path,
-                    fs_path,
-                } => {
-                    if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
-                        &mut std::io::stdout(),
-                        id_or_path,
-                        &fs_path,
-                    )) {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-                FsCommand::Cat {
-                    id_or_path,
-                    file_path,
-                } => {
-                    if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
-                        &mut std::io::stdout(),
-                        id_or_path,
-                        &file_path,
-                    )) {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
         Command::Run {
             allow,
             no_default_allows,
@@ -112,6 +81,37 @@ fn main() {
             if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Command::Fs { command } => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            match command {
+                FsCommand::Ls {
+                    id_or_path,
+                    fs_path,
+                } => {
+                    if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
+                        &mut std::io::stdout(),
+                        id_or_path,
+                        &fs_path,
+                    )) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                FsCommand::Cat {
+                    id_or_path,
+                    file_path,
+                } => {
+                    if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
+                        &mut std::io::stdout(),
+                        id_or_path,
+                        &file_path,
+                    )) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Command::Completions { command } => handle_completions(command),
