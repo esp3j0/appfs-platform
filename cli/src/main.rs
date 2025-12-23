@@ -1,21 +1,9 @@
-mod cmd;
-mod parser;
-mod sandbox;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod daemon;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod fuse;
-
-#[cfg(target_os = "macos")]
-mod nfs;
-
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 
-use crate::{
-    cmd::completions::handle_completions,
+use agentfs::{
+    cmd::{self, completions::handle_completions},
+    get_runtime,
     parser::{Args, Command, FsCommand},
 };
 
@@ -27,7 +15,7 @@ fn main() {
 
     match args.command {
         Command::Init { id, force, base } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::init::init_database(id, force, base)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -41,7 +29,7 @@ fn main() {
             command,
             args,
         } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
                 allow,
                 no_default_allows,
@@ -77,14 +65,14 @@ fn main() {
             }
         }
         Command::Diff { id_or_path } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
         Command::Fs { command } => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = get_runtime();
             match command {
                 FsCommand::Ls {
                     id_or_path,

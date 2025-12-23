@@ -4,6 +4,10 @@ version = "0.4.0-pre.4"
 edition = "2021"
 repository = "https://github.com/tursodatabase/agentfs"
 
+[lib]
+name = "agentfs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agentfs"
 path = "src/main.rs"
