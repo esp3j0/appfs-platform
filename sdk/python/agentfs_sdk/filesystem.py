@@ -1049,6 +1049,7 @@ class Filesystem:
 
                 # Replace destination contents
                 await self._db.execute("DELETE FROM fs_data WHERE ino = ?", (dest_ino,))
+                await self._db.commit()
 
                 # Copy data chunks
                 cursor = await self._db.execute(
