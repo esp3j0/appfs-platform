@@ -331,9 +331,7 @@ class Filesystem:
         row = await cursor.fetchone()
         return row[0] if row else None
 
-    async def _resolve_path_or_throw(
-        self, path: str, syscall: FsSyscall
-    ) -> tuple[str, int]:
+    async def _resolve_path_or_throw(self, path: str, syscall: FsSyscall) -> tuple[str, int]:
         """Resolve path to inode or throw ENOENT"""
         normalized_path = self._normalize_path(path)
         ino = await self._resolve_path(normalized_path)
@@ -793,9 +791,7 @@ class Filesystem:
                 assert_not_symlink_mode(mode, "rm", "<symlink>")
                 await self._remove_dentry_and_maybe_inode(dir_ino, name, child_ino)
 
-    async def _remove_dentry_and_maybe_inode(
-        self, parent_ino: int, name: str, ino: int
-    ) -> None:
+    async def _remove_dentry_and_maybe_inode(self, parent_ino: int, name: str, ino: int) -> None:
         """Remove directory entry and inode if last link"""
         await self._db.execute(
             """
@@ -864,9 +860,7 @@ class Filesystem:
         # Begin transaction
         # Note: turso.aio doesn't support explicit BEGIN, but execute should be atomic
         try:
-            old_normalized, old_ino = await self._resolve_path_or_throw(
-                old_normalized, "rename"
-            )
+            old_normalized, old_ino = await self._resolve_path_or_throw(old_normalized, "rename")
             old_mode = await get_inode_mode_or_throw(self._db, old_ino, "rename", old_normalized)
             assert_not_symlink_mode(old_mode, "rename", old_normalized)
             old_is_dir = (old_mode & S_IFMT) == S_IFDIR
@@ -992,9 +986,7 @@ class Filesystem:
             )
 
         # Resolve and validate source
-        src_normalized, src_ino = await self._resolve_path_or_throw(
-            src_normalized, "copyfile"
-        )
+        src_normalized, src_ino = await self._resolve_path_or_throw(src_normalized, "copyfile")
         await assert_readable_existing_inode(self._db, src_ino, "copyfile", src_normalized)
 
         cursor = await self._db.execute(
@@ -1025,9 +1017,7 @@ class Filesystem:
             )
 
         dest_parent_ino, dest_name = dest_parent
-        await assert_inode_is_directory(
-            self._db, dest_parent_ino, "copyfile", dest_normalized
-        )
+        await assert_inode_is_directory(self._db, dest_parent_ino, "copyfile", dest_normalized)
 
         try:
             now = int(time.time())

@@ -4,14 +4,14 @@ from typing import Literal, Optional
 
 # POSIX-style error codes for filesystem operations
 FsErrorCode = Literal[
-    "ENOENT",    # No such file or directory
-    "EEXIST",    # File already exists
-    "EISDIR",    # Is a directory (when file expected)
-    "ENOTDIR",   # Not a directory (when directory expected)
-    "ENOTEMPTY", # Directory not empty
-    "EPERM",     # Operation not permitted
-    "EINVAL",    # Invalid argument
-    "ENOSYS",    # Function not implemented (use for symlinks)
+    "ENOENT",  # No such file or directory
+    "EEXIST",  # File already exists
+    "EISDIR",  # Is a directory (when file expected)
+    "ENOTDIR",  # Not a directory (when directory expected)
+    "ENOTEMPTY",  # Directory not empty
+    "EPERM",  # Operation not permitted
+    "EINVAL",  # Invalid argument
+    "ENOSYS",  # Function not implemented (use for symlinks)
 ]
 
 # Filesystem syscall names for error reporting
