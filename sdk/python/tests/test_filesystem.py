@@ -6,7 +6,7 @@ import tempfile
 import pytest
 from turso.aio import connect
 
-from agentfs_sdk import Filesystem
+from agentfs_sdk import Filesystem, ErrnoException
 
 
 @pytest.mark.asyncio
@@ -752,7 +752,7 @@ class TestFilesystemMkdir:
             fs = await Filesystem.from_database(db)
 
             await fs.mkdir("/exists")
-            with pytest.raises(Exception, match="EEXIST"):
+            with pytest.raises(ErrnoException, match="EEXIST"):
                 await fs.mkdir("/exists")
             await db.close()
 
@@ -764,7 +764,7 @@ class TestFilesystemMkdir:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="ENOENT"):
+            with pytest.raises(ErrnoException, match="ENOENT"):
                 await fs.mkdir("/missing-parent/child")
             await db.close()
 
@@ -807,7 +807,7 @@ class TestFilesystemRm:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="ENOENT"):
+            with pytest.raises(ErrnoException, match="ENOENT"):
                 await fs.rm("/does-not-exist")
             await db.close()
 
@@ -820,7 +820,7 @@ class TestFilesystemRm:
             fs = await Filesystem.from_database(db)
 
             await fs.mkdir("/rmdir")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.rm("/rmdir")
             await db.close()
 
@@ -870,7 +870,7 @@ class TestFilesystemRmdir:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/nonempty/file.txt", "content")
-            with pytest.raises(Exception, match="ENOTEMPTY"):
+            with pytest.raises(ErrnoException, match="ENOTEMPTY"):
                 await fs.rmdir("/nonempty")
             await db.close()
 
@@ -883,7 +883,7 @@ class TestFilesystemRmdir:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/afile", "content")
-            with pytest.raises(Exception, match="ENOTDIR"):
+            with pytest.raises(ErrnoException, match="ENOTDIR"):
                 await fs.rmdir("/afile")
             await db.close()
 
@@ -895,7 +895,7 @@ class TestFilesystemRmdir:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="EPERM"):
+            with pytest.raises(ErrnoException, match="EPERM"):
                 await fs.rmdir("/")
             await db.close()
 
@@ -963,7 +963,7 @@ class TestFilesystemRename:
 
             await fs.write_file("/dir/file.txt", "content")
             await fs.write_file("/file.txt", "content")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.rename("/file.txt", "/dir")
             await db.close()
 
@@ -977,7 +977,7 @@ class TestFilesystemRename:
 
             await fs.mkdir("/somedir")
             await fs.write_file("/somefile", "content")
-            with pytest.raises(Exception, match="ENOTDIR"):
+            with pytest.raises(ErrnoException, match="ENOTDIR"):
                 await fs.rename("/somedir", "/somefile")
             await db.close()
 
@@ -1009,7 +1009,7 @@ class TestFilesystemRename:
 
             await fs.mkdir("/fromdir")
             await fs.write_file("/todir/file.txt", "content")
-            with pytest.raises(Exception, match="ENOTEMPTY"):
+            with pytest.raises(ErrnoException, match="ENOTEMPTY"):
                 await fs.rename("/fromdir", "/todir")
             await db.close()
 
@@ -1021,7 +1021,7 @@ class TestFilesystemRename:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="EPERM"):
+            with pytest.raises(ErrnoException, match="EPERM"):
                 await fs.rename("/", "/x")
             await db.close()
 
@@ -1034,7 +1034,7 @@ class TestFilesystemRename:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/cycle/sub/file.txt", "content")
-            with pytest.raises(Exception, match="EINVAL"):
+            with pytest.raises(ErrnoException, match="EINVAL"):
                 await fs.rename("/cycle", "/cycle/sub/moved")
             await db.close()
 
@@ -1082,7 +1082,7 @@ class TestFilesystemCopyFile:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="ENOENT"):
+            with pytest.raises(ErrnoException, match="ENOENT"):
                 await fs.copy_file("/nope.txt", "/out.txt")
             await db.close()
 
@@ -1095,7 +1095,7 @@ class TestFilesystemCopyFile:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/src3.txt", "content")
-            with pytest.raises(Exception, match="ENOENT"):
+            with pytest.raises(ErrnoException, match="ENOENT"):
                 await fs.copy_file("/src3.txt", "/missing/child.txt")
             await db.close()
 
@@ -1108,7 +1108,7 @@ class TestFilesystemCopyFile:
             fs = await Filesystem.from_database(db)
 
             await fs.mkdir("/asrcdir")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.copy_file("/asrcdir", "/out2.txt")
             await db.close()
 
@@ -1122,7 +1122,7 @@ class TestFilesystemCopyFile:
 
             await fs.write_file("/src4.txt", "content")
             await fs.mkdir("/adstdir")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.copy_file("/src4.txt", "/adstdir")
             await db.close()
 
@@ -1135,7 +1135,7 @@ class TestFilesystemCopyFile:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/same.txt", "content")
-            with pytest.raises(Exception, match="EINVAL"):
+            with pytest.raises(ErrnoException, match="EINVAL"):
                 await fs.copy_file("/same.txt", "/same.txt")
             await db.close()
 
@@ -1178,7 +1178,7 @@ class TestFilesystemAccess:
             await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
 
-            with pytest.raises(Exception, match="ENOENT"):
+            with pytest.raises(ErrnoException, match="ENOENT"):
                 await fs.access("/does-not-exist")
             await db.close()
 
@@ -1196,7 +1196,7 @@ class TestFilesystemErrorCodes:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.write_file("/dir", "nope")
             await db.close()
 
@@ -1209,7 +1209,7 @@ class TestFilesystemErrorCodes:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/a", "file-content")
-            with pytest.raises(Exception, match="ENOTDIR"):
+            with pytest.raises(ErrnoException, match="ENOTDIR"):
                 await fs.write_file("/a/b.txt", "child")
             await db.close()
 
@@ -1222,7 +1222,7 @@ class TestFilesystemErrorCodes:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/dir/file.txt", "content")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.read_file("/dir")
             await db.close()
 
@@ -1235,7 +1235,7 @@ class TestFilesystemErrorCodes:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/notadir.txt", "content")
-            with pytest.raises(Exception, match="ENOTDIR"):
+            with pytest.raises(ErrnoException, match="ENOTDIR"):
                 await fs.readdir("/notadir.txt")
             await db.close()
 
@@ -1248,6 +1248,6 @@ class TestFilesystemErrorCodes:
             fs = await Filesystem.from_database(db)
 
             await fs.write_file("/adir/file.txt", "content")
-            with pytest.raises(Exception, match="EISDIR"):
+            with pytest.raises(ErrnoException, match="EISDIR"):
                 await fs.unlink("/adir")
             await db.close()
