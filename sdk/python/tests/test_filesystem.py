@@ -6,7 +6,7 @@ import tempfile
 import pytest
 from turso.aio import connect
 
-from agentfs_sdk import Filesystem, ErrnoException
+from agentfs_sdk import ErrnoException, Filesystem
 
 
 @pytest.mark.asyncio

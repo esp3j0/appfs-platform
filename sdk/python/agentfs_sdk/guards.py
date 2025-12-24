@@ -1,6 +1,7 @@
 """Guard functions for filesystem operations validation"""
 
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
+
 from turso.aio import Connection
 
 from .constants import S_IFDIR, S_IFLNK, S_IFMT
