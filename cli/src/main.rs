@@ -4,7 +4,7 @@ use clap_complete::CompleteEnv;
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
-    parser::{Args, Command, FsCommand},
+    parser::{Args, Command, FsCommand, SyncConfig},
 };
 
 fn main() {
@@ -14,9 +14,15 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Init { id, force, base } => {
+        Command::Init {
+            id,
+            sync_config_path,
+            force,
+            base,
+        } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, force, base)) {
+            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync_config_path, force, base))
+            {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -44,6 +50,7 @@ fn main() {
         }
         Command::Mount {
             id_or_path,
+            sync_config_path,
             mountpoint,
             auto_unmount,
             allow_root,
@@ -64,20 +71,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Diff { id_or_path } => {
+        Command::Diff {
+            id_or_path,
+            sync_config_path,
+        } => {
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        Command::Fs { command } => {
+        Command::Fs {
+            command,
+            id_or_path,
+            sync_config_path,
+        } => {
             let rt = get_runtime();
             match command {
-                FsCommand::Ls {
-                    id_or_path,
-                    fs_path,
-                } => {
+                FsCommand::Ls { fs_path } => {
                     if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
@@ -87,10 +98,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                FsCommand::Cat {
-                    id_or_path,
-                    file_path,
-                } => {
+                FsCommand::Cat { file_path } => {
                     if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
@@ -106,6 +114,7 @@ fn main() {
         #[cfg(unix)]
         Command::Nfs {
             id_or_path,
+            sync_config_path,
             bind,
             port,
         } => {

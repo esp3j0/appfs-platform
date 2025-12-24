@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use clap_complete::{
     engine::ValueCompleter, ArgValueCompleter, CompletionCandidate, PathCompleter,
 };
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -13,6 +14,22 @@ use std::path::{Path, PathBuf};
 pub struct Args {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncConfig {
+    pub remote_url: String,
+    pub auth_token: Option<String>,
+}
+
+impl SyncConfig {
+    pub fn parse(path: Option<PathBuf>) -> anyhow::Result<Option<SyncConfig>> {
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let data = std::fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&data)?))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -34,9 +51,19 @@ pub enum Command {
         /// Base directory for overlay filesystem (copy-on-write)
         #[arg(long)]
         base: Option<PathBuf>,
+
+        #[arg(long)]
+        sync_config_path: Option<PathBuf>,
     },
     /// Filesystem operations
     Fs {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        #[arg(long)]
+        sync_config_path: Option<PathBuf>,
+
         #[command(subcommand)]
         command: FsCommand,
     },
@@ -76,6 +103,9 @@ pub enum Command {
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
+        #[arg(long)]
+        sync_config_path: Option<PathBuf>,
+
         /// Mount point directory
         #[arg(value_name = "MOUNTPOINT", add = ArgValueCompleter::new(PathCompleter::dir()))]
         mountpoint: PathBuf,
@@ -105,6 +135,9 @@ pub enum Command {
         /// Agent ID or database path
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
+
+        #[arg(long)]
+        sync_config_path: Option<PathBuf>,
     },
     /// Start an NFS server to export an AgentFS filesystem over the network
     #[cfg(unix)]
@@ -112,6 +145,9 @@ pub enum Command {
         /// Agent ID or database path
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
+
+        #[arg(long)]
+        sync_config_path: Option<PathBuf>,
 
         /// IP address to bind to
         #[arg(long, default_value = "127.0.0.1")]
@@ -127,20 +163,12 @@ pub enum Command {
 pub enum FsCommand {
     /// List files in the filesystem
     Ls {
-        /// Agent ID or database path
-        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
-        id_or_path: String,
-
         /// Path to list (default: /)
         #[arg(default_value = "/")]
         fs_path: String,
     },
     /// Display file contents
     Cat {
-        /// Agent ID or database path
-        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
-        id_or_path: String,
-
         /// Path to the file in the filesystem
         file_path: String,
     },

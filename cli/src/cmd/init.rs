@@ -4,8 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
 use anyhow::{Context, Result as AnyhowResult};
 
+use crate::parser::SyncConfig;
+
 pub async fn init_database(
     id: Option<String>,
+    sync_config_path: Option<PathBuf>,
     force: bool,
     base: Option<PathBuf>,
 ) -> AnyhowResult<()> {
@@ -19,7 +22,7 @@ pub async fn init_database(
     });
 
     // Validate agent ID for safety
-    if !AgentFS::validate_agent_id(&id) {
+    if !AgentFSOptions::validate_agent_id(&id) {
         anyhow::bail!(
             "Invalid agent ID '{}'. Agent IDs must contain only alphanumeric characters, hyphens, and underscores.",
             id
@@ -59,9 +62,26 @@ pub async fn init_database(
 
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
-    let agent = AgentFS::open(AgentFSOptions::with_id(&id))
-        .await
-        .context("Failed to initialize database")?;
+    let sync_config = SyncConfig::parse(sync_config_path)?;
+    let options = AgentFSOptions::with_id(&id);
+    let mut synced_db = None;
+    let agent = if let Some(sync) = sync_config {
+        let mut builder = turso::sync::Builder::new_remote(&options.db_path()?, &sync.remote_url);
+        if let Some(auth_token) = sync.auth_token {
+            builder = builder.with_auth_token(auth_token);
+        }
+        let db = builder.build().await?;
+        let conn = db.connect().await?;
+        let agent = AgentFS::open_with(conn)
+            .await
+            .context("Failed to initialize synced database")?;
+        synced_db = Some(db);
+        agent
+    } else {
+        AgentFS::open(options)
+            .await
+            .context("Failed to initialize database")?
+    };
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
@@ -76,10 +96,18 @@ pub async fn init_database(
             .await
             .context("Failed to initialize overlay schema")?;
 
+        if let Some(synced_db) = synced_db {
+            synced_db.push().await?;
+        }
+
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
         eprintln!("Base: {}", base_path_str);
     } else {
+        if let Some(synced_db) = synced_db {
+            synced_db.push().await?;
+        }
+
         eprintln!("Created agent filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
     }

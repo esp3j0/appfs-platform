@@ -89,6 +89,7 @@ dependencies = [
  "reverie-process",
  "reverie-ptrace",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing-subscriber",
@@ -2624,15 +2625,15 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.146"
+version = "1.0.147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "217ca874ae0207aac254aa02c957ded05585a90892cc8d87f9e5fa49669dadd8"
+checksum = "6af14725505314343e673e9ecb7cd7e8a36aa9791eb936235a3567cc31447ae4"
 dependencies = [
  "itoa",
  "memchr",
- "ryu",
  "serde",
  "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3126,7 +3127,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turso"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -3145,7 +3146,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "aegis",
  "aes",
@@ -3197,7 +3198,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -3207,7 +3208,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3217,7 +3218,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bitflags 2.10.0",
  "miette",
@@ -3230,7 +3231,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -3244,7 +3245,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3254,7 +3255,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "base64",
  "bytes",
@@ -3275,7 +3276,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -4030,3 +4031,9 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
+
+[[package]]
+name = "zmij"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e404bcd8afdaf006e529269d3e85a743f9480c3cef60034d77860d02964f3ba"
