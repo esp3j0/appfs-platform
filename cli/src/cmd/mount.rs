@@ -1,7 +1,7 @@
 use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::Result;
 use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
-use turso::Value;
+use turso::value::Value;
 
 use crate::fuse::FuseMountOptions;
 
