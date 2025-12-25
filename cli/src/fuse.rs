@@ -43,9 +43,9 @@ pub struct FuseMountOptions {
 }
 
 /// Tracks an open file handle
-struct OpenFile {
+enum OpenFile {
     /// The file handle from the filesystem layer.
-    file: BoxedFile,
+    File { file: BoxedFile },
 }
 
 struct AgentFSFuse {
@@ -77,6 +77,7 @@ impl Filesystem for AgentFSFuse {
     /// - No opendir support: skips opendir/releasedir calls since we don't track
     ///   directory handles, reducing round-trips for directory operations.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+        tracing::info!("fuse::init(config={config:?})");
         let _ = config.add_capabilities(
             FUSE_ASYNC_READ
                 | FUSE_WRITEBACK_CACHE
@@ -96,6 +97,7 @@ impl Filesystem for AgentFSFuse {
     /// Resolves `name` under the directory identified by `parent` inode, stats the
     /// resulting path, and caches the inode-to-path mapping on success.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        tracing::info!("fuse::lookup(parent={parent}, name={name:?})");
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -120,7 +122,8 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Returns metadata (size, permissions, timestamps, etc.) for the file or
     /// directory identified by `ino`. Root inode (1) is handled specially.
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        tracing::info!("fuse::getattr(ino={ino}, fh={fh:?})");
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -141,6 +144,7 @@ impl Filesystem for AgentFSFuse {
     /// Returns the path that the symlink points to. This is called by operations
     /// like `ls -l` to display symlink targets.
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        tracing::info!("fuse::readlink(ino={ino})");
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -180,22 +184,24 @@ impl Filesystem for AgentFSFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        tracing::info!("fuse::setattr(ino={ino}, size={size:?}, fh={fh:?})");
         // Handle truncate
         if let Some(new_size) = size {
             let result = if let Some(fh) = fh {
                 // Use file handle if available (ftruncate)
                 let file = {
                     let open_files = self.open_files.lock();
-                    open_files.get(&fh).map(|f| f.file.clone())
+                    match open_files.get(&fh) {
+                        Some(OpenFile::File { file }) => file.clone(),
+                        _ => {
+                            reply.error(libc::EBADF);
+                            return;
+                        }
+                    }
                 };
 
-                if let Some(file) = file {
-                    self.runtime
-                        .block_on(async move { file.truncate(new_size).await })
-                } else {
-                    reply.error(libc::EBADF);
-                    return;
-                }
+                self.runtime
+                    .block_on(async move { file.truncate(new_size).await })
             } else {
                 // Open file and truncate via file handle
                 let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
@@ -247,10 +253,11 @@ impl Filesystem for AgentFSFuse {
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        tracing::info!("fuse::readdir(ino={ino}, fh={fh:?}, offset={offset})");
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -346,10 +353,11 @@ impl Filesystem for AgentFSFuse {
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        tracing::info!("fuse::readdirplus(ino={ino}, fh={fh:?}, offset={offset})");
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -487,10 +495,11 @@ impl Filesystem for AgentFSFuse {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
+        tracing::info!("fuse::mkdir(parent={parent}, name={name:?}, mode={mode}, mask={umask})");
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -532,6 +541,7 @@ impl Filesystem for AgentFSFuse {
     /// Verifies the target is a directory and is empty before removal.
     /// Returns `ENOTDIR` if not a directory, `ENOTEMPTY` if not empty.
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::info!("fuse::rmdir(parent={parent}, name={name:?})");
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -611,11 +621,12 @@ impl Filesystem for AgentFSFuse {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _flags: i32,
+        mode: u32,
+        umask: u32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
+        tracing::info!("fuse::create(parent={parent}, name={name:?}, mode={mode}, umask={umask}, flags={flags})");
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -669,7 +680,7 @@ impl Filesystem for AgentFSFuse {
         };
 
         let fh = self.alloc_fh();
-        self.open_files.lock().insert(fh, OpenFile { file });
+        self.open_files.lock().insert(fh, OpenFile::File { file });
 
         reply.created(&TTL, &attr, 0, fh, 0);
     }
@@ -685,6 +696,9 @@ impl Filesystem for AgentFSFuse {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        tracing::info!(
+            "fuse::symlink(parent={parent}, link_name={link_name:?}, target={target:?})"
+        );
         let Some(path) = self.lookup_path(parent, link_name) else {
             reply.error(libc::ENOENT);
             return;
@@ -730,6 +744,7 @@ impl Filesystem for AgentFSFuse {
     ///
     /// Gets the file's inode before removal to clean up the path cache.
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::info!("fuse::unlink(parent={parent}, name={name:?})");
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -784,9 +799,10 @@ impl Filesystem for AgentFSFuse {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
+        tracing::info!("fuse::rename(parent={parent}, name={name:?}, newparent={newparent}, newname={newname:?}, flags={flags})");
         let Some(from_path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -852,7 +868,8 @@ impl Filesystem for AgentFSFuse {
     /// Opens a file for reading or writing.
     ///
     /// Allocates a file handle and opens the file in the filesystem layer.
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        tracing::info!("fuse::open(ino={ino}, flags={flags})");
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -867,7 +884,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.open_files.lock().insert(fh, OpenFile { file });
+                self.open_files.lock().insert(fh, OpenFile::File { file });
                 reply.opened(fh, 0);
             }
             Err(_) => reply.error(libc::EIO),
@@ -878,21 +895,22 @@ impl Filesystem for AgentFSFuse {
     fn read(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        flags: i32,
+        lock: Option<u64>,
         reply: ReplyData,
     ) {
+        tracing::info!("fuse::read(ino={ino}, fh={fh:?}, offset={offset}, size={size}, flags={flags}, lock={lock:?})");
         let file = {
             let open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get(&fh) else {
+            let Some(OpenFile::File { file }) = open_files.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.file.clone()
+            file.clone()
         };
 
         let result = self
@@ -909,22 +927,23 @@ impl Filesystem for AgentFSFuse {
     fn write(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        write_flags: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        tracing::info!("fuse::write(ino={ino}, fh={fh}, offset={offset}, data.len()={}, write_flags={write_flags}, flags={flags}, lock_owner={lock_owner:?})", data.len());
         let file = {
             let open_files = self.open_files.lock();
-            let Some(open_file) = open_files.get(&fh) else {
+            let Some(OpenFile::File { file }) = open_files.get(&fh) else {
                 reply.error(libc::EBADF);
                 return;
             };
-            open_file.file.clone()
+            file.clone()
         };
 
         let data_len = data.len();
@@ -942,7 +961,8 @@ impl Filesystem for AgentFSFuse {
     /// Flushes data to the backend storage.
     ///
     /// Since writes go directly to the database, this is a no-op.
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, _req: &Request, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        tracing::info!("fuse::flush(ino={ino}, fh={fh}, lock_owner={lock_owner})");
         let open_files = self.open_files.lock();
         if open_files.contains_key(&fh) {
             reply.ok();
@@ -955,12 +975,13 @@ impl Filesystem for AgentFSFuse {
     ///
     /// This now uses the file handle's fsync which knows which layer(s) the
     /// file exists in, avoiding errors when a file only exists in one layer.
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        tracing::info!("fuse::fsync(ino={ino}, fh={fh}, datasync={datasync})");
         let file = {
             let open_files = self.open_files.lock();
             match open_files.get(&fh) {
-                Some(open_file) => open_file.file.clone(),
-                None => {
+                Some(OpenFile::File { file }) => file.clone(),
+                _ => {
                     reply.error(libc::EBADF);
                     return;
                 }
@@ -982,13 +1003,14 @@ impl Filesystem for AgentFSFuse {
     fn release(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
+        flags: i32,
+        lock_owner: Option<u64>,
+        flush: bool,
         reply: ReplyEmpty,
     ) {
+        tracing::info!("fuse::release(ino={ino}, fh={fh}, flags={flags}, lock_owner={lock_owner:?}, flush={flush})");
         self.open_files.lock().remove(&fh);
         reply.ok();
     }
@@ -996,7 +1018,8 @@ impl Filesystem for AgentFSFuse {
     /// Returns filesystem statistics.
     ///
     /// Queries actual usage from the SDK and reports it to tools like `df`.
-    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request, ino: u64, reply: ReplyStatfs) {
+        tracing::info!("fuse::statfs(ino={ino})");
         const BLOCK_SIZE: u64 = 4096;
         const TOTAL_INODES: u64 = 1_000_000; // Virtual limit
         const MAX_NAMELEN: u32 = 255;

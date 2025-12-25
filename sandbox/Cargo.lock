@@ -2652,7 +2652,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "mimalloc",
  "thiserror 2.0.17",
@@ -2665,7 +2665,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "aegis",
  "aes",
@@ -2717,7 +2717,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -2727,7 +2727,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bitflags 2.10.0",
  "miette",
@@ -2750,7 +2750,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -2764,7 +2764,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2774,7 +2774,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "base64",
  "bytes",
@@ -2795,7 +2795,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.4.0-pre.18"
-source = "git+https://github.com/tursodatabase/turso?branch=rust-bindings-sync#a6cc0201ba2f6560951583165675765119c37b90"
+source = "git+https://github.com/tursodatabase/turso?rev=5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee#5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee"
 dependencies = [
  "bindgen",
  "env_logger",
