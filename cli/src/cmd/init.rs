@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
+use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
 
 pub async fn init_database(
@@ -57,28 +57,22 @@ pub async fn init_database(
         }
     }
 
+    let mut open_options = AgentFSOptions::with_id(&id);
+    if let Some(base_path) = base.as_ref() {
+        open_options = open_options.with_base(base_path);
+    }
+
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
-    let agent = AgentFS::open(AgentFSOptions::with_id(&id))
+    let _agent = AgentFS::open(open_options)
         .await
         .context("Failed to initialize database")?;
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
-        let base_path_str = base_path
-            .canonicalize()
-            .context("Failed to canonicalize base path")?
-            .to_string_lossy()
-            .to_string();
-
-        // Use SDK's OverlayFS::init_schema to ensure schema consistency
-        OverlayFS::init_schema(&agent.get_connection(), &base_path_str)
-            .await
-            .context("Failed to initialize overlay schema")?;
-
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
-        eprintln!("Base: {}", base_path_str);
+        eprintln!("Base: {}", base_path.display());
     } else {
         eprintln!("Created agent filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
