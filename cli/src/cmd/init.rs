@@ -16,6 +16,10 @@ pub async fn create_agentfs(
         if let Some(auth_token) = sync.auth_token {
             builder = builder.with_auth_token(auth_token);
         }
+        tracing::info!("partial_sync: {:?}", sync.partial_sync_experimental);
+        if let Some(partial_sync) = sync.partial_sync_experimental {
+            builder = builder.with_partial_sync_opts_experimental(partial_sync);
+        }
         let db = builder.build().await?;
         let conn = db.connect().await?;
         let agent = AgentFS::open_with(conn)

@@ -25,6 +25,47 @@ use tokio::runtime::Runtime;
 /// This is safe because we are the only writer to the filesystem.
 const TTL: Duration = Duration::MAX;
 
+const SYNC_STATUS_INO: u64 = u64::MAX - 1;
+const SYNC_STATUS_NAME: &str = ".fuse.sync.status";
+
+const SYNC_CONTROL_INO: u64 = u64::MAX;
+const SYNC_CONTROL_NAME: &str = ".fuse.sync.control";
+
+const SYNC_FILE_INOS: &[u64] = &[SYNC_STATUS_INO, SYNC_CONTROL_INO];
+
+fn sync_file_ino(name: &OsStr) -> Option<u64> {
+    match name.to_str() {
+        Some(SYNC_STATUS_NAME) => Some(SYNC_STATUS_INO),
+        Some(SYNC_CONTROL_NAME) => Some(SYNC_CONTROL_INO),
+        _ => None,
+    }
+}
+
+fn sync_file_attr(ino: u64, uid: u32, gid: u32) -> FileAttr {
+    let (size, blocks, perm) = if ino == SYNC_CONTROL_INO {
+        (0, 0, 0o200)
+    } else {
+        (4096, 1, 0o400)
+    };
+    FileAttr {
+        ino: ino,
+        size,
+        blocks,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm,
+        nlink: 1,
+        uid,
+        gid,
+        rdev: 0,
+        flags: 0,
+        blksize: 4096,
+    }
+}
+
 /// Options for mounting an agent filesystem via FUSE.
 #[derive(Debug, Clone)]
 pub struct FuseMountOptions {
@@ -46,6 +87,8 @@ pub struct FuseMountOptions {
 enum OpenFile {
     /// The file handle from the filesystem layer.
     File { file: BoxedFile },
+    /// Special .fuse.sync.control file
+    SyncControl,
 }
 
 struct AgentFSFuse {
@@ -98,6 +141,12 @@ impl Filesystem for AgentFSFuse {
     /// resulting path, and caches the inode-to-path mapping on success.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         tracing::info!("fuse::lookup(parent={parent}, name={name:?})");
+        if self.synced_db.is_some() {
+            if let Some(ino) = sync_file_ino(name) {
+                reply.entry(&TTL, &&sync_file_attr(ino, self.uid, self.gid), 0);
+                return;
+            }
+        }
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -124,6 +173,10 @@ impl Filesystem for AgentFSFuse {
     /// directory identified by `ino`. Root inode (1) is handled specially.
     fn getattr(&mut self, _req: &Request, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
         tracing::info!("fuse::getattr(ino={ino}, fh={fh:?})");
+        if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
+            reply.attr(&TTL, &&sync_file_attr(ino, self.uid, self.gid));
+            return;
+        }
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -185,6 +238,10 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyAttr,
     ) {
         tracing::info!("fuse::setattr(ino={ino}, size={size:?}, fh={fh:?})");
+        if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
+            reply.attr(&TTL, &&sync_file_attr(ino, self.uid, self.gid));
+            return;
+        }
         // Handle truncate
         if let Some(new_size) = size {
             let result = if let Some(fh) = fh {
@@ -627,6 +684,14 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyCreate,
     ) {
         tracing::info!("fuse::create(parent={parent}, name={name:?}, mode={mode}, umask={umask}, flags={flags})");
+        if self.synced_db.is_some() {
+            if let Some(ino) = sync_file_ino(name) {
+                let fh = self.alloc_fh();
+                self.open_files.lock().insert(fh, OpenFile::SyncControl);
+                reply.created(&TTL, &&sync_file_attr(ino, self.uid, self.gid), 0, fh, 0);
+                return;
+            }
+        }
         let Some(path) = self.lookup_path(parent, name) else {
             reply.error(libc::ENOENT);
             return;
@@ -870,6 +935,12 @@ impl Filesystem for AgentFSFuse {
     /// Allocates a file handle and opens the file in the filesystem layer.
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         tracing::info!("fuse::open(ino={ino}, flags={flags})");
+        if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
+            let fh = self.alloc_fh();
+            self.open_files.lock().insert(fh, OpenFile::SyncControl);
+            reply.opened(fh, 0);
+            return;
+        }
         let Some(path) = self.get_path(ino) else {
             reply.error(libc::ENOENT);
             return;
@@ -904,6 +975,33 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyData,
     ) {
         tracing::info!("fuse::read(ino={ino}, fh={fh:?}, offset={offset}, size={size}, flags={flags}, lock={lock:?})");
+        if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
+            tracing::info!("fuse::sync_control::read(offset={offset}, size={size})");
+            let synced_db = self.synced_db.clone().unwrap();
+            if ino == SYNC_STATUS_INO {
+                let stats = self
+                    .runtime
+                    .block_on(async move { synced_db.stats().await });
+                match stats {
+                    Ok(stats) => match serde_json::to_string(&stats) {
+                        Ok(stats) => {
+                            reply.data(stats.as_bytes());
+                        }
+                        Err(err) => {
+                            tracing::error!("sync-control stats serialization failed: {err}");
+                            reply.error(libc::EIO);
+                        }
+                    },
+                    Err(err) => {
+                        tracing::error!("sync-control stats failed: {err}");
+                        reply.error(libc::EIO);
+                    }
+                }
+            } else {
+                reply.data(&[]);
+            }
+            return;
+        }
         let file = {
             let open_files = self.open_files.lock();
             let Some(OpenFile::File { file }) = open_files.get(&fh) else {
@@ -937,6 +1035,33 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyWrite,
     ) {
         tracing::info!("fuse::write(ino={ino}, fh={fh}, offset={offset}, data.len()={}, write_flags={write_flags}, flags={flags}, lock_owner={lock_owner:?})", data.len());
+        if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
+            tracing::info!("fuse::sync_control::write(offset={offset}, data={data:?})");
+            let synced_db = self.synced_db.clone().unwrap();
+            let command = std::str::from_utf8(data).map(|x| x.trim());
+            if ino == SYNC_CONTROL_INO {
+                let result = match command {
+                    Ok("push") => self.runtime.block_on(async move { synced_db.push().await }),
+                    Ok("pull") => self
+                        .runtime
+                        .block_on(async move { synced_db.pull().await.map(|_| ()) }),
+                    Ok("checkpoint") => self
+                        .runtime
+                        .block_on(async move { synced_db.checkpoint().await }),
+                    _ => Err(turso::Error::Error("unexpected command".to_string())),
+                };
+                match result {
+                    Ok(()) => reply.written(data.len() as u32),
+                    Err(err) => {
+                        tracing::error!("sync-control command {command:?} failed: {err}");
+                        reply.error(libc::EIO);
+                    }
+                }
+            } else {
+                reply.written(data.len() as u32);
+            }
+            return;
+        }
         let file = {
             let open_files = self.open_files.lock();
             let Some(OpenFile::File { file }) = open_files.get(&fh) else {

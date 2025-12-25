@@ -6,6 +6,7 @@ use clap_complete::{
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use turso::sync::PartialSyncOpts;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
@@ -20,6 +21,7 @@ pub struct Args {
 pub struct SyncConfig {
     pub remote_url: String,
     pub auth_token: Option<String>,
+    pub partial_sync_experimental: Option<PartialSyncOpts>,
 }
 
 impl SyncConfig {

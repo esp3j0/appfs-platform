@@ -93,7 +93,7 @@ fn main() {
             sync_config_path,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
+            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path, sync_config_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -109,6 +109,7 @@ fn main() {
                     if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
+                        sync_config_path,
                         &fs_path,
                     )) {
                         eprintln!("Error: {}", e);
@@ -119,6 +120,7 @@ fn main() {
                     if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
+                        sync_config_path,
                         &file_path,
                     )) {
                         eprintln!("Error: {}", e);
@@ -136,7 +138,12 @@ fn main() {
             port,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
+            if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(
+                id_or_path,
+                sync_config_path,
+                bind,
+                port,
+            )) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

@@ -17,7 +17,7 @@ agentfs-sdk = { path = "../sdk/rust" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"
-turso = { git = "https://github.com/tursodatabase/turso", rev = "5d1f07ac241286fc3cbf7f7c707abcd6df46d2ee", features = [
+turso = { git = "https://github.com/tursodatabase/turso", rev = "bd2b3314a0d860ac8bde2fe560650f7d753591eb", features = [
     "sync",
 ] }
 serde = { version = "1.0", features = ["derive"] }
