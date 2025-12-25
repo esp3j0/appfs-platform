@@ -48,7 +48,7 @@ fn sync_file_attr(ino: u64, uid: u32, gid: u32) -> FileAttr {
         (4096, 1, 0o400)
     };
     FileAttr {
-        ino: ino,
+        ino,
         size,
         blocks,
         atime: UNIX_EPOCH,
@@ -143,7 +143,7 @@ impl Filesystem for AgentFSFuse {
         tracing::info!("fuse::lookup(parent={parent}, name={name:?})");
         if self.synced_db.is_some() {
             if let Some(ino) = sync_file_ino(name) {
-                reply.entry(&TTL, &&sync_file_attr(ino, self.uid, self.gid), 0);
+                reply.entry(&TTL, &sync_file_attr(ino, self.uid, self.gid), 0);
                 return;
             }
         }
@@ -174,7 +174,7 @@ impl Filesystem for AgentFSFuse {
     fn getattr(&mut self, _req: &Request, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
         tracing::info!("fuse::getattr(ino={ino}, fh={fh:?})");
         if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
-            reply.attr(&TTL, &&sync_file_attr(ino, self.uid, self.gid));
+            reply.attr(&TTL, &sync_file_attr(ino, self.uid, self.gid));
             return;
         }
         let Some(path) = self.get_path(ino) else {
@@ -239,7 +239,7 @@ impl Filesystem for AgentFSFuse {
     ) {
         tracing::info!("fuse::setattr(ino={ino}, size={size:?}, fh={fh:?})");
         if self.synced_db.is_some() && SYNC_FILE_INOS.contains(&ino) {
-            reply.attr(&TTL, &&sync_file_attr(ino, self.uid, self.gid));
+            reply.attr(&TTL, &sync_file_attr(ino, self.uid, self.gid));
             return;
         }
         // Handle truncate
@@ -688,7 +688,7 @@ impl Filesystem for AgentFSFuse {
             if let Some(ino) = sync_file_ino(name) {
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile::SyncControl);
-                reply.created(&TTL, &&sync_file_attr(ino, self.uid, self.gid), 0, fh, 0);
+                reply.created(&TTL, &sync_file_attr(ino, self.uid, self.gid), 0, fh, 0);
                 return;
             }
         }

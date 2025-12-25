@@ -53,7 +53,7 @@ impl AgentFSOptions {
             Ok(path.to_string())
         } else if let Some(id) = &self.id {
             // Validate agent ID to prevent path traversal attacks
-            if !Self::validate_agent_id(&id) {
+            if !Self::validate_agent_id(id) {
                 anyhow::bail!(
                     "Invalid agent ID '{}'. Agent IDs must contain only alphanumeric characters, hyphens, and underscores.",
                     id
