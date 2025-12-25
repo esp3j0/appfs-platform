@@ -87,7 +87,7 @@ pub struct FuseMountOptions {
 enum OpenFile {
     /// The file handle from the filesystem layer.
     File { file: BoxedFile },
-    /// Special .fuse.sync.control file
+    /// Special .fuse.sync.* files
     SyncControl,
 }
 
