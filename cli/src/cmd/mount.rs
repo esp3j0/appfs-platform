@@ -1,15 +1,17 @@
-use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::Result;
 use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
 use turso::value::Value;
 
-use crate::fuse::FuseMountOptions;
+use crate::{cmd::init::create_agentfs, fuse::FuseMountOptions};
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
 pub struct MountArgs {
     /// The agent filesystem ID or path.
     pub id_or_path: String,
+    /// optional sync config path
+    pub sync_config_path: Option<PathBuf>,
     /// The mountpoint path.
     pub mountpoint: PathBuf,
     /// Automatically unmount when the process exits.
@@ -63,7 +65,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 
     let mount = move || {
         let rt = crate::get_runtime();
-        let agentfs = rt.block_on(AgentFS::open(opts))?;
+        let (db, agentfs) = rt.block_on(create_agentfs(opts, args.sync_config_path))?;
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
@@ -100,7 +102,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
             }
         })?;
 
-        crate::fuse::mount(fs, fuse_opts, rt)
+        crate::fuse::mount(fs, db, fuse_opts, rt)
     };
 
     if args.foreground {

@@ -6,6 +6,32 @@ use anyhow::{Context, Result as AnyhowResult};
 
 use crate::parser::SyncConfig;
 
+pub async fn create_agentfs(
+    options: AgentFSOptions,
+    sync_config_path: Option<PathBuf>,
+) -> anyhow::Result<(Option<turso::sync::Database>, AgentFS)> {
+    let sync_config = SyncConfig::parse(sync_config_path)?;
+    if let Some(sync) = sync_config {
+        let mut builder = turso::sync::Builder::new_remote(&options.db_path()?, &sync.remote_url);
+        if let Some(auth_token) = sync.auth_token {
+            builder = builder.with_auth_token(auth_token);
+        }
+        let db = builder.build().await?;
+        let conn = db.connect().await?;
+        let agent = AgentFS::open_with(conn)
+            .await
+            .context("Failed to initialize synced database")?;
+        Ok((Some(db), agent))
+    } else {
+        Ok((
+            None,
+            AgentFS::open(options)
+                .await
+                .context("Failed to initialize database")?,
+        ))
+    }
+}
+
 pub async fn init_database(
     id: Option<String>,
     sync_config_path: Option<PathBuf>,
@@ -62,26 +88,8 @@ pub async fn init_database(
 
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
-    let sync_config = SyncConfig::parse(sync_config_path)?;
     let options = AgentFSOptions::with_id(&id);
-    let mut synced_db = None;
-    let agent = if let Some(sync) = sync_config {
-        let mut builder = turso::sync::Builder::new_remote(&options.db_path()?, &sync.remote_url);
-        if let Some(auth_token) = sync.auth_token {
-            builder = builder.with_auth_token(auth_token);
-        }
-        let db = builder.build().await?;
-        let conn = db.connect().await?;
-        let agent = AgentFS::open_with(conn)
-            .await
-            .context("Failed to initialize synced database")?;
-        synced_db = Some(db);
-        agent
-    } else {
-        AgentFS::open(options)
-            .await
-            .context("Failed to initialize database")?
-    };
+    let (synced_db, agent) = create_agentfs(options, sync_config_path).await?;
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {

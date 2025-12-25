@@ -60,6 +60,7 @@ fn main() {
         } => {
             if let Err(e) = cmd::mount(cmd::MountArgs {
                 id_or_path,
+                sync_config_path,
                 mountpoint,
                 auto_unmount,
                 allow_root,

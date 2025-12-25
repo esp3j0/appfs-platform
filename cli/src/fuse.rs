@@ -50,6 +50,7 @@ struct OpenFile {
 
 struct AgentFSFuse {
     fs: Arc<dyn FileSystem>,
+    synced_db: Option<turso::sync::Database>,
     runtime: Runtime,
     path_cache: Arc<Mutex<HashMap<u64, String>>>,
     /// Maps file handle -> open file state
@@ -1037,9 +1038,16 @@ impl AgentFSFuse {
     ///
     /// The uid and gid are used for all file ownership to avoid "dubious ownership"
     /// errors from tools like git that check file ownership.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, uid: u32, gid: u32) -> Self {
+    fn new(
+        fs: Arc<dyn FileSystem>,
+        synced_db: Option<turso::sync::Database>,
+        runtime: Runtime,
+        uid: u32,
+        gid: u32,
+    ) -> Self {
         Self {
             fs,
+            synced_db,
             runtime,
             path_cache: Arc::new(Mutex::new(HashMap::new())),
             open_files: Arc::new(Mutex::new(HashMap::new())),
@@ -1147,6 +1155,7 @@ fn fillattr(stats: &Stats, uid: u32, gid: u32) -> FileAttr {
 
 pub fn mount(
     fs: Arc<dyn FileSystem>,
+    synced_db: Option<turso::sync::Database>,
     opts: FuseMountOptions,
     runtime: Runtime,
 ) -> anyhow::Result<()> {
@@ -1155,7 +1164,7 @@ pub fn mount(
     let uid = opts.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    let fs = AgentFSFuse::new(fs, runtime, uid, gid);
+    let fs = AgentFSFuse::new(fs, synced_db, runtime, uid, gid);
 
     fs.add_path(1, "/".to_string());
 
