@@ -148,9 +148,7 @@ pub async fn handle_statfs<T: Guest<Sandbox>>(
 ) -> Result<Option<Syscall>, Error> {
     if let Some(path_addr) = args.path() {
         if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
-            let new_syscall = reverie::syscalls::Statfs::new()
-                .with_path(Some(new_path_addr))
-                .with_buf(args.buf());
+            let new_syscall = args.with_path(Some(new_path_addr));
 
             return Ok(Some(Syscall::Statfs(new_syscall)));
         }

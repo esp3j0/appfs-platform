@@ -5,7 +5,7 @@ pub mod toolcalls;
 use anyhow::Result;
 use std::{
     collections::{HashSet, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use turso::{Builder, Connection, Value};
@@ -35,6 +35,9 @@ pub struct AgentFSOptions {
     /// Optional custom path to the database file.
     /// Takes precedence over `id` if both are set.
     pub path: Option<String>,
+    /// Optional base directory for overlay filesystem (copy-on-write).
+    /// When set, the filesystem operates as an overlay on top of this directory.
+    pub base: Option<PathBuf>,
 }
 
 impl AgentFSOptions {
@@ -76,6 +79,7 @@ impl AgentFSOptions {
         Self {
             id: Some(id.into()),
             path: None,
+            base: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl AgentFSOptions {
         Self {
             id: None,
             path: None,
+            base: None,
         }
     }
 
@@ -92,7 +97,14 @@ impl AgentFSOptions {
         Self {
             id: None,
             path: Some(path.into()),
+            base: None,
         }
+    }
+
+    /// Set the base directory for overlay filesystem (copy-on-write)
+    pub fn with_base(mut self, base: impl Into<PathBuf>) -> Self {
+        self.base = Some(base.into());
+        self
     }
 
     /// Resolve an id-or-path string to AgentFSOptions
@@ -173,9 +185,26 @@ impl AgentFS {
     /// # }
     /// ```
     pub async fn open(options: AgentFSOptions) -> Result<Self> {
+        // Validate base directory if provided
+        if let Some(ref path) = options.base {
+            if !path.exists() {
+                anyhow::bail!("Base directory does not exist: {}", path.display());
+            }
+            if !path.is_dir() {
+                anyhow::bail!("Base path is not a directory: {}", path.display());
+            }
+        }
         let db_path = options.db_path()?;
         let db = Builder::new_local(&db_path).build().await?;
         let conn = db.connect()?;
+
+        // Initialize overlay schema if base is provided
+        if let Some(base_path) = options.base {
+            let canonical_base = std::fs::canonicalize(base_path)?;
+            let base_path_str = canonical_base.to_string_lossy().to_string();
+            OverlayFS::init_schema(&conn, &base_path_str).await?;
+        }
+
         Self::open_with(conn).await
     }
 

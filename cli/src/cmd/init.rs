@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
+use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions};
 use anyhow::{Context, Result as AnyhowResult};
 use turso::sync::{PartialBootstrapStrategy, PartialSyncOpts};
 
@@ -138,10 +138,14 @@ pub async fn init_database(
         }
     }
 
+    let mut open_options = AgentFSOptions::with_id(&id);
+    if let Some(base_path) = base.as_ref() {
+        open_options = open_options.with_base(base_path);
+    }
+
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
-    let options = AgentFSOptions::with_id(&id);
-    let (synced_db, agent) = create_agentfs(options, sync_options).await?;
+    let (synced_db, agent) = create_agentfs(open_options, sync_options).await?;
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
@@ -162,7 +166,7 @@ pub async fn init_database(
 
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
-        eprintln!("Base: {}", base_path_str);
+        eprintln!("Base: {}", base_path.display());
     } else {
         if let Some(synced_db) = synced_db {
             synced_db.push().await?;
