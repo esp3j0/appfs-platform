@@ -1718,3 +1718,67 @@ pub async fn handle_getpeername<T: Guest<Sandbox>>(
     // FD not in table, let the original syscall through (will likely fail with EBADF)
     Ok(None)
 }
+
+/// The `chdir` system call.
+///
+/// This intercepts `chdir` system calls and translates paths according to the mount table.
+pub async fn handle_chdir<T: Guest<Sandbox>>(
+    guest: &mut T,
+    args: &reverie::syscalls::Chdir,
+    mount_table: &MountTable,
+) -> Result<Option<Syscall>, Error> {
+    if let Some(path_addr) = args.path() {
+        if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
+            let new_syscall = args.with_path(Some(new_path_addr));
+
+            return Ok(Some(Syscall::Chdir(new_syscall)));
+        }
+    }
+    Ok(None)
+}
+
+/// The `fchownat` system call.
+///
+/// This intercepts `fchownat` system calls, translates paths according to the mount table,
+/// and virtualizes the dirfd parameter.
+pub async fn handle_fchownat<T: Guest<Sandbox>>(
+    guest: &mut T,
+    args: &reverie::syscalls::Fchownat,
+    mount_table: &MountTable,
+    fd_table: &FdTable,
+) -> Result<Option<i64>, Error> {
+    let Some(pathname_addr) = args.path() else {
+        return Ok(None);
+    };
+    let dirfd = args.dirfd();
+
+    // Check if dirfd needs virtualization
+    let dirfd_needs_translation = dirfd != libc::AT_FDCWD && fd_table.translate(dirfd).is_some();
+
+    // Check if path needs virtualization
+    let translated_path_opt = translate_path(guest, pathname_addr, mount_table).await?;
+    let path_needs_translation = translated_path_opt.is_some();
+
+    // If nothing needs virtualization, let the original syscall pass through
+    if !dirfd_needs_translation && !path_needs_translation {
+        return Ok(None);
+    }
+
+    // Virtualize the dirfd if needed
+    let kernel_dirfd = if dirfd == libc::AT_FDCWD {
+        dirfd
+    } else {
+        fd_table.translate(dirfd).unwrap_or(dirfd)
+    };
+
+    let new_path_addr = translated_path_opt.unwrap_or(pathname_addr);
+    let new_syscall = Syscall::Fchownat(
+        args.with_dirfd(kernel_dirfd)
+            .with_path(Some(new_path_addr)),
+    );
+
+    // Build and inject the syscall with virtualized parameters
+    let result = guest.inject(new_syscall).await?;
+
+    Ok(Some(result))
+}

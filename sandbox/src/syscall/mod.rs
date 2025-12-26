@@ -403,8 +403,20 @@ pub async fn dispatch_syscall<T: Guest<Sandbox>>(
                 Ok(SyscallResult::Syscall(syscall))
             }
         }
-        Syscall::Chdir(_) => Ok(SyscallResult::Syscall(syscall)),
-        Syscall::Fchownat(_) => Ok(SyscallResult::Syscall(syscall)),
+        Syscall::Chdir(args) => {
+            if let Some(modified) = file::handle_chdir(guest, args, mount_table).await? {
+                Ok(SyscallResult::Syscall(modified))
+            } else {
+                Ok(SyscallResult::Syscall(syscall))
+            }
+        }
+        Syscall::Fchownat(args) => {
+            if let Some(result) = file::handle_fchownat(guest, args, mount_table, fd_table).await? {
+                Ok(SyscallResult::Value(result))
+            } else {
+                Ok(SyscallResult::Syscall(syscall))
+            }
+        }
         // Threading and synchronization - passthrough
         Syscall::SetTidAddress(_) => Ok(SyscallResult::Syscall(syscall)),
         Syscall::SetRobustList(_) => Ok(SyscallResult::Syscall(syscall)),
