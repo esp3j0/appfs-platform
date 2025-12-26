@@ -1326,7 +1326,7 @@ pub async fn handle_rename<T: Guest<Sandbox>>(
     }
 
     // Build new syscall with translated paths
-    let mut new_syscall = args;
+    let mut new_syscall = *args;
     let mut modified = false;
 
     // Translate oldpath
