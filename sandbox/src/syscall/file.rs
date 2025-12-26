@@ -154,10 +154,7 @@ pub async fn handle_read<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Read::new()
-                    .with_fd(kernel_fd)
-                    .with_buf(args.buf())
-                    .with_len(args.len());
+                let new_syscall = args.with_fd(kernel_fd);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Read(
                     new_syscall,
@@ -216,10 +213,7 @@ pub async fn handle_write<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Write::new()
-                    .with_fd(kernel_fd)
-                    .with_buf(args.buf())
-                    .with_len(args.len());
+                let new_syscall = args.with_fd(kernel_fd);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Write(
                     new_syscall,
@@ -277,7 +271,7 @@ pub async fn handle_close<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Close::new().with_fd(kernel_fd);
+                let new_syscall = args.with_fd(kernel_fd);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Close(
                     new_syscall,
@@ -967,10 +961,7 @@ pub async fn handle_getdents64<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Getdents64::new()
-                    .with_fd(kernel_fd as u32)
-                    .with_dirent(args.dirent())
-                    .with_count(args.count());
+                let new_syscall = args.with_fd(kernel_fd as u32);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Getdents64(
                     new_syscall,
@@ -1056,9 +1047,7 @@ pub async fn handle_fstat<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Fstat::new()
-                    .with_fd(kernel_fd)
-                    .with_stat(args.stat());
+                let new_syscall = args.with_fd(kernel_fd);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Fstat(
                     new_syscall,
@@ -1170,10 +1159,7 @@ pub async fn handle_lseek<T: Guest<Sandbox>>(
         match entry {
             FdEntry::Passthrough { kernel_fd, .. } => {
                 // Passthrough file - rewrite FD and return modified syscall for tail_inject
-                let new_syscall = reverie::syscalls::Lseek::new()
-                    .with_fd(kernel_fd)
-                    .with_offset(args.offset())
-                    .with_whence(args.whence());
+                let new_syscall = args.with_fd(kernel_fd);
 
                 return Ok(crate::syscall::SyscallResult::Syscall(Syscall::Lseek(
                     new_syscall,
@@ -1257,9 +1243,7 @@ pub async fn handle_access<T: Guest<Sandbox>>(
 ) -> Result<Option<Syscall>, Error> {
     if let Some(path_addr) = args.path() {
         if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
-            let new_syscall = reverie::syscalls::Access::new()
-                .with_path(Some(new_path_addr))
-                .with_mode(args.mode());
+            let new_syscall = args.with_path(Some(new_path_addr));
 
             return Ok(Some(Syscall::Access(new_syscall)));
         }
@@ -1342,7 +1326,7 @@ pub async fn handle_rename<T: Guest<Sandbox>>(
     }
 
     // Build new syscall with translated paths
-    let mut new_syscall = reverie::syscalls::Rename::new();
+    let mut new_syscall = args;
     let mut modified = false;
 
     // Translate oldpath
@@ -1382,7 +1366,7 @@ pub async fn handle_unlink<T: Guest<Sandbox>>(
 ) -> Result<Option<Syscall>, Error> {
     if let Some(path_addr) = args.path() {
         if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
-            let new_syscall = reverie::syscalls::Unlink::new().with_path(Some(new_path_addr));
+            let new_syscall = args.with_path(Some(new_path_addr));
 
             return Ok(Some(Syscall::Unlink(new_syscall)));
         }
