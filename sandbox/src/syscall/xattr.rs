@@ -13,10 +13,7 @@ pub async fn handle_llistxattr<T: Guest<Sandbox>>(
 ) -> Result<Option<Syscall>, Error> {
     if let Some(path_addr) = args.path() {
         if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
-            let new_syscall = reverie::syscalls::Llistxattr::new()
-                .with_path(Some(new_path_addr))
-                .with_list(args.list())
-                .with_size(args.size());
+            let new_syscall = args.with_path(Some(new_path_addr));
 
             return Ok(Some(Syscall::Llistxattr(new_syscall)));
         }
@@ -36,11 +33,7 @@ pub async fn handle_lgetxattr<T: Guest<Sandbox>>(
 ) -> Result<Option<Syscall>, Error> {
     if let Some(path_addr) = args.path() {
         if let Some(new_path_addr) = translate_path(guest, path_addr, mount_table).await? {
-            let new_syscall = reverie::syscalls::Lgetxattr::new()
-                .with_path(Some(new_path_addr))
-                .with_name(args.name())
-                .with_value(args.value())
-                .with_size(args.size());
+            let new_syscall = args.with_path(Some(new_path_addr));
 
             return Ok(Some(Syscall::Lgetxattr(new_syscall)));
         }
