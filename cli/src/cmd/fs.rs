@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::collections::VecDeque;
 
 use agentfs_sdk::AgentFSOptions;
 use anyhow::{Context, Result as AnyhowResult};

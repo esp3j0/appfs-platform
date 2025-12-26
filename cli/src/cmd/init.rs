@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions};
+use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
 use anyhow::{Context, Result as AnyhowResult};
 use turso::sync::{PartialBootstrapStrategy, PartialSyncOpts};
 
