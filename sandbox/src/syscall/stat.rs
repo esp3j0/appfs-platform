@@ -4,7 +4,7 @@ use crate::{
     vfs::{fdtable::FdTable, mount::MountTable},
 };
 use reverie::{
-    syscalls::{AtFlags, MemoryAccess, ReadAddr, Syscall},
+    syscalls::{MemoryAccess, ReadAddr, Syscall},
     Error, Guest,
 };
 
@@ -70,6 +70,7 @@ pub async fn handle_newfstatat<T: Guest<Sandbox>>(
     mount_table: &MountTable,
     fd_table: &FdTable,
 ) -> Result<Option<i64>, Error> {
+    use reverie::syscalls::AtFlags;
     let dirfd = args.dirfd();
     // AT_FDCWD is -100
     let kernel_dirfd = if dirfd == -100 {
