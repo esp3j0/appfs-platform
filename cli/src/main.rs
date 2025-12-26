@@ -4,7 +4,7 @@ use clap_complete::CompleteEnv;
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
-    parser::{Args, Command, FsCommand},
+    parser::{Args, Command, FsCommand, SyncCommand},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,17 +32,52 @@ fn main() {
     match args.command {
         Command::Init {
             id,
-            sync_config_path,
             force,
             base,
+            sync,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync_config_path, force, base))
-            {
+            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync, force, base)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
+        Command::Sync {
+            id_or_path,
+            command,
+        } => match command {
+            SyncCommand::Pull => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_pull_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Push => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_push_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Checkpoint => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Stats => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_stats_command(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                )) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Command::Run {
             allow,
             no_default_allows,
@@ -66,7 +101,6 @@ fn main() {
         }
         Command::Mount {
             id_or_path,
-            sync_config_path,
             mountpoint,
             auto_unmount,
             allow_root,
@@ -76,7 +110,6 @@ fn main() {
         } => {
             if let Err(e) = cmd::mount(cmd::MountArgs {
                 id_or_path,
-                sync_config_path,
                 mountpoint,
                 auto_unmount,
                 allow_root,
@@ -88,12 +121,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Diff {
-            id_or_path,
-            sync_config_path,
-        } => {
+        Command::Diff { id_or_path } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path, sync_config_path)) {
+            if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -101,7 +131,6 @@ fn main() {
         Command::Fs {
             command,
             id_or_path,
-            sync_config_path,
         } => {
             let rt = get_runtime();
             match command {
@@ -109,7 +138,6 @@ fn main() {
                     if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
-                        sync_config_path,
                         &fs_path,
                     )) {
                         eprintln!("Error: {}", e);
@@ -120,7 +148,6 @@ fn main() {
                     if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
-                        sync_config_path,
                         &file_path,
                     )) {
                         eprintln!("Error: {}", e);
@@ -133,17 +160,11 @@ fn main() {
         #[cfg(unix)]
         Command::Nfs {
             id_or_path,
-            sync_config_path,
             bind,
             port,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(
-                id_or_path,
-                sync_config_path,
-                bind,
-                port,
-            )) {
+            if let Err(e) = rt.block_on(cmd::nfs::handle_nfs_command(id_or_path, bind, port)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }

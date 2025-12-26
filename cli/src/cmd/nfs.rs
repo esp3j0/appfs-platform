@@ -12,16 +12,11 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::Mutex;
 
-use crate::cmd::init::create_agentfs;
+use crate::cmd::init::open_agentfs;
 use crate::nfs::AgentNFS;
 
 /// Handle the `nfs` command - start a standalone NFS server.
-pub async fn handle_nfs_command(
-    id_or_path: String,
-    sync_config_path: Option<PathBuf>,
-    bind: String,
-    port: u32,
-) -> Result<()> {
+pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> Result<()> {
     // Resolve database path
     let db_path = resolve_db_path(&id_or_path)?;
 
@@ -31,7 +26,7 @@ pub async fn handle_nfs_command(
         .context("Database path contains non-UTF8 characters")?;
 
     let options = AgentFSOptions::with_path(db_path_str);
-    let (_, agentfs) = create_agentfs(options, sync_config_path).await?;
+    let (_, agentfs) = open_agentfs(options).await?;
 
     // Check if overlay is configured in the database
     let base_path = agentfs

@@ -4,9 +4,7 @@ use clap::{Parser, Subcommand};
 use clap_complete::{
     engine::ValueCompleter, ArgValueCompleter, CompletionCandidate, PathCompleter,
 };
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use turso::sync::PartialSyncOpts;
 
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
@@ -17,21 +15,18 @@ pub struct Args {
     pub command: Command,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SyncConfig {
-    pub remote_url: String,
-    pub auth_token: Option<String>,
-    pub partial_sync_experimental: Option<PartialSyncOpts>,
-}
-
-impl SyncConfig {
-    pub fn parse(path: Option<PathBuf>) -> anyhow::Result<Option<SyncConfig>> {
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        let data = std::fs::read_to_string(path)?;
-        Ok(Some(serde_json::from_str(&data)?))
-    }
+#[derive(Debug, Parser)]
+pub struct SyncCommandOptions {
+    #[arg(long)]
+    pub sync_remote_url: Option<String>,
+    #[arg(long)]
+    pub sync_partial_prefetch: Option<bool>,
+    #[arg(long)]
+    pub sync_partial_segment_size: Option<usize>,
+    #[arg(long)]
+    pub sync_partial_bootstrap_query: Option<String>,
+    #[arg(long)]
+    pub sync_partial_bootstrap_length: Option<usize>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -54,17 +49,23 @@ pub enum Command {
         #[arg(long)]
         base: Option<PathBuf>,
 
-        #[arg(long)]
-        sync_config_path: Option<PathBuf>,
+        #[command(flatten)]
+        sync: SyncCommandOptions,
+    },
+    /// Remote sync operations
+    Sync {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        #[command(subcommand)]
+        command: SyncCommand,
     },
     /// Filesystem operations
     Fs {
         /// Agent ID or database path
         #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
-
-        #[arg(long)]
-        sync_config_path: Option<PathBuf>,
 
         #[command(subcommand)]
         command: FsCommand,
@@ -105,9 +106,6 @@ pub enum Command {
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
 
-        #[arg(long)]
-        sync_config_path: Option<PathBuf>,
-
         /// Mount point directory
         #[arg(value_name = "MOUNTPOINT", add = ArgValueCompleter::new(PathCompleter::dir()))]
         mountpoint: PathBuf,
@@ -137,9 +135,6 @@ pub enum Command {
         /// Agent ID or database path
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
-
-        #[arg(long)]
-        sync_config_path: Option<PathBuf>,
     },
     /// Start an NFS server to export an AgentFS filesystem over the network
     #[cfg(unix)]
@@ -147,9 +142,6 @@ pub enum Command {
         /// Agent ID or database path
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
-
-        #[arg(long)]
-        sync_config_path: Option<PathBuf>,
 
         /// IP address to bind to
         #[arg(long, default_value = "127.0.0.1")]
@@ -174,6 +166,18 @@ pub enum FsCommand {
         /// Path to the file in the filesystem
         file_path: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncCommand {
+    /// Pull remote changes (only of agentfs was initialized with remote sync)
+    Pull,
+    /// Push remote changes (only of agentfs was initialized with remote sync)
+    Push,
+    /// Print synced database stats
+    Stats,
+    /// Checkpoint local synced db
+    Checkpoint,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]

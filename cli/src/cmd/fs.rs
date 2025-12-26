@@ -4,7 +4,7 @@ use agentfs_sdk::AgentFSOptions;
 use anyhow::{Context, Result as AnyhowResult};
 use turso::Value;
 
-use crate::cmd::init::create_agentfs;
+use crate::cmd::init::open_agentfs;
 
 const ROOT_INO: i64 = 1;
 const S_IFMT: u32 = 0o170000;
@@ -15,13 +15,12 @@ const S_IFLNK: u32 = 0o120000;
 pub async fn ls_filesystem(
     stdout: &mut impl std::io::Write,
     id_or_path: String,
-    sync_config_path: Option<PathBuf>,
     path: &str,
 ) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     eprintln!("Using agent: {}", id_or_path);
 
-    let (_, agentfs) = create_agentfs(options, sync_config_path).await?;
+    let (_, agentfs) = open_agentfs(options).await?;
     let conn = agentfs.get_connection();
 
     if path != "/" {
@@ -99,11 +98,10 @@ pub async fn ls_filesystem(
 pub async fn cat_filesystem(
     stdout: &mut impl std::io::Write,
     id_or_path: String,
-    sync_config_path: Option<PathBuf>,
     path: &str,
 ) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
-    let (_, agentfs) = create_agentfs(options, sync_config_path).await?;
+    let (_, agentfs) = open_agentfs(options).await?;
     let conn = agentfs.get_connection();
 
     let path_components: Vec<&str> = path
@@ -225,14 +223,11 @@ fn path_exists_in_base(base_path: &str, rel_path: &str) -> bool {
     std::path::Path::new(&full_path).exists()
 }
 
-pub async fn diff_filesystem(
-    id_or_path: String,
-    sync_config_path: Option<PathBuf>,
-) -> AnyhowResult<()> {
+pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     eprintln!("Using agent: {}", id_or_path);
 
-    let (_, agent) = create_agentfs(options, sync_config_path)
+    let (_, agent) = open_agentfs(options)
         .await
         .context("Failed to open agent")?;
 
@@ -324,9 +319,7 @@ mod tests {
     pub async fn cat_file_not_found() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
-        let err = cat_filesystem(&mut buf, path, None, "test.md")
-            .await
-            .unwrap_err();
+        let err = cat_filesystem(&mut buf, path, "test.md").await.unwrap_err();
         assert!(err.to_string().contains("File not found"));
     }
 
@@ -336,9 +329,7 @@ mod tests {
         let content = b"hello, agentfs";
         agentfs.fs.write_file("test.md", content).await.unwrap();
         let mut buf = Vec::new();
-        cat_filesystem(&mut buf, path, None, "test.md")
-            .await
-            .unwrap();
+        cat_filesystem(&mut buf, path, "test.md").await.unwrap();
         assert_eq!(buf, content);
     }
 
@@ -348,9 +339,7 @@ mod tests {
         let content = vec![100u8; 4 * 1024 * 1024];
         agentfs.fs.write_file("test.md", &content).await.unwrap();
         let mut buf = Vec::new();
-        cat_filesystem(&mut buf, path, None, "test.md")
-            .await
-            .unwrap();
+        cat_filesystem(&mut buf, path, "test.md").await.unwrap();
         assert_eq!(buf, content);
     }
 
@@ -358,7 +347,7 @@ mod tests {
     pub async fn ls_empty() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, None, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/").await.unwrap();
         assert_eq!(buf, b"");
     }
 
@@ -370,7 +359,7 @@ mod tests {
         let big = vec![100u8; 1024 * 1024];
         agentfs.fs.write_file("3.md", &big).await.unwrap();
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, None, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/").await.unwrap();
         assert_eq!(
             buf,
             b"f 1.md
@@ -393,7 +382,7 @@ f 3.md
         let big = vec![100u8; 1024 * 1024];
         agentfs.fs.write_file("d/e/3.md", &big).await.unwrap();
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, None, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/").await.unwrap();
         assert_eq!(
             buf,
             b"d a

@@ -3,21 +3,69 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
 use anyhow::{Context, Result as AnyhowResult};
+use turso::sync::{PartialBootstrapStrategy, PartialSyncOpts};
 
-use crate::parser::SyncConfig;
+use crate::parser::SyncCommandOptions;
+
+pub async fn open_agentfs(
+    options: AgentFSOptions,
+) -> anyhow::Result<(Option<turso::sync::Database>, AgentFS)> {
+    let path = options.db_path()?;
+    let meta_path = format!("{path}-info");
+    if !std::fs::exists(meta_path)? {
+        return Ok((
+            None,
+            AgentFS::open(options)
+                .await
+                .context("Failed to open database")?,
+        ));
+    }
+    let mut builder = turso::sync::Builder::new_remote(&options.db_path()?);
+    if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
+        builder = builder.with_auth_token(auth_token);
+    }
+    let db = builder.build().await?;
+    let conn = db.connect().await?;
+    let agent = AgentFS::open_with(conn)
+        .await
+        .context("Failed to open synced database")?;
+    Ok((Some(db), agent))
+}
 
 pub async fn create_agentfs(
     options: AgentFSOptions,
-    sync_config_path: Option<PathBuf>,
+    sync_options: SyncCommandOptions,
 ) -> anyhow::Result<(Option<turso::sync::Database>, AgentFS)> {
-    let sync_config = SyncConfig::parse(sync_config_path)?;
-    if let Some(sync) = sync_config {
-        let mut builder = turso::sync::Builder::new_remote(&options.db_path()?, &sync.remote_url);
-        if let Some(auth_token) = sync.auth_token {
+    if let Some(remote_url) = sync_options.sync_remote_url {
+        let mut builder =
+            turso::sync::Builder::new_remote(&options.db_path()?).with_remote_url(remote_url);
+        if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
             builder = builder.with_auth_token(auth_token);
         }
-        tracing::info!("partial_sync: {:?}", sync.partial_sync_experimental);
-        if let Some(partial_sync) = sync.partial_sync_experimental {
+        let mut partial_sync = PartialSyncOpts {
+            bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
+            prefetch: false,
+            segment_size: 128 * 1024,
+        };
+        let mut has_partial_sync = false;
+        if let Some(prefetch) = sync_options.sync_partial_prefetch {
+            partial_sync.prefetch = prefetch;
+            has_partial_sync = true;
+        }
+        if let Some(segment_size) = sync_options.sync_partial_segment_size {
+            partial_sync.segment_size = segment_size;
+            has_partial_sync = true;
+        }
+        if let Some(length) = sync_options.sync_partial_bootstrap_length {
+            partial_sync.bootstrap_strategy =
+                Some(PartialBootstrapStrategy::Prefix { length: length });
+            has_partial_sync = true;
+        }
+        if let Some(query) = sync_options.sync_partial_bootstrap_query {
+            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Query { query });
+            has_partial_sync = true;
+        }
+        if has_partial_sync {
             builder = builder.with_partial_sync_opts_experimental(partial_sync);
         }
         let db = builder.build().await?;
@@ -38,7 +86,7 @@ pub async fn create_agentfs(
 
 pub async fn init_database(
     id: Option<String>,
-    sync_config_path: Option<PathBuf>,
+    sync_options: SyncCommandOptions,
     force: bool,
     base: Option<PathBuf>,
 ) -> AnyhowResult<()> {
@@ -93,7 +141,7 @@ pub async fn init_database(
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
     let options = AgentFSOptions::with_id(&id);
-    let (synced_db, agent) = create_agentfs(options, sync_config_path).await?;
+    let (synced_db, agent) = create_agentfs(options, sync_options).await?;
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
