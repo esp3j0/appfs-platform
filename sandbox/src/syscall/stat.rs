@@ -4,7 +4,7 @@ use crate::{
     vfs::{fdtable::FdTable, mount::MountTable},
 };
 use reverie::{
-    syscalls::{MemoryAccess, ReadAddr, Syscall, AtFlags},
+    syscalls::{AtFlags, MemoryAccess, ReadAddr, Syscall},
     Error, Guest,
 };
 
@@ -63,6 +63,7 @@ pub async fn handle_statx<T: Guest<Sandbox>>(
 /// and virtualizes the dirfd.
 /// Returns `Some(result)` if the syscall was handled and the result should be returned directly,
 /// or `None` if the original syscall should be used.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_newfstatat<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Newfstatat,
@@ -159,6 +160,7 @@ pub async fn handle_statfs<T: Guest<Sandbox>>(
 /// The `readlink` system call.
 ///
 /// This intercepts `readlink` system calls and translates paths according to the mount table.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_readlink<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Readlink,
@@ -293,6 +295,7 @@ pub async fn handle_readlinkat<T: Guest<Sandbox>>(
 /// The target path is left as-is since it's just a string stored in the symlink.
 /// Returns `Some(result)` if the syscall was handled and the result should be returned directly,
 /// or `None` if the original syscall should be used.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_symlink<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Symlink,
