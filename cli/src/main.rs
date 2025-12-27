@@ -164,6 +164,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::McpServer { id_or_path, tools } => {
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::mcp_server::handle_mcp_server_command(
+                id_or_path,
+                tools,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
