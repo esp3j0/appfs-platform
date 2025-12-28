@@ -1,0 +1,17 @@
+{
+  "name": "just-bash-agentfs-example",
+  "version": "1.0.0",
+  "description": "Interactive AI agent with persistent AgentFS storage",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx main.ts",
+    "typecheck": "npx tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "ai": "^6.0.0",
+    "agentfs-sdk": "file:../../sdk/typescript",
+    "glob": "^11.0.0",
+    "just-bash": "^1.0.1"
+  }
+}

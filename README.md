@@ -142,6 +142,7 @@ This source repository also contains examples that demonstrate how to integrate 
 - **[Claude Agent SDK](examples/claude-agent/research-assistant)** - Research assistant using Anthropic's Claude Agent SDK
 - **[OpenAI Agents](examples/openai-agents/research-assistant)** - Research assistant using OpenAI Agents SDK
 - **[Firecracker](examples/firecracker)** - Minimal Firecracker VM with AgentFS mounted via NFSv3
+- **[AI SDK + just-bash](examples/ai-sdk-just-bash)** - Interactive AI agent using Vercel AI SDK with just-bash for command execution
 
 See the **[examples](examples)** directory for more details.
 

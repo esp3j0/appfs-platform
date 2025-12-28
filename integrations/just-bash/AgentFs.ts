@@ -19,7 +19,7 @@ import type {
   ReadFileOptions,
   RmOptions,
   WriteFileOptions,
-} from "../fs-interface.js";
+} from "just-bash";
 
 // Text encoder/decoder for encoding conversions
 const textEncoder = new TextEncoder();
