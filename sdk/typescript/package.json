@@ -21,6 +21,10 @@
       "node": "./dist/index_node.js",
       "browser": "./dist/index_browser.js",
       "default": "./dist/index_node.js"
+    },
+    "./just-bash": {
+      "import": "./dist/integrations/just-bash/index.js",
+      "types": "./dist/integrations/just-bash/index.d.ts"
     }
   },
   "keywords": [
@@ -43,8 +47,17 @@
     "@vitest/browser": "^4.0.16",
     "@vitest/browser-playwright": "^4.0.16",
     "@vitest/ui": "^4.0.1",
+    "just-bash": "^1.0.1",
     "typescript": "^5.3.0",
     "vitest": "^4.0.1"
+  },
+  "peerDependencies": {
+    "just-bash": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "just-bash": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@tursodatabase/database": "^0.4.0-pre.18",

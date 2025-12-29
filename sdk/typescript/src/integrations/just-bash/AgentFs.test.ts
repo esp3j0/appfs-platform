@@ -1,15 +1,15 @@
-import { AgentFS } from "agentfs-sdk";
+import { AgentFS } from "../../index_node.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AgentFs } from "./AgentFs.js";
+import { AgentFsWrapper } from "./AgentFs.js";
 
-describe("AgentFs", () => {
+describe("AgentFsWrapper", () => {
   let agentHandle: Awaited<ReturnType<typeof AgentFS.open>>;
-  let fs: AgentFs;
+  let fs: AgentFsWrapper;
 
   beforeEach(async () => {
     // Use in-memory database for tests
     agentHandle = await AgentFS.open({ path: ":memory:" });
-    fs = new AgentFs({ fs: agentHandle });
+    fs = new AgentFsWrapper({ fs: agentHandle });
   });
 
   afterEach(async () => {
@@ -22,7 +22,7 @@ describe("AgentFs", () => {
     });
 
     it("should accept custom mount point", () => {
-      const customFs = new AgentFs({
+      const customFs = new AgentFsWrapper({
         fs: agentHandle,
         mountPoint: "/mnt/data",
       });
@@ -30,7 +30,7 @@ describe("AgentFs", () => {
     });
 
     it("should normalize mount point with trailing slash", () => {
-      const customFs = new AgentFs({
+      const customFs = new AgentFsWrapper({
         fs: agentHandle,
         mountPoint: "/mnt/data/",
       });
@@ -39,7 +39,7 @@ describe("AgentFs", () => {
 
     it("should throw for non-absolute mount point", () => {
       expect(
-        () => new AgentFs({ fs: agentHandle, mountPoint: "relative" }),
+        () => new AgentFsWrapper({ fs: agentHandle, mountPoint: "relative" }),
       ).toThrow("Mount point must be an absolute path");
     });
   });
@@ -675,7 +675,7 @@ describe("AgentFs", () => {
 
   describe("mount point handling", () => {
     it("should work with custom mount point", async () => {
-      const customFs = new AgentFs({
+      const customFs = new AgentFsWrapper({
         fs: agentHandle,
         mountPoint: "/mnt/data",
       });

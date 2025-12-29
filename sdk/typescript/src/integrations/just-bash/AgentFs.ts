@@ -9,17 +9,25 @@
  * @see https://docs.turso.tech/agentfs/sdk/typescript
  */
 
-import type { Filesystem } from "agentfs-sdk";
+import type { Filesystem } from "../../filesystem.js";
 import type {
   BufferEncoding,
   CpOptions,
   FsStat,
   IFileSystem,
   MkdirOptions,
-  ReadFileOptions,
   RmOptions,
-  WriteFileOptions,
 } from "just-bash";
+
+/** Options for reading files */
+interface ReadFileOptions {
+  encoding?: BufferEncoding | null;
+}
+
+/** Options for writing files */
+interface WriteFileOptions {
+  encoding?: BufferEncoding;
+}
 
 // Text encoder/decoder for encoding conversions
 const textEncoder = new TextEncoder();
@@ -82,7 +90,7 @@ function getEncoding(
     return undefined;
   }
   if (typeof options === "string") {
-    return options;
+    return options as BufferEncoding;
   }
   return options.encoding ?? undefined;
 }
@@ -110,7 +118,7 @@ export interface AgentFsOptions {
 /** Default mount point for AgentFs */
 const DEFAULT_MOUNT_POINT = "/";
 
-export class AgentFs implements IFileSystem {
+export class AgentFsWrapper implements IFileSystem {
   private readonly agentFs: Filesystem;
   private readonly mountPoint: string;
 
@@ -507,4 +515,20 @@ export class AgentFs implements IFileSystem {
 
     throw new Error(`EINVAL: invalid argument, readlink '${path}'`);
   }
+}
+
+/**
+ * Create a just-bash compatible filesystem backed by AgentFS.
+ *
+ * @example
+ * ```ts
+ * import { AgentFS } from "agentfs-sdk";
+ * import { agentfs } from "agentfs-sdk/just-bash";
+ *
+ * const fs = agentfs(await AgentFS.open({ path: "agent.db" }));
+ * const bashTool = createBashTool({ fs });
+ * ```
+ */
+export function agentfs(handle: AgentFsHandle, mountPoint?: string): IFileSystem {
+  return new AgentFsWrapper({ fs: handle, mountPoint });
 }
