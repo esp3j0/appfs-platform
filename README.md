@@ -143,6 +143,7 @@ This source repository also contains examples that demonstrate how to integrate 
 - **[OpenAI Agents](examples/openai-agents/research-assistant)** - Research assistant using OpenAI Agents SDK
 - **[Firecracker](examples/firecracker)** - Minimal Firecracker VM with AgentFS mounted via NFSv3
 - **[AI SDK + just-bash](examples/ai-sdk-just-bash)** - Interactive AI agent using Vercel AI SDK with just-bash for command execution
+- **[Cloudflare Workers](examples/cloudflare)** - AI agent using AI SDK + just-bash on Cloudflare Workers with Durable Objects storage
 
 See the **[examples](examples)** directory for more details.
 

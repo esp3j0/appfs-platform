@@ -25,6 +25,10 @@
     "./just-bash": {
       "import": "./dist/integrations/just-bash/index.js",
       "types": "./dist/integrations/just-bash/index.d.ts"
+    },
+    "./cloudflare": {
+      "import": "./dist/integrations/cloudflare/index.js",
+      "types": "./dist/integrations/cloudflare/index.d.ts"
     }
   },
   "keywords": [
