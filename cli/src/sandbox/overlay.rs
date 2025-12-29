@@ -829,6 +829,21 @@ fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
 fn setup_env_vars() {
     std::env::set_var("AGENTFS", "1");
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
+
+    // Configure SSH to skip system config files.
+    // Inside the user namespace, root-owned files in /etc/ssh/ssh_config.d/
+    // appear with invalid ownership (unmapped uid), causing SSH to reject them.
+    // Using only ~/.ssh/config avoids this issue while preserving user settings.
+    if let Some(home) = dirs::home_dir() {
+        let user_ssh_config = home.join(".ssh/config");
+        // Use user's config if it exists, otherwise use /dev/null (no config)
+        let config_path = if user_ssh_config.exists() {
+            user_ssh_config.to_string_lossy().to_string()
+        } else {
+            "/dev/null".to_string()
+        };
+        std::env::set_var("GIT_SSH_COMMAND", format!("ssh -F {}", config_path));
+    }
 }
 
 /// Extract exit code from wait status.
