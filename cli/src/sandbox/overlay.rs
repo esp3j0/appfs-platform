@@ -76,7 +76,14 @@ pub async fn run_cmd(
     if is_mountpoint(&session.fuse_mountpoint) {
         eprintln!("Joining existing session: {}", session.run_id);
         eprintln!();
-        return run_in_existing_session(&cwd, &session.fuse_mountpoint, &allowed_paths, command, args);
+        return run_in_existing_session(
+            &cwd,
+            &session.fuse_mountpoint,
+            &allowed_paths,
+            command,
+            args,
+            &session.run_id,
+        );
     }
 
     print_welcome_banner(&cwd, &allowed_paths, &session.run_id);
@@ -165,6 +172,7 @@ pub async fn run_cmd(
             &allowed_paths,
             command,
             args,
+            &session.run_id,
             pipe_to_child[0],
             pipe_to_parent[1],
         );
@@ -213,6 +221,7 @@ fn run_in_existing_session(
     allowed_paths: &[PathBuf],
     command: PathBuf,
     args: Vec<String>,
+    session_id: &str,
 ) -> Result<()> {
     // SAFETY: getuid/getgid are always safe
     let uid = unsafe { libc::getuid() };
@@ -241,6 +250,7 @@ fn run_in_existing_session(
             allowed_paths,
             command,
             args,
+            session_id,
             pipe_to_child[0],
             pipe_to_parent[1],
         );
@@ -447,6 +457,7 @@ fn run_child(
     allowed_paths: &[PathBuf],
     command: PathBuf,
     args: Vec<String>,
+    session_id: &str,
     pipe_from_parent: libc::c_int,
     pipe_to_parent: libc::c_int,
 ) -> ! {
@@ -526,7 +537,7 @@ fn run_child(
     }
 
     // Step 8: Execute the command (does not return).
-    exec_command(command, args);
+    exec_command(command, args, session_id);
 }
 
 /// Remount all filesystems as read-only, except for the specified paths.
@@ -866,8 +877,8 @@ fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Execute the command, replacing the current process.
-fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
-    setup_env_vars();
+fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
+    setup_env_vars(session_id);
 
     let cmd_cstr = match CString::new(command.as_os_str().as_bytes()) {
         Ok(s) => s,
@@ -913,8 +924,9 @@ fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
 }
 
 /// Setup environment variables for the sandbox.
-fn setup_env_vars() {
+fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS", "1");
+    std::env::set_var("AGENTFS_SESSION", session_id);
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
 
     // Configure SSH to skip system config files.
