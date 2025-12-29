@@ -14,7 +14,6 @@ import { glob } from "glob";
 import { anthropic } from "@ai-sdk/anthropic";
 import { streamText, stepCountIs } from "ai";
 import { createBashTool } from "just-bash/ai";
-import { AgentFS } from "agentfs-sdk";
 import { agentfs } from "agentfs-sdk/just-bash";
 
 export interface AgentRunner {
@@ -40,7 +39,7 @@ export async function createAgent(
   options: CreateAgentOptions = {}
 ): Promise<AgentRunner> {
   // Open AgentFS for persistent storage
-  const fs = agentfs(await AgentFS.open({ id: "just-bash-agent" }));
+  const fs = await agentfs({ id: "just-bash-agent" });
 
   // Seed agentfs source files on first run
   const agentfsRoot = path.resolve(import.meta.dirname, "../..");
