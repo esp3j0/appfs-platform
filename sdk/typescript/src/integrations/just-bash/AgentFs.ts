@@ -10,6 +10,7 @@
  */
 
 import type { Filesystem } from "../../filesystem.js";
+import { AgentFS, type AgentFSOptions } from "../../index_node.js";
 import type {
   BufferEncoding,
   CpOptions,
@@ -522,13 +523,19 @@ export class AgentFsWrapper implements IFileSystem {
  *
  * @example
  * ```ts
- * import { AgentFS } from "agentfs-sdk";
  * import { agentfs } from "agentfs-sdk/just-bash";
  *
- * const fs = agentfs(await AgentFS.open({ path: "agent.db" }));
+ * const fs = await agentfs({ path: "agent.db" });
  * const bashTool = createBashTool({ fs });
  * ```
  */
-export function agentfs(handle: AgentFsHandle, mountPoint?: string): IFileSystem {
+export async function agentfs(
+  handleOrOptions: AgentFsHandle | AgentFSOptions,
+  mountPoint?: string
+): Promise<IFileSystem> {
+  if ("fs" in handleOrOptions) {
+    return new AgentFsWrapper({ fs: handleOrOptions, mountPoint });
+  }
+  const handle = await AgentFS.open(handleOrOptions);
   return new AgentFsWrapper({ fs: handle, mountPoint });
 }
