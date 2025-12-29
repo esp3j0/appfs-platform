@@ -60,6 +60,7 @@ const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
 pub async fn run_cmd(
     allow: Vec<PathBuf>,
     no_default_allows: bool,
+    session_id: Option<String>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -67,6 +68,16 @@ pub async fn run_cmd(
 
     // Build the list of allowed writable paths
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
+
+    // Check if we're joining an existing session
+    let session = setup_run_directory(session_id)?;
+
+    // If the FUSE mountpoint is already mounted, join the existing session
+    if is_mountpoint(&session.fuse_mountpoint) {
+        eprintln!("Joining existing session: {}", session.run_id);
+        print_welcome_banner(&cwd, &allowed_paths);
+        return run_in_existing_session(&cwd, &session.fuse_mountpoint, &allowed_paths, command, args);
+    }
 
     print_welcome_banner(&cwd, &allowed_paths);
 
@@ -76,8 +87,6 @@ pub async fn run_cmd(
     let cwd_fd = std::fs::File::open(&cwd).context("Failed to open current directory")?;
     let fd_num = cwd_fd.as_raw_fd();
     let fd_path = format!("/proc/self/fd/{}", fd_num);
-
-    let session = setup_run_directory()?;
 
     let db_path_str = session
         .db_path
@@ -194,6 +203,79 @@ pub async fn run_cmd(
     }
 }
 
+/// Run a command in an existing session's FUSE mount.
+///
+/// This is used when joining an existing session that already has a FUSE mount active.
+/// We don't need to start a new FUSE server, just run the command in the existing mount.
+fn run_in_existing_session(
+    cwd: &Path,
+    fuse_mountpoint: &Path,
+    allowed_paths: &[PathBuf],
+    command: PathBuf,
+    args: Vec<String>,
+) -> Result<()> {
+    // SAFETY: getuid/getgid are always safe
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Create pipes for parent-child coordination.
+    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
+
+    // SAFETY: fork() is safe here
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        bail!("Failed to fork: {}", std::io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // Child process
+        unsafe {
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+
+        run_child(
+            cwd,
+            fuse_mountpoint,
+            allowed_paths,
+            command,
+            args,
+            pipe_to_child[0],
+            pipe_to_parent[1],
+        );
+    } else {
+        // Parent process
+        unsafe {
+            libc::close(pipe_to_child[0]);
+            libc::close(pipe_to_parent[1]);
+        }
+
+        // Wait for child to signal it has called unshare
+        if !wait_for_pipe_signal(pipe_to_parent[0]) {
+            eprintln!("Error: Failed to read sync signal from child process");
+            abort_child(pipe_to_child[1], child_pid);
+        }
+
+        // Configure user namespace mappings for the child
+        write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+
+        // Signal child that mappings are done
+        unsafe {
+            libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+
+        // Wait for child to exit (don't unmount or cleanup - the original session owns that)
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        let exit_code = wait_status_to_exit_code(status);
+
+        std::process::exit(exit_code);
+    }
+}
+
 /// Print the welcome banner showing sandbox configuration.
 fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf]) {
     eprintln!("Welcome to AgentFS!");
@@ -221,9 +303,12 @@ struct RunSession {
     fuse_mountpoint: PathBuf,
 }
 
-/// Create a unique run directory with database and mountpoint paths.
-fn setup_run_directory() -> Result<RunSession> {
-    let run_id = uuid::Uuid::new_v4().to_string();
+/// Create a run directory with database and mountpoint paths.
+///
+/// If `session_id` is provided, uses that as the run ID (allowing multiple
+/// runs to share the same delta layer). Otherwise generates a unique UUID.
+fn setup_run_directory(session_id: Option<String>) -> Result<RunSession> {
+    let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
     let run_dir = home_dir.join(".agentfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
