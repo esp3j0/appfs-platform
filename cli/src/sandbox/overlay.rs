@@ -75,11 +75,11 @@ pub async fn run_cmd(
     // If the FUSE mountpoint is already mounted, join the existing session
     if is_mountpoint(&session.fuse_mountpoint) {
         eprintln!("Joining existing session: {}", session.run_id);
-        print_welcome_banner(&cwd, &allowed_paths);
+        eprintln!();
         return run_in_existing_session(&cwd, &session.fuse_mountpoint, &allowed_paths, command, args);
     }
 
-    print_welcome_banner(&cwd, &allowed_paths);
+    print_welcome_banner(&cwd, &allowed_paths, &session.run_id);
 
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
@@ -277,19 +277,21 @@ fn run_in_existing_session(
 }
 
 /// Print the welcome banner showing sandbox configuration.
-fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf]) {
+fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str) {
     eprintln!("Welcome to AgentFS!");
     eprintln!();
-    eprintln!("  {} (copy-on-write)", cwd.display());
-    if allowed_paths.is_empty() {
-        eprintln!("  Everything else is read-only.");
-    } else {
-        eprintln!("  The following directories are also writable:");
-        for path in allowed_paths {
-            eprintln!("    - {}", path.display());
-        }
-        eprintln!("  Everything else is read-only.");
+    eprintln!("The following directories are writable:");
+    eprintln!();
+    eprintln!("  - {} (copy-on-write)", cwd.display());
+    for path in allowed_paths {
+        eprintln!("  - {}", path.display());
     }
+    eprintln!();
+    eprintln!("Everything else is read-only.");
+    eprintln!();
+    eprintln!("To join this session from another terminal:");
+    eprintln!();
+    eprintln!("  agentfs run --session {} <command>", session_id);
     eprintln!();
 }
 
