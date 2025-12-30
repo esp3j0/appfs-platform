@@ -286,8 +286,14 @@ impl FileOps for SqliteFileOps {
     async fn write(&self, buf: &[u8]) -> VfsResult<usize> {
         let mut data = self.data.lock().unwrap();
         let mut offset = self.offset.lock().unwrap();
+        let flags = *self.flags.lock().unwrap();
 
-        let start = *offset as usize;
+        // Handle O_APPEND: always write at the end of the file
+        let start = if flags & libc::O_APPEND != 0 {
+            data.len()
+        } else {
+            *offset as usize
+        };
 
         // Extend the buffer if necessary
         if start + buf.len() > data.len() {
@@ -295,7 +301,7 @@ impl FileOps for SqliteFileOps {
         }
 
         data[start..start + buf.len()].copy_from_slice(buf);
-        *offset += buf.len() as i64;
+        *offset = (start + buf.len()) as i64;
 
         // Mark as dirty since we modified the data
         *self.dirty.lock().unwrap() = true;
