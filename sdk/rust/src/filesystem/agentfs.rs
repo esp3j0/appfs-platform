@@ -47,21 +47,61 @@ impl File for AgentFSFile {
 
         let mut result = Vec::with_capacity(size as usize);
         let start_offset_in_chunk = (offset % chunk_size) as usize;
+        let mut next_expected_chunk = start_chunk;
 
         while let Some(row) = rows.next().await? {
+            let chunk_index = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64;
+
+            // Fill gaps with zeros for sparse files
+            while next_expected_chunk < chunk_index && result.len() < size as usize {
+                let skip = if next_expected_chunk == start_chunk {
+                    start_offset_in_chunk
+                } else {
+                    0
+                };
+                let zeros_needed =
+                    std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
+                result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                next_expected_chunk += 1;
+            }
+
             if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
-                let skip = if result.is_empty() {
+                let skip = if chunk_index == start_chunk {
                     start_offset_in_chunk
                 } else {
                     0
                 };
                 if skip >= chunk_data.len() {
-                    continue;
+                    // Chunk is smaller than skip offset, fill with zeros
+                    let zeros_needed =
+                        std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
+                    result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                } else {
+                    let remaining = size as usize - result.len();
+                    let take = std::cmp::min(chunk_data.len() - skip, remaining);
+                    result.extend_from_slice(&chunk_data[skip..skip + take]);
+
+                    // If chunk is smaller than chunk_size, pad with zeros
+                    let chunk_end = skip + take;
+                    if chunk_end < chunk_size as usize && result.len() < size as usize {
+                        let zeros_needed = std::cmp::min(
+                            chunk_size as usize - chunk_end,
+                            size as usize - result.len(),
+                        );
+                        result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                    }
                 }
-                let remaining = size as usize - result.len();
-                let take = std::cmp::min(chunk_data.len() - skip, remaining);
-                result.extend_from_slice(&chunk_data[skip..skip + take]);
             }
+            next_expected_chunk = chunk_index + 1;
+        }
+
+        // Fill any remaining space with zeros (for sparse file tail or missing chunks at end)
+        if result.len() < size as usize {
+            result.resize(size as usize, 0);
         }
 
         Ok(result)

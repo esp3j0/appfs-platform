@@ -47,5 +47,6 @@ int test_lstat(const char *base_path);
 int test_getdents64(const char *base_path);
 int test_append_existing(const char *base_path);
 int test_pwrite_nested(const char *base_path);
+int test_pread_sparse(const char *base_path);
 
 #endif /* TEST_COMMON_H */
