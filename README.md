@@ -29,7 +29,7 @@ The AgentFS repository consists of the following:
 
 * **SDK** - [TypeScript](sdk/typescript), [Python](sdk/python), and [Rust](sdk/rust) libraries for programmatic filesystem access.
 * **[CLI](MANUAL.md)** - Command-line interface for managing agent filesystems:
-  - Mount AgentFS on host filesystem with FUSE on Linux and macFUSE on macOS.
+  - Mount AgentFS on host filesystem with FUSE on Linux and NFS on macOS.
   - Access AgentFS files with a command line tool.
 * **[AgentFS Specification](SPEC.md)** - SQLite-based agent filesystem specification.
 
@@ -73,7 +73,7 @@ $ agentfs fs cat .agentfs/my-agent.db hello.txt
 hello from agent
 ```
 
-You can mount an agent filesystem using FUSE:
+You can mount an agent filesystem using FUSE (Linux) or NFS (macOS):
 
 ```bash
 $ agentfs mount my-agent ./mnt

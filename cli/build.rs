@@ -9,14 +9,6 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=gcc_s");
     }
 
-    // macOS: Weak-link libfuse so the binary can load without macFUSE installed.
-    #[cfg(target_os = "macos")]
-    {
-        println!("cargo:rustc-link-arg=-Wl,-weak-lfuse");
-        println!("cargo:rustc-link-search=/usr/local/lib");
-        println!("cargo:rustc-link-search=/Library/Frameworks/macFUSE.framework/Versions/A");
-    }
-
     // Capture git version from tags for --version flag
     // Rerun if git HEAD changes (new commits or tags)
     println!("cargo:rerun-if-changed=../.git/HEAD");
