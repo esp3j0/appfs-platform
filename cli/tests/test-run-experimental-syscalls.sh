@@ -30,6 +30,10 @@ cargo run -- run --experimental-sandbox /bin/bash -c 'echo "Hello from virtual F
 # Create existing.txt for the append test
 cargo run -- run --experimental-sandbox /bin/bash -c 'echo -n "original content" > /agent/existing.txt' > /dev/null 2>&1
 
+# Note: The nested directory test (test_append_nested) is skipped for experimental sandbox
+# because it tests FUSE overlay COW behavior where parent dirs need to be created in delta.
+# The experimental sandbox has no base layer, so this scenario doesn't apply.
+
 # Run the syscall tests using the experimental ptrace-based sandbox
 if ! output=$(cargo run -- run --experimental-sandbox "$DIR/syscall/test-syscalls" /agent 2>&1); then
     echo "FAILED"

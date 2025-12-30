@@ -51,6 +51,28 @@ pub struct OverlayFile {
     copied_to_delta: std::sync::atomic::AtomicBool,
 }
 
+impl OverlayFile {
+    /// Ensure parent directories exist in the delta layer.
+    ///
+    /// This is needed for copy-on-write: when a file exists only in the base layer
+    /// and we need to copy it to delta, the parent directories may not exist in delta yet.
+    async fn ensure_parent_dirs_in_delta(&self) -> Result<()> {
+        let components: Vec<&str> = self.path.split('/').filter(|s| !s.is_empty()).collect();
+
+        let mut current = String::new();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            current = format!("{}/{}", current, component);
+
+            // Check if directory exists in delta
+            if self.delta.stat(&current).await?.is_none() {
+                // Create it in delta
+                self.delta.mkdir(&current).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl File for OverlayFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -77,6 +99,9 @@ impl File for OverlayFile {
             .copied_to_delta
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            // Ensure parent directories exist in delta before writing
+            self.ensure_parent_dirs_in_delta().await?;
+
             if let Some(ref base_file) = self.base_file {
                 let stats = base_file.fstat().await?;
                 let base_data = base_file.pread(0, stats.size as u64).await?;
@@ -104,6 +129,9 @@ impl File for OverlayFile {
             .copied_to_delta
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            // Ensure parent directories exist in delta before writing
+            self.ensure_parent_dirs_in_delta().await?;
+
             if let Some(ref base_file) = self.base_file {
                 let stats = base_file.fstat().await?;
                 let base_data = base_file.pread(0, stats.size as u64).await?;
