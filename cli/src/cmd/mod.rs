@@ -2,9 +2,9 @@ pub mod completions;
 pub mod fs;
 pub mod init;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod mount;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 #[path = "mount_stub.rs"]
 mod mount;
 

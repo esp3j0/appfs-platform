@@ -41,12 +41,8 @@ reverie = { git = "https://github.com/facebookexperimental/reverie" }
 reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
 reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
 
-# macOS dependencies for FUSE and NFS functionality
+# macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.15", default-features = false, features = [
-    "abi-7-29",
-    "libfuse",
-] }
 # NFS server for userspace filesystem without FUSE (used by `agentfs run`)
 nfsserve = "0.10"
 uuid = { version = "1", features = ["v4"] }

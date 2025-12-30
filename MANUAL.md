@@ -9,7 +9,7 @@ AgentFS provides the following components:
 1. SDK - TypeScript and Rust libraries for programmatic filesystem access
 2. CLI - Command-line interface for managing agent filesystems
 3. Specification - SQLite-based agent filesystem specification
-4. FUSE Mount - Mount agent filesystems on the host using FUSE
+4. FUSE/NFS Mount - Mount agent filesystems on the host using FUSE (Linux) or NFS (macOS)
 5. Overlay Filesystem - Copy-on-write filesystem layer over host directories
 6. Sandbox - Linux-compatible execution environment with agent filesystem support (experimental)
 
@@ -41,7 +41,7 @@ Created agent filesystem: .agentfs/my-agent.db
 Agent ID: my-agent
 ```
 
-### 2. Mount the AgentFS filesystem with FUSE (Linux and macOS)
+### 2. Mount the AgentFS filesystem with FUSE (Linux) or NFS (macOS)
 
 Mount an AgentFS filesystem on the host:
 
@@ -149,7 +149,7 @@ The `.agentfs/` directory is automatically created if it doesn't exist.
 
 ### `agentfs mount`
 
-Mount an agent filesystem using FUSE (Linux and macOS).
+Mount an agent filesystem using FUSE (Linux) or NFS (macOS).
 
 **Usage:**
 ```bash
@@ -176,9 +176,8 @@ agentfs mount .agentfs/my-agent.db ./my-agent-mount
 Mounts the agent filesystem as a FUSE filesystem on the host, allowing you to interact with the agent's files using standard filesystem tools (ls, cat, cp, etc.).
 
 **Requirements:**
-- Linux or macOS operating system
-- FUSE must be installed on your system (on macOS, install [macFUSE](https://osxfuse.github.io/))
-- The CLI must be built with the `fuse` feature enabled
+- Linux: FUSE must be installed on your system
+- macOS: Uses NFS (no additional installation required)
 
 **Usage after mounting:**
 ```bash
@@ -192,7 +191,7 @@ cat ./my-agent-mount/hello.txt
 ls ./my-agent-mount/
 ```
 
-To unmount, use `fusermount -u ./my-agent-mount`.
+To unmount, use `fusermount -u ./my-agent-mount` on Linux or `umount ./my-agent-mount` on macOS.
 
 ### `agentfs run`
 
