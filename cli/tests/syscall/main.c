@@ -30,6 +30,7 @@ int main(int argc, char *argv[]) {
         {"getdents64", test_getdents64},
         {"append_existing", test_append_existing},
         {"pwrite_nested", test_pwrite_nested},
+        {"pread_sparse", test_pread_sparse},
     };
 
     int num_tests = sizeof(tests) / sizeof(tests[0]);

@@ -14,7 +14,8 @@ SRCS = main.c \
        test-fstat.c \
        test-lstat.c \
        test-getdents64.c \
-       test-append.c
+       test-append.c \
+       test-pread-sparse.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)
