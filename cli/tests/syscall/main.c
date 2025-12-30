@@ -28,6 +28,7 @@ int main(int argc, char *argv[]) {
         {"fstat", test_fstat},
         {"lstat", test_lstat},
         {"getdents64", test_getdents64},
+        {"append_existing", test_append_existing},
     };
 
     int num_tests = sizeof(tests) / sizeof(tests[0]);

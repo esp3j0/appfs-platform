@@ -13,7 +13,8 @@ SRCS = main.c \
        test-stat.c \
        test-fstat.c \
        test-lstat.c \
-       test-getdents64.c
+       test-getdents64.c \
+       test-append.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)

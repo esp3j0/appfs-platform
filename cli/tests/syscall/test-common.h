@@ -45,5 +45,6 @@ int test_stat(const char *base_path);
 int test_fstat(const char *base_path);
 int test_lstat(const char *base_path);
 int test_getdents64(const char *base_path);
+int test_append_existing(const char *base_path);
 
 #endif /* TEST_COMMON_H */
