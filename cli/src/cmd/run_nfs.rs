@@ -176,6 +176,7 @@ const DEFAULT_ALLOWED_DIRS: &[&str] = &[
     ".npm",         // npm local registry
     ".config",      // XDG config directory
     ".cache",       // XDG cache directory
+    ".bun",         // Used by opencode to install packages at runtime
 ];
 
 /// Create a run directory with database and mountpoint paths.
