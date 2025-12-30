@@ -22,6 +22,10 @@ trap "rm -rf '$TEST_DIR'" EXIT
 echo -n "original content" > "$TEST_DIR/existing.txt"
 echo "Hello from test setup!" > "$TEST_DIR/test.txt"
 
+# Create nested directory structure for COW parent dir test
+mkdir -p "$TEST_DIR/subdir"
+echo -n "nested content" > "$TEST_DIR/subdir/nested.txt"
+
 # Run syscall tests directly on Linux
 if ! output=$("$DIR/syscall/test-syscalls" "$TEST_DIR" 2>&1); then
     echo "FAILED"

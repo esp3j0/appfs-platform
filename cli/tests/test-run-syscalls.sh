@@ -30,6 +30,12 @@ cargo run -- init > /dev/null 2>&1
 echo -n "original content" > existing.txt
 echo "Hello from test setup!" > test.txt
 
+# Create nested directory structure for COW parent dir test
+# This catches the bug where .git/logs/HEAD fails because parent dirs
+# don't exist in delta layer during copy-on-write
+mkdir -p subdir
+echo -n "nested content" > subdir/nested.txt
+
 # Run syscall tests through FUSE overlay
 # The test binary runs inside the overlay where:
 # - Files from current directory are visible (base layer)
@@ -38,20 +44,20 @@ echo "Hello from test setup!" > test.txt
 if ! output=$(cargo run -- run "$DIR/syscall/test-syscalls" . 2>&1); then
     echo "FAILED"
     echo "Output was: $output"
-    rm -f "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
     exit 1
 fi
 
 echo "$output" | grep -q "All tests passed!" || {
     echo "FAILED: 'All tests passed!' not found"
     echo "Output was: $output"
-    rm -f "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
     exit 1
 }
 
 # Note: output.txt is created in the delta layer (session-specific) so we can't
 # verify it with a separate agentfs run. The "All tests passed!" check is sufficient.
 
-rm -f "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt
+rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
 
 echo "OK"
