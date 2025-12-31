@@ -1,13 +1,21 @@
-use clap::{CommandFactory, Parser};
-use clap_complete::CompleteEnv;
-
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
     parser::{Args, Command, FsCommand},
 };
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
+use tracing_subscriber::prelude::*;
 
 fn main() {
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "agentfs=info".into()),
+        )
+        .try_init();
+
     reset_sigpipe();
 
     CompleteEnv::with_factory(Args::command).complete();
