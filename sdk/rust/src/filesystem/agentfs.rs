@@ -1557,6 +1557,84 @@ impl AgentFS {
         Ok(())
     }
 
+    /// Create a hard link
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
+    /// Both paths will share the same file data and metadata (except for the name).
+    /// The link count (nlink) of the inode is incremented.
+    pub async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let oldpath = self.normalize_path(oldpath);
+        let newpath = self.normalize_path(newpath);
+        let components = self.split_path(&newpath);
+
+        if components.is_empty() {
+            anyhow::bail!("Cannot create hard link at root");
+        }
+
+        // Resolve old path to get its inode
+        let ino = self
+            .resolve_path(&oldpath)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Source path does not exist"))?;
+
+        // Check if source is a directory (hard links to directories are not allowed)
+        let mut rows = self
+            .conn
+            .query("SELECT mode FROM fs_inode WHERE ino = ?", (ino,))
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) == super::S_IFDIR {
+                anyhow::bail!("Cannot create hard link to directory");
+            }
+        } else {
+            anyhow::bail!("Source inode not found");
+        }
+
+        // Get parent directory of new path
+        let parent_path = if components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!("/{}", components[..components.len() - 1].join("/"))
+        };
+
+        let parent_ino = self
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Parent directory does not exist"))?;
+
+        let name = components.last().unwrap();
+
+        // Check if new path already exists
+        if (self.resolve_path(&newpath).await?).is_some() {
+            anyhow::bail!("Path already exists");
+        }
+
+        // Create directory entry pointing to the same inode
+        self.conn
+            .execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                (name.as_str(), parent_ino, ino),
+            )
+            .await?;
+
+        // Increment link count
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                (ino,),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Read the target of a symbolic link
     pub async fn readlink(&self, path: &str) -> Result<Option<String>> {
         let path = self.normalize_path(path);
@@ -2046,6 +2124,10 @@ impl FileSystem for AgentFS {
 
     async fn symlink(&self, target: &str, linkpath: &str) -> Result<()> {
         AgentFS::symlink(self, target, linkpath).await
+    }
+
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        AgentFS::link(self, oldpath, newpath).await
     }
 
     async fn readlink(&self, path: &str) -> Result<Option<String>> {

@@ -795,6 +795,48 @@ impl FileSystem for OverlayFS {
         self.delta.symlink(target, &normalized).await
     }
 
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let old_normalized = self.normalize_path(oldpath);
+        let new_normalized = self.normalize_path(newpath);
+
+        // Check if source is whited out
+        if self.is_whiteout(&old_normalized).await? {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Remove any whiteout at destination
+        self.remove_whiteout(&new_normalized).await?;
+
+        // Ensure parent directories exist for the new path
+        self.ensure_parent_dirs(&new_normalized).await?;
+
+        // If source is only in base, copy it to delta first
+        let in_delta = self.exists_in_delta(&old_normalized).await?;
+
+        if !in_delta {
+            // Check if exists in base
+            let base_stats = self.base.lstat(&old_normalized).await?;
+            if let Some(stats) = base_stats {
+                // Hard links to directories are not allowed
+                if stats.is_directory() {
+                    anyhow::bail!("Cannot create hard link to directory");
+                }
+                // Copy-up: read from base and write to delta
+                if let Some(data) = self.base.read_file(&old_normalized).await? {
+                    self.ensure_parent_dirs(&old_normalized).await?;
+                    self.delta.write_file(&old_normalized, &data).await?;
+                } else {
+                    return Err(FsError::NotFound.into());
+                }
+            } else {
+                return Err(FsError::NotFound.into());
+            }
+        }
+
+        // Create hard link in delta
+        self.delta.link(&old_normalized, &new_normalized).await
+    }
+
     async fn readlink(&self, path: &str) -> Result<Option<String>> {
         let normalized = self.normalize_path(path);
 

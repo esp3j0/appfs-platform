@@ -252,6 +252,27 @@ impl Vfs for SqliteVfs {
 
         Ok(PathBuf::from(target))
     }
+
+    async fn link(&self, oldpath: &Path, newpath: &Path) -> VfsResult<()> {
+        let oldpath_rel = self.translate_to_relative(oldpath)?;
+        let newpath_rel = self.translate_to_relative(newpath)?;
+
+        self.fs
+            .link(&oldpath_rel, &newpath_rel)
+            .await
+            .map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("does not exist") {
+                    VfsError::NotFound
+                } else if err_msg.contains("already exists") {
+                    VfsError::AlreadyExists
+                } else if err_msg.contains("directory") {
+                    VfsError::PermissionDenied
+                } else {
+                    VfsError::Other(format!("Failed to create hard link: {}", e))
+                }
+            })
+    }
 }
 
 /// File operations for SQLite VFS files
