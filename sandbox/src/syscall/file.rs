@@ -1737,6 +1737,47 @@ pub async fn handle_chdir<T: Guest<Sandbox>>(
     Ok(None)
 }
 
+/// The `fchmodat` system call (used for `chmod` on ARM).
+///
+/// This intercepts `fchmodat` system calls and translates paths according to the mount table.
+/// Signature: int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags);
+/// Note: On ARM (aarch64), chmod is implemented via fchmodat with AT_FDCWD.
+pub async fn handle_chmod<T: Guest<Sandbox>>(
+    guest: &mut T,
+    syscall_args: &reverie::syscalls::SyscallArgs,
+    mount_table: &MountTable,
+) -> Result<Option<i64>, Error> {
+    use libc::AT_FDCWD;
+    use reverie::syscalls::{AtFlags, Mode, PathPtr, Syscall};
+
+    let dirfd = syscall_args.arg0 as i32;
+    let pathname_addr = match unsafe { PathPtr::from_ptr(syscall_args.arg1 as _) } {
+        Some(ptr) => ptr,
+        None => {
+            return Ok(None);
+        }
+    };
+    let mode = syscall_args.arg2 as u32;
+    let flags = syscall_args.arg3 as i32;
+
+    if dirfd != libc::AT_FDCWD {
+        return Ok(None);
+    }
+
+    if let Some(new_path_addr) = translate_path(guest, pathname_addr, mount_table).await? {
+        let new_syscall = reverie::syscalls::Fchmodat::new()
+            .with_dirfd(AT_FDCWD)
+            .with_path(Some(new_path_addr))
+            .with_mode(Mode::from_bits_truncate(mode))
+            .with_flags(AtFlags::from_bits_truncate(flags));
+        let injected = guest.inject(Syscall::Fchmodat(new_syscall)).await?;
+
+        Ok(Some(injected))
+    } else {
+        Ok(None)
+    }
+}
+
 /// The `fchownat` system call.
 ///
 /// This intercepts `fchownat` system calls, translates paths according to the mount table,
@@ -1772,10 +1813,8 @@ pub async fn handle_fchownat<T: Guest<Sandbox>>(
     };
 
     let new_path_addr = translated_path_opt.unwrap_or(pathname_addr);
-    let new_syscall = Syscall::Fchownat(
-        args.with_dirfd(kernel_dirfd)
-            .with_path(Some(new_path_addr)),
-    );
+    let new_syscall =
+        Syscall::Fchownat(args.with_dirfd(kernel_dirfd).with_path(Some(new_path_addr)));
 
     // Build and inject the syscall with virtualized parameters
     let result = guest.inject(new_syscall).await?;
