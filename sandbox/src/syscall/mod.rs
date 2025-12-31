@@ -134,6 +134,22 @@ pub async fn dispatch_syscall<T: Guest<Sandbox>>(
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
+        Syscall::Rmdir(args) => {
+            if let Some(modified) = file::handle_rmdir(guest, args, mount_table).await? {
+                Ok(SyscallResult::Syscall(modified))
+            } else {
+                Ok(SyscallResult::Syscall(syscall))
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Unlinkat(args) => {
+            if let Some(modified) = file::handle_unlinkat(guest, args, mount_table).await? {
+                Ok(SyscallResult::Syscall(modified))
+            } else {
+                Ok(SyscallResult::Syscall(syscall))
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         Syscall::Fork(args) => {
             if let Some(result) = process::handle_fork(guest, args, fd_table).await? {
                 Ok(SyscallResult::Value(result))
