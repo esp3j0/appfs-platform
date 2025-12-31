@@ -42,7 +42,7 @@ pub enum Command {
     },
     /// Run a command in the sandboxed environment.
     ///
-    /// By default, uses FUSE+overlay with unshare/pivot_root for isolation.
+    /// By default, uses FUSE+overlay with Linux user and mount namespaces for isolation.
     /// The overlay uses the host filesystem as a read-only base and stores
     /// all changes in an AgentFS-backed delta layer.
     Run {
