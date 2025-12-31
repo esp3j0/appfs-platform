@@ -22,6 +22,7 @@ serde = { version = "1.0", features = ["derive"] }
 parking_lot = "0.12.5"
 clap_complete = { version = "=4.5.61", features = ["unstable-dynamic"] }
 dirs = "6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Unix dependencies
 [target.'cfg(unix)'.dependencies]
@@ -34,7 +35,6 @@ uuid = { version = "1", features = ["v4"] }
 # NFS server for userspace filesystem (used by `agentfs run` and `agentfs nfs`)
 nfsserve = "0.10"
 async-trait = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Sandbox dependencies - (requires libunwind-dev on ARM)
 agentfs-sandbox = { path = "../sandbox" }
 reverie = { git = "https://github.com/facebookexperimental/reverie" }
@@ -47,7 +47,6 @@ reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
 nfsserve = "0.10"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Ensure transitive `aegis` (pulled in by `turso`) builds on macOS arm64 by
 # forcing the `pure-rust` feature, which skips the C/NEON backend that fails
 # with Apple clang (`veor3q_u8` in `aegis128l_neon_sha3.c`).
