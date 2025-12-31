@@ -1769,7 +1769,6 @@ pub async fn handle_unlinkat<T: Guest<Sandbox>>(
     mount_table: &MountTable,
 ) -> Result<Option<Syscall>, Error> {
     use libc::AT_FDCWD;
-    use reverie::syscalls::AtFlags;
 
     let dirfd = args.dirfd();
     let flags = args.flags();
@@ -1784,7 +1783,7 @@ pub async fn handle_unlinkat<T: Guest<Sandbox>>(
             let new_syscall = args
                 .with_dirfd(AT_FDCWD)
                 .with_path(Some(new_path_addr))
-                .with_flags(AtFlags::from_bits_truncate(flags));
+                .with_flags(flags);
             return Ok(Some(Syscall::Unlinkat(new_syscall)));
         }
     }
