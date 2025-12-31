@@ -24,8 +24,19 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
 };
+
+/// Global child PID for signal forwarding.
+/// Set by the parent before installing signal handlers.
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Counter for termination signals received.
+/// First signal forwards to child, second signal sends SIGKILL.
+static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
 use crate::fuse::FuseMountOptions;
 
@@ -55,6 +66,72 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 /// Commands to try for FUSE unmounting, in order of preference.
 /// fusermount3 is from fuse3 package; fusermount is the legacy fallback.
 const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
+
+/// Signal handler that forwards signals to the child process.
+///
+/// When the parent receives SIGTERM or SIGINT, this handler forwards
+/// the signal to the child process so it can shut down gracefully.
+/// On the second signal, SIGKILL is sent to force termination (handles
+/// cases where the child ignores SIGTERM, like interactive bash).
+///
+/// SAFETY: This is a signal handler. It must only use async-signal-safe functions.
+/// kill() and atomic operations are async-signal-safe.
+extern "C" fn forward_signal_to_child(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // Increment signal counter (fetch_add returns previous value)
+        let count = TERM_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        // SAFETY: kill() is async-signal-safe
+        unsafe {
+            if count == 0 {
+                // First signal: forward to child gracefully
+                libc::kill(pid, sig);
+            } else {
+                // Second+ signal: force kill the child
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Install signal handlers to forward SIGTERM and SIGINT to the child process.
+///
+/// This ensures that when the parent receives a termination signal, it forwards
+/// it to the child and waits for it to exit before cleaning up.
+fn install_signal_handlers() {
+    // Reset the signal counter for fresh signal handling
+    TERM_SIGNAL_COUNT.store(0, Ordering::SeqCst);
+
+    // SAFETY: sigaction() and sigprocmask() with valid signal numbers are safe.
+    // SA_RESTART ensures most syscalls restart after the handler returns.
+    unsafe {
+        // Ensure SIGTERM and SIGINT are not blocked (tokio might block them in worker threads)
+        let mut sigset: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut sigset);
+        libc::sigaddset(&mut sigset, libc::SIGTERM);
+        libc::sigaddset(&mut sigset, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
+
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_sigaction = forward_signal_to_child as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
+            panic!(
+                "failed to install SIGTERM handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
+            panic!(
+                "failed to install SIGINT handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
 
 /// Run a command in an overlay sandbox.
 pub async fn run_cmd(
@@ -277,10 +354,13 @@ fn run_in_existing_session(
             libc::close(pipe_to_parent[0]);
         }
 
+        // Store child PID and install signal handlers before waiting
+        CHILD_PID.store(child_pid, Ordering::SeqCst);
+        install_signal_handlers();
+
         // Wait for child to exit (don't unmount or cleanup - the original session owns that)
-        let mut status: libc::c_int = 0;
-        unsafe { libc::waitpid(child_pid, &mut status, 0) };
-        let exit_code = wait_status_to_exit_code(status);
+        // Retry on EINTR (signal interruption)
+        let exit_code = wait_for_child(child_pid);
 
         std::process::exit(exit_code);
     }
@@ -798,10 +878,12 @@ fn run_parent(
     _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
     db_path: &Path,
 ) -> ! {
-    // Wait for child process to exit
-    let mut status: libc::c_int = 0;
-    unsafe { libc::waitpid(child_pid, &mut status, 0) };
-    let exit_code = wait_status_to_exit_code(status);
+    // Store child PID and install signal handlers before waiting
+    CHILD_PID.store(child_pid, Ordering::SeqCst);
+    install_signal_handlers();
+
+    // Wait for child process to exit, retrying on EINTR (signal interruption)
+    let exit_code = wait_for_child(child_pid);
 
     // Move away from mountpoint before unmounting to avoid EBUSY
     let _ = std::env::set_current_dir("/");
@@ -945,6 +1027,28 @@ fn setup_env_vars(session_id: &str) {
         };
         std::env::set_var("GIT_SSH_COMMAND", format!("ssh -F {}", config_path));
     }
+}
+
+/// Wait for a child process to exit, retrying on EINTR.
+///
+/// Returns the exit code of the child process, or 1 if waitpid fails.
+fn wait_for_child(child_pid: libc::pid_t) -> i32 {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid with valid child pid is safe
+        let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                // Interrupted by signal, retry
+                continue;
+            }
+            // Other error, return exit code 1
+            return 1;
+        }
+        break;
+    }
+    wait_status_to_exit_code(status)
 }
 
 /// Extract exit code from wait status.
