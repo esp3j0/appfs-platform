@@ -1,15 +1,17 @@
 /**
- * AgentFs - Read-write filesystem backed by AgentFS (Turso)
+ * AgentFs - Read-write filesystem backed by any AgentFS FileSystem implementation
  *
- * Full read-write filesystem that persists to an AgentFS SQLite database.
+ * Full read-write filesystem that persists to a SQLite database.
  * Designed for AI agents needing persistent, auditable file storage.
  *
- * This is a thin wrapper around AgentFS - uses native mkdir, rm, rename, etc.
+ * Supports any FileSystem implementation:
+ * - AgentFS (Turso/libsql) for Node.js and browser
+ * - Cloudflare AgentFS (Durable Objects) for Cloudflare Workers
  *
  * @see https://docs.turso.tech/agentfs/sdk/typescript
  */
 
-import type { AgentFS as Filesystem } from "../../filesystem/agentfs.js";
+import type { FileSystem } from "../../filesystem/interface.js";
 import { AgentFS, type AgentFSOptions } from "../../index_node.js";
 import type {
   BufferEncoding,
@@ -97,15 +99,16 @@ function getEncoding(
 }
 
 /**
- * Handle to an AgentFS instance (from AgentFS.open())
+ * Handle to any FileSystem implementation.
+ * Can be from AgentFS.open() (Turso) or AgentFS.create() (Cloudflare).
  */
 export interface AgentFsHandle {
-  fs: Filesystem;
+  fs: FileSystem;
 }
 
 export interface AgentFsOptions {
   /**
-   * The AgentFS handle from AgentFS.open()
+   * The AgentFS handle containing a FileSystem implementation.
    */
   fs: AgentFsHandle;
 
@@ -120,7 +123,7 @@ export interface AgentFsOptions {
 const DEFAULT_MOUNT_POINT = "/";
 
 export class AgentFsWrapper implements IFileSystem {
-  private readonly agentFs: Filesystem;
+  private readonly agentFs: FileSystem;
   private readonly mountPoint: string;
 
   constructor(options: AgentFsOptions) {
@@ -469,8 +472,8 @@ export class AgentFsWrapper implements IFileSystem {
       throw new Error(`EEXIST: file already exists, symlink '${linkPath}'`);
     }
 
-    // AgentFS doesn't support symlinks natively yet
-    // Create a special file that acts like a symlink
+    // Use JSON workaround for symlinks - this provides consistent behavior
+    // across all FileSystem implementations and allows reading symlink content
     const content = JSON.stringify({ __symlink: target });
     await this.writeFile(normalized, content);
   }
@@ -503,7 +506,7 @@ export class AgentFsWrapper implements IFileSystem {
       throw new Error(`ENOENT: no such file or directory, readlink '${path}'`);
     }
 
-    // Try to read as symlink (our special JSON format)
+    // Read as JSON symlink workaround
     try {
       const content = await this.readFile(normalized);
       const parsed = JSON.parse(content);
@@ -511,7 +514,7 @@ export class AgentFsWrapper implements IFileSystem {
         return parsed.__symlink;
       }
     } catch {
-      // Not a symlink
+      // Not a JSON symlink
     }
 
     throw new Error(`EINVAL: invalid argument, readlink '${path}'`);
@@ -519,23 +522,40 @@ export class AgentFsWrapper implements IFileSystem {
 }
 
 /**
- * Create a just-bash compatible filesystem backed by AgentFS.
+ * Create a just-bash compatible filesystem backed by any AgentFS FileSystem.
  *
- * @example
+ * @example Node.js with Turso:
  * ```ts
  * import { agentfs } from "agentfs-sdk/just-bash";
  *
  * const fs = await agentfs({ path: "agent.db" });
  * const bashTool = createBashTool({ fs });
  * ```
+ *
+ * @example Cloudflare Workers:
+ * ```ts
+ * import { agentfs } from "agentfs-sdk/just-bash";
+ * import { AgentFS } from "agentfs-sdk/cloudflare";
+ *
+ * // In a Durable Object:
+ * const agentFs = AgentFS.create(ctx.storage);
+ * const fs = agentfs({ fs: agentFs });
+ * const bashTool = createBashTool({ fs });
+ * ```
  */
 export async function agentfs(
-  handleOrOptions: AgentFsHandle | AgentFSOptions,
+  handleOrOptions: AgentFsHandle | FileSystem | AgentFSOptions,
   mountPoint?: string
 ): Promise<IFileSystem> {
-  if ("fs" in handleOrOptions) {
-    return new AgentFsWrapper({ fs: handleOrOptions, mountPoint });
+  // Check if it's a FileSystem directly (has stat method but not a handle)
+  if (typeof (handleOrOptions as FileSystem).stat === 'function' && !('fs' in handleOrOptions)) {
+    return new AgentFsWrapper({ fs: { fs: handleOrOptions as FileSystem }, mountPoint });
   }
-  const handle = await AgentFS.open(handleOrOptions);
+  // Check if it's an AgentFsHandle (has fs property containing a FileSystem)
+  if ("fs" in handleOrOptions && typeof (handleOrOptions as AgentFsHandle).fs?.stat === 'function') {
+    return new AgentFsWrapper({ fs: handleOrOptions as AgentFsHandle, mountPoint });
+  }
+  // Otherwise it's AgentFSOptions for creating a new Turso-based AgentFS
+  const handle = await AgentFS.open(handleOrOptions as AgentFSOptions);
   return new AgentFsWrapper({ fs: handle, mountPoint });
 }
