@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.1] - 2026-01-02
+
+### Added
+
+- Cloudflare Durable Objects integration prototype.
+- Sandbox: Intercept `rmdir` system call.
+
+### Changed
+
+- Init tracing subscriber to allow debugging turso_core.
+
+### Fixed
+
+- FUSE overlay deadlock.
+- SIGTERM signal handling for graceful shutdown.
+- `agentfs run` help text.
+- ARM build for `rmdir` syscall.
+
 ## [0.4.0] - 2025-12-31
 
 ### Added
@@ -153,6 +171,7 @@
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.4.1]: https://github.com/tursodatabase/agentfs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tursodatabase/agentfs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/tursodatabase/agentfs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tursodatabase/agentfs/compare/v0.2.3...v0.3.0
