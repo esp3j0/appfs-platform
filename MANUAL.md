@@ -13,7 +13,13 @@ AgentFS provides the following components:
 5. Overlay Filesystem - Copy-on-write filesystem layer over host directories
 6. Sandbox - Linux-compatible execution environment with agent filesystem support (experimental)
 
-## Quick Start
+## AgentFS CLI
+
+### Installation
+
+```bash
+curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh
+```
 
 ### 1. Initialize an Agent Filesystem
 

@@ -47,6 +47,12 @@ Read more about the motivation for AgentFS in the announcement [blog post](https
 
 ### Using the CLI
 
+Install the AgentFS CLI:
+
+```bash
+curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh
+```
+
 Initialize an agent filesystem:
 
 ```bash
