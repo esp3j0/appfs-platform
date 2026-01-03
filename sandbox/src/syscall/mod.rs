@@ -236,6 +236,13 @@ pub async fn dispatch_syscall<T: Guest<Sandbox>>(
                 Ok(SyscallResult::Syscall(syscall))
             }
         }
+        Syscall::Linkat(args) => {
+            if let Some(result) = stat::handle_linkat(guest, args, mount_table, fd_table).await? {
+                Ok(SyscallResult::Value(result))
+            } else {
+                Ok(SyscallResult::Syscall(syscall))
+            }
+        }
         Syscall::Llistxattr(args) => {
             if let Some(modified) = xattr::handle_llistxattr(guest, args, mount_table).await? {
                 Ok(SyscallResult::Syscall(modified))

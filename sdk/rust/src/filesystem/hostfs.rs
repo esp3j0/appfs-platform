@@ -302,6 +302,13 @@ impl FileSystem for HostFS {
         Ok(())
     }
 
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let old_full_path = self.resolve_path(oldpath);
+        let new_full_path = self.resolve_path(newpath);
+        tokio::fs::hard_link(&old_full_path, &new_full_path).await?;
+        Ok(())
+    }
+
     async fn readlink(&self, path: &str) -> Result<Option<String>> {
         let full_path = self.resolve_path(path);
         match fs::read_link(&full_path).await {

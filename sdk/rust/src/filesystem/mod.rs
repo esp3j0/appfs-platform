@@ -196,6 +196,13 @@ pub trait FileSystem: Send + Sync {
     /// Create a symbolic link
     async fn symlink(&self, target: &str, linkpath: &str) -> Result<()>;
 
+    /// Create a hard link
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
+    /// Both paths will share the same file data and metadata (except for the name).
+    /// The link count (nlink) of the inode is incremented.
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()>;
+
     /// Read the target of a symbolic link
     ///
     /// Returns `Ok(None)` if the path does not exist.

@@ -773,6 +773,63 @@ impl Filesystem for AgentFSFuse {
         }
     }
 
+    /// Creates a hard link.
+    ///
+    /// Creates a new directory entry `newname` under `newparent` that refers to the
+    /// same inode as `ino`. The link count of the inode is incremented.
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        // Get the path for the source inode
+        let Some(oldpath) = self.get_path(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        // Get the path for the new link
+        let Some(newpath) = self.lookup_path(newparent, newname) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let fs = self.fs.clone();
+        let (result, newpath) = self.runtime.block_on(async move {
+            let result = fs.link(&oldpath, &newpath).await;
+            (result, newpath)
+        });
+
+        if let Err(e) = result {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        // Get the new link's stats
+        let fs = self.fs.clone();
+        let (stat_result, newpath) = self.runtime.block_on(async move {
+            let result = fs.lstat(&newpath).await;
+            (result, newpath)
+        });
+
+        match stat_result {
+            Ok(Some(stats)) => {
+                let attr = fillattr(&stats, self.uid, self.gid);
+                self.add_path(attr.ino, newpath);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
     /// Removes a file (unlinks it from the directory).
     ///
     /// Gets the file's inode before removal to clean up the path cache.

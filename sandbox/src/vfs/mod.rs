@@ -111,6 +111,16 @@ pub trait Vfs: Send + Sync {
             "readlink() not supported by this VFS".to_string(),
         ))
     }
+
+    /// Create a hard link (for virtual filesystems)
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
+    /// This is only called for virtual VFS implementations.
+    async fn link(&self, _oldpath: &Path, _newpath: &Path) -> VfsResult<()> {
+        Err(VfsError::Other(
+            "link() not supported by this VFS".to_string(),
+        ))
+    }
 }
 
 /// A boxed VFS trait object for dynamic dispatch
