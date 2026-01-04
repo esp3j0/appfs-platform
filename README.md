@@ -184,6 +184,9 @@ At the heart of AgentFS is the [agent filesystem](SPEC.md), a complete SQLite-ba
 
 - **[Introducing AgentFS](https://turso.tech/blog/agentfs)** - The motivation behind AgentFS
 - **[AgentFS with FUSE](https://turso.tech/blog/agentfs-fuse)** - Mounting agent filesystems using FUSE
+- **[AgentFS with Overlay Filesystem](https://turso.tech/blog/agentfs-overlay)** - Sandboxing agents with copy-on-write overlays
+- **[AI Agents with Just Bash](https://turso.tech/blog/agentfs-just-bash)** - Safe bash command execution for agents
+- **[AgentFS in the Browser](https://turso.tech/blog/agentfs_browser)** - Running AgentFS in browsers with WebAssembly
 - **[Making Coding Agents Safe Using LlamaIndex](https://www.llamaindex.ai/blog/making-coding-agents-safe-using-llamaindex)** - Using AgentFS with LlamaIndex
 
 ## 📝 License
