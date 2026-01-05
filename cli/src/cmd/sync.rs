@@ -54,6 +54,6 @@ pub async fn handle_stats_command(
         return Err(anyhow!("db is not connected to the remote"));
     };
     let stats = db.stats().await?;
-    stdout.write(serde_json::to_string(&stats)?.as_bytes())?;
+    stdout.write_all(serde_json::to_string(&stats)?.as_bytes())?;
     Ok(())
 }

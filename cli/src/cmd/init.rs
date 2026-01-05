@@ -57,8 +57,7 @@ pub async fn create_agentfs(
             has_partial_sync = true;
         }
         if let Some(length) = sync_options.sync_partial_bootstrap_length {
-            partial_sync.bootstrap_strategy =
-                Some(PartialBootstrapStrategy::Prefix { length: length });
+            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Prefix { length });
             has_partial_sync = true;
         }
         if let Some(query) = sync_options.sync_partial_bootstrap_query {
