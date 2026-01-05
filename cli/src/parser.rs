@@ -185,6 +185,14 @@ pub enum FsCommand {
         /// Path to the file in the filesystem
         file_path: String,
     },
+    /// Write file content
+    Write {
+        /// Path to the file in the filesystem
+        file_path: String,
+
+        /// Content of the file
+        content: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
