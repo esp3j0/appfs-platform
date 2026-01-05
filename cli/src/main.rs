@@ -1,7 +1,7 @@
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
-    parser::{Args, Command, FsCommand},
+    parser::{Args, Command, FsCommand, SyncCommand},
 };
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -22,13 +22,54 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Command::Init { id, force, base } => {
+        Command::Init {
+            id,
+            force,
+            base,
+            sync,
+        } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, force, base)) {
+            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync, force, base)) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
+        Command::Sync {
+            id_or_path,
+            command,
+        } => match command {
+            SyncCommand::Pull => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_pull_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Push => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_push_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Checkpoint => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_checkpoint_command(id_or_path)) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            SyncCommand::Stats => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::sync::handle_stats_command(
+                    &mut std::io::stdout(),
+                    id_or_path,
+                )) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Command::Run {
             allow,
             no_default_allows,
@@ -82,13 +123,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Fs { command } => {
+        Command::Fs {
+            command,
+            id_or_path,
+        } => {
             let rt = get_runtime();
             match command {
-                FsCommand::Ls {
-                    id_or_path,
-                    fs_path,
-                } => {
+                FsCommand::Ls { fs_path } => {
                     if let Err(e) = rt.block_on(cmd::fs::ls_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,
@@ -98,10 +139,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                FsCommand::Cat {
-                    id_or_path,
-                    file_path,
-                } => {
+                FsCommand::Cat { file_path } => {
                     if let Err(e) = rt.block_on(cmd::fs::cat_filesystem(
                         &mut std::io::stdout(),
                         id_or_path,

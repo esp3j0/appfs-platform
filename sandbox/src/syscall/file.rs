@@ -1804,7 +1804,7 @@ pub async fn handle_chmod<T: Guest<Sandbox>>(
     use reverie::syscalls::{AtFlags, Mode, PathPtr, Syscall};
 
     let dirfd = syscall_args.arg0 as i32;
-    let pathname_addr = match unsafe { PathPtr::from_ptr(syscall_args.arg1 as _) } {
+    let pathname_addr = match PathPtr::from_ptr(syscall_args.arg1 as _) {
         Some(ptr) => ptr,
         None => {
             return Ok(None);
