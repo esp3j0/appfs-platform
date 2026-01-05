@@ -21,21 +21,6 @@ fn main() {
     CompleteEnv::with_factory(Args::command).complete();
     let args = Args::parse();
 
-    let default_env_filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing::level_filters::LevelFilter::ERROR.into())
-        .from_env_lossy();
-    if let Err(e) = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_line_number(true)
-                .with_thread_ids(true),
-        )
-        .with(default_env_filter.add_directive("rustyline=off".parse().unwrap()))
-        .try_init()
-    {
-        println!("Unable to setup tracing appender: {e:?}");
-    }
-
     match args.command {
         Command::Init {
             id,
