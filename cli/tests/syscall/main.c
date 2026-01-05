@@ -28,6 +28,10 @@ int main(int argc, char *argv[]) {
         {"fstat", test_fstat},
         {"lstat", test_lstat},
         {"getdents64", test_getdents64},
+        {"append_existing", test_append_existing},
+        {"pwrite_nested", test_pwrite_nested},
+        {"pread_sparse", test_pread_sparse},
+        {"link", test_link},
     };
 
     int num_tests = sizeof(tests) / sizeof(tests[0]);

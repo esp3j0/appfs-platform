@@ -4,8 +4,8 @@ use crate::{
     vfs::{fdtable::FdTable, mount::MountTable},
 };
 use reverie::{
-    syscalls::{MemoryAccess, ReadAddr, Syscall, AtFlags},
-    Error, Guest,
+    syscalls::{MemoryAccess, ReadAddr, Syscall},
+    Error, Guest, Stack,
 };
 
 /// The `statx` system call.
@@ -63,12 +63,14 @@ pub async fn handle_statx<T: Guest<Sandbox>>(
 /// and virtualizes the dirfd.
 /// Returns `Some(result)` if the syscall was handled and the result should be returned directly,
 /// or `None` if the original syscall should be used.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_newfstatat<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Newfstatat,
     mount_table: &MountTable,
     fd_table: &FdTable,
 ) -> Result<Option<i64>, Error> {
+    use reverie::syscalls::AtFlags;
     let dirfd = args.dirfd();
     // AT_FDCWD is -100
     let kernel_dirfd = if dirfd == -100 {
@@ -159,6 +161,7 @@ pub async fn handle_statfs<T: Guest<Sandbox>>(
 /// The `readlink` system call.
 ///
 /// This intercepts `readlink` system calls and translates paths according to the mount table.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_readlink<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Readlink,
@@ -293,6 +296,7 @@ pub async fn handle_readlinkat<T: Guest<Sandbox>>(
 /// The target path is left as-is since it's just a string stored in the symlink.
 /// Returns `Some(result)` if the syscall was handled and the result should be returned directly,
 /// or `None` if the original syscall should be used.
+#[cfg(not(target_arch = "aarch64"))]
 pub async fn handle_symlink<T: Guest<Sandbox>>(
     guest: &mut T,
     args: &reverie::syscalls::Symlink,
@@ -401,6 +405,148 @@ pub async fn handle_symlinkat<T: Guest<Sandbox>>(
 
                 let result = guest.inject(Syscall::Symlinkat(new_syscall)).await?;
                 return Ok(Some(result));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The `linkat` system call.
+///
+/// This intercepts `linkat` system calls and translates paths according to the mount table
+/// and virtualizes the dirfds.
+/// Returns `Some(result)` if the syscall was handled and the result should be returned directly,
+/// or `None` if the original syscall should be used.
+pub async fn handle_linkat<T: Guest<Sandbox>>(
+    guest: &mut T,
+    args: &reverie::syscalls::Linkat,
+    mount_table: &MountTable,
+    fd_table: &FdTable,
+) -> Result<Option<i64>, Error> {
+    let olddirfd = args.olddirfd();
+    let newdirfd = args.newdirfd();
+
+    // AT_FDCWD is -100
+    let kernel_olddirfd = if olddirfd == -100 {
+        olddirfd
+    } else {
+        fd_table.translate(olddirfd).unwrap_or(olddirfd)
+    };
+    let kernel_newdirfd = if newdirfd == -100 {
+        newdirfd
+    } else {
+        fd_table.translate(newdirfd).unwrap_or(newdirfd)
+    };
+
+    // Read oldpath and newpath from guest memory
+    if let Some(oldpath_addr) = args.oldpath() {
+        let oldpath: std::path::PathBuf = oldpath_addr.read(&guest.memory())?;
+
+        if let Some(newpath_addr) = args.newpath() {
+            let newpath: std::path::PathBuf = newpath_addr.read(&guest.memory())?;
+
+            // Check if newpath matches a mount point with virtual VFS
+            if let Some((vfs, _translated_path)) = mount_table.resolve(&newpath) {
+                // Check if this is a virtual VFS (like SQLite)
+                if vfs.is_virtual() {
+                    // Call VFS link method directly
+                    match vfs.link(&oldpath, &newpath).await {
+                        Ok(()) => return Ok(Some(0)), // Success
+                        Err(e) => {
+                            // Map VFS errors to errno
+                            let errno = match e {
+                                crate::vfs::VfsError::NotFound => -libc::ENOENT as i64,
+                                crate::vfs::VfsError::PermissionDenied => -libc::EPERM as i64,
+                                crate::vfs::VfsError::AlreadyExists => -libc::EEXIST as i64,
+                                _ => -libc::EIO as i64,
+                            };
+                            return Ok(Some(errno));
+                        }
+                    }
+                }
+            }
+
+            // Check if either path needs translation by consulting the mount table.
+            // We resolve both paths first (without guest memory allocation) to determine
+            // what needs translation, then allocate and inject if needed.
+            let oldpath_translated = mount_table.resolve(&oldpath);
+            let newpath_translated = mount_table.resolve(&newpath);
+
+            match (oldpath_translated, newpath_translated) {
+                (Some((_vfs1, translated_oldpath)), Some((_vfs2, translated_newpath))) => {
+                    // Both paths need translation
+                    use std::ffi::CString;
+
+                    let old_cstr =
+                        CString::new(translated_oldpath.to_string_lossy().to_string())
+                            .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                    let new_cstr =
+                        CString::new(translated_newpath.to_string_lossy().to_string())
+                            .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+
+                    // Allocate space for both paths on guest stack
+                    let old_bytes = old_cstr.as_bytes_with_nul();
+                    let new_bytes = new_cstr.as_bytes_with_nul();
+
+                    let mut stack = guest.stack().await;
+                    let old_addr: reverie::syscalls::AddrMut<std::path::PathBuf> = stack.reserve();
+                    let new_addr: reverie::syscalls::AddrMut<std::path::PathBuf> = stack.reserve();
+                    stack.commit()?;
+
+                    let old_byte_addr = old_addr.cast::<u8>();
+                    let new_byte_addr = new_addr.cast::<u8>();
+                    guest.memory().write_exact(old_byte_addr, old_bytes)?;
+                    guest.memory().write_exact(new_byte_addr, new_bytes)?;
+
+                    let new_oldpath_ptr: reverie::syscalls::PathPtr = unsafe {
+                        std::mem::transmute(old_byte_addr)
+                    };
+                    let new_newpath_ptr: reverie::syscalls::PathPtr = unsafe {
+                        std::mem::transmute(new_byte_addr)
+                    };
+
+                    let new_syscall = reverie::syscalls::Linkat::new()
+                        .with_olddirfd(kernel_olddirfd)
+                        .with_oldpath(Some(new_oldpath_ptr))
+                        .with_newdirfd(kernel_newdirfd)
+                        .with_newpath(Some(new_newpath_ptr))
+                        .with_flags(args.flags());
+                    let result = guest.inject(Syscall::Linkat(new_syscall)).await?;
+                    return Ok(Some(result));
+                }
+                (Some(_), None) => {
+                    // Only oldpath needs translation
+                    if let Some(new_oldpath_addr) =
+                        translate_path(guest, oldpath_addr, mount_table).await?
+                    {
+                        let new_syscall = reverie::syscalls::Linkat::new()
+                            .with_olddirfd(kernel_olddirfd)
+                            .with_oldpath(Some(new_oldpath_addr))
+                            .with_newdirfd(kernel_newdirfd)
+                            .with_newpath(Some(newpath_addr))
+                            .with_flags(args.flags());
+                        let result = guest.inject(Syscall::Linkat(new_syscall)).await?;
+                        return Ok(Some(result));
+                    }
+                }
+                (None, Some(_)) => {
+                    // Only newpath needs translation
+                    if let Some(new_newpath_addr) =
+                        translate_path(guest, newpath_addr, mount_table).await?
+                    {
+                        let new_syscall = reverie::syscalls::Linkat::new()
+                            .with_olddirfd(kernel_olddirfd)
+                            .with_oldpath(Some(oldpath_addr))
+                            .with_newdirfd(kernel_newdirfd)
+                            .with_newpath(Some(new_newpath_addr))
+                            .with_flags(args.flags());
+                        let result = guest.inject(Syscall::Linkat(new_syscall)).await?;
+                        return Ok(Some(result));
+                    }
+                }
+                (None, None) => {
+                    // Neither path needs translation
+                }
             }
         }
     }

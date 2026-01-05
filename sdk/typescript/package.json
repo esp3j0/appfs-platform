@@ -1,6 +1,6 @@
 {
   "name": "agentfs-sdk",
-  "version": "0.4.0-pre.6",
+  "version": "0.4.1",
   "description": "AgentFS SDK",
   "main": "dist/index_node.js",
   "types": "dist/index_node.d.ts",
@@ -21,6 +21,14 @@
       "node": "./dist/index_node.js",
       "browser": "./dist/index_browser.js",
       "default": "./dist/index_node.js"
+    },
+    "./just-bash": {
+      "import": "./dist/integrations/just-bash/index.js",
+      "types": "./dist/integrations/just-bash/index.d.ts"
+    },
+    "./cloudflare": {
+      "import": "./dist/integrations/cloudflare/index.js",
+      "types": "./dist/integrations/cloudflare/index.d.ts"
     }
   },
   "keywords": [
@@ -38,17 +46,26 @@
     "url": "https://github.com/tursodatabase/agentfs"
   },
   "devDependencies": {
-    "@tursodatabase/database-wasm": "^0.4.0-pre.17",
+    "@tursodatabase/database-wasm": "^0.4.0-pre.18",
     "@types/node": "^20.0.0",
     "@vitest/browser": "^4.0.16",
     "@vitest/browser-playwright": "^4.0.16",
     "@vitest/ui": "^4.0.1",
+    "just-bash": "^1.0.1",
     "typescript": "^5.3.0",
     "vitest": "^4.0.1"
   },
+  "peerDependencies": {
+    "just-bash": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "just-bash": {
+      "optional": true
+    }
+  },
   "dependencies": {
-    "@tursodatabase/database": "^0.4.0-pre.17",
-    "@tursodatabase/database-common": "^0.4.0-pre.17",
+    "@tursodatabase/database": "^0.4.0-pre.18",
+    "@tursodatabase/database-common": "^0.4.0-pre.18",
     "buffer": "^6.0.3"
   },
   "files": [

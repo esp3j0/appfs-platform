@@ -51,6 +51,28 @@ pub struct OverlayFile {
     copied_to_delta: std::sync::atomic::AtomicBool,
 }
 
+impl OverlayFile {
+    /// Ensure parent directories exist in the delta layer.
+    ///
+    /// This is needed for copy-on-write: when a file exists only in the base layer
+    /// and we need to copy it to delta, the parent directories may not exist in delta yet.
+    async fn ensure_parent_dirs_in_delta(&self) -> Result<()> {
+        let components: Vec<&str> = self.path.split('/').filter(|s| !s.is_empty()).collect();
+
+        let mut current = String::new();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            current = format!("{}/{}", current, component);
+
+            // Check if directory exists in delta
+            if self.delta.stat(&current).await?.is_none() {
+                // Create it in delta
+                self.delta.mkdir(&current).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl File for OverlayFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -77,6 +99,9 @@ impl File for OverlayFile {
             .copied_to_delta
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            // Ensure parent directories exist in delta before writing
+            self.ensure_parent_dirs_in_delta().await?;
+
             if let Some(ref base_file) = self.base_file {
                 let stats = base_file.fstat().await?;
                 let base_data = base_file.pread(0, stats.size as u64).await?;
@@ -104,6 +129,9 @@ impl File for OverlayFile {
             .copied_to_delta
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            // Ensure parent directories exist in delta before writing
+            self.ensure_parent_dirs_in_delta().await?;
+
             if let Some(ref base_file) = self.base_file {
                 let stats = base_file.fstat().await?;
                 let base_data = base_file.pread(0, stats.size as u64).await?;
@@ -659,6 +687,49 @@ impl FileSystem for OverlayFS {
         Ok(())
     }
 
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let normalized = self.normalize_path(path);
+
+        // Check if whited-out
+        if self.is_whiteout(&normalized).await? {
+            return Err(FsError::NotFound.into());
+        }
+
+        // If file exists in delta, chmod there directly
+        if self.exists_in_delta(&normalized).await? {
+            return self.delta.chmod(&normalized, mode).await;
+        }
+
+        // Check if exists in base
+        let base_stats = self.base.lstat(&normalized).await?;
+        if let Some(stats) = base_stats {
+            // Need to copy to delta first, then chmod
+            if stats.is_directory() {
+                // For directories, just create in delta and chmod
+                self.ensure_parent_dirs(&normalized).await?;
+                self.delta.mkdir(&normalized).await?;
+                self.delta.chmod(&normalized, mode).await?;
+            } else if stats.is_symlink() {
+                // For symlinks, copy the symlink to delta
+                if let Some(target) = self.base.readlink(&normalized).await? {
+                    self.ensure_parent_dirs(&normalized).await?;
+                    self.delta.symlink(&target, &normalized).await?;
+                    self.delta.chmod(&normalized, mode).await?;
+                }
+            } else {
+                // For regular files, copy content to delta
+                if let Some(data) = self.base.read_file(&normalized).await? {
+                    self.ensure_parent_dirs(&normalized).await?;
+                    self.delta.write_file(&normalized, &data).await?;
+                    self.delta.chmod(&normalized, mode).await?;
+                }
+            }
+            Ok(())
+        } else {
+            Err(FsError::NotFound.into())
+        }
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let from_normalized = self.normalize_path(from);
         let to_normalized = self.normalize_path(to);
@@ -722,6 +793,48 @@ impl FileSystem for OverlayFS {
 
         // Create in delta
         self.delta.symlink(target, &normalized).await
+    }
+
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let old_normalized = self.normalize_path(oldpath);
+        let new_normalized = self.normalize_path(newpath);
+
+        // Check if source is whited out
+        if self.is_whiteout(&old_normalized).await? {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Remove any whiteout at destination
+        self.remove_whiteout(&new_normalized).await?;
+
+        // Ensure parent directories exist for the new path
+        self.ensure_parent_dirs(&new_normalized).await?;
+
+        // If source is only in base, copy it to delta first
+        let in_delta = self.exists_in_delta(&old_normalized).await?;
+
+        if !in_delta {
+            // Check if exists in base
+            let base_stats = self.base.lstat(&old_normalized).await?;
+            if let Some(stats) = base_stats {
+                // Hard links to directories are not allowed
+                if stats.is_directory() {
+                    anyhow::bail!("Cannot create hard link to directory");
+                }
+                // Copy-up: read from base and write to delta
+                if let Some(data) = self.base.read_file(&old_normalized).await? {
+                    self.ensure_parent_dirs(&old_normalized).await?;
+                    self.delta.write_file(&old_normalized, &data).await?;
+                } else {
+                    return Err(FsError::NotFound.into());
+                }
+            } else {
+                return Err(FsError::NotFound.into());
+            }
+        }
+
+        // Create hard link in delta
+        self.delta.link(&old_normalized, &new_normalized).await
     }
 
     async fn readlink(&self, path: &str) -> Result<Option<String>> {
@@ -940,6 +1053,98 @@ mod tests {
         // Should be visible again with new content
         let data = overlay.read_file("/base.txt").await?.unwrap();
         assert_eq!(data, b"recreated");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_chmod_delta_file() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        // Write a new file to delta
+        overlay.write_file("/new.txt", b"content").await?;
+
+        // chmod it
+        overlay.chmod("/new.txt", 0o755).await?;
+
+        let stats = overlay.stat("/new.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o777,
+            0o755,
+            "Mode should be 0o755 after chmod"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_chmod_base_file_copies_to_delta() -> Result<()> {
+        let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+
+        // Get original mode of base file
+        let original_stats = overlay.stat("/base.txt").await?.unwrap();
+
+        // chmod the base file - should copy to delta
+        overlay.chmod("/base.txt", 0o755).await?;
+
+        let stats = overlay.stat("/base.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o777,
+            0o755,
+            "Mode should be 0o755 after chmod"
+        );
+
+        // Verify base file is unchanged
+        use std::os::unix::fs::PermissionsExt;
+        let base_path = base_dir.path().join("base.txt");
+        let base_meta = std::fs::metadata(&base_path)?;
+        assert_eq!(
+            base_meta.permissions().mode() & 0o777,
+            original_stats.mode & 0o777,
+            "Base file should be unchanged"
+        );
+
+        // Verify content is preserved after copy-on-write
+        let data = overlay.read_file("/base.txt").await?.unwrap();
+        assert_eq!(data, b"base content", "Content should be preserved");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_chmod_whiteout_fails() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        // Delete the base file (creates whiteout)
+        overlay.remove("/base.txt").await?;
+
+        // chmod should fail on whited-out file
+        let result = overlay.chmod("/base.txt", 0o755).await;
+        assert!(result.is_err(), "chmod on whited-out file should fail");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_chmod_nonexistent_fails() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        let result = overlay.chmod("/nonexistent.txt", 0o755).await;
+        assert!(result.is_err(), "chmod on nonexistent file should fail");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_chmod_directory() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+
+        // chmod the base subdir
+        overlay.chmod("/subdir", 0o700).await?;
+
+        let stats = overlay.stat("/subdir").await?.unwrap();
+        assert_eq!(stats.mode & 0o777, 0o700, "Directory mode should be 0o700");
+        assert!(stats.is_directory(), "Should still be a directory");
 
         Ok(())
     }

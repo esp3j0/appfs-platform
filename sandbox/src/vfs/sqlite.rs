@@ -169,7 +169,7 @@ impl Vfs for SqliteVfs {
             let stat_ptr = stat.as_mut_ptr();
             (*stat_ptr).st_dev = 0;
             (*stat_ptr).st_ino = stats.ino as u64;
-            (*stat_ptr).st_nlink = stats.nlink as u64;
+            (*stat_ptr).st_nlink = stats.nlink.into();
             (*stat_ptr).st_mode = stats.mode;
             (*stat_ptr).st_uid = stats.uid;
             (*stat_ptr).st_gid = stats.gid;
@@ -203,7 +203,7 @@ impl Vfs for SqliteVfs {
             let stat_ptr = stat.as_mut_ptr();
             (*stat_ptr).st_dev = 0;
             (*stat_ptr).st_ino = stats.ino as u64;
-            (*stat_ptr).st_nlink = stats.nlink as u64;
+            (*stat_ptr).st_nlink = stats.nlink.into();
             (*stat_ptr).st_mode = stats.mode;
             (*stat_ptr).st_uid = stats.uid;
             (*stat_ptr).st_gid = stats.gid;
@@ -252,6 +252,27 @@ impl Vfs for SqliteVfs {
 
         Ok(PathBuf::from(target))
     }
+
+    async fn link(&self, oldpath: &Path, newpath: &Path) -> VfsResult<()> {
+        let oldpath_rel = self.translate_to_relative(oldpath)?;
+        let newpath_rel = self.translate_to_relative(newpath)?;
+
+        self.fs
+            .link(&oldpath_rel, &newpath_rel)
+            .await
+            .map_err(|e| {
+                let err_msg = e.to_string();
+                if err_msg.contains("does not exist") {
+                    VfsError::NotFound
+                } else if err_msg.contains("already exists") {
+                    VfsError::AlreadyExists
+                } else if err_msg.contains("directory") {
+                    VfsError::PermissionDenied
+                } else {
+                    VfsError::Other(format!("Failed to create hard link: {}", e))
+                }
+            })
+    }
 }
 
 /// File operations for SQLite VFS files
@@ -286,8 +307,14 @@ impl FileOps for SqliteFileOps {
     async fn write(&self, buf: &[u8]) -> VfsResult<usize> {
         let mut data = self.data.lock().unwrap();
         let mut offset = self.offset.lock().unwrap();
+        let flags = *self.flags.lock().unwrap();
 
-        let start = *offset as usize;
+        // Handle O_APPEND: always write at the end of the file
+        let start = if flags & libc::O_APPEND != 0 {
+            data.len()
+        } else {
+            *offset as usize
+        };
 
         // Extend the buffer if necessary
         if start + buf.len() > data.len() {
@@ -295,7 +322,7 @@ impl FileOps for SqliteFileOps {
         }
 
         data[start..start + buf.len()].copy_from_slice(buf);
-        *offset += buf.len() as i64;
+        *offset = (start + buf.len()) as i64;
 
         // Mark as dirty since we modified the data
         *self.dirty.lock().unwrap() = true;
@@ -339,7 +366,7 @@ impl FileOps for SqliteFileOps {
             let stat_ptr = stat.as_mut_ptr();
             (*stat_ptr).st_dev = 0;
             (*stat_ptr).st_ino = stats.ino as u64;
-            (*stat_ptr).st_nlink = stats.nlink as u64;
+            (*stat_ptr).st_nlink = stats.nlink.into();
             (*stat_ptr).st_mode = stats.mode;
             (*stat_ptr).st_uid = stats.uid;
             (*stat_ptr).st_gid = stats.gid;
@@ -468,7 +495,7 @@ impl FileOps for SqliteDirectoryOps {
             let stat_ptr = stat.as_mut_ptr();
             (*stat_ptr).st_dev = 0;
             (*stat_ptr).st_ino = stats.ino as u64;
-            (*stat_ptr).st_nlink = stats.nlink as u64;
+            (*stat_ptr).st_nlink = stats.nlink.into();
             (*stat_ptr).st_mode = stats.mode;
             (*stat_ptr).st_uid = stats.uid;
             (*stat_ptr).st_gid = stats.gid;

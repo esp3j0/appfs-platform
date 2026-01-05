@@ -20,12 +20,25 @@ use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
     ffi::CString,
+    fs,
     io::BufRead,
     os::unix::ffi::OsStrExt,
+    os::unix::fs::MetadataExt,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
 };
+
+/// Global child PID for signal forwarding.
+/// Set by the parent before installing signal handlers.
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Counter for termination signals received.
+/// First signal forwards to child, second signal sends SIGKILL.
+static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
 use crate::fuse::FuseMountOptions;
 
@@ -37,7 +50,7 @@ const FUSE_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Virtual filesystems that must remain writable for system operation.
 /// These are skipped when remounting the filesystem hierarchy as read-only.
-const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev"];
+const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 
 /// Default directories that are allowed to be writable.
 /// These are common application config/cache directories that many programs need.
@@ -56,10 +69,77 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 /// fusermount3 is from fuse3 package; fusermount is the legacy fallback.
 const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
 
+/// Signal handler that forwards signals to the child process.
+///
+/// When the parent receives SIGTERM or SIGINT, this handler forwards
+/// the signal to the child process so it can shut down gracefully.
+/// On the second signal, SIGKILL is sent to force termination (handles
+/// cases where the child ignores SIGTERM, like interactive bash).
+///
+/// SAFETY: This is a signal handler. It must only use async-signal-safe functions.
+/// kill() and atomic operations are async-signal-safe.
+extern "C" fn forward_signal_to_child(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // Increment signal counter (fetch_add returns previous value)
+        let count = TERM_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        // SAFETY: kill() is async-signal-safe
+        unsafe {
+            if count == 0 {
+                // First signal: forward to child gracefully
+                libc::kill(pid, sig);
+            } else {
+                // Second+ signal: force kill the child
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Install signal handlers to forward SIGTERM and SIGINT to the child process.
+///
+/// This ensures that when the parent receives a termination signal, it forwards
+/// it to the child and waits for it to exit before cleaning up.
+fn install_signal_handlers() {
+    // Reset the signal counter for fresh signal handling
+    TERM_SIGNAL_COUNT.store(0, Ordering::SeqCst);
+
+    // SAFETY: sigaction() and sigprocmask() with valid signal numbers are safe.
+    // SA_RESTART ensures most syscalls restart after the handler returns.
+    unsafe {
+        // Ensure SIGTERM and SIGINT are not blocked (tokio might block them in worker threads)
+        let mut sigset: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut sigset);
+        libc::sigaddset(&mut sigset, libc::SIGTERM);
+        libc::sigaddset(&mut sigset, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
+
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_sigaction = forward_signal_to_child as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
+            panic!(
+                "failed to install SIGTERM handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
+            panic!(
+                "failed to install SIGINT handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 /// Run a command in an overlay sandbox.
 pub async fn run_cmd(
     allow: Vec<PathBuf>,
     no_default_allows: bool,
+    session_id: Option<String>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -68,7 +148,24 @@ pub async fn run_cmd(
     // Build the list of allowed writable paths
     let allowed_paths = build_allowed_paths(&allow, no_default_allows)?;
 
-    print_welcome_banner(&cwd, &allowed_paths);
+    // Check if we're joining an existing session
+    let session = setup_run_directory(session_id)?;
+
+    // If the FUSE mountpoint is already mounted, join the existing session
+    if is_mountpoint(&session.fuse_mountpoint) {
+        eprintln!("Joining existing session: {}", session.run_id);
+        eprintln!();
+        return run_in_existing_session(
+            &cwd,
+            &session.fuse_mountpoint,
+            &allowed_paths,
+            command,
+            args,
+            &session.run_id,
+        );
+    }
+
+    print_welcome_banner(&cwd, &allowed_paths, &session.run_id);
 
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
@@ -76,8 +173,6 @@ pub async fn run_cmd(
     let cwd_fd = std::fs::File::open(&cwd).context("Failed to open current directory")?;
     let fd_num = cwd_fd.as_raw_fd();
     let fd_path = format!("/proc/self/fd/{}", fd_num);
-
-    let session = setup_run_directory()?;
 
     let db_path_str = session
         .db_path
@@ -87,7 +182,16 @@ pub async fn run_cmd(
         .await
         .context("Failed to create delta AgentFS")?;
 
-    let base = Arc::new(HostFS::new(&fd_path).context("Failed to create HostFS")?);
+    let hostfs = HostFS::new(&fd_path).context("Failed to create HostFS")?;
+    #[cfg(target_family = "unix")]
+    let hostfs = {
+        let mountpoint_inode = fs::metadata(&session.fuse_mountpoint)
+            .map(|m| m.ino())
+            .context("Failed to get mountpoint inode")?;
+        hostfs.with_fuse_mountpoint(mountpoint_inode)
+    };
+
+    let base = Arc::new(hostfs);
     let overlay = OverlayFS::new(base, agentfs.fs);
 
     let cwd_str = cwd
@@ -156,6 +260,7 @@ pub async fn run_cmd(
             &allowed_paths,
             command,
             args,
+            &session.run_id,
             pipe_to_child[0],
             pipe_to_parent[1],
         );
@@ -194,20 +299,100 @@ pub async fn run_cmd(
     }
 }
 
+/// Run a command in an existing session's FUSE mount.
+///
+/// This is used when joining an existing session that already has a FUSE mount active.
+/// We don't need to start a new FUSE server, just run the command in the existing mount.
+fn run_in_existing_session(
+    cwd: &Path,
+    fuse_mountpoint: &Path,
+    allowed_paths: &[PathBuf],
+    command: PathBuf,
+    args: Vec<String>,
+    session_id: &str,
+) -> Result<()> {
+    // SAFETY: getuid/getgid are always safe
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Create pipes for parent-child coordination.
+    let (pipe_to_child, pipe_to_parent) = create_sync_pipes()?;
+
+    // SAFETY: fork() is safe here
+    let child_pid = unsafe { libc::fork() };
+
+    if child_pid < 0 {
+        bail!("Failed to fork: {}", std::io::Error::last_os_error());
+    }
+
+    if child_pid == 0 {
+        // Child process
+        unsafe {
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+
+        run_child(
+            cwd,
+            fuse_mountpoint,
+            allowed_paths,
+            command,
+            args,
+            session_id,
+            pipe_to_child[0],
+            pipe_to_parent[1],
+        );
+    } else {
+        // Parent process
+        unsafe {
+            libc::close(pipe_to_child[0]);
+            libc::close(pipe_to_parent[1]);
+        }
+
+        // Wait for child to signal it has called unshare
+        if !wait_for_pipe_signal(pipe_to_parent[0]) {
+            eprintln!("Error: Failed to read sync signal from child process");
+            abort_child(pipe_to_child[1], child_pid);
+        }
+
+        // Configure user namespace mappings for the child
+        write_namespace_mappings(child_pid, uid, gid, pipe_to_child[1]);
+
+        // Signal child that mappings are done
+        unsafe {
+            libc::write(pipe_to_child[1], b"x".as_ptr() as *const libc::c_void, 1);
+            libc::close(pipe_to_child[1]);
+            libc::close(pipe_to_parent[0]);
+        }
+
+        // Store child PID and install signal handlers before waiting
+        CHILD_PID.store(child_pid, Ordering::SeqCst);
+        install_signal_handlers();
+
+        // Wait for child to exit (don't unmount or cleanup - the original session owns that)
+        // Retry on EINTR (signal interruption)
+        let exit_code = wait_for_child(child_pid);
+
+        std::process::exit(exit_code);
+    }
+}
+
 /// Print the welcome banner showing sandbox configuration.
-fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf]) {
+fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str) {
     eprintln!("Welcome to AgentFS!");
     eprintln!();
-    eprintln!("  {} (copy-on-write)", cwd.display());
-    if allowed_paths.is_empty() {
-        eprintln!("  Everything else is read-only.");
-    } else {
-        eprintln!("  The following directories are also writable:");
-        for path in allowed_paths {
-            eprintln!("    - {}", path.display());
-        }
-        eprintln!("  Everything else is read-only.");
+    eprintln!("The following directories are writable:");
+    eprintln!();
+    eprintln!("  - {} (copy-on-write)", cwd.display());
+    for path in allowed_paths {
+        eprintln!("  - {}", path.display());
     }
+    eprintln!();
+    eprintln!("🔒 Everything else is read-only.");
+    eprintln!();
+    eprintln!("To join this session from another terminal:");
+    eprintln!();
+    eprintln!("  agentfs run --session {} <command>", session_id);
     eprintln!();
 }
 
@@ -221,9 +406,12 @@ struct RunSession {
     fuse_mountpoint: PathBuf,
 }
 
-/// Create a unique run directory with database and mountpoint paths.
-fn setup_run_directory() -> Result<RunSession> {
-    let run_id = uuid::Uuid::new_v4().to_string();
+/// Create a run directory with database and mountpoint paths.
+///
+/// If `session_id` is provided, uses that as the run ID (allowing multiple
+/// runs to share the same delta layer). Otherwise generates a unique UUID.
+fn setup_run_directory(session_id: Option<String>) -> Result<RunSession> {
+    let run_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
     let run_dir = home_dir.join(".agentfs").join("run").join(&run_id);
     std::fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
@@ -354,12 +542,14 @@ fn child_exit(msg: &str) -> ! {
 }
 
 /// Child process: set up namespace isolation and execute the command.
+#[allow(clippy::too_many_arguments)]
 fn run_child(
     cwd: &Path,
     fuse_mountpoint: &Path,
     allowed_paths: &[PathBuf],
     command: PathBuf,
     args: Vec<String>,
+    session_id: &str,
     pipe_from_parent: libc::c_int,
     pipe_to_parent: libc::c_int,
 ) -> ! {
@@ -439,7 +629,7 @@ fn run_child(
     }
 
     // Step 8: Execute the command (does not return).
-    exec_command(command, args);
+    exec_command(command, args, session_id);
 }
 
 /// Remount all filesystems as read-only, except for the specified paths.
@@ -699,10 +889,12 @@ fn run_parent(
     _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
     db_path: &Path,
 ) -> ! {
-    // Wait for child process to exit
-    let mut status: libc::c_int = 0;
-    unsafe { libc::waitpid(child_pid, &mut status, 0) };
-    let exit_code = wait_status_to_exit_code(status);
+    // Store child PID and install signal handlers before waiting
+    CHILD_PID.store(child_pid, Ordering::SeqCst);
+    install_signal_handlers();
+
+    // Wait for child process to exit, retrying on EINTR (signal interruption)
+    let exit_code = wait_for_child(child_pid);
 
     // Move away from mountpoint before unmounting to avoid EBUSY
     let _ = std::env::set_current_dir("/");
@@ -779,8 +971,8 @@ fn is_mountpoint(path: &Path) -> bool {
 }
 
 /// Execute the command, replacing the current process.
-fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
-    setup_env_vars();
+fn exec_command(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
+    setup_env_vars(session_id);
 
     let cmd_cstr = match CString::new(command.as_os_str().as_bytes()) {
         Ok(s) => s,
@@ -826,9 +1018,48 @@ fn exec_command(command: PathBuf, args: Vec<String>) -> ! {
 }
 
 /// Setup environment variables for the sandbox.
-fn setup_env_vars() {
+fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS", "1");
+    std::env::set_var("AGENTFS_SANDBOX", "linux-namespace");
+    std::env::set_var("AGENTFS_SESSION", session_id);
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
+
+    // Configure SSH to skip system config files.
+    // Inside the user namespace, root-owned files in /etc/ssh/ssh_config.d/
+    // appear with invalid ownership (unmapped uid), causing SSH to reject them.
+    // Using only ~/.ssh/config avoids this issue while preserving user settings.
+    if let Some(home) = dirs::home_dir() {
+        let user_ssh_config = home.join(".ssh/config");
+        // Use user's config if it exists, otherwise use /dev/null (no config)
+        let config_path = if user_ssh_config.exists() {
+            user_ssh_config.to_string_lossy().to_string()
+        } else {
+            "/dev/null".to_string()
+        };
+        std::env::set_var("GIT_SSH_COMMAND", format!("ssh -F {}", config_path));
+    }
+}
+
+/// Wait for a child process to exit, retrying on EINTR.
+///
+/// Returns the exit code of the child process, or 1 if waitpid fails.
+fn wait_for_child(child_pid: libc::pid_t) -> i32 {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid with valid child pid is safe
+        let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                // Interrupted by signal, retry
+                continue;
+            }
+            // Other error, return exit code 1
+            return 1;
+        }
+        break;
+    }
+    wait_status_to_exit_code(status)
 }
 
 /// Extract exit code from wait status.

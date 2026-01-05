@@ -1,30 +1,35 @@
-//! Run command handler for Linux x86_64.
+//! Run command - common entry point.
 //!
-//! Dispatches to either the overlay sandbox (default) or the experimental
-//! ptrace-based sandbox based on command-line flags.
+//! Dispatches to platform-specific implementations:
+//! - Linux: FUSE + namespace sandbox (or experimental ptrace)
+//! - Darwin: NFS + sandbox-exec
 
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// Handle the `run` command, dispatching to the appropriate sandbox implementation.
+#[cfg_attr(target_os = "linux", path = "run_linux.rs")]
+#[cfg_attr(target_os = "macos", path = "run_darwin.rs")]
+#[cfg_attr(target_os = "windows", path = "run_windows.rs")]
+mod sys;
+
+/// Handle the `run` command, dispatching to the platform-specific implementation.
 pub async fn handle_run_command(
     allow: Vec<PathBuf>,
     no_default_allows: bool,
     experimental_sandbox: bool,
     strace: bool,
+    session: Option<String>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
-    if experimental_sandbox {
-        if !allow.is_empty() || no_default_allows {
-            eprintln!("Warning: --allow and --no-default-allows are not supported with --experimental-sandbox, ignoring");
-        }
-        crate::sandbox::ptrace::run_cmd(strace, command, args).await;
-    } else {
-        if strace {
-            eprintln!("Warning: --strace is only supported with --experimental-sandbox, ignoring");
-        }
-        crate::sandbox::overlay::run_cmd(allow, no_default_allows, command, args).await?;
-    }
-    Ok(())
+    sys::run(
+        allow,
+        no_default_allows,
+        experimental_sandbox,
+        strace,
+        session,
+        command,
+        args,
+    )
+    .await
 }

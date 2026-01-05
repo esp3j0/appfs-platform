@@ -184,11 +184,24 @@ pub trait FileSystem: Send + Sync {
     /// Remove a file or empty directory
     async fn remove(&self, path: &str) -> Result<()>;
 
+    /// Change file mode/permissions
+    ///
+    /// The mode parameter contains the full mode including file type bits,
+    /// but only the permission bits (lower 12 bits) will be modified.
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()>;
+
     /// Rename/move a file or directory
     async fn rename(&self, from: &str, to: &str) -> Result<()>;
 
     /// Create a symbolic link
     async fn symlink(&self, target: &str, linkpath: &str) -> Result<()>;
+
+    /// Create a hard link
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
+    /// Both paths will share the same file data and metadata (except for the name).
+    /// The link count (nlink) of the inode is incremented.
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()>;
 
     /// Read the target of a symbolic link
     ///

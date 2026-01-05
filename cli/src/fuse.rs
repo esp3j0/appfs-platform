@@ -21,6 +21,16 @@ use std::{
 };
 use tokio::runtime::Runtime;
 
+/// Convert an anyhow::Error to an errno code for FUSE replies.
+///
+/// If the error is a filesystem-specific FsError, returns the appropriate
+/// errno code (ENOENT, EEXIST, ENOTDIR, etc.). Otherwise falls back to EIO.
+fn error_to_errno(e: &anyhow::Error) -> i32 {
+    e.downcast_ref::<FsError>()
+        .map(|fs_err| fs_err.to_errno())
+        .unwrap_or(libc::EIO)
+}
+
 /// Cache entries never expire - we explicitly invalidate on mutations.
 /// This is safe because we are the only writer to the filesystem.
 const TTL: Duration = Duration::MAX;
@@ -60,6 +70,13 @@ struct AgentFSFuse {
     uid: u32,
     /// Group ID to report for all files (set at mount time)
     gid: u32,
+    /// Lossy string representation of the absolute mountpoint path.
+    /// This is used to avoid looking up ourselves inside ourselves,
+    /// e.g., when we mount an under filesystem `/` at /mntpnt,
+    /// we do not want to look up `/mntpnt/mntpnt`, because the handler will then try
+    /// to lookup `/mntpnt` from he under filesystem, which will hit our mountpoint again,
+    /// causing a deadlock.
+    mountpoint_path: String,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -111,7 +128,7 @@ impl Filesystem for AgentFSFuse {
                 reply.entry(&TTL, &attr, 0);
             }
             Ok(None) => reply.error(libc::ENOENT),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -131,7 +148,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats, self.uid, self.gid)),
             Ok(None) => reply.error(libc::ENOENT),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -153,19 +170,19 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(Some(target)) => reply.data(target.as_bytes()),
             Ok(None) => reply.error(libc::ENOENT),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
-    /// Sets file attributes, primarily handling truncate operations.
+    /// Sets file attributes, handling truncate and chmod operations.
     ///
-    /// Currently only `size` changes (truncate) are supported. Other attribute
-    /// changes (mode, uid, gid, timestamps) are accepted but ignored.
+    /// Currently `size` changes (truncate) and `mode` changes (chmod) are supported.
+    /// Other attribute changes (uid, gid, timestamps) are accepted but ignored.
     fn setattr(
         &mut self,
         _req: &Request,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -179,6 +196,24 @@ impl Filesystem for AgentFSFuse {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        // Handle chmod
+        if let Some(new_mode) = mode {
+            let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
+                reply.error(libc::ENOENT);
+                return;
+            };
+
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.chmod(&path, new_mode).await });
+
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        }
+
         // Handle truncate
         if let Some(new_size) = size {
             let result = if let Some(fh) = fh {
@@ -209,8 +244,8 @@ impl Filesystem for AgentFSFuse {
                 })
             };
 
-            if result.is_err() {
-                reply.error(libc::EIO);
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
                 return;
             }
         }
@@ -227,7 +262,7 @@ impl Filesystem for AgentFSFuse {
         match result {
             Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats, self.uid, self.gid)),
             Ok(None) => reply.error(libc::ENOENT),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -267,8 +302,8 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::ENOENT);
                 return;
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
         };
@@ -366,8 +401,8 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::ENOENT);
                 return;
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
         };
@@ -501,8 +536,8 @@ impl Filesystem for AgentFSFuse {
             (result, path)
         });
 
-        if result.is_err() {
-            reply.error(libc::EIO);
+        if let Err(e) = result {
+            reply.error(error_to_errno(&e));
             return;
         }
 
@@ -519,9 +554,11 @@ impl Filesystem for AgentFSFuse {
                 self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
             }
-            _ => {
-                // Fail the operation if we cannot stat the new directory
-                reply.error(libc::EIO);
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
             }
         }
     }
@@ -549,8 +586,8 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::ENOENT);
                 return;
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
         };
@@ -576,8 +613,8 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::ENOENT);
                 return;
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
             Ok(Some(_)) => {} // Empty directory, proceed
@@ -593,7 +630,7 @@ impl Filesystem for AgentFSFuse {
                 self.drop_path(ino);
                 reply.ok();
             }
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -610,7 +647,7 @@ impl Filesystem for AgentFSFuse {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
@@ -620,24 +657,29 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
-        // Create empty file
+        // Create empty file and set mode
         let fs = self.fs.clone();
-        let (result, path) = self.runtime.block_on(async move {
-            let result = fs.write_file(&path, &[]).await;
-            (result, path)
+        let result = self.runtime.block_on(async move {
+            fs.write_file(&path, &[]).await?;
+            // Set the requested mode (includes execute permissions for build scripts)
+            fs.chmod(&path, mode).await?;
+            Ok::<_, anyhow::Error>(path)
         });
 
-        if result.is_err() {
-            reply.error(libc::EIO);
-            return;
-        }
+        let path = match result {
+            Ok(p) => p,
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        };
 
         // Get the new file's stats
         let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.stat(&path).await;
-            (result, path)
-        });
+        let path_for_stat = path.clone();
+        let stat_result = self
+            .runtime
+            .block_on(async move { fs.stat(&path_for_stat).await });
 
         let attr = match stat_result {
             Ok(Some(stats)) => {
@@ -645,9 +687,12 @@ impl Filesystem for AgentFSFuse {
                 self.add_path(attr.ino, path.clone());
                 attr
             }
-            _ => {
-                // Fail the operation if we cannot stat the new file
-                reply.error(libc::EIO);
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
         };
@@ -661,8 +706,8 @@ impl Filesystem for AgentFSFuse {
 
         let file = match open_result {
             Ok(file) => file,
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(&e));
                 return;
             }
         };
@@ -701,8 +746,8 @@ impl Filesystem for AgentFSFuse {
             (result, path)
         });
 
-        if result.is_err() {
-            reply.error(libc::EIO);
+        if let Err(e) = result {
+            reply.error(error_to_errno(&e));
             return;
         }
 
@@ -719,8 +764,68 @@ impl Filesystem for AgentFSFuse {
                 self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
             }
-            _ => {
-                reply.error(libc::EIO);
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
+            }
+        }
+    }
+
+    /// Creates a hard link.
+    ///
+    /// Creates a new directory entry `newname` under `newparent` that refers to the
+    /// same inode as `ino`. The link count of the inode is incremented.
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        // Get the path for the source inode
+        let Some(oldpath) = self.get_path(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        // Get the path for the new link
+        let Some(newpath) = self.lookup_path(newparent, newname) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        let fs = self.fs.clone();
+        let (result, newpath) = self.runtime.block_on(async move {
+            let result = fs.link(&oldpath, &newpath).await;
+            (result, newpath)
+        });
+
+        if let Err(e) = result {
+            reply.error(error_to_errno(&e));
+            return;
+        }
+
+        // Get the new link's stats
+        let fs = self.fs.clone();
+        let (stat_result, newpath) = self.runtime.block_on(async move {
+            let result = fs.lstat(&newpath).await;
+            (result, newpath)
+        });
+
+        match stat_result {
+            Ok(Some(stats)) => {
+                let attr = fillattr(&stats, self.uid, self.gid);
+                self.add_path(attr.ino, newpath);
+                reply.entry(&TTL, &attr, 0);
+            }
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                reply.error(error_to_errno(&e));
             }
         }
     }
@@ -747,8 +852,8 @@ impl Filesystem for AgentFSFuse {
                 reply.error(libc::ENOENT);
                 return;
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            Err(e) => {
+                reply.error(error_to_errno(e));
                 return;
             }
         };
@@ -768,7 +873,7 @@ impl Filesystem for AgentFSFuse {
                 self.drop_path(ino);
                 reply.ok();
             }
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -834,13 +939,7 @@ impl Filesystem for AgentFSFuse {
                 }
                 reply.ok();
             }
-            Err(e) => {
-                let errno = e
-                    .downcast_ref::<FsError>()
-                    .map(|fs_err| fs_err.to_errno())
-                    .unwrap_or(libc::EIO);
-                reply.error(errno);
-            }
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -869,7 +968,7 @@ impl Filesystem for AgentFSFuse {
                 self.open_files.lock().insert(fh, OpenFile { file });
                 reply.opened(fh, 0);
             }
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -900,7 +999,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(data) => reply.data(&data),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -934,7 +1033,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => reply.written(data_len as u32),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -970,7 +1069,7 @@ impl Filesystem for AgentFSFuse {
 
         match result {
             Ok(()) => reply.ok(),
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(error_to_errno(&e)),
         }
     }
 
@@ -1037,7 +1136,13 @@ impl AgentFSFuse {
     ///
     /// The uid and gid are used for all file ownership to avoid "dubious ownership"
     /// errors from tools like git that check file ownership.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, uid: u32, gid: u32) -> Self {
+    fn new(
+        fs: Arc<dyn FileSystem>,
+        runtime: Runtime,
+        uid: u32,
+        gid: u32,
+        mountpoint_path: PathBuf,
+    ) -> Self {
         Self {
             fs,
             runtime,
@@ -1046,6 +1151,7 @@ impl AgentFSFuse {
             next_fh: AtomicU64::new(1),
             uid,
             gid,
+            mountpoint_path: mountpoint_path.as_os_str().to_string_lossy().to_string(),
         }
     }
 
@@ -1062,10 +1168,18 @@ impl AgentFSFuse {
         let parent_path = path_cache.get(&parent_ino)?;
         let name_str = name.to_str()?;
 
-        if parent_path == "/" {
-            Some(format!("/{}", name_str))
+        let path = if parent_path == "/" {
+            format!("/{}", name_str)
         } else {
-            Some(format!("{}/{}", parent_path, name_str))
+            format!("{}/{}", parent_path, name_str)
+        };
+
+        if path.starts_with(&self.mountpoint_path) {
+            // Cut the head off here so we never try to lookup anything that falls within
+            // our own mount inside our handlers by immediately returning ENOENT.
+            None
+        } else {
+            Some(path)
         }
     }
 
@@ -1155,7 +1269,7 @@ pub fn mount(
     let uid = opts.uid.unwrap_or_else(|| unsafe { libc::getuid() });
     let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getgid() });
 
-    let fs = AgentFSFuse::new(fs, runtime, uid, gid);
+    let fs = AgentFSFuse::new(fs, runtime, uid, gid, opts.mountpoint.clone());
 
     fs.add_path(1, "/".to_string());
 

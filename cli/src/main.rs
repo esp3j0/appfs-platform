@@ -1,14 +1,21 @@
-use clap::{CommandFactory, Parser};
-use clap_complete::CompleteEnv;
-
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
     parser::{Args, Command, FsCommand, SyncCommand},
 };
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
+use tracing_subscriber::prelude::*;
 
 fn main() {
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "agentfs=info".into()),
+        )
+        .try_init();
+
     reset_sigpipe();
 
     CompleteEnv::with_factory(Args::command).complete();
@@ -83,15 +90,18 @@ fn main() {
             no_default_allows,
             experimental_sandbox,
             strace,
+            session,
             command,
             args,
         } => {
+            let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
                 allow,
                 no_default_allows,
                 experimental_sandbox,
                 strace,
+                session,
                 command,
                 args,
             )) {
@@ -183,3 +193,16 @@ fn reset_sigpipe() {
 
 #[cfg(not(unix))]
 fn reset_sigpipe() {}
+
+/// Returns the default shell for the current platform.
+/// Linux uses bash, macOS uses zsh.
+fn default_shell() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("zsh")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::path::PathBuf::from("bash")
+    }
+}

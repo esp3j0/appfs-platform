@@ -9,11 +9,17 @@ AgentFS provides the following components:
 1. SDK - TypeScript and Rust libraries for programmatic filesystem access
 2. CLI - Command-line interface for managing agent filesystems
 3. Specification - SQLite-based agent filesystem specification
-4. FUSE Mount - Mount agent filesystems on the host using FUSE
+4. FUSE/NFS Mount - Mount agent filesystems on the host using FUSE (Linux) or NFS (macOS)
 5. Overlay Filesystem - Copy-on-write filesystem layer over host directories
 6. Sandbox - Linux-compatible execution environment with agent filesystem support (experimental)
 
-## Quick Start
+## AgentFS CLI
+
+### Installation
+
+```bash
+curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh
+```
 
 ### 1. Initialize an Agent Filesystem
 
@@ -41,7 +47,7 @@ Created agent filesystem: .agentfs/my-agent.db
 Agent ID: my-agent
 ```
 
-### 2. Mount the AgentFS filesystem with FUSE (Linux and macOS)
+### 2. Mount the AgentFS filesystem with FUSE (Linux) or NFS (macOS)
 
 Mount an AgentFS filesystem on the host:
 
@@ -149,7 +155,7 @@ The `.agentfs/` directory is automatically created if it doesn't exist.
 
 ### `agentfs mount`
 
-Mount an agent filesystem using FUSE (Linux and macOS).
+Mount an agent filesystem using FUSE (Linux) or NFS (macOS).
 
 **Usage:**
 ```bash
@@ -176,9 +182,8 @@ agentfs mount .agentfs/my-agent.db ./my-agent-mount
 Mounts the agent filesystem as a FUSE filesystem on the host, allowing you to interact with the agent's files using standard filesystem tools (ls, cat, cp, etc.).
 
 **Requirements:**
-- Linux or macOS operating system
-- FUSE must be installed on your system (on macOS, install [macFUSE](https://osxfuse.github.io/))
-- The CLI must be built with the `fuse` feature enabled
+- Linux: FUSE must be installed on your system
+- macOS: Uses NFS (no additional installation required)
 
 **Usage after mounting:**
 ```bash
@@ -192,13 +197,11 @@ cat ./my-agent-mount/hello.txt
 ls ./my-agent-mount/
 ```
 
-To unmount, use `fusermount -u ./my-agent-mount`.
+To unmount, use `fusermount -u ./my-agent-mount` on Linux or `umount ./my-agent-mount` on macOS.
 
 ### `agentfs run`
 
 Execute a program in a sandboxed environment with copy-on-write filesystem isolation.
-
-By default, uses FUSE+overlay with user namespaces for isolation. The current working directory becomes copy-on-write (changes are stored in an AgentFS database), while the rest of the filesystem is read-only.
 
 **Usage:**
 ```bash
@@ -210,9 +213,30 @@ agentfs run [OPTIONS] <COMMAND> [ARGS]...
 - `[ARGS]...` - Arguments for the command
 
 **Options:**
-- `--experimental-sandbox` - Use experimental ptrace-based syscall interception sandbox
+- `--session <ID>` - Session identifier for sharing the delta layer across multiple runs. If not provided, a unique session ID is generated for each run. Use the same session ID to share modifications between runs or to join an existing session from another terminal.
+- `--allow <PATH>` - Additional paths to allow read-write access (can be specified multiple times)
+- `--no-default-allows` - Disable default allowed directories (~/.config, ~/.cache, ~/.local, ~/.claude, etc.)
+- `--experimental-sandbox` - Use experimental ptrace-based syscall interception sandbox (Linux only)
 - `--strace` - Enable strace-like output for system calls (only with `--experimental-sandbox`)
 - `-h, --help` - Print help
+
+**Environment Variables:**
+- `AGENTFS` - Set to `1` inside the sandbox to indicate an AgentFS environment
+- `AGENTFS_SANDBOX` - Set to the sandbox type (`macos-sandbox` or `linux-namespace`)
+
+#### Platform-Specific Sandboxing
+
+**Linux:**
+Uses FUSE + overlay filesystem with user namespaces for isolation. The current working directory becomes copy-on-write (changes are stored in an AgentFS database), while the rest of the filesystem is read-only.
+
+**macOS:**
+Uses NFS + overlay filesystem with Apple's Sandbox (`sandbox-exec`) for kernel-enforced isolation. The current working directory becomes copy-on-write, and file writes are restricted to:
+- Current working directory (via the copy-on-write overlay)
+- `/tmp`
+- Default allowed directories in HOME: `~/.claude`, `~/.config`, `~/.cache`, `~/.local`, `~/.npm`
+- Any paths specified with `--allow`
+
+All other locations are read-only. Use `--no-default-allows` to disable the default allowed directories.
 
 **Examples:**
 
@@ -224,6 +248,32 @@ agentfs run /bin/bash
 Run a Python script:
 ```bash
 agentfs run python3 agent.py
+```
+
+Run with a named session to persist changes across runs:
+```bash
+# First run - creates session "my-session"
+agentfs run --session my-session /bin/bash
+# ... make some changes, then exit
+
+# Second run - reuses the same delta layer
+agentfs run --session my-session /bin/bash
+# ... changes from the first run are still present
+```
+
+Join an existing session from another terminal:
+```bash
+# Terminal 1: Start a session
+agentfs run --session shared-session /bin/bash
+
+# Terminal 2: Join the same session
+agentfs run --session shared-session /bin/bash
+# Both terminals share the same copy-on-write filesystem
+```
+
+Access the session ID from within the sandbox:
+```bash
+agentfs run /bin/bash -c 'echo "Session: $AGENTFS_SESSION"'
 ```
 
 Use experimental ptrace sandbox with strace output:

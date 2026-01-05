@@ -1,6 +1,6 @@
 [package]
 name = "agentfs"
-version = "0.4.0-pre.6"
+version = "0.4.1"
 edition = "2021"
 repository = "https://github.com/tursodatabase/agentfs"
 
@@ -24,7 +24,7 @@ clap_complete = { version = "=4.5.61", features = ["unstable-dynamic"] }
 dirs = "6"
 serde_json = "1.0.147"
 tracing = "0.1.44"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Unix dependencies
 [target.'cfg(unix)'.dependencies]
@@ -37,30 +37,23 @@ uuid = { version = "1", features = ["v4"] }
 # NFS server for userspace filesystem (used by `agentfs run` and `agentfs nfs`)
 nfsserve = "0.10"
 async-trait = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Sandbox dependencies - (requires libunwind-dev on ARM)
+agentfs-sandbox = { path = "../sandbox" }
+reverie = { git = "https://github.com/facebookexperimental/reverie" }
+reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
+reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
 
-# macOS dependencies for FUSE and NFS functionality
+# macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.15", default-features = false, features = [
-    "abi-7-29",
-    "libfuse",
-] }
 # NFS server for userspace filesystem without FUSE (used by `agentfs run`)
 nfsserve = "0.10"
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Ensure transitive `aegis` (pulled in by `turso`) builds on macOS arm64 by
 # forcing the `pure-rust` feature, which skips the C/NEON backend that fails
 # with Apple clang (`veor3q_u8` in `aegis128l_neon_sha3.c`).
 aegis = { version = "0.9.6", features = ["pure-rust"] }
 
-# Sandbox dependencies - Linux x86_64 only (requires libunwind-ptrace)
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-agentfs-sandbox = { path = "../sandbox" }
-reverie = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
 
 # The profile that 'dist' will build with
 [profile.dist]

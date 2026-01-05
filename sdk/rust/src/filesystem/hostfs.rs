@@ -15,6 +15,22 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct HostFS {
     root: PathBuf,
+    // If the HostFS is mounted as an overlay underfilesystem via FUSE, we need to know
+    // the inode of the FUSE mountpoint to avoid deadlock.
+    //
+    // For example, if we overlay `/` and mount it at /mntpnt, then when we do an `ls /mntpnt`,
+    // inside the readdir_plus handler (which grabs a global fuser lock),
+    // agentfs reads `/`, and sees the direntry `mntpnt`, and then stats `/mntpnt`, which would enter a new fuser handler
+    // trying to grab the fuser lock, causing a deadlock.
+    //
+    // The linux kernel overlay filesystem does not have this problem because it has access to the under filesystem
+    // directly, and it does not cross mountpoints, so it will just return /mntpnt as a raw direntry of the underlying ext4/xfs
+    // filesystem and does not call into the overlay layer at all. We do not have this access, so we have to special-case ourselves.
+    //
+    // We only need to compare the root inode, because for anything under /mntpnt, the access is gated by the fuse layer, and we block
+    // looking up ourselves in the fuse layer, but `ls /mntpnt` has to pass the fuse layer and come to us.
+    #[cfg(target_family = "unix")]
+    fuse_mountpoint_inode: Option<u64>,
 }
 
 /// An open file handle for HostFS.
@@ -84,7 +100,17 @@ impl HostFS {
         if !root.is_dir() {
             anyhow::bail!("Root path is not a directory: {}", root.display());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            fuse_mountpoint_inode: None,
+        })
+    }
+
+    /// Create a new HostFS rooted at the given directory with a FUSE mountpoint inode
+    #[cfg(target_family = "unix")]
+    pub fn with_fuse_mountpoint(mut self, inode: u64) -> Self {
+        self.fuse_mountpoint_inode = Some(inode);
+        self
     }
 
     /// Get the root directory
@@ -174,6 +200,16 @@ impl FileSystem for HostFS {
         };
 
         while let Some(entry) = dir.next_entry().await? {
+            #[cfg(target_family = "unix")]
+            {
+                // We won't be able to stat the mountpoint, so better not even expose it
+                if let Some(inode) = self.fuse_mountpoint_inode {
+                    if entry.ino() == inode {
+                        continue;
+                    }
+                }
+            }
+
             if let Some(name) = entry.file_name().to_str() {
                 entries.push(name.to_string());
             }
@@ -194,6 +230,15 @@ impl FileSystem for HostFS {
         };
 
         while let Some(entry) = dir.next_entry().await? {
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(inode) = self.fuse_mountpoint_inode {
+                    if entry.ino() == inode {
+                        continue;
+                    }
+                }
+            }
+
             if let Some(name) = entry.file_name().to_str() {
                 // Build the virtual path for this entry
                 let entry_path = if path == "/" {
@@ -235,6 +280,15 @@ impl FileSystem for HostFS {
         Ok(())
     }
 
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let full_path = self.resolve_path(path);
+        let permissions = std::fs::Permissions::from_mode(mode);
+        fs::set_permissions(&full_path, permissions).await?;
+        Ok(())
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let from_path = self.resolve_path(from);
         let to_path = self.resolve_path(to);
@@ -245,6 +299,13 @@ impl FileSystem for HostFS {
     async fn symlink(&self, target: &str, linkpath: &str) -> Result<()> {
         let full_path = self.resolve_path(linkpath);
         tokio::fs::symlink(target, &full_path).await?;
+        Ok(())
+    }
+
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let old_full_path = self.resolve_path(oldpath);
+        let new_full_path = self.resolve_path(newpath);
+        tokio::fs::hard_link(&old_full_path, &new_full_path).await?;
         Ok(())
     }
 
@@ -363,6 +424,55 @@ mod tests {
         file.pwrite(6, b"rust!").await?;
         let data = fs.read_file("/test.txt").await?.unwrap();
         assert_eq!(data, b"hello rust!");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hostfs_chmod() -> Result<()> {
+        let dir = tempdir()?;
+        let fs = HostFS::new(dir.path())?;
+
+        // Create a file
+        fs.write_file("/test.txt", b"content").await?;
+
+        // Change to executable
+        fs.chmod("/test.txt", 0o755).await?;
+
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o777,
+            0o755,
+            "Mode should be 0o755 after chmod"
+        );
+
+        // Change to read-only
+        fs.chmod("/test.txt", 0o444).await?;
+
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o777,
+            0o444,
+            "Mode should be 0o444 after chmod"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hostfs_chmod_directory() -> Result<()> {
+        let dir = tempdir()?;
+        let fs = HostFS::new(dir.path())?;
+
+        // Create a directory
+        fs.mkdir("/subdir").await?;
+
+        // Change permissions
+        fs.chmod("/subdir", 0o700).await?;
+
+        let stats = fs.stat("/subdir").await?.unwrap();
+        assert_eq!(stats.mode & 0o777, 0o700, "Directory mode should be 0o700");
+        assert!(stats.is_directory(), "Should still be a directory");
 
         Ok(())
     }

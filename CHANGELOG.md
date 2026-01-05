@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.4.1] - 2026-01-02
+
+### Added
+
+- Cloudflare Durable Objects integration prototype.
+- Sandbox: Intercept `rmdir` system call.
+
+### Changed
+
+- Init tracing subscriber to allow debugging turso_core.
+
+### Fixed
+
+- FUSE overlay deadlock.
+- SIGTERM signal handling for graceful shutdown.
+- `agentfs run` help text.
+- ARM build for `rmdir` syscall.
+
+## [0.4.0] - 2025-12-31
+
+### Added
+
+- `agentfs run` command with overlay filesystem for sandboxed execution.
+- `agentfs diff` command to show filesystem changes.
+- Multi-session support with `--session` flag and `AGENTFS_SESSION` environment variable.
+- `--allow` flag for specifying writable directories in sandbox.
+- macOS Sandbox support for filesystem isolation.
+- NFS-based `agentfs run` support for macOS.
+- Linux ARM64 support.
+- TypeScript SDK: `FileSystem` interface for filesystem operations.
+- TypeScript SDK: New APIs (`access`, `copyFile`, `rmdir`, `rename`).
+- TypeScript SDK: `agentfs()` convenience function for just-bash integration.
+- Python SDK: Python 3.10+ support.
+- Rust SDK: `base` option for `agentfs::open`.
+- Rust SDK: VFS-style `File` trait for efficient file handle operations.
+- Rust SDK: `get_runtime()` helper for runtime initialization.
+- FUSE: Symlink support.
+- FUSE: `readdir_plus` optimization to eliminate N+1 queries.
+- Database: `nlink` column for O(1) link count lookups.
+- Sandbox: Intercept `chmod` system call.
+- `--version` flag using git tags.
+- Firecracker + AgentFS example.
+- AI SDK + just-bash example with AgentFS integration.
+
+### Changed
+
+- Default shell is now bash on Linux, zsh on macOS.
+- `/tmp` is writable by default in sandbox.
+- `~/.bun` added to default allowed directories.
+- npm local registry added to allowlist.
+- `AGENTFS_SANDBOX` environment variable is more descriptive.
+- FUSE optimizations: async read, parallel directory operations, symlink/directory caching.
+- Rust SDK: Configure busy timeout instead of failing immediately.
+
+### Fixed
+
+- Overlay filesystem nested `pwrite()`.
+- `O_APPEND` not appending to file.
+- FUSE error handling.
+- Execute permissions in FUSE mount.
+- SSH inside user namespace by bypassing system configs.
+- Symlink handling in FUSE and overlay filesystem.
+- Rust SDK: `pread()` for sparse files.
+- Rust SDK: `pwrite()` buffer flushing before returning.
+- Rust SDK: `resolve` to prioritize agent ID over file path.
+- `agentfs init --force` to reinitialize agent filesystem.
+- Overlay mount I/O error by unifying whiteout schema in SDK.
+- UID/GID mapping to use current user instead of root.
+
+### Removed
+
+- macFUSE support on macOS (replaced by NFS).
+
 ## [0.3.1] - 2025-12-17
 
 - This is the exact same version as 0.3.0, but had to bump version number
@@ -98,6 +171,9 @@
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.4.1]: https://github.com/tursodatabase/agentfs/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/tursodatabase/agentfs/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/tursodatabase/agentfs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tursodatabase/agentfs/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/tursodatabase/agentfs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/tursodatabase/agentfs/compare/v0.2.1...v0.2.2

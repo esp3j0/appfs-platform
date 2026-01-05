@@ -72,7 +72,7 @@ pub enum Command {
     },
     /// Run a command in the sandboxed environment.
     ///
-    /// By default, uses FUSE+overlay with unshare/pivot_root for isolation.
+    /// By default, uses FUSE+overlay with Linux user and mount namespaces for isolation.
     /// The overlay uses the host filesystem as a read-only base and stores
     /// all changes in an AgentFS-backed delta layer.
     Run {
@@ -93,8 +93,14 @@ pub enum Command {
         #[arg(long = "strace")]
         strace: bool,
 
-        /// Command to execute
-        command: PathBuf,
+        /// Session identifier for sharing delta layer across multiple runs.
+        /// If not provided, a unique session ID is generated for each run.
+        /// Use the same session ID to share the delta layer between runs.
+        #[arg(long = "session", value_name = "ID")]
+        session: Option<String>,
+
+        /// Command to execute (defaults to bash on Linux, zsh on macOS)
+        command: Option<PathBuf>,
 
         /// Arguments for the command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

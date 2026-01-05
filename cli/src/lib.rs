@@ -2,10 +2,10 @@ pub mod cmd;
 pub mod parser;
 pub mod sandbox;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub mod daemon;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub mod fuse;
 
 #[cfg(unix)]

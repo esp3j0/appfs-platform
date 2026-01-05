@@ -47,21 +47,61 @@ impl File for AgentFSFile {
 
         let mut result = Vec::with_capacity(size as usize);
         let start_offset_in_chunk = (offset % chunk_size) as usize;
+        let mut next_expected_chunk = start_chunk;
 
         while let Some(row) = rows.next().await? {
+            let chunk_index = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64;
+
+            // Fill gaps with zeros for sparse files
+            while next_expected_chunk < chunk_index && result.len() < size as usize {
+                let skip = if next_expected_chunk == start_chunk {
+                    start_offset_in_chunk
+                } else {
+                    0
+                };
+                let zeros_needed =
+                    std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
+                result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                next_expected_chunk += 1;
+            }
+
             if let Ok(Value::Blob(chunk_data)) = row.get_value(1) {
-                let skip = if result.is_empty() {
+                let skip = if chunk_index == start_chunk {
                     start_offset_in_chunk
                 } else {
                     0
                 };
                 if skip >= chunk_data.len() {
-                    continue;
+                    // Chunk is smaller than skip offset, fill with zeros
+                    let zeros_needed =
+                        std::cmp::min(chunk_size as usize - skip, size as usize - result.len());
+                    result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                } else {
+                    let remaining = size as usize - result.len();
+                    let take = std::cmp::min(chunk_data.len() - skip, remaining);
+                    result.extend_from_slice(&chunk_data[skip..skip + take]);
+
+                    // If chunk is smaller than chunk_size, pad with zeros
+                    let chunk_end = skip + take;
+                    if chunk_end < chunk_size as usize && result.len() < size as usize {
+                        let zeros_needed = std::cmp::min(
+                            chunk_size as usize - chunk_end,
+                            size as usize - result.len(),
+                        );
+                        result.extend(std::iter::repeat_n(0u8, zeros_needed));
+                    }
                 }
-                let remaining = size as usize - result.len();
-                let take = std::cmp::min(chunk_data.len() - skip, remaining);
-                result.extend_from_slice(&chunk_data[skip..skip + take]);
             }
+            next_expected_chunk = chunk_index + 1;
+        }
+
+        // Fill any remaining space with zeros (for sparse file tail or missing chunks at end)
+        if result.len() < size as usize {
+            result.resize(size as usize, 0);
         }
 
         Ok(result)
@@ -300,6 +340,10 @@ impl AgentFS {
 
         // Disable synchronous mode for filesystem fsync() semantics.
         conn.execute("PRAGMA synchronous = OFF", ()).await?;
+
+        // Set busy timeout to handle concurrent access gracefully.
+        // Without this, concurrent transactions fail immediately with SQLITE_BUSY.
+        conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
 
         // Get chunk_size from config (or use default)
         let chunk_size = Self::read_chunk_size(&conn).await?;
@@ -1513,6 +1557,84 @@ impl AgentFS {
         Ok(())
     }
 
+    /// Create a hard link
+    ///
+    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
+    /// Both paths will share the same file data and metadata (except for the name).
+    /// The link count (nlink) of the inode is incremented.
+    pub async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let oldpath = self.normalize_path(oldpath);
+        let newpath = self.normalize_path(newpath);
+        let components = self.split_path(&newpath);
+
+        if components.is_empty() {
+            anyhow::bail!("Cannot create hard link at root");
+        }
+
+        // Resolve old path to get its inode
+        let ino = self
+            .resolve_path(&oldpath)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Source path does not exist"))?;
+
+        // Check if source is a directory (hard links to directories are not allowed)
+        let mut rows = self
+            .conn
+            .query("SELECT mode FROM fs_inode WHERE ino = ?", (ino,))
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) == super::S_IFDIR {
+                anyhow::bail!("Cannot create hard link to directory");
+            }
+        } else {
+            anyhow::bail!("Source inode not found");
+        }
+
+        // Get parent directory of new path
+        let parent_path = if components.len() == 1 {
+            "/".to_string()
+        } else {
+            format!("/{}", components[..components.len() - 1].join("/"))
+        };
+
+        let parent_ino = self
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Parent directory does not exist"))?;
+
+        let name = components.last().unwrap();
+
+        // Check if new path already exists
+        if (self.resolve_path(&newpath).await?).is_some() {
+            anyhow::bail!("Path already exists");
+        }
+
+        // Create directory entry pointing to the same inode
+        self.conn
+            .execute(
+                "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                (name.as_str(), parent_ino, ino),
+            )
+            .await?;
+
+        // Increment link count
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+                (ino,),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Read the target of a symbolic link
     pub async fn readlink(&self, path: &str) -> Result<Option<String>> {
         let path = self.normalize_path(path);
@@ -1651,6 +1773,45 @@ impl AgentFS {
                 .execute("DELETE FROM fs_inode WHERE ino = ?", (ino,))
                 .await?;
         }
+
+        Ok(())
+    }
+
+    /// Change file mode/permissions.
+    ///
+    /// Only modifies the permission bits (lower 12 bits), preserving the file type.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let path = self.normalize_path(path);
+
+        let ino = self
+            .resolve_path(&path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Path does not exist"))?;
+
+        // Get current mode to preserve file type bits
+        let mut rows = self
+            .conn
+            .query("SELECT mode FROM fs_inode WHERE ino = ?", (ino,))
+            .await?;
+
+        let current_mode = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32
+        } else {
+            anyhow::bail!("Inode not found");
+        };
+
+        // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
+        let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
+
+        self.conn
+            .execute(
+                "UPDATE fs_inode SET mode = ? WHERE ino = ?",
+                (new_mode as i64, ino),
+            )
+            .await?;
 
         Ok(())
     }
@@ -1953,12 +2114,20 @@ impl FileSystem for AgentFS {
         AgentFS::remove(self, path).await
     }
 
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        AgentFS::chmod(self, path, mode).await
+    }
+
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         AgentFS::rename(self, from, to).await
     }
 
     async fn symlink(&self, target: &str, linkpath: &str) -> Result<()> {
         AgentFS::symlink(self, target, linkpath).await
+    }
+
+    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        AgentFS::link(self, oldpath, newpath).await
     }
 
     async fn readlink(&self, path: &str) -> Result<Option<String>> {
@@ -2240,7 +2409,7 @@ mod tests {
 
         // Verify correct number of chunks
         let chunk_size = fs.chunk_size();
-        let expected_chunks = (data_size + chunk_size - 1) / chunk_size;
+        let expected_chunks = data_size.div_ceil(chunk_size);
         let ino = fs.resolve_path("/large.bin").await?.unwrap();
         let actual_chunks = fs.get_chunk_count(ino).await? as usize;
         assert_eq!(actual_chunks, expected_chunks);
@@ -2428,11 +2597,7 @@ mod tests {
             let expected_data: Vec<u8> = (0..*size).map(|i| (i % 256) as u8).collect();
             assert_eq!(read_data, expected_data, "Data mismatch for {}", path);
 
-            let expected_chunks = if *size == 0 {
-                0
-            } else {
-                (size + chunk_size - 1) / chunk_size
-            };
+            let expected_chunks = size.div_ceil(chunk_size);
             let ino = fs.resolve_path(path).await?.unwrap();
             let actual_chunks = fs.get_chunk_count(ino).await? as usize;
             assert_eq!(
@@ -2996,6 +3161,94 @@ mod tests {
         // Verify the content
         let content = fs.read_file("/link.txt").await?.unwrap();
         assert_eq!(content, b"new content");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chmod_regular_file() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a file with default permissions
+        fs.write_file("/test.txt", b"content").await?;
+
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o7777,
+            0o644,
+            "Default file mode should be 0o644"
+        );
+
+        // Change to executable
+        fs.chmod("/test.txt", 0o755).await?;
+
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o7777,
+            0o755,
+            "Mode should be 0o755 after chmod"
+        );
+        assert!(stats.is_file(), "Should still be a regular file");
+
+        // Change to read-only
+        fs.chmod("/test.txt", 0o444).await?;
+
+        let stats = fs.stat("/test.txt").await?.unwrap();
+        assert_eq!(
+            stats.mode & 0o7777,
+            0o444,
+            "Mode should be 0o444 after chmod"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chmod_preserves_file_type() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create a regular file
+        fs.write_file("/file.txt", b"content").await?;
+        fs.chmod("/file.txt", 0o755).await?;
+        let stats = fs.stat("/file.txt").await?.unwrap();
+        assert!(stats.is_file(), "Should remain a regular file after chmod");
+
+        // Create a directory
+        fs.mkdir("/dir").await?;
+        fs.chmod("/dir", 0o700).await?;
+        let stats = fs.stat("/dir").await?.unwrap();
+        assert!(
+            stats.is_directory(),
+            "Should remain a directory after chmod"
+        );
+        assert_eq!(stats.mode & 0o7777, 0o700, "Directory mode should be 0o700");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chmod_nonexistent_fails() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        let result = fs.chmod("/nonexistent.txt", 0o755).await;
+        assert!(result.is_err(), "chmod on nonexistent file should fail");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_chmod_symlink() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+
+        // Create target and symlink
+        fs.write_file("/target.txt", b"content").await?;
+        fs.symlink("/target.txt", "/link.txt").await?;
+
+        // chmod the symlink path (should work on the symlink inode)
+        fs.chmod("/link.txt", 0o755).await?;
+
+        let stats = fs.lstat("/link.txt").await?.unwrap();
+        assert!(stats.is_symlink(), "Should still be a symlink");
 
         Ok(())
     }
