@@ -3,6 +3,7 @@ pub mod fs;
 pub mod init;
 pub mod mcp_server;
 pub mod sync;
+pub mod timeline;
 
 #[cfg(target_os = "linux")]
 mod mount;

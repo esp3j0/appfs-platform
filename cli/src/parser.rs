@@ -142,6 +142,28 @@ pub enum Command {
         #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
     },
+    /// Display agent action timeline from tool call audit log
+    Timeline {
+        /// Agent ID or database path
+        #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Limit number of entries to display
+        #[arg(long, default_value = "100")]
+        limit: i64,
+
+        /// Filter by tool name
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Filter by status (pending/success/error)
+        #[arg(long, value_parser = ["pending", "success", "error"])]
+        status: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "table", value_parser = ["table", "json"])]
+        format: String,
+    },
     /// Start an NFS server to export an AgentFS filesystem over the network
     #[cfg(unix)]
     Nfs {

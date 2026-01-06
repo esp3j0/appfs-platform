@@ -79,6 +79,17 @@ $ agentfs fs cat .agentfs/my-agent.db hello.txt
 hello from agent
 ```
 
+View the agent's action timeline:
+
+```bash
+$ agentfs timeline my-agent
+ID   TOOL                 STATUS       DURATION STARTED
+4    execute_code         pending            -- 2024-01-05 09:44:20
+3    api_call             error           300ms 2024-01-05 09:44:15
+2    read_file            success          50ms 2024-01-05 09:44:10
+1    web_search           success        1200ms 2024-01-05 09:43:45
+```
+
 You can mount an agent filesystem using FUSE (Linux) or NFS (macOS):
 
 ```bash
