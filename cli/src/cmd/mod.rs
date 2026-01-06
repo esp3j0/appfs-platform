@@ -2,6 +2,7 @@ pub mod completions;
 pub mod fs;
 pub mod init;
 pub mod sync;
+pub mod timeline;
 
 #[cfg(target_os = "linux")]
 mod mount;
