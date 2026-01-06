@@ -74,6 +74,15 @@ pub async fn show_timeline(
     Ok(())
 }
 
+/// Truncate a string to a maximum length, adding ellipsis if truncated
+fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
 /// Format timestamp as YYYY-MM-DD HH:MM:SS
 fn format_timestamp(timestamp: i64) -> String {
     chrono::Utc
@@ -99,6 +108,7 @@ fn format_table(stdout: &mut impl Write, calls: &[ToolCall]) -> AnyhowResult<()>
 
     // Print rows
     for call in calls {
+        let tool_name = truncate_with_ellipsis(&call.name, 20);
         let status = call.status.to_string();
         let duration = call
             .duration_ms
@@ -109,7 +119,7 @@ fn format_table(stdout: &mut impl Write, calls: &[ToolCall]) -> AnyhowResult<()>
         writeln!(
             stdout,
             "{:<4} {:<20} {:<10} {:>10} {:<20}",
-            call.id, call.name, status, duration, timestamp
+            call.id, tool_name, status, duration, timestamp
         )?;
     }
 
@@ -296,5 +306,27 @@ mod tests {
         assert!(!output.contains("tool_2"));
         assert!(!output.contains("tool_1"));
         assert!(!output.contains("tool_0"));
+    }
+
+    #[tokio::test]
+    async fn test_timeline_truncate_long_names() {
+        let (agentfs, path, _file) = create_test_agentfs().await;
+
+        // Create a tool call with a very long name (>20 chars)
+        agentfs
+            .tools
+            .start("very_long_tool_name_that_exceeds_twenty_characters", None)
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        show_timeline(&mut buf, &path, &default_options())
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(buf).unwrap();
+        // Should contain truncated version with ellipsis (20 chars total: 17 chars + "...")
+        assert!(output.contains("very_long_tool_na..."));
+        assert!(!output.contains("very_long_tool_name_that_exceeds_twenty_characters"));
     }
 }

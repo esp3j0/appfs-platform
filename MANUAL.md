@@ -348,6 +348,80 @@ agentfs fs cat my-agent /artifacts/report.txt
 agentfs fs cat .agentfs/my-agent.db /artifacts/report.txt
 ```
 
+### `agentfs timeline`
+
+Display agent action timeline from the tool call audit log.
+
+**Usage:**
+```bash
+agentfs timeline [OPTIONS] <ID_OR_PATH>
+```
+
+**Arguments:**
+- `<ID_OR_PATH>` - Agent ID or database path
+
+**Options:**
+- `--limit  <LIMIT>` - Limit number of entries to display (default: 100)
+- `--filter <FILTER>` - Filter by tool name
+- `--status <STATUS>` - Filter by status: `pending`, `success`, or `error`
+- `--format <FORMAT>` - Output format: `table` or `json` (default: table)
+- `-h, --help` - Print help
+
+**Examples:**
+```bash
+# Show last 100 tool calls in table format (default)
+agentfs timeline my-agent
+
+# Show last 50 calls
+agentfs timeline my-agent --limit 50
+
+# Show only errors
+agentfs timeline my-agent --status error
+
+# Show only web_search calls
+agentfs timeline my-agent --filter web_search
+
+# Show in JSON format
+agentfs timeline my-agent --format json
+
+# Combine filters
+agentfs timeline my-agent --filter web_search --status success
+```
+
+**Output Formats:**
+
+*Table format* (default):
+```
+ID   TOOL                 STATUS       DURATION STARTED
+4    execute_code         pending            -- 2024-01-05 09:44:20
+3    api_call             error           300ms 2024-01-05 09:44:15
+2    read_file            success          50ms 2024-01-05 09:44:10
+1    web_search           success        1200ms 2024-01-05 09:43:45
+```
+
+*JSON format*:
+```json
+[
+  {
+    "id": 1,
+    "name": "web_search",
+    "status": "success",
+    "started_at": 1704447825,
+    "completed_at": 1704447826,
+    "duration_ms": 1200,
+    "parameters": {"query": "AI agents"},
+    "result": {"results": ["result1", "result2"]}
+  }
+]
+```
+
+**What it does:**
+Queries the `tool_calls` Records from the agent database and displays a timeline of agent actions. This is useful for:
+- Debugging agent behavior
+- Performance analysis
+- Understanding agent execution history
+- Auditing tool usage
+
 ### `agentfs completions`
 
 Manage shell completions for the AgentFS CLI.

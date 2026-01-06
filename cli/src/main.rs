@@ -123,6 +123,29 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Timeline {
+            id_or_path,
+            limit,
+            filter,
+            status,
+            format,
+        } => {
+            let rt = get_runtime();
+            let options = cmd::timeline::TimelineOptions {
+                limit,
+                filter,
+                status,
+                format,
+            };
+            if let Err(e) = rt.block_on(cmd::timeline::show_timeline(
+                &mut std::io::stdout(),
+                &id_or_path,
+                &options,
+            )) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Fs {
             command,
             id_or_path,
