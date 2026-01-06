@@ -78,6 +78,7 @@ dependencies = [
  "agentfs-sdk",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap 4.5.53",
  "clap_complete",

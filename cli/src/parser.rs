@@ -179,6 +179,19 @@ pub enum Command {
         #[arg(long, default_value = "11111")]
         port: u32,
     },
+
+    /// Start an MCP server exposing filesystem and KV-store tools
+    McpServer {
+        /// Agent ID or database path
+        #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Tools to expose (comma-separated). If not provided, all tools are exposed.
+        /// Available tools: read_file, write_file, readdir, mkdir, rmdir, rm, unlink,
+        /// copy_file, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
+        #[arg(long, value_delimiter = ',')]
+        tools: Option<Vec<String>>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -193,6 +206,14 @@ pub enum FsCommand {
     Cat {
         /// Path to the file in the filesystem
         file_path: String,
+    },
+    /// Write file content
+    Write {
+        /// Path to the file in the filesystem
+        file_path: String,
+
+        /// Content of the file
+        content: String,
     },
 }
 
