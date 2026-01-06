@@ -1,6 +1,7 @@
 pub mod completions;
 pub mod fs;
 pub mod init;
+pub mod mcp_server;
 pub mod sync;
 
 #[cfg(target_os = "linux")]

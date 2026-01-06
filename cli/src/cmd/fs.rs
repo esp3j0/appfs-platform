@@ -102,90 +102,33 @@ pub async fn cat_filesystem(
 ) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     let (_, agentfs) = open_agentfs(options).await?;
-    let conn = agentfs.get_connection();
 
-    let path_components: Vec<&str> = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    match agentfs.fs.read_file(path).await? {
+        Some(file) => {
+            stdout.write_all(&file)?;
+            Ok(())
+        }
+        None => anyhow::bail!("File not found: {}", path),
+    }
+}
 
-    let mut current_ino = ROOT_INO;
+pub async fn write_filesystem(id_or_path: String, path: &str, content: &str) -> AnyhowResult<()> {
+    let options = AgentFSOptions::resolve(&id_or_path)?;
+    let (_, agentfs) = open_agentfs(options).await?;
 
-    for component in path_components {
-        let query = format!(
-            "SELECT ino FROM fs_dentry WHERE parent_ino = {} AND name = '{}'",
-            current_ino, component
-        );
-
-        let mut rows = conn
-            .query(&query, ())
-            .await
-            .context("Failed to query directory entries")?;
-
-        if let Some(row) = rows.next().await.context("Failed to fetch row")? {
-            current_ino = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Invalid inode"))?;
-        } else {
-            anyhow::bail!("File not found: {}", path);
+    let mut components = path.split("/").collect::<Vec<_>>();
+    if !path.starts_with("/") {
+        components.insert(0, "");
+    }
+    // /a/b/c is split to ["", "a", "b", "c"]
+    // we must start with /a (first TWO entries)
+    for i in 2..components.len() {
+        let dir_path = components[0..i].join("/");
+        if agentfs.fs.stat(&dir_path).await?.is_none() {
+            agentfs.fs.mkdir(&dir_path).await?;
         }
     }
-
-    let query = format!("SELECT mode FROM fs_inode WHERE ino = {}", current_ino);
-    let mut rows = conn
-        .query(&query, ())
-        .await
-        .context("Failed to query inode")?;
-
-    if let Some(row) = rows.next().await.context("Failed to fetch row")? {
-        let mode: u32 = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| v.as_integer().copied())
-            .unwrap_or(0) as u32;
-
-        if mode & S_IFMT == S_IFDIR {
-            anyhow::bail!("'{}' is a directory", path);
-        } else if mode & S_IFMT != S_IFREG {
-            anyhow::bail!("'{}' is not a regular file", path);
-        }
-    } else {
-        anyhow::bail!("File not found: {}", path);
-    }
-
-    let query = format!(
-        "SELECT data FROM fs_data WHERE ino = {} ORDER BY chunk_index",
-        current_ino
-    );
-
-    let mut rows = conn
-        .query(&query, ())
-        .await
-        .context("Failed to query file data")?;
-
-    while let Some(row) = rows.next().await.context("Failed to fetch row")? {
-        let data: Vec<u8> = row
-            .get_value(0)
-            .ok()
-            .and_then(|v| {
-                if let Value::Blob(b) = v {
-                    Some(b.clone())
-                } else if let Value::Text(t) = v {
-                    Some(t.as_bytes().to_vec())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("Invalid file data"))?;
-
-        stdout
-            .write_all(&data)
-            .context("Failed to write to stdout")?;
-    }
-
+    agentfs.fs.write_file(path, content.as_bytes()).await?;
     Ok(())
 }
 
