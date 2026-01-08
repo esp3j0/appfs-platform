@@ -12,6 +12,15 @@ path = "src/lib.rs"
 name = "agentfs"
 path = "src/main.rs"
 
+[features]
+default = ["sandbox"]
+sandbox = [
+    "dep:agentfs-sandbox",
+    "dep:reverie",
+    "dep:reverie-ptrace",
+    "dep:reverie-process",
+]
+
 [dependencies]
 agentfs-sdk = { path = "../sdk/rust" }
 tokio = { version = "1", features = ["full"] }
@@ -42,10 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 nfsserve = "0.10"
 async-trait = "0.1"
 # Sandbox dependencies - (requires libunwind-dev on ARM)
-agentfs-sandbox = { path = "../sandbox" }
-reverie = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie" }
-reverie-process = { git = "https://github.com/facebookexperimental/reverie" }
+agentfs-sandbox = { path = "../sandbox", optional = true }
+reverie = { git = "https://github.com/facebookexperimental/reverie", optional = true }
+reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie", optional = true }
+reverie-process = { git = "https://github.com/facebookexperimental/reverie", optional = true }
 
 # macOS dependencies for NFS functionality (no FUSE - uses nfsserve instead)
 [target.'cfg(target_os = "macos")'.dependencies]

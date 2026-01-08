@@ -5,11 +5,11 @@
 //! - `linux_ptrace`: ptrace-based syscall interception sandbox (experimental)
 //! - `darwin`: Kernel-enforced sandbox using sandbox-exec
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod linux;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "sandbox"))]
 pub mod linux_ptrace;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "sandbox"))]
 pub mod darwin;
