@@ -6,10 +6,10 @@ pub mod sync;
 pub mod timeline;
 
 #[cfg(target_os = "linux")]
-mod mount;
+pub mod mount;
 #[cfg(not(target_os = "linux"))]
 #[path = "mount_stub.rs"]
-mod mount;
+pub mod mount;
 
 mod run;
 

@@ -48,6 +48,13 @@ if ! mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
     exit 1
 fi
 
+# Test that 'agentfs mount' (no args) lists our mount
+if ! cargo run -- mount 2>/dev/null | grep -q "$MOUNTPOINT"; then
+    echo "FAILED: 'agentfs mount' did not list our mountpoint"
+    kill $MOUNT_PID 2>/dev/null || true
+    exit 1
+fi
+
 # Write a file through the FUSE mount
 echo "hello from fuse mount" > "$MOUNTPOINT/hello.txt"
 

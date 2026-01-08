@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::{io::Write, path::PathBuf};
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
@@ -19,6 +19,11 @@ pub struct MountArgs {
     pub uid: Option<u32>,
     /// Group ID to report for all files (defaults to current group).
     pub gid: Option<u32>,
+}
+
+/// List all currently mounted agentfs filesystems
+pub fn list_mounts<W: Write>(out: &mut W) {
+    let _ = writeln!(out, "Mount listing is only available on Linux.");
 }
 
 /// Mount the agent filesystem using FUSE.
