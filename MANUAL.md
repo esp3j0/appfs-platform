@@ -155,28 +155,42 @@ The `.agentfs/` directory is automatically created if it doesn't exist.
 
 ### `agentfs mount`
 
-Mount an agent filesystem using FUSE (Linux) or NFS (macOS).
+Mount an agent filesystem using FUSE (Linux) or NFS (macOS), or list currently mounted filesystems.
 
 **Usage:**
 ```bash
-agentfs mount <ID_OR_PATH> <MOUNT_POINT>
+agentfs mount [ID_OR_PATH] [MOUNT_POINT]
 ```
 
 **Arguments:**
-- `<ID_OR_PATH>` - Agent ID or database path
-- `<MOUNT_POINT>` - Directory where the filesystem will be mounted
+- `[ID_OR_PATH]` - Agent ID or database path (optional)
+- `[MOUNT_POINT]` - Directory where the filesystem will be mounted (optional)
+
+When called without arguments, lists all currently mounted agentfs filesystems.
 
 **Options:**
 - `-h, --help` - Print help
 
 **Examples:**
 ```bash
+# List all mounted agentfs filesystems
+agentfs mount
+
 # Mount using agent ID
 agentfs mount my-agent ./my-agent-mount
 
 # Mount using database path
 agentfs mount .agentfs/my-agent.db ./my-agent-mount
 ```
+
+**Listing output:**
+```
+ID        MOUNTPOINT
+my-agent  /home/user/my-agent-mount
+other     /tmp/other-mount
+```
+
+If no filesystems are mounted, displays "No agentfs filesystems mounted."
 
 **What it does:**
 Mounts the agent filesystem as a FUSE filesystem on the host, allowing you to interact with the agent's files using standard filesystem tools (ls, cat, cp, etc.).

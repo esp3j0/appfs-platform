@@ -1,6 +1,6 @@
-use agentfs_sdk::{AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{get_mounts, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::Result;
-use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
+use std::{io::Write, os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
 use turso::value::Value;
 
 use crate::{cmd::init::open_agentfs, fuse::FuseMountOptions};
@@ -42,9 +42,12 @@ pub fn mount(args: MountArgs) -> Result<()> {
 
     let opts = AgentFSOptions::resolve(&args.id_or_path)?;
 
-    let fsname = std::fs::canonicalize(&args.id_or_path)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| args.id_or_path.clone());
+    let fsname = format!(
+        "agentfs:{}",
+        std::fs::canonicalize(&args.id_or_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| args.id_or_path.clone())
+    );
 
     if !args.mountpoint.exists() {
         anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
@@ -179,4 +182,45 @@ fn supports_fuse() -> bool {
 #[cfg(target_os = "linux")]
 fn supports_fuse() -> bool {
     true
+}
+
+/// List all currently mounted agentfs filesystems
+pub fn list_mounts<W: Write>(out: &mut W) {
+    let mounts = get_mounts();
+
+    if mounts.is_empty() {
+        let _ = writeln!(out, "No agentfs filesystems mounted.");
+        return;
+    }
+
+    // Calculate column widths
+    let id_width = mounts.iter().map(|m| m.id.len()).max().unwrap_or(2).max(2);
+    let mount_width = mounts
+        .iter()
+        .map(|m| m.mountpoint.to_string_lossy().len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+
+    // Print header
+    let _ = writeln!(
+        out,
+        "{:<id_width$}  {:<mount_width$}",
+        "ID",
+        "MOUNTPOINT",
+        id_width = id_width,
+        mount_width = mount_width
+    );
+
+    // Print mounts
+    for mount in &mounts {
+        let _ = writeln!(
+            out,
+            "{:<id_width$}  {:<mount_width$}",
+            mount.id,
+            mount.mountpoint.display(),
+            id_width = id_width,
+            mount_width = mount_width
+        );
+    }
 }

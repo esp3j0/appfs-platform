@@ -102,20 +102,29 @@ fn main() {
             foreground,
             uid,
             gid,
-        } => {
-            if let Err(e) = cmd::mount(cmd::MountArgs {
-                id_or_path,
-                mountpoint,
-                auto_unmount,
-                allow_root,
-                foreground,
-                uid,
-                gid,
-            }) {
-                eprintln!("Error: {}", e);
+        } => match (id_or_path, mountpoint) {
+            (Some(id_or_path), Some(mountpoint)) => {
+                if let Err(e) = cmd::mount(cmd::MountArgs {
+                    id_or_path,
+                    mountpoint,
+                    auto_unmount,
+                    allow_root,
+                    foreground,
+                    uid,
+                    gid,
+                }) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            (None, None) => {
+                cmd::mount::list_mounts(&mut std::io::stdout());
+            }
+            _ => {
+                eprintln!("Error: both ID_OR_PATH and MOUNTPOINT are required to mount");
                 std::process::exit(1);
             }
-        }
+        },
         Command::Diff { id_or_path } => {
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::fs::diff_filesystem(id_or_path)) {
