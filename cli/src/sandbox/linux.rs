@@ -57,6 +57,7 @@ const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 const DEFAULT_ALLOWED_DIRS: &[&str] = &[
     ".claude",      // Claude Code config
     ".claude.json", // Claude Code config file
+    ".codex",       // OpenAI Codex config
     ".local",       // Local data directory
     ".npm",         // npm local registry
 ];
