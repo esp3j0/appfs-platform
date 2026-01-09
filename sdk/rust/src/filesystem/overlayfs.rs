@@ -11,6 +11,48 @@ use super::{
     agentfs::AgentFS, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats,
 };
 
+/// A normalized path that is guaranteed to start with /
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NormalizedPath(String);
+
+impl NormalizedPath {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Create a NormalizedPath from a string that is already known to be normalized.
+    /// This skips validation and should only be used for paths derived from
+    /// already-normalized paths (e.g., parent directories, path components).
+    fn from_normalized(s: String) -> Self {
+        NormalizedPath(s)
+    }
+}
+
+impl AsRef<str> for NormalizedPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for NormalizedPath {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NormalizedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq<&str> for NormalizedPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// A copy-on-write overlay filesystem.
 ///
 /// Combines a read-only base layer with a writable delta layer (AgentFS).
@@ -272,27 +314,27 @@ impl OverlayFS {
     }
 
     /// Normalize a path
-    fn normalize_path(&self, path: &str) -> String {
+    fn normalize_path(&self, path: &str) -> NormalizedPath {
         let normalized = path.trim_end_matches('/');
-        if normalized.is_empty() {
+        let s = if normalized.is_empty() {
             "/".to_string()
         } else if !normalized.starts_with('/') {
             format!("/{}", normalized)
         } else {
             normalized.to_string()
-        }
+        };
+        NormalizedPath(s)
     }
 
     /// Check if a path has a whiteout (is deleted from base)
     ///
     /// This also checks parent directories - if /foo is whiteout,
     /// then /foo/bar is also considered deleted.
-    async fn is_whiteout(&self, path: &str) -> Result<bool> {
-        let normalized = self.normalize_path(path);
+    async fn is_whiteout(&self, path: &NormalizedPath) -> Result<bool> {
         let conn = self.delta.get_connection();
 
         // Check the path itself and all parent paths
-        let mut check_path = normalized.clone();
+        let mut check_path = path.0.clone();
         loop {
             let result = conn
                 .query(
@@ -428,17 +470,17 @@ impl OverlayFS {
     }
 
     /// Check if a path is traversable (all parent components are directories, not whited out)
-    async fn is_path_traversable(&self, path: &str) -> Result<bool> {
-        let normalized = self.normalize_path(path);
-        let components: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    async fn is_path_traversable(&self, path: &NormalizedPath) -> Result<bool> {
+        let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
         // Check each parent component
         let mut current = String::new();
         for component in components.iter().take(components.len().saturating_sub(1)) {
             current = format!("{}/{}", current, component);
+            let current_normalized = NormalizedPath::from_normalized(current.clone());
 
             // Check for whiteout
-            if self.is_whiteout(&current).await? {
+            if self.is_whiteout(&current_normalized).await? {
                 return Ok(false);
             }
 
@@ -770,7 +812,8 @@ impl FileSystem for OverlayFS {
             // Check for visible children in base (not whiteout-ed)
             if let Some(base_children) = self.base.readdir(&normalized).await? {
                 for child in base_children {
-                    let child_path = format!("{}/{}", normalized, child);
+                    let child_path =
+                        NormalizedPath::from_normalized(format!("{}/{}", normalized, child));
                     if !self.is_whiteout(&child_path).await? {
                         return Err(FsError::NotEmpty.into());
                     }
@@ -1012,7 +1055,7 @@ impl FileSystem for OverlayFS {
             delta_file,
             base_file,
             delta: self.delta.clone(),
-            path: normalized,
+            path: normalized.0,
             copied_to_delta: std::sync::atomic::AtomicBool::new(false),
         }))
     }
