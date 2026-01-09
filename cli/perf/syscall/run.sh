@@ -11,7 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TEST_FILE="$SCRIPT_DIR/hello.txt"
-ITERATIONS="${1:-1000000}"
+ITERATIONS="${1:-100000}"
 AGENTFS="$CLI_DIR/target/release/agentfs"
 
 # Build benchmarks if needed
