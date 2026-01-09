@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.1] - 2026-01-09
+
+### Performance
+
+- Rust SDK: Add dentry cache and path resolution optimizations.
+- Rust SDK: Add in-memory whiteout cache.
+- Rust SDK: Add NormalizedPath type for overlay filesystem.
+- Update Turso to 0.4.3 pre-release to fix WAL read amplification.
+
+### Fixed
+
+- Inode consistency after copy-up in overlay filesystem.
+- `unlink()` path cache invalidation in FUSE module.
+
+### Documentation
+
+- Update installation command for AgentFS CLI.
+
 ## [0.5.0] - 2026-01-08
 
 ### Added
@@ -195,6 +213,7 @@
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.5.1]: https://github.com/tursodatabase/agentfs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tursodatabase/agentfs/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/tursodatabase/agentfs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tursodatabase/agentfs/compare/v0.3.1...v0.4.0
