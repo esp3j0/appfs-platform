@@ -173,6 +173,7 @@ struct RunSession {
 const DEFAULT_ALLOWED_DIRS: &[&str] = &[
     ".claude",      // Claude Code config
     ".claude.json", // Claude Code config file
+    ".gemini",      // Gemini CLI config
     ".local",       // Local data directory
     ".npm",         // npm local registry
     ".config",      // XDG config directory
