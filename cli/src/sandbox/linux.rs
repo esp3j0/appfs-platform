@@ -55,6 +55,7 @@ const SKIP_MOUNT_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/tmp"];
 /// Default directories that are allowed to be writable.
 /// These are common application config/cache directories that many programs need.
 const DEFAULT_ALLOWED_DIRS: &[&str] = &[
+    ".amp",         // Amp config
     ".claude",      // Claude Code config
     ".claude.json", // Claude Code config file
     ".codex",       // OpenAI Codex config

@@ -171,6 +171,7 @@ struct RunSession {
 /// Default directories in HOME that are allowed to be writable.
 /// These are common application config/cache directories that many programs need.
 const DEFAULT_ALLOWED_DIRS: &[&str] = &[
+    ".amp",         // Amp config
     ".claude",      // Claude Code config
     ".claude.json", // Claude Code config file
     ".gemini",      // Gemini CLI config
