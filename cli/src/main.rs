@@ -240,6 +240,12 @@ fn main() {
                 }
             }
         },
+        Command::Ps => {
+            if let Err(e) = cmd::ps::list_ps(&mut std::io::stdout()) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
