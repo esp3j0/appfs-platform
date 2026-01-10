@@ -15,6 +15,7 @@
 //! The HostFS base layer then accesses files through `/proc/self/fd/N`,
 //! bypassing the FUSE mount entirely.
 
+use super::group_paths_by_parent;
 use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::{bail, Context, Result};
 use std::{
@@ -406,8 +407,8 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str)
     eprintln!("The following directories are writable:");
     eprintln!();
     eprintln!("  - {} (copy-on-write)", cwd.display());
-    for path in allowed_paths {
-        eprintln!("  - {}", path.display());
+    for grouped_path in group_paths_by_parent(allowed_paths) {
+        eprintln!("  - {}", grouped_path);
     }
     eprintln!();
     eprintln!("🔒 Everything else is read-only.");
