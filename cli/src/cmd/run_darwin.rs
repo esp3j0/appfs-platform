@@ -124,14 +124,16 @@ pub async fn run(
 /// Print the welcome banner showing sandbox configuration (macOS).
 #[cfg(target_os = "macos")]
 fn print_welcome_banner(session: &RunSession) {
+    use crate::sandbox::group_paths_by_parent;
+
     eprintln!("Welcome to AgentFS!");
     eprintln!();
     eprintln!("The following directories are writable:");
     eprintln!();
     eprintln!("  - {} (copy-on-write)", session.cwd.display());
     eprintln!("  - /tmp");
-    for path in &session.allow_paths {
-        eprintln!("  - {}", path.display());
+    for grouped_path in group_paths_by_parent(&session.allow_paths) {
+        eprintln!("  - {}", grouped_path);
     }
     eprintln!();
     eprintln!("🔒 Everything else is read-only.");
