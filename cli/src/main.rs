@@ -1,7 +1,7 @@
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
-    parser::{Args, Command, FsCommand, ServeCommand, SyncCommand},
+    parser::{Args, Command, FsCommand, PruneCommand, ServeCommand, SyncCommand},
 };
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
@@ -246,6 +246,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Prune { command } => match command {
+            PruneCommand::Mounts { force } => {
+                if let Err(e) = cmd::mount::prune_mounts(force) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 

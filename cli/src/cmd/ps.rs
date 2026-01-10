@@ -75,6 +75,54 @@ struct SessionInfo {
     procs: Vec<ProcInfo>,
 }
 
+/// Get the set of active session IDs.
+pub fn active_session_ids() -> std::collections::HashSet<String> {
+    list_sessions().into_iter().map(|s| s.session_id).collect()
+}
+
+/// Read and validate a proc file, cleaning up stale entries.
+///
+/// Returns `Some(ProcInfo)` if the file is valid and the process is still alive,
+/// or `None` if the file should be skipped (invalid, stale, or wrong extension).
+fn read_proc_file_if_alive(path: &Path) -> Option<ProcInfo> {
+    if path.extension() != Some(std::ffi::OsStr::new("json")) {
+        return None;
+    }
+
+    let content = std::fs::read_to_string(path).ok()?;
+    let info: ProcInfo = serde_json::from_str(&content).ok()?;
+
+    if is_process_alive(info.pid) {
+        Some(info)
+    } else {
+        // Clean up stale proc file
+        let _ = std::fs::remove_file(path);
+        None
+    }
+}
+
+/// Collect active processes from a session's procs directory.
+fn collect_session_procs(procs_dir: &Path) -> Vec<ProcInfo> {
+    let proc_entries = match std::fs::read_dir(procs_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let mut procs: Vec<ProcInfo> = proc_entries
+        .flatten()
+        .filter_map(|entry| read_proc_file_if_alive(&entry.path()))
+        .collect();
+
+    // Sort by owner (true first), then by started_at
+    procs.sort_by(|a, b| {
+        b.owner
+            .cmp(&a.owner)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+    });
+
+    procs
+}
+
 /// List all active sessions and their processes.
 fn list_sessions() -> Vec<SessionInfo> {
     let home = match dirs::home_dir() {
@@ -88,59 +136,24 @@ fn list_sessions() -> Vec<SessionInfo> {
         Err(_) => return vec![],
     };
 
-    let mut sessions = Vec::new();
+    let mut sessions: Vec<SessionInfo> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            let procs_dir = entry.path().join("procs");
 
-    for entry in entries.flatten() {
-        let session_id = entry.file_name().to_string_lossy().to_string();
-        let procs_dir = entry.path().join("procs");
-
-        if !procs_dir.exists() {
-            continue;
-        }
-
-        let proc_entries = match std::fs::read_dir(&procs_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let mut procs = Vec::new();
-
-        for proc_entry in proc_entries.flatten() {
-            let path = proc_entry.path();
-            if path.extension() != Some(std::ffi::OsStr::new("json")) {
-                continue;
+            if !procs_dir.exists() {
+                return None;
             }
 
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let info: ProcInfo = match serde_json::from_str(&content) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-
-            // Check if process is still alive
-            if !is_process_alive(info.pid) {
-                // Clean up stale proc file
-                let _ = std::fs::remove_file(&path);
-                continue;
+            let procs = collect_session_procs(&procs_dir);
+            if procs.is_empty() {
+                return None;
             }
 
-            procs.push(info);
-        }
-
-        if !procs.is_empty() {
-            // Sort by owner (true first), then by started_at
-            procs.sort_by(|a, b| {
-                b.owner
-                    .cmp(&a.owner)
-                    .then_with(|| a.started_at.cmp(&b.started_at))
-            });
-            sessions.push(SessionInfo { session_id, procs });
-        }
-    }
+            Some(SessionInfo { session_id, procs })
+        })
+        .collect();
 
     // Sort sessions by earliest start time
     sessions.sort_by_key(|s| s.procs.first().map(|p| p.started_at));
