@@ -292,6 +292,13 @@ pub async fn run_cmd(
             libc::close(pipe_to_parent[0]);
         }
 
+        // Write proc file for this session (owner = true)
+        if let Err(e) =
+            crate::cmd::ps::write_proc_file(&session.run_id, true, &command.to_string_lossy(), &cwd)
+        {
+            eprintln!("Warning: Failed to write proc file: {}", e);
+        }
+
         // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread
         run_parent(
             child_pid,
@@ -299,6 +306,7 @@ pub async fn run_cmd(
             &session.fuse_mountpoint,
             fuse_handle,
             &session.db_path,
+            &session.run_id,
         );
     }
 }
@@ -369,6 +377,13 @@ fn run_in_existing_session(
             libc::close(pipe_to_parent[0]);
         }
 
+        // Write proc file for this joined session (owner = false)
+        if let Err(e) =
+            crate::cmd::ps::write_proc_file(session_id, false, &command.to_string_lossy(), cwd)
+        {
+            eprintln!("Warning: Failed to write proc file: {}", e);
+        }
+
         // Store child PID and install signal handlers before waiting
         CHILD_PID.store(child_pid, Ordering::SeqCst);
         install_signal_handlers();
@@ -376,6 +391,9 @@ fn run_in_existing_session(
         // Wait for child to exit (don't unmount or cleanup - the original session owns that)
         // Retry on EINTR (signal interruption)
         let exit_code = wait_for_child(child_pid);
+
+        // Clean up proc file
+        crate::cmd::ps::remove_proc_file(session_id);
 
         std::process::exit(exit_code);
     }
@@ -892,6 +910,7 @@ fn run_parent(
     fuse_mountpoint: &Path,
     _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
     db_path: &Path,
+    session_id: &str,
 ) -> ! {
     // Store child PID and install signal handlers before waiting
     CHILD_PID.store(child_pid, Ordering::SeqCst);
@@ -899,6 +918,9 @@ fn run_parent(
 
     // Wait for child process to exit, retrying on EINTR (signal interruption)
     let exit_code = wait_for_child(child_pid);
+
+    // Clean up proc file
+    crate::cmd::ps::remove_proc_file(session_id);
 
     // Move away from mountpoint before unmounting to avoid EBUSY
     let _ = std::env::set_current_dir("/");
@@ -927,6 +949,10 @@ fn run_parent(
             e
         );
     }
+
+    // Clean up procs directory if empty
+    let procs_dir = crate::cmd::ps::procs_dir(session_id);
+    let _ = std::fs::remove_dir(&procs_dir);
 
     // Print the location of the delta layer for the user
     eprintln!();

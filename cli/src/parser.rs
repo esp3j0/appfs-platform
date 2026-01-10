@@ -200,6 +200,8 @@ pub enum Command {
         #[command(subcommand)]
         command: ServeCommand,
     },
+    /// List active agentfs run sessions
+    Ps,
 }
 
 #[derive(Subcommand, Debug)]
