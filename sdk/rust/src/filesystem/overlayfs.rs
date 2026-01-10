@@ -1222,6 +1222,22 @@ impl FileSystem for OverlayFS {
             copied_to_delta: std::sync::atomic::AtomicBool::new(false),
         }))
     }
+
+    async fn create_file(&self, path: &str, mode: u32) -> Result<(Stats, BoxedFile)> {
+        let normalized = self.normalize_path(path);
+
+        // Remove any whiteout for this path
+        self.remove_whiteout(&normalized).await?;
+
+        // Invalidate directory cache
+        self.delta_dir_cache.remove(&normalized);
+
+        // Ensure parent directories exist in delta
+        self.ensure_parent_dirs(&normalized).await?;
+
+        // Create in delta layer
+        self.delta.create_file(&normalized, mode).await
+    }
 }
 
 impl OverlayFS {
