@@ -94,6 +94,23 @@ impl WhiteoutCache {
         node.is_whiteout // Check the final node itself
     }
 
+    /// Check if this exact path is a whiteout (not ancestors) - O(depth)
+    ///
+    /// Unlike `has_whiteout_ancestor`, this only returns true if the exact
+    /// path is marked as a whiteout, not if any ancestor is.
+    pub fn has_exact_whiteout(&self, path: &str) -> bool {
+        let root = self.root.read().unwrap();
+        let mut node = &*root;
+
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            match node.children.get(component) {
+                Some(child) => node = child,
+                None => return false, // Path not in trie
+            }
+        }
+        node.is_whiteout
+    }
+
     /// Insert a whiteout path into the cache
     pub fn insert(&self, path: &str) {
         let mut root = self.root.write().unwrap();
@@ -539,8 +556,17 @@ impl OverlayFS {
     }
 
     /// Remove a whiteout (un-delete a path)
+    ///
+    /// Fast path: if the path is not a whiteout in the cache, skip the DB operation.
+    /// The cache is authoritative (loaded at init, kept in sync with all mutations).
     async fn remove_whiteout(&self, path: &str) -> Result<()> {
         let normalized = self.normalize_path(path);
+
+        // Fast path: if not in cache, nothing to remove from DB
+        if !self.whiteout_cache.has_exact_whiteout(&normalized) {
+            return Ok(());
+        }
+
         let conn = self.delta.get_connection();
 
         let mut stmt = conn
