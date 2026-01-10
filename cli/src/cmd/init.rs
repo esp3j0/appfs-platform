@@ -139,7 +139,8 @@ pub async fn init_database(
             .to_string();
 
         // Use SDK's OverlayFS::init_schema to ensure schema consistency
-        OverlayFS::init_schema(&agent.get_connection(), &base_path_str)
+        let conn = agent.get_connection().await?;
+        OverlayFS::init_schema(&conn, &base_path_str)
             .await
             .context("Failed to initialize overlay schema")?;
 

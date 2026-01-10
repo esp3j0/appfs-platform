@@ -91,7 +91,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
-            let conn = agentfs.get_connection();
+            let conn = agentfs.get_connection().await?;
 
             // Check if fs_overlay_config table exists and has base_path
             let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";

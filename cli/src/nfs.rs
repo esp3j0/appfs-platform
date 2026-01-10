@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agentfs_sdk::error::Error as SdkError;
 use agentfs_sdk::{FileSystem, Stats, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use async_trait::async_trait;
 use nfsserve::nfs::{
@@ -17,6 +18,17 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
+
+/// Convert an SDK error to an NFS status code.
+///
+/// Connection pool timeouts return NFS3ERR_JUKEBOX to signal the client
+/// should retry the operation later. Other errors map to NFS3ERR_IO.
+fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
+    match e {
+        SdkError::ConnectionPoolTimeout => nfsstat3::NFS3ERR_JUKEBOX,
+        _ => nfsstat3::NFS3ERR_IO,
+    }
+}
 
 /// NFS adapter that wraps an AgentFS FileSystem.
 pub struct AgentNFS {
@@ -191,14 +203,14 @@ impl NFSFileSystem for AgentNFS {
         let stats = fs
             .lstat(&full_path)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         // Verify parent is a directory
         let dir_stats = fs
             .lstat(&dir_path)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         drop(fs); // Release lock before acquiring inode_map lock
@@ -217,7 +229,7 @@ impl NFSFileSystem for AgentNFS {
         let stats = fs
             .lstat(&path)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         Ok(self.stats_to_fattr(&stats, id))
@@ -229,10 +241,8 @@ impl NFSFileSystem for AgentNFS {
         // Handle size change (truncate)
         if let nfsserve::nfs::set_size3::size(size) = setattr.size {
             let fs = self.fs.lock().await;
-            let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            file.truncate(size)
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let file = fs.open(&path).await.map_err(error_to_nfsstat)?;
+            file.truncate(size).await.map_err(error_to_nfsstat)?;
         }
 
         // Return updated attributes
@@ -252,10 +262,10 @@ impl NFSFileSystem for AgentNFS {
         let data = file
             .pread(offset, count as u64)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(error_to_nfsstat)?;
 
         // Check if we've reached EOF
-        let stats = file.fstat().await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let stats = file.fstat().await.map_err(error_to_nfsstat)?;
 
         let eof = offset + data.len() as u64 >= stats.size as u64;
         Ok((data, eof))
@@ -266,10 +276,8 @@ impl NFSFileSystem for AgentNFS {
 
         {
             let fs = self.fs.lock().await;
-            let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            file.pwrite(offset, data)
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let file = fs.open(&path).await.map_err(error_to_nfsstat)?;
+            file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
         }
 
         self.getattr(id).await
@@ -290,7 +298,7 @@ impl NFSFileSystem for AgentNFS {
             let fs = self.fs.lock().await;
             fs.write_file(&full_path, &[])
                 .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                .map_err(error_to_nfsstat)?;
         }
 
         let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
@@ -313,7 +321,7 @@ impl NFSFileSystem for AgentNFS {
         if fs
             .lstat(&full_path)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(error_to_nfsstat)?
             .is_some()
         {
             return Err(nfsstat3::NFS3ERR_EXIST);
@@ -322,7 +330,7 @@ impl NFSFileSystem for AgentNFS {
         // Create empty file
         fs.write_file(&full_path, &[])
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(error_to_nfsstat)?;
 
         drop(fs);
         Ok(self.inode_map.write().await.get_or_create_ino(&full_path))
@@ -339,9 +347,7 @@ impl NFSFileSystem for AgentNFS {
 
         {
             let fs = self.fs.lock().await;
-            fs.mkdir(&full_path)
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            fs.mkdir(&full_path).await.map_err(error_to_nfsstat)?;
         }
 
         let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
@@ -356,9 +362,7 @@ impl NFSFileSystem for AgentNFS {
 
         {
             let fs = self.fs.lock().await;
-            fs.remove(&full_path)
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            fs.remove(&full_path).await.map_err(error_to_nfsstat)?;
         }
 
         self.inode_map.write().await.remove_path(&full_path);
@@ -384,7 +388,7 @@ impl NFSFileSystem for AgentNFS {
             let fs = self.fs.lock().await;
             fs.rename(&from_path, &to_path)
                 .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                .map_err(error_to_nfsstat)?;
         }
 
         self.inode_map
@@ -406,7 +410,7 @@ impl NFSFileSystem for AgentNFS {
             let fs = self.fs.lock().await;
             fs.readdir_plus(&dir_path)
                 .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?
         };
 
@@ -464,7 +468,7 @@ impl NFSFileSystem for AgentNFS {
             let fs = self.fs.lock().await;
             fs.symlink(target, &full_path)
                 .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                .map_err(error_to_nfsstat)?;
         }
 
         let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
@@ -479,7 +483,7 @@ impl NFSFileSystem for AgentNFS {
         let target = fs
             .readlink(&path)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         Ok(target.into_bytes().into())
