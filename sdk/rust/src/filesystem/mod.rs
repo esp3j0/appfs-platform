@@ -216,4 +216,11 @@ pub trait FileSystem: Send + Sync {
     /// The returned file handle can be used for efficient read/write/fsync
     /// operations without requiring path lookups on each operation.
     async fn open(&self, path: &str) -> Result<BoxedFile>;
+
+    /// Create a new empty file with the specified mode.
+    ///
+    /// Returns both the file stats and an open file handle in a single operation.
+    /// This is optimized for FUSE create() which needs both atomically.
+    /// Fails with AlreadyExists if the file exists.
+    async fn create_file(&self, path: &str, mode: u32) -> Result<(Stats, BoxedFile)>;
 }

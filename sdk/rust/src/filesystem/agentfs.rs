@@ -9,7 +9,7 @@ use turso::{Builder, Connection, Value};
 
 use super::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, DEFAULT_DIR_MODE,
-    DEFAULT_FILE_MODE, S_IFLNK, S_IFMT,
+    DEFAULT_FILE_MODE, S_IFLNK, S_IFMT, S_IFREG,
 };
 
 const ROOT_INO: i64 = 1;
@@ -1007,6 +1007,92 @@ impl AgentFS {
                 Err(e)
             }
         }
+    }
+
+    /// Create a new empty file with the specified mode.
+    ///
+    /// This is an optimized path for FUSE create() that combines inode creation,
+    /// dentry creation, and file handle opening in a single operation.
+    /// Returns both Stats and an open file handle.
+    pub async fn create_file(&self, path: &str, mode: u32) -> Result<(Stats, BoxedFile)> {
+        let path = self.normalize_path(path);
+        let components = self.split_path(&path);
+
+        if components.is_empty() {
+            anyhow::bail!("Cannot create root directory");
+        }
+
+        let parent_path = match components.len() {
+            1 => "/".to_string(),
+            _ => format!("/{}", components[..components.len() - 1].join("/")),
+        };
+
+        let parent_ino = self
+            .resolve_path(&parent_path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Parent directory does not exist"))?;
+
+        let name = components.last().unwrap();
+
+        if self.lookup_child(parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
+
+        // Prepare statements before starting the transaction
+        let mut inode_stmt = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime)
+                 VALUES (?, 1, 0, 0, 0, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let mut dentry_stmt = self
+            .conn
+            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+            .await?;
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let file_mode = S_IFREG | (mode & 0o7777);
+
+        let row = inode_stmt
+            .query_row((file_mode as i64, now, now, now))
+            .await?;
+
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| anyhow::anyhow!("Failed to get inode"))?;
+
+        dentry_stmt
+            .execute((name.as_str(), parent_ino, ino))
+            .await?;
+
+        self.conn.execute("COMMIT", ()).await?;
+
+        self.dentry_cache.insert(parent_ino, name, ino);
+
+        let stats = Stats {
+            ino,
+            mode: file_mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        };
+
+        let file: BoxedFile = Arc::new(AgentFSFile {
+            conn: self.conn.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+        });
+
+        Ok((stats, file))
     }
 
     /// Read data from a file
@@ -2264,6 +2350,10 @@ impl FileSystem for AgentFS {
 
     async fn open(&self, path: &str) -> Result<BoxedFile> {
         AgentFS::open(self, path).await
+    }
+
+    async fn create_file(&self, path: &str, mode: u32) -> Result<(Stats, BoxedFile)> {
+        AgentFS::create_file(self, path, mode).await
     }
 }
 

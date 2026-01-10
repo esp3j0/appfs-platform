@@ -657,65 +657,27 @@ impl Filesystem for AgentFSFuse {
             return;
         };
 
-        // Create empty file and set mode
+        // Create file with mode, get stats and file handle in one operation
         let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move {
-            fs.write_file(&path, &[]).await?;
-            // Set the requested mode (includes execute permissions for build scripts)
-            fs.chmod(&path, mode).await?;
-            Ok::<_, anyhow::Error>(path)
-        });
-
-        let path = match result {
-            Ok(p) => p,
-            Err(e) => {
-                reply.error(error_to_errno(&e));
-                return;
-            }
-        };
-
-        // Get the new file's stats
-        let fs = self.fs.clone();
-        let path_for_stat = path.clone();
-        let stat_result = self
+        let path_for_create = path.clone();
+        let result = self
             .runtime
-            .block_on(async move { fs.stat(&path_for_stat).await });
+            .block_on(async move { fs.create_file(&path_for_create, mode).await });
 
-        let attr = match stat_result {
-            Ok(Some(stats)) => {
+        match result {
+            Ok((stats, file)) => {
                 let attr = fillattr(&stats, self.uid, self.gid);
-                self.add_path(attr.ino, path.clone());
-                attr
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
+                self.add_path(attr.ino, path);
+
+                let fh = self.alloc_fh();
+                self.open_files.lock().insert(fh, OpenFile { file });
+
+                reply.created(&TTL, &attr, 0, fh, 0);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
-                return;
             }
-        };
-
-        // Open the file to get a file handle
-        let fs = self.fs.clone();
-        let path_clone = path.clone();
-        let open_result = self
-            .runtime
-            .block_on(async move { fs.open(&path_clone).await });
-
-        let file = match open_result {
-            Ok(file) => file,
-            Err(e) => {
-                reply.error(error_to_errno(&e));
-                return;
-            }
-        };
-
-        let fh = self.alloc_fh();
-        self.open_files.lock().insert(fh, OpenFile { file });
-
-        reply.created(&TTL, &attr, 0, fh, 0);
+        }
     }
 
     /// Creates a symbolic link.

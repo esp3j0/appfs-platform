@@ -359,6 +359,15 @@ impl FileSystem for HostFS {
             virtual_path: path.to_string(),
         }))
     }
+
+    async fn create_file(&self, path: &str, mode: u32) -> Result<(Stats, BoxedFile)> {
+        // Fallback implementation for HostFS
+        self.write_file(path, &[]).await?;
+        self.chmod(path, mode).await?;
+        let stats = self.stat(path).await?.ok_or(FsError::NotFound)?;
+        let file = self.open(path).await?;
+        Ok((stats, file))
+    }
 }
 
 #[cfg(test)]
