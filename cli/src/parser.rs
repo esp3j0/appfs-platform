@@ -202,6 +202,11 @@ pub enum Command {
     },
     /// List active agentfs run sessions
     Ps,
+    /// Prune unused resources
+    Prune {
+        #[command(subcommand)]
+        command: PruneCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -268,6 +273,16 @@ pub enum ServeCommand {
         /// copy_file, rename, stat, access, kv_get, kv_set, kv_delete, kv_list
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PruneCommand {
+    /// Unmount unused agentfs mount points
+    Mounts {
+        /// Skip confirmation prompt and unmount immediately
+        #[arg(long)]
+        force: bool,
     },
 }
 

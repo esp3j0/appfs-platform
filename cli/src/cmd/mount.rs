@@ -1,6 +1,11 @@
-use agentfs_sdk::{get_mounts, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{get_mounts, AgentFSOptions, FileSystem, HostFS, Mount, OverlayFS};
 use anyhow::Result;
-use std::{io::Write, os::unix::fs::MetadataExt, path::PathBuf, sync::Arc};
+use std::{
+    io::{self, Write},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use turso::value::Value;
 
 use crate::{cmd::init::open_agentfs, fuse::FuseMountOptions};
@@ -223,4 +228,154 @@ pub fn list_mounts<W: Write>(out: &mut W) {
             mount_width = mount_width
         );
     }
+}
+
+/// Check if a mount point is in use by any process.
+///
+/// Scans /proc to find processes with open files or current working directory
+/// on the given mountpoint.
+fn is_mount_in_use(mountpoint: &Path) -> bool {
+    let mountpoint = match mountpoint.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false, // Can't check, assume not in use
+    };
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only check numeric directories (PIDs)
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let pid_path = entry.path();
+
+        // Check cwd
+        if let Ok(cwd) = std::fs::read_link(pid_path.join("cwd")) {
+            if cwd.starts_with(&mountpoint) {
+                return true;
+            }
+        }
+
+        // Check open file descriptors
+        let fd_dir = pid_path.join("fd");
+        if let Ok(fds) = std::fs::read_dir(&fd_dir) {
+            for fd_entry in fds.flatten() {
+                if let Ok(target) = std::fs::read_link(fd_entry.path()) {
+                    if target.starts_with(&mountpoint) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Unmount a FUSE filesystem.
+///
+/// Tries fusermount3 first, then falls back to fusermount.
+fn unmount_fuse(mountpoint: &Path) -> Result<()> {
+    const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
+
+    for cmd in FUSERMOUNT_COMMANDS {
+        let result = std::process::Command::new(cmd)
+            .args(["-u"])
+            .arg(mountpoint.as_os_str())
+            .status();
+
+        match result {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => continue,  // Command ran but failed, try next
+            Err(_) => continue, // Command not found, try next
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to unmount {}. You may need to unmount manually with: fusermount -u {}",
+        mountpoint.display(),
+        mountpoint.display()
+    )
+}
+
+/// Ask for user confirmation.
+fn confirm(prompt: &str) -> bool {
+    eprint!("{} ", prompt);
+    let _ = io::stderr().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Prune unused agentfs mount points.
+///
+/// Finds all mounted agentfs filesystems that are not in use by any process
+/// and unmounts them.
+pub fn prune_mounts(force: bool) -> Result<()> {
+    let mounts = get_mounts();
+
+    // Get active session IDs to exclude from pruning
+    let active_sessions = super::ps::active_session_ids();
+
+    // Find unused mounts (not in use by any process and no active session)
+    let unused_mounts: Vec<&Mount> = mounts
+        .iter()
+        .filter(|m| !is_mount_in_use(&m.mountpoint) && !active_sessions.contains(&m.id))
+        .collect();
+
+    if unused_mounts.is_empty() {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+
+    // Display what will be unmounted
+    println!("The following unused mount points will be unmounted:");
+    println!();
+    for mount in &unused_mounts {
+        println!("  {} -> {}", mount.id, mount.mountpoint.display());
+    }
+    println!();
+
+    // Ask for confirmation unless --force
+    if !force && !confirm("Are you sure? (y/N)") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Unmount each unused mount
+    let mut errors = Vec::new();
+    for mount in &unused_mounts {
+        print!("Unmounting {}... ", mount.mountpoint.display());
+        let _ = io::stdout().flush();
+
+        match unmount_fuse(&mount.mountpoint) {
+            Ok(()) => println!("done"),
+            Err(e) => {
+                println!("failed");
+                errors.push(format!("{}: {}", mount.mountpoint.display(), e));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        eprintln!();
+        eprintln!("Some mounts could not be unmounted:");
+        for error in &errors {
+            eprintln!("  {}", error);
+        }
+        anyhow::bail!("Failed to unmount {} mount(s)", errors.len());
+    }
+
+    Ok(())
 }

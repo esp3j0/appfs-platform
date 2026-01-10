@@ -30,3 +30,8 @@ pub fn list_mounts<W: Write>(out: &mut W) {
 pub fn mount(_args: MountArgs) -> Result<()> {
     anyhow::bail!("FUSE mount is only available on Linux")
 }
+
+/// Prune unused agentfs mount points.
+pub fn prune_mounts(_force: bool) -> Result<()> {
+    anyhow::bail!("Mount pruning is only available on Linux")
+}
