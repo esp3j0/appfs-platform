@@ -1208,10 +1208,16 @@ fn fillattr(stats: &Stats, uid: u32, gid: u32) -> FileAttr {
         FileType::RegularFile
     };
 
+    let size = if stats.is_directory() {
+        4096_u64 // Standard directory size
+    } else {
+        stats.size as u64
+    };
+
     FileAttr {
         ino: stats.ino as u64,
-        size: stats.size as u64,
-        blocks: ((stats.size + 511) / 512) as u64,
+        size,
+        blocks: size.div_ceil(512),
         atime: UNIX_EPOCH + Duration::from_secs(stats.atime as u64),
         mtime: UNIX_EPOCH + Duration::from_secs(stats.mtime as u64),
         ctime: UNIX_EPOCH + Duration::from_secs(stats.ctime as u64),
