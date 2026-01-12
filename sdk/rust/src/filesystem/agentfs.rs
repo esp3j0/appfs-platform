@@ -621,13 +621,11 @@ impl AgentFS {
     /// This is more efficient than `resolve_path` when you already have the parent inode,
     /// as it avoids re-resolving all parent path components.
     async fn lookup_child(&self, parent_ino: i64, name: &str) -> Result<Option<i64>> {
-        let mut rows = self
+        let mut stmt = self
             .conn
-            .query(
-                "SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?",
-                (parent_ino, name),
-            )
+            .prepare_cached("SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?")
             .await?;
+        let mut rows = stmt.query((parent_ino, name)).await?;
 
         let mut found_ino = None;
         let mut row_count = 0;
