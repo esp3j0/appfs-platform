@@ -1,8 +1,9 @@
+pub mod error;
 pub mod filesystem;
 pub mod kvstore;
 pub mod toolcalls;
 
-use anyhow::Result;
+use error::{Error, Result};
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -96,7 +97,7 @@ impl AgentFSOptions {
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
-    pub fn db_path(&self) -> anyhow::Result<String> {
+    pub fn db_path(&self) -> Result<String> {
         // Determine database path: path takes precedence over id
         if let Some(path) = &self.path {
             // Custom path provided directly
@@ -104,10 +105,7 @@ impl AgentFSOptions {
         } else if let Some(id) = &self.id {
             // Validate agent ID to prevent path traversal attacks
             if !Self::validate_agent_id(id) {
-                anyhow::bail!(
-                    "Invalid agent ID '{}'. Agent IDs must contain only alphanumeric characters, hyphens, and underscores.",
-                    id
-                );
+                return Err(Error::InvalidAgentId(id.clone()));
             }
 
             // Ensure .agentfs directory exists
@@ -174,7 +172,7 @@ impl AgentFSOptions {
             let db_path = agentfs_dir().join(format!("{}.db", id_or_path));
             if db_path.exists() {
                 return Ok(Self::with_path(db_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("Database path '{}' is not valid UTF-8", db_path.display())
+                    Error::InvalidUtf8Path(db_path.display().to_string())
                 })?));
             }
         }
@@ -183,20 +181,17 @@ impl AgentFSOptions {
         let path = Path::new(&id_or_path);
         if path.is_file() {
             Ok(Self::with_path(id_or_path))
-        } else {
+        } else if AgentFSOptions::validate_agent_id(&id_or_path) {
             // Not a valid agent and not an existing file
-            if AgentFSOptions::validate_agent_id(&id_or_path) {
-                anyhow::bail!(
-                    "Agent '{}' not found at '{}'",
-                    id_or_path,
-                    agentfs_dir().join(format!("{}.db", id_or_path)).display()
-                );
-            } else {
-                anyhow::bail!(
-                    "Invalid agent ID '{}'. Agent IDs must contain only alphanumeric characters, hyphens, and underscores.",
-                    id_or_path
-                );
-            }
+            Err(Error::AgentNotFound {
+                id: id_or_path.clone(),
+                path: agentfs_dir()
+                    .join(format!("{}.db", id_or_path))
+                    .display()
+                    .to_string(),
+            })
+        } else {
+            Err(Error::InvalidAgentId(id_or_path))
         }
     }
 }
@@ -222,7 +217,7 @@ impl AgentFS {
     /// ```no_run
     /// use agentfs_sdk::{AgentFS, AgentFSOptions};
     ///
-    /// # async fn example() -> anyhow::Result<()> {
+    /// # async fn example() -> agentfs_sdk::error::Result<()> {
     /// // Persistent storage
     /// let agent = AgentFS::open(AgentFSOptions::with_id("my-agent")).await?;
     ///
@@ -235,10 +230,10 @@ impl AgentFS {
         // Validate base directory if provided
         if let Some(ref path) = options.base {
             if !path.exists() {
-                anyhow::bail!("Base directory does not exist: {}", path.display());
+                return Err(Error::BaseDirectoryNotFound(path.display().to_string()));
             }
             if !path.is_dir() {
-                anyhow::bail!("Base path is not a directory: {}", path.display());
+                return Err(Error::NotADirectory(path.display().to_string()));
             }
         }
         let db_path = options.db_path()?;
@@ -643,7 +638,7 @@ mod tests {
         // Agent IDs with path traversal should be rejected
         let result = AgentFSOptions::resolve("../evil");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid agent ID"));
+        assert!(result.unwrap_err().to_string().contains("invalid agent ID"));
 
         // Agent IDs with spaces should be rejected
         let result = AgentFSOptions::resolve("invalid agent");
