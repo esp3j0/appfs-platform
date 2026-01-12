@@ -778,13 +778,12 @@ impl AgentFS {
             None => return Ok(None),
         };
 
-        let mut rows = self
+        let mut stmt = self
             .conn
-            .query(
-                "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
-                (ino,),
-            )
+            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?")
             .await?;
+
+        let mut rows = stmt.query((ino,)).await?;
 
         if let Some(row) = rows.next().await? {
             let stats = Self::build_stats_from_row(&row)?;
