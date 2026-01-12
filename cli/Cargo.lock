@@ -121,7 +121,6 @@ name = "agentfs-sdk"
 version = "0.5.3"
 dependencies = [
  "aegis",
- "anyhow",
  "async-trait",
  "libc",
  "lru",

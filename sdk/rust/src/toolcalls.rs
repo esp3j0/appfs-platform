@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -149,7 +149,7 @@ impl ToolCalls {
             .get_value(0)
             .ok()
             .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
+            .ok_or_else(|| Error::Internal("failed to get tool call ID".to_string()))?;
         Ok(id)
     }
 
@@ -168,9 +168,9 @@ impl ToolCalls {
             row.get_value(0)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Invalid started_at value"))?
+                .ok_or_else(|| Error::Internal("invalid started_at value".to_string()))?
         } else {
-            anyhow::bail!("Tool call not found");
+            return Err(Error::ToolCallNotFound);
         };
 
         let duration_ms = (completed_at - started_at) * 1000;
@@ -232,7 +232,7 @@ impl ToolCalls {
             .get_value(0)
             .ok()
             .and_then(|v| v.as_integer().copied())
-            .ok_or_else(|| anyhow::anyhow!("Failed to get tool call ID"))?;
+            .ok_or_else(|| Error::Internal("failed to get tool call ID".to_string()))?;
         Ok(id)
     }
 
@@ -250,9 +250,9 @@ impl ToolCalls {
             row.get_value(0)
                 .ok()
                 .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| anyhow::anyhow!("Invalid started_at value"))?
+                .ok_or_else(|| Error::Internal("invalid started_at value".to_string()))?
         } else {
-            anyhow::bail!("Tool call not found");
+            return Err(Error::ToolCallNotFound);
         };
 
         let duration_ms = (completed_at - started_at) * 1000;

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -95,10 +95,10 @@ impl HostFS {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         if !root.exists() {
-            anyhow::bail!("Root directory does not exist: {}", root.display());
+            return Err(Error::BaseDirectoryNotFound(root.display().to_string()));
         }
         if !root.is_dir() {
-            anyhow::bail!("Root path is not a directory: {}", root.display());
+            return Err(Error::NotADirectory(root.display().to_string()));
         }
         Ok(Self {
             root,

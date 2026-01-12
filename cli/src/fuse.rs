@@ -1,4 +1,5 @@
-use agentfs_sdk::{BoxedFile, FileSystem, FsError, Stats};
+use agentfs_sdk::error::Error as SdkError;
+use agentfs_sdk::{BoxedFile, FileSystem, Stats};
 use fuser::{
     consts::{
         FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
@@ -21,14 +22,16 @@ use std::{
 };
 use tokio::runtime::Runtime;
 
-/// Convert an anyhow::Error to an errno code for FUSE replies.
+/// Convert an SDK error to an errno code for FUSE replies.
 ///
 /// If the error is a filesystem-specific FsError, returns the appropriate
 /// errno code (ENOENT, EEXIST, ENOTDIR, etc.). Otherwise falls back to EIO.
-fn error_to_errno(e: &anyhow::Error) -> i32 {
-    e.downcast_ref::<FsError>()
-        .map(|fs_err| fs_err.to_errno())
-        .unwrap_or(libc::EIO)
+fn error_to_errno(e: &SdkError) -> i32 {
+    match e {
+        SdkError::Fs(fs_err) => fs_err.to_errno(),
+        SdkError::Io(io_err) => io_err.raw_os_error().unwrap_or(libc::EIO),
+        _ => libc::EIO,
+    }
 }
 
 /// Cache entries never expire - we explicitly invalidate on mutations.

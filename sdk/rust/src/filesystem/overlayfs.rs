@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use async_trait::async_trait;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -1194,7 +1194,7 @@ impl FileSystem for OverlayFS {
             if let Some(stats) = base_stats {
                 // Hard links to directories are not allowed
                 if stats.is_directory() {
-                    anyhow::bail!("Cannot create hard link to directory");
+                    return Err(FsError::IsADirectory.into());
                 }
                 // Copy-up: read from base and write to delta
                 if let Some(data) = self.base.read_file(&old_normalized).await? {

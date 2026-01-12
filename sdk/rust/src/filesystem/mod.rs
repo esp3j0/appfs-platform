@@ -3,7 +3,7 @@ pub mod agentfs;
 pub mod hostfs;
 pub mod overlayfs;
 
-use anyhow::Result;
+use crate::error::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;

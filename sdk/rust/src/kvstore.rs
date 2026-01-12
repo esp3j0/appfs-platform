@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use turso::{Builder, Connection};
