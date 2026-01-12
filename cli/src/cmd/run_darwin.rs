@@ -40,6 +40,21 @@ pub async fn run(
 
     let session = setup_run_directory(session_id, allow, no_default_allows, &cwd, &home)?;
 
+    // Check if we're joining an existing session
+    if is_mountpoint(&session.mountpoint) {
+        if is_mount_healthy(&session.mountpoint) {
+            eprintln!("Joining existing session: {}", session.session_id);
+            eprintln!();
+            let exit_code = run_command_in_mount(&session, command, args)?;
+            std::process::exit(exit_code);
+        } else {
+            eprintln!("Cleaning up stale NFS mount...");
+            if let Err(e) = unmount(&session.mountpoint) {
+                eprintln!("Warning: Failed to unmount stale mount: {}", e);
+            }
+        }
+    }
+
     // Initialize the AgentFS database
     let db_path_str = session
         .db_path
@@ -228,6 +243,33 @@ fn setup_run_directory(
         allow_paths,
         cwd: cwd.to_path_buf(),
     })
+}
+
+/// Check if a path is a mountpoint by comparing device IDs with parent.
+fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(path_meta) = std::fs::metadata(path) else {
+        return false;
+    };
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("/"));
+
+    let Ok(parent_meta) = std::fs::metadata(parent) else {
+        return false;
+    };
+
+    path_meta.dev() != parent_meta.dev()
+}
+
+/// Check if a mount is healthy (not stale).
+///
+/// Stale NFS mounts will fail when trying to access them.
+fn is_mount_healthy(mountpoint: &Path) -> bool {
+    std::fs::read_dir(mountpoint).is_ok()
 }
 
 /// Find an available TCP port starting from the given port.
