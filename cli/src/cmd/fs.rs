@@ -20,7 +20,7 @@ pub async fn ls_filesystem(
     let options = AgentFSOptions::resolve(&id_or_path)?;
     eprintln!("Using agent: {}", id_or_path);
 
-    let (_, agentfs) = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options).await?;
     let conn = agentfs.get_connection();
 
     if path != "/" {
@@ -101,7 +101,7 @@ pub async fn cat_filesystem(
     path: &str,
 ) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
-    let (_, agentfs) = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options).await?;
 
     match agentfs.fs.read_file(path).await? {
         Some(file) => {
@@ -114,7 +114,7 @@ pub async fn cat_filesystem(
 
 pub async fn write_filesystem(id_or_path: String, path: &str, content: &str) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
-    let (_, agentfs) = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options).await?;
 
     let mut components = path.split("/").collect::<Vec<_>>();
     if !path.starts_with("/") {
@@ -170,9 +170,7 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
     let options = AgentFSOptions::resolve(&id_or_path)?;
     eprintln!("Using agent: {}", id_or_path);
 
-    let (_, agent) = open_agentfs(options)
-        .await
-        .context("Failed to open agent")?;
+    let agent = open_agentfs(options).await?;
 
     // Check if overlay is enabled
     let base_path = match agent.is_overlay_enabled().await? {

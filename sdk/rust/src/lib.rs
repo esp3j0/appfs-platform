@@ -11,6 +11,9 @@ use std::{
 };
 use turso::{Builder, Connection, Value};
 
+// Re-export turso sync types for CLI usage
+pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
+
 // Re-export filesystem types
 #[cfg(unix)]
 pub use filesystem::HostFS;
@@ -73,6 +76,17 @@ pub fn get_mounts() -> Vec<Mount> {
     vec![]
 }
 
+/// Configuration options for sync
+#[derive(Debug, Clone, Default)]
+pub struct SyncOptions {
+    /// Remote URL for syncing
+    pub remote_url: Option<String>,
+    /// Auth token for remote sync
+    pub auth_token: Option<String>,
+    /// Partial sync options
+    pub partial_sync: Option<PartialSyncOpts>,
+}
+
 /// Configuration options for opening an AgentFS instance
 #[derive(Debug, Clone, Default)]
 pub struct AgentFSOptions {
@@ -86,6 +100,8 @@ pub struct AgentFSOptions {
     /// Optional base directory for overlay filesystem (copy-on-write).
     /// When set, the filesystem operates as an overlay on top of this directory.
     pub base: Option<PathBuf>,
+    /// Sync options for remote database synchronization
+    pub sync: SyncOptions,
 }
 
 impl AgentFSOptions {
@@ -125,6 +141,7 @@ impl AgentFSOptions {
             id: Some(id.into()),
             path: None,
             base: None,
+            sync: SyncOptions::default(),
         }
     }
 
@@ -134,6 +151,7 @@ impl AgentFSOptions {
             id: None,
             path: None,
             base: None,
+            sync: SyncOptions::default(),
         }
     }
 
@@ -143,7 +161,14 @@ impl AgentFSOptions {
             id: None,
             path: Some(path.into()),
             base: None,
+            sync: SyncOptions::default(),
         }
+    }
+
+    /// Set sync options
+    pub fn with_sync(mut self, sync: SyncOptions) -> Self {
+        self.sync = sync;
+        self
     }
 
     /// Set the base directory for overlay filesystem (copy-on-write)
@@ -202,6 +227,7 @@ impl AgentFSOptions {
 /// and tool calls tracking backed by a SQLite database.
 pub struct AgentFS {
     conn: Arc<Connection>,
+    sync_db: Option<turso::sync::Database>,
     pub kv: KvStore,
     pub fs: filesystem::AgentFS,
     pub tools: ToolCalls,
@@ -236,9 +262,42 @@ impl AgentFS {
                 return Err(Error::NotADirectory(path.display().to_string()));
             }
         }
+
         let db_path = options.db_path()?;
-        let db = Builder::new_local(&db_path).build().await?;
-        let conn = db.connect()?;
+        let meta_path = format!("{db_path}-info");
+
+        // Determine if this is a synced database:
+        // 1. If sync.remote_url is set, create a new synced database
+        // 2. If {path}-info file exists, open as existing synced database
+        // 3. Otherwise, open as local database
+        let (sync_db, conn) = if let Some(remote_url) = options.sync.remote_url {
+            // Creating a new synced database
+            let mut builder =
+                turso::sync::Builder::new_remote(&db_path).with_remote_url(remote_url);
+            if let Some(auth_token) = options.sync.auth_token {
+                builder = builder.with_auth_token(auth_token);
+            }
+            if let Some(partial_sync) = options.sync.partial_sync {
+                builder = builder.with_partial_sync_opts_experimental(partial_sync);
+            }
+            let db = builder.build().await?;
+            let conn = db.connect().await?;
+            (Some(db), conn)
+        } else if std::fs::exists(&meta_path).unwrap_or(false) {
+            // Opening existing synced database
+            let mut builder = turso::sync::Builder::new_remote(&db_path);
+            if let Some(auth_token) = options.sync.auth_token {
+                builder = builder.with_auth_token(auth_token);
+            }
+            let db = builder.build().await?;
+            let conn = db.connect().await?;
+            (Some(db), conn)
+        } else {
+            // Local database
+            let db = Builder::new_local(&db_path).build().await?;
+            let conn = db.connect()?;
+            (None, conn)
+        };
 
         // Initialize overlay schema if base is provided
         if let Some(base_path) = options.base {
@@ -247,10 +306,14 @@ impl AgentFS {
             OverlayFS::init_schema(&conn, &base_path_str).await?;
         }
 
-        Self::open_with(conn).await
+        Self::open_with(conn, sync_db).await
     }
 
-    pub async fn open_with(conn: Connection) -> Result<Self> {
+    /// Open AgentFS with an existing connection and optional sync database
+    pub async fn open_with(
+        conn: Connection,
+        sync_db: Option<turso::sync::Database>,
+    ) -> Result<Self> {
         let conn = Arc::new(conn);
 
         let kv = KvStore::from_connection(conn.clone()).await?;
@@ -259,6 +322,7 @@ impl AgentFS {
 
         Ok(Self {
             conn,
+            sync_db,
             kv,
             fs,
             tools,
@@ -276,23 +340,50 @@ impl AgentFS {
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
         let conn = db.connect()?;
-        let conn = Arc::new(conn);
-
-        let kv = KvStore::from_connection(conn.clone()).await?;
-        let fs = filesystem::AgentFS::from_connection(conn.clone()).await?;
-        let tools = ToolCalls::from_connection(conn.clone()).await?;
-
-        Ok(Self {
-            conn,
-            kv,
-            fs,
-            tools,
-        })
+        Self::open_with(conn, None).await
     }
 
     /// Get the underlying database connection
     pub fn get_connection(&self) -> Arc<Connection> {
         self.conn.clone()
+    }
+
+    /// Check if sync is enabled for this database
+    pub fn is_synced(&self) -> bool {
+        self.sync_db.is_some()
+    }
+
+    /// Get the underlying sync database (if sync is enabled)
+    pub fn get_sync_db(&self) -> Option<&turso::sync::Database> {
+        self.sync_db.as_ref()
+    }
+
+    /// Pull changes from remote database
+    pub async fn pull(&self) -> Result<()> {
+        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
+        db.pull().await?;
+        Ok(())
+    }
+
+    /// Push local changes to remote database
+    pub async fn push(&self) -> Result<()> {
+        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
+        db.push().await?;
+        Ok(())
+    }
+
+    /// Checkpoint the local database
+    pub async fn checkpoint(&self) -> Result<()> {
+        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
+        db.checkpoint().await?;
+        Ok(())
+    }
+
+    /// Get sync statistics
+    pub async fn sync_stats(&self) -> Result<DatabaseSyncStats> {
+        let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
+        let stats = db.stats().await?;
+        Ok(stats)
     }
 
     /// Get all paths in the delta layer (files in fs_dentry)

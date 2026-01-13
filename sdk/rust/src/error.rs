@@ -49,6 +49,10 @@ pub enum Error {
     #[error("tool call not found")]
     ToolCallNotFound,
 
+    /// Sync not enabled for this database
+    #[error("sync is not enabled for this database")]
+    SyncNotEnabled,
+
     /// Internal error (for unexpected conditions)
     #[error("{0}")]
     Internal(String),

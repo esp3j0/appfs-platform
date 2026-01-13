@@ -23,9 +23,7 @@ pub async fn handle_mcp_server_command(
 
     eprintln!("Using agent: {}", id_or_path);
 
-    let (_, agentfs) = open_agentfs(options)
-        .await
-        .context("Failed to open AgentFS")?;
+    let agentfs = open_agentfs(options).await?;
 
     // Create MCP server with tool filtering
     let server = McpServer::new(agentfs, tools_filter);
