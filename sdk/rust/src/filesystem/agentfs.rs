@@ -165,6 +165,11 @@ impl File for AgentFSFile {
 
         let conn = self.pool.get_connection().await?;
 
+        conn.prepare_cached("BEGIN IMMEDIATE")
+            .await?
+            .execute(())
+            .await?;
+
         // Get current file size
         let mut stmt = conn
             .prepare_cached("SELECT size FROM fs_inode WHERE ino = ?")
@@ -197,6 +202,8 @@ impl File for AgentFSFile {
             .prepare_cached("UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?")
             .await?;
         stmt.execute((new_size as i64, now, self.ino)).await?;
+
+        conn.prepare_cached("COMMIT").await?.execute(()).await?;
 
         Ok(())
     }
