@@ -1,6 +1,4 @@
-use agentfs_sdk::error::Error as SdkError;
-use agentfs_sdk::{BoxedFile, FileSystem, Stats};
-use fuser::{
+use crate::fuser::{
     consts::{
         FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
         FUSE_WRITEBACK_CACHE,
@@ -9,6 +7,8 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request,
 };
+use agentfs_sdk::error::Error as SdkError;
+use agentfs_sdk::{BoxedFile, FileSystem, Stats};
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
@@ -193,8 +193,8 @@ impl Filesystem for AgentFSFuse {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        _atime: Option<crate::fuser::TimeOrNow>,
+        _mtime: Option<crate::fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -1262,7 +1262,7 @@ pub fn mount(
         mount_opts.push(MountOption::AllowRoot);
     }
 
-    fuser::mount2(fs, &opts.mountpoint, &mount_opts)?;
+    crate::fuser::mount2(fs, &opts.mountpoint, &mount_opts)?;
 
     Ok(())
 }
