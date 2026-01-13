@@ -53,6 +53,10 @@ pub enum Error {
     #[error("sync is not enabled for this database")]
     SyncNotEnabled,
 
+    /// Connection pool timeout - no connections available
+    #[error("connection pool timeout: no connections available")]
+    ConnectionPoolTimeout,
+
     /// Internal error (for unexpected conditions)
     #[error("{0}")]
     Internal(String),

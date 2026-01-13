@@ -1,3 +1,4 @@
+pub mod connection_pool;
 pub mod error;
 pub mod filesystem;
 pub mod kvstore;
@@ -7,9 +8,8 @@ use error::{Error, Result};
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
 };
-use turso::{Builder, Connection, Value};
+use turso::{Builder, Value};
 
 // Re-export turso sync types for CLI usage
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
@@ -226,7 +226,7 @@ impl AgentFSOptions {
 /// This provides a unified interface to the filesystem, key-value store,
 /// and tool calls tracking backed by a SQLite database.
 pub struct AgentFS {
-    conn: Arc<Connection>,
+    pool: connection_pool::ConnectionPool,
     sync_db: Option<turso::sync::Database>,
     pub kv: KvStore,
     pub fs: filesystem::AgentFS,
@@ -270,7 +270,7 @@ impl AgentFS {
         // 1. If sync.remote_url is set, create a new synced database
         // 2. If {path}-info file exists, open as existing synced database
         // 3. Otherwise, open as local database
-        let (sync_db, conn) = if let Some(remote_url) = options.sync.remote_url {
+        let (sync_db, pool) = if let Some(remote_url) = options.sync.remote_url {
             // Creating a new synced database
             let mut builder =
                 turso::sync::Builder::new_remote(&db_path).with_remote_url(remote_url);
@@ -281,8 +281,8 @@ impl AgentFS {
                 builder = builder.with_partial_sync_opts_experimental(partial_sync);
             }
             let db = builder.build().await?;
-            let conn = db.connect().await?;
-            (Some(db), conn)
+            let pool = connection_pool::ConnectionPool::new_sync(db.clone());
+            (Some(db), pool)
         } else if std::fs::exists(&meta_path).unwrap_or(false) {
             // Opening existing synced database
             let mut builder = turso::sync::Builder::new_remote(&db_path);
@@ -290,43 +290,48 @@ impl AgentFS {
                 builder = builder.with_auth_token(auth_token);
             }
             let db = builder.build().await?;
-            let conn = db.connect().await?;
-            (Some(db), conn)
+            let pool = connection_pool::ConnectionPool::new_sync(db.clone());
+            (Some(db), pool)
         } else {
             // Local database
             let db = Builder::new_local(&db_path).build().await?;
-            let conn = db.connect()?;
-            (None, conn)
+            let pool = connection_pool::ConnectionPool::new(db);
+            (None, pool)
         };
 
         // Initialize overlay schema if base is provided
         if let Some(base_path) = options.base {
             let canonical_base = std::fs::canonicalize(base_path)?;
             let base_path_str = canonical_base.to_string_lossy().to_string();
+            let conn = pool.get_connection().await?;
             OverlayFS::init_schema(&conn, &base_path_str).await?;
         }
 
-        Self::open_with(conn, sync_db).await
+        Self::open_with_pool(pool, sync_db).await
     }
 
-    /// Open AgentFS with an existing connection and optional sync database
-    pub async fn open_with(
-        conn: Connection,
+    /// Open an AgentFS instance from a connection pool
+    pub async fn open_with_pool(
+        pool: connection_pool::ConnectionPool,
         sync_db: Option<turso::sync::Database>,
     ) -> Result<Self> {
-        let conn = Arc::new(conn);
-
-        let kv = KvStore::from_connection(conn.clone()).await?;
-        let fs = filesystem::AgentFS::from_connection(conn.clone()).await?;
-        let tools = ToolCalls::from_connection(conn.clone()).await?;
+        let kv = KvStore::from_pool(pool.clone()).await?;
+        let fs = filesystem::AgentFS::from_pool(pool.clone()).await?;
+        let tools = ToolCalls::from_pool(pool.clone()).await?;
 
         Ok(Self {
-            conn,
+            pool,
             sync_db,
             kv,
             fs,
             tools,
         })
+    }
+
+    /// Open an AgentFS instance from a sync database
+    pub async fn open_with_sync_db(db: turso::sync::Database) -> Result<Self> {
+        let pool = connection_pool::ConnectionPool::new_sync(db.clone());
+        Self::open_with_pool(pool, Some(db)).await
     }
 
     /// Create a new AgentFS instance (deprecated, use `open` instead)
@@ -339,13 +344,18 @@ impl AgentFS {
     )]
     pub async fn new(db_path: &str) -> Result<Self> {
         let db = Builder::new_local(db_path).build().await?;
-        let conn = db.connect()?;
-        Self::open_with(conn, None).await
+        let pool = connection_pool::ConnectionPool::new(db);
+        Self::open_with_pool(pool, None).await
     }
 
-    /// Get the underlying database connection
-    pub fn get_connection(&self) -> Arc<Connection> {
-        self.conn.clone()
+    /// Get a connection from the pool
+    pub async fn get_connection(&self) -> Result<connection_pool::PooledConnection> {
+        self.pool.get_connection().await
+    }
+
+    /// Get the connection pool
+    pub fn get_pool(&self) -> connection_pool::ConnectionPool {
+        self.pool.clone()
     }
 
     /// Check if sync is enabled for this database
@@ -392,6 +402,7 @@ impl AgentFS {
     /// delta layer, which represents files that have been added or modified.
     pub async fn get_delta_paths(&self) -> Result<HashSet<String>> {
         const ROOT_INO: i64 = 1;
+        let conn = self.pool.get_connection().await?;
 
         let mut paths = HashSet::new();
         let mut queue: VecDeque<(i64, String)> = VecDeque::new();
@@ -406,7 +417,7 @@ impl AgentFS {
                 parent_ino
             );
 
-            let mut rows = self.conn.query(&query, ()).await?;
+            let mut rows = conn.query(&query, ()).await?;
 
             while let Some(row) = rows.next().await? {
                 let name: String = row
@@ -457,6 +468,7 @@ impl AgentFS {
     /// the path doesn't exist in the delta layer.
     pub async fn get_file_mode(&self, path: &str) -> Result<Option<u32>> {
         const ROOT_INO: i64 = 1;
+        let conn = self.pool.get_connection().await?;
 
         // Resolve path to inode
         let components: Vec<&str> = path
@@ -467,8 +479,7 @@ impl AgentFS {
 
         if components.is_empty() {
             // Root directory
-            let mut rows = self
-                .conn
+            let mut rows = conn
                 .query("SELECT mode FROM fs_inode WHERE ino = ?", (ROOT_INO,))
                 .await?;
 
@@ -490,7 +501,7 @@ impl AgentFS {
                 current_ino, component
             );
 
-            let mut rows = self.conn.query(&query, ()).await?;
+            let mut rows = conn.query(&query, ()).await?;
 
             if let Some(row) = rows.next().await? {
                 current_ino = row
@@ -503,8 +514,7 @@ impl AgentFS {
             }
         }
 
-        let mut rows = self
-            .conn
+        let mut rows = conn
             .query("SELECT mode FROM fs_inode WHERE ino = ?", (current_ino,))
             .await?;
 
@@ -525,9 +535,10 @@ impl AgentFS {
     /// Whiteouts mark paths that existed in the base layer but have been
     /// deleted in the overlay.
     pub async fn get_whiteouts(&self) -> Result<HashSet<String>> {
+        let conn = self.pool.get_connection().await?;
         let mut whiteouts = HashSet::new();
 
-        let result = self.conn.query("SELECT path FROM fs_whiteout", ()).await;
+        let result = conn.query("SELECT path FROM fs_whiteout", ()).await;
 
         if let Ok(mut rows) = result {
             while let Some(row) = rows.next().await? {
@@ -544,9 +555,9 @@ impl AgentFS {
     ///
     /// Returns the base path if overlay is enabled, None otherwise.
     pub async fn is_overlay_enabled(&self) -> Result<Option<String>> {
+        let conn = self.pool.get_connection().await?;
         // Check if fs_overlay_config table exists and has base_path
-        let result = self
-            .conn
+        let result = conn
             .query(
                 "SELECT value FROM fs_overlay_config WHERE key = 'base_path'",
                 (),
@@ -585,7 +596,7 @@ mod tests {
     async fn test_agentfs_creation() {
         let agentfs = AgentFS::open(AgentFSOptions::ephemeral()).await.unwrap();
         // Just verify we can get the connection
-        let _conn = agentfs.get_connection();
+        let _conn = agentfs.get_connection().await.unwrap();
     }
 
     #[tokio::test]
@@ -594,7 +605,7 @@ mod tests {
             .await
             .unwrap();
         // Just verify we can get the connection
-        let _conn = agentfs.get_connection();
+        let _conn = agentfs.get_connection().await.unwrap();
 
         // Cleanup
         let agentfs_dir = agentfs_dir();
