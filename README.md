@@ -186,6 +186,10 @@ At the heart of AgentFS is the [agent filesystem](SPEC.md), a complete SQLite-ba
 
 [Git worktrees](https://git-scm.com/docs/git-worktree) let you check out multiple branches of a repository into separate directories, allowing agents to work on independent copies of the source code—similar to AgentFS. But AgentFS solves the problem at a lower level. With git worktrees, nothing prevents an agent from modifying files outside its worktree: another agent's worktree, system files, or anything else on the filesystem. The isolation is purely conventional, not enforced. AgentFS provides filesystem-level copy-on-write isolation that's system-wide and cannot be bypassed—letting you safely run untrusted agents. And because it operates below git, it also handles untracked files, making it useful beyond just version-controlled source code.
 
+### Why implement AgentFS at the filesystem layer instead of using containers or VMs?
+
+The filesystem layer gives us capabilities that block devices can't. First, because everything is stored in structured SQLite tables, you can query the filesystem, which is essential for auditability and debugging agent behavior. Second, SQLite's write-ahead log enables snapshotting and time-travel forking by capturing every filesystem change. Third, we can provide an SDK that works in environments such as serverless or the browser, where there's no way to mount a block device at all. Note that this approach works fine with containers and VMs too—you can use AgentFS via remote filesystem protocols like NFS or through mechanisms like virtio-fuse.
+
 ## 📚 Learn More
 
 - **[User Manual](MANUAL.md)** - Complete guide to using the AgentFS CLI and SDK
