@@ -1,86 +1,67 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, OverlayFS};
+use agentfs_sdk::{
+    agentfs_dir, AgentFS, AgentFSOptions, OverlayFS, PartialBootstrapStrategy, PartialSyncOpts,
+    SyncOptions,
+};
 use anyhow::{Context, Result as AnyhowResult};
-use turso::sync::{PartialBootstrapStrategy, PartialSyncOpts};
 
 use crate::parser::SyncCommandOptions;
 
-pub async fn open_agentfs(
-    options: AgentFSOptions,
-) -> anyhow::Result<(Option<turso::sync::Database>, AgentFS)> {
-    let path = options.db_path()?;
-    let meta_path = format!("{path}-info");
-    if !std::fs::exists(meta_path)? {
-        return Ok((
-            None,
-            AgentFS::open(options)
-                .await
-                .context("Failed to open database")?,
-        ));
+pub async fn open_agentfs(options: AgentFSOptions) -> anyhow::Result<AgentFS> {
+    let mut options = options;
+    // CLI handles env var fallback for auth token
+    if options.sync.auth_token.is_none() {
+        if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
+            options.sync.auth_token = Some(auth_token);
+        }
     }
-    let mut builder = turso::sync::Builder::new_remote(&options.db_path()?);
-    if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
-        builder = builder.with_auth_token(auth_token);
-    }
-    let db = builder.build().await?;
-    let conn = db.connect().await?;
-    let agent = AgentFS::open_with(conn)
+    AgentFS::open(options)
         .await
-        .context("Failed to open synced database")?;
-    Ok((Some(db), agent))
+        .context("Failed to open database")
 }
 
-pub async fn create_agentfs(
-    options: AgentFSOptions,
-    sync_options: SyncCommandOptions,
-) -> anyhow::Result<(Option<turso::sync::Database>, AgentFS)> {
-    if let Some(remote_url) = sync_options.sync_remote_url {
-        let mut builder =
-            turso::sync::Builder::new_remote(&options.db_path()?).with_remote_url(remote_url);
-        if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
-            builder = builder.with_auth_token(auth_token);
-        }
+pub fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
+    let mut sync = SyncOptions {
+        remote_url: sync_cmd_options.sync_remote_url.clone(),
+        auth_token: std::env::var("TURSO_DB_AUTH_TOKEN").ok(),
+        partial_sync: None,
+    };
+
+    if sync_cmd_options.sync_remote_url.is_some() {
         let mut partial_sync = PartialSyncOpts {
             bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
             prefetch: false,
             segment_size: 128 * 1024,
         };
         let mut has_partial_sync = false;
-        if let Some(prefetch) = sync_options.sync_partial_prefetch {
+
+        if let Some(prefetch) = sync_cmd_options.sync_partial_prefetch {
             partial_sync.prefetch = prefetch;
             has_partial_sync = true;
         }
-        if let Some(segment_size) = sync_options.sync_partial_segment_size {
+        if let Some(segment_size) = sync_cmd_options.sync_partial_segment_size {
             partial_sync.segment_size = segment_size;
             has_partial_sync = true;
         }
-        if let Some(length) = sync_options.sync_partial_bootstrap_length {
+        if let Some(length) = sync_cmd_options.sync_partial_bootstrap_length {
             partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Prefix { length });
             has_partial_sync = true;
         }
-        if let Some(query) = sync_options.sync_partial_bootstrap_query {
-            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Query { query });
+        if let Some(ref query) = sync_cmd_options.sync_partial_bootstrap_query {
+            partial_sync.bootstrap_strategy = Some(PartialBootstrapStrategy::Query {
+                query: query.clone(),
+            });
             has_partial_sync = true;
         }
+
         if has_partial_sync {
-            builder = builder.with_partial_sync_opts_experimental(partial_sync);
+            sync.partial_sync = Some(partial_sync);
         }
-        let db = builder.build().await?;
-        let conn = db.connect().await?;
-        let agent = AgentFS::open_with(conn)
-            .await
-            .context("Failed to initialize synced database")?;
-        Ok((Some(db), agent))
-    } else {
-        Ok((
-            None,
-            AgentFS::open(options)
-                .await
-                .context("Failed to initialize database")?,
-        ))
     }
+
+    sync
 }
 
 pub async fn init_database(
@@ -137,14 +118,17 @@ pub async fn init_database(
         }
     }
 
-    let mut open_options = AgentFSOptions::with_id(&id);
+    let mut open_options =
+        AgentFSOptions::with_id(&id).with_sync(build_sync_options(&sync_options));
     if let Some(base_path) = base.as_ref() {
         open_options = open_options.with_base(base_path);
     }
 
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
-    let (synced_db, agent) = create_agentfs(open_options, sync_options).await?;
+    let agent = AgentFS::open(open_options)
+        .await
+        .context("Failed to initialize database")?;
 
     // If base is provided, initialize the overlay schema using the SDK
     if let Some(base_path) = base {
@@ -159,16 +143,16 @@ pub async fn init_database(
             .await
             .context("Failed to initialize overlay schema")?;
 
-        if let Some(synced_db) = synced_db {
-            synced_db.push().await?;
+        if agent.is_synced() {
+            agent.push().await?;
         }
 
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
         eprintln!("Base: {}", base_path.display());
     } else {
-        if let Some(synced_db) = synced_db {
-            synced_db.push().await?;
+        if agent.is_synced() {
+            agent.push().await?;
         }
 
         eprintln!("Created agent filesystem: {}", db_path.display());

@@ -87,7 +87,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 
     let mount = move || {
         let rt = crate::get_runtime();
-        let (_db, agentfs) = rt.block_on(open_agentfs(opts))?;
+        let agentfs = rt.block_on(open_agentfs(opts))?;
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {

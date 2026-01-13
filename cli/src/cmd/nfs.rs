@@ -26,7 +26,7 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         .context("Database path contains non-UTF8 characters")?;
 
     let options = AgentFSOptions::with_path(db_path_str);
-    let (_, agentfs) = open_agentfs(options).await?;
+    let agentfs = open_agentfs(options).await?;
 
     // Check if overlay is configured in the database
     let base_path = agentfs

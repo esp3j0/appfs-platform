@@ -42,7 +42,7 @@ pub async fn show_timeline(
 ) -> AnyhowResult<()> {
     let agent_options = AgentFSOptions::resolve(id_or_path)?;
 
-    let (_, agentfs) = open_agentfs(agent_options).await?;
+    let agentfs = open_agentfs(agent_options).await?;
     let conn = agentfs.get_connection();
 
     let toolcalls = ToolCalls::from_connection(conn)
