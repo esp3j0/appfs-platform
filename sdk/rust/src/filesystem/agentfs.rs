@@ -1312,8 +1312,11 @@ impl AgentFS {
             .await?;
 
         let result: Result<()> = async {
+            // Calculate the final size upfront
+            let write_end = offset + data.len() as u64;
+
             // Get or create the inode
-            let (ino, current_size) =
+            let (ino, current_size, is_new) =
                 if let Some(ino) = self.resolve_path_with_conn(&conn, &path).await? {
                     // Get current file size
                     let mut stmt = conn
@@ -1328,18 +1331,19 @@ impl AgentFS {
                     } else {
                         0
                     };
-                    (ino, size)
+                    (ino, size, false)
                 } else {
-                    // Create new inode
+                    // Create new inode with correct size upfront
                     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                    let new_size = write_end as i64;
                     let mut stmt = conn
                         .prepare_cached(
-                            "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                        VALUES (?, 0, 0, 0, ?, ?, ?) RETURNING ino",
+                            "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, nlink)
+                        VALUES (?, 0, 0, ?, ?, ?, ?, 1) RETURNING ino",
                         )
                         .await?;
                     let row = stmt
-                        .query_row((DEFAULT_FILE_MODE as i64, now, now, now))
+                        .query_row((DEFAULT_FILE_MODE as i64, new_size, now, now, now))
                         .await?;
 
                     let ino = row
@@ -1356,13 +1360,7 @@ impl AgentFS {
                         .await?;
                     stmt.execute((name.as_str(), parent_ino, ino)).await?;
 
-                    // Increment link count
-                    let mut stmt = conn
-                        .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-                        .await?;
-                    stmt.execute((ino,)).await?;
-
-                    (ino, 0)
+                    (ino, 0, true)
                 };
 
             // Handle empty writes - just update mtime
@@ -1376,7 +1374,6 @@ impl AgentFS {
             }
 
             let chunk_size = self.chunk_size as u64;
-            let write_end = offset + data.len() as u64;
 
             // Calculate affected chunk range
             let start_chunk = offset / chunk_size;
@@ -1456,13 +1453,15 @@ impl AgentFS {
                 .await?;
             }
 
-            // Update size and mtime
-            let new_size = std::cmp::max(current_size, write_end);
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((new_size as i64, now, ino)).await?;
+            // Update size and mtime (only if not new, since new inodes already have correct values)
+            if !is_new {
+                let new_size = std::cmp::max(current_size, write_end);
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                let mut stmt = conn
+                    .prepare_cached("UPDATE fs_inode SET size = ?, mtime = ? WHERE ino = ?")
+                    .await?;
+                stmt.execute((new_size as i64, now, ino)).await?;
+            }
 
             Ok(())
         }
