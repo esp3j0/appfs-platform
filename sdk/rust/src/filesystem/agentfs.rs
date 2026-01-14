@@ -352,33 +352,38 @@ impl AgentFSFile {
             let remaining_data = data.len() - written;
             let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
 
-            // Get existing chunk data (if any)
-            let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
+            let mut chunk_data;
+            if to_write != chunk_size as usize {
+                // Get existing chunk data (if any)
+                let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
 
-            let mut chunk_data = if let Some(row) = rows.next().await? {
-                row.get_value(0)
-                    .ok()
-                    .and_then(|v| {
-                        if let Value::Blob(b) = v {
-                            Some(b.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
+                chunk_data = if let Some(row) = rows.next().await? {
+                    row.get_value(0)
+                        .ok()
+                        .and_then(|v| {
+                            if let Value::Blob(b) = v {
+                                Some(b)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                select_stmt.reset()?;
+
+                // Extend chunk if needed
+                if chunk_data.len() < offset_in_chunk + to_write {
+                    chunk_data.resize(offset_in_chunk + to_write, 0);
+                }
+
+                // Write data into chunk
+                chunk_data[offset_in_chunk..offset_in_chunk + to_write]
+                    .copy_from_slice(&data[written..written + to_write]);
             } else {
-                Vec::new()
-            };
-            select_stmt.reset()?;
-
-            // Extend chunk if needed
-            if chunk_data.len() < offset_in_chunk + to_write {
-                chunk_data.resize(offset_in_chunk + to_write, 0);
+                chunk_data = data[written..written + to_write].to_vec();
             }
-
-            // Write data into chunk
-            chunk_data[offset_in_chunk..offset_in_chunk + to_write]
-                .copy_from_slice(&data[written..written + to_write]);
 
             // Save chunk
             insert_stmt
