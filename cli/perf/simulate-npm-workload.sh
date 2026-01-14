@@ -22,6 +22,7 @@
 
 set -e
 
+RANDOM=42
 TARGET_DIR="${1:-./sim-project}"
 SCALE="${2:-1.0}"
 
@@ -68,24 +69,24 @@ SUBDIRS=("lib" "dist" "src" "types" "cjs" "esm" "build" "test" "tests" "__tests_
 
 # Generate content of varying sizes (avg ~2700 bytes, min few bytes, max ~50KB)
 generate_content() {
-    local size_category=$((RANDOM % 100))
+    local size_category=$(($1 % 100))
     local content=""
 
     if [ $size_category -lt 10 ]; then
         # ~10%: Small files (10-100 bytes)
-        local size=$((10 + RANDOM % 90))
+        local size=$((10 + $1 % 90))
         content=$(head -c $size /dev/urandom | base64 | head -c $size)
     elif [ $size_category -lt 70 ]; then
         # ~60%: Medium files (500-5000 bytes, centered around 2700)
-        local size=$((500 + RANDOM % 4500))
+        local size=$((500 + $1 % 4500))
         content=$(head -c $size /dev/urandom | base64 | head -c $size)
     elif [ $size_category -lt 95 ]; then
         # ~25%: Larger files (5000-20000 bytes)
-        local size=$((5000 + RANDOM % 15000))
+        local size=$((5000 + $1 % 15000))
         content=$(head -c $size /dev/urandom | base64 | head -c $size)
     else
         # ~5%: Large files (20000-50000 bytes)
-        local size=$((20000 + RANDOM % 30000))
+        local size=$((20000 + $1 % 30000))
         content=$(head -c $size /dev/urandom | base64 | head -c $size)
     fi
 
@@ -215,7 +216,8 @@ while [ $files_created -lt $NUM_FILES ]; do
     fi
 
     # Generate content with realistic size distribution
-    content=$(generate_content)
+    seed=$RANDOM
+    content=$(generate_content $seed)
     content_size=${#content}
 
     # Write file (this triggers: create -> write -> flush -> release)
@@ -223,7 +225,7 @@ while [ $files_created -lt $NUM_FILES ]; do
 
     CREATED_FILES+=("$filepath")
     total_bytes=$((total_bytes + content_size))
-    ((files_created++))
+    files_created=$((files_created + 1))
 
     # Progress indicator every 500 files
     if [ $((files_created % 500)) -eq 0 ]; then
@@ -238,7 +240,7 @@ echo "  Created ${#CREATED_FILES[@]} files in ${CREATE_TIME}s"
 echo "  Total bytes: $total_bytes, Average: $avg_bytes bytes/file"
 
 # Combine all paths
-ALL_PATHS=("${CREATED_DIRS[@]}" "${CREATED_FILES[@]}")
+ALL_PATHS=("${CREATED_FILES[@]}")
 
 # Phase 3: setattr operations (chmod - triggers lookup + setattr)
 echo "Phase 3: setattr/chmod operations ($NUM_SETATTRS)..."
