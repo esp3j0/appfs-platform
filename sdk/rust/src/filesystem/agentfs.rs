@@ -329,6 +329,19 @@ impl AgentFSFile {
         let chunk_size = self.chunk_size as u64;
         let mut written = 0usize;
 
+        if data.len() == 0 {
+            return Ok(());
+        }
+
+        // get statements only once (in order to avoid heavy clone on every while iteration)
+        let mut select_stmt = conn
+            .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
+            .await?;
+        let mut insert_stmt = conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+            )
+            .await?;
         while written < data.len() {
             let current_offset = offset + written as u64;
             let chunk_index = (current_offset / chunk_size) as i64;
@@ -340,10 +353,7 @@ impl AgentFSFile {
             let to_write = std::cmp::min(remaining_in_chunk, remaining_data);
 
             // Get existing chunk data (if any)
-            let mut stmt = conn
-                .prepare_cached("SELECT data FROM fs_data WHERE ino = ? AND chunk_index = ?")
-                .await?;
-            let mut rows = stmt.query((self.ino, chunk_index)).await?;
+            let mut rows = select_stmt.query((self.ino, chunk_index)).await?;
 
             let mut chunk_data = if let Some(row) = rows.next().await? {
                 row.get_value(0)
@@ -359,6 +369,7 @@ impl AgentFSFile {
             } else {
                 Vec::new()
             };
+            select_stmt.reset()?;
 
             // Extend chunk if needed
             if chunk_data.len() < offset_in_chunk + to_write {
@@ -370,13 +381,10 @@ impl AgentFSFile {
                 .copy_from_slice(&data[written..written + to_write]);
 
             // Save chunk
-            let mut stmt = conn
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                )
+            insert_stmt
+                .execute((self.ino, chunk_index, Value::Blob(chunk_data)))
                 .await?;
-            stmt.execute((self.ino, chunk_index, Value::Blob(chunk_data)))
-                .await?;
+            insert_stmt.reset()?;
 
             written += to_write;
         }
@@ -477,7 +485,7 @@ impl AgentFS {
         // Create index for efficient path lookups
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent
-            ON fs_dentry(parent_ino, name)",
+            ON fs_dentry(parent_ino, name, ino)",
             (),
         )
         .await?;
@@ -726,6 +734,7 @@ impl AgentFS {
             return Ok(Some(ROOT_INO));
         }
 
+        let mut statement: Option<turso::Statement> = None;
         let mut current_ino = ROOT_INO;
         for component in components {
             // Check cache first
@@ -735,9 +744,17 @@ impl AgentFS {
             }
 
             // Cache miss - query database
-            let mut statement = conn
-                .prepare_cached("SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?")
-                .await?;
+            if let Some(statement) = &mut statement {
+                statement.reset()?;
+            } else {
+                statement = Some(
+                    conn.prepare_cached(
+                        "SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?",
+                    )
+                    .await?,
+                );
+            }
+            let statement = statement.as_mut().expect("statement was set above");
             let mut rows = statement.query((current_ino, component.as_str())).await?;
 
             let mut found_row = None;
