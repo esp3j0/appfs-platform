@@ -823,18 +823,17 @@ impl AgentFS {
         let mut current_path = path;
         let max_symlink_depth = 40; // Standard limit for symlink following
 
+        let mut stmt = conn.prepare_cached(
+            "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
+        ).await?;
         for _ in 0..max_symlink_depth {
             let ino = match self.resolve_path_with_conn(&conn, &current_path).await? {
                 Some(ino) => ino,
                 None => return Ok(None),
             };
 
-            let mut rows = conn
-                .query(
-                    "SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime FROM fs_inode WHERE ino = ?",
-                    (ino,),
-                )
-                .await?;
+            stmt.reset()?;
+            let mut rows = stmt.query((ino,)).await?;
 
             if let Some(row) = rows.next().await? {
                 let mode = row
