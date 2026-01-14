@@ -497,7 +497,7 @@ impl AgentFS {
         // Create index for efficient path lookups
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent
-            ON fs_dentry(parent_ino, name, ino)",
+            ON fs_dentry(parent_ino, name)",
             (),
         )
         .await?;
