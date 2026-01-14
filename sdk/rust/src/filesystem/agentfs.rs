@@ -329,7 +329,7 @@ impl AgentFSFile {
         let chunk_size = self.chunk_size as u64;
         let mut written = 0usize;
 
-        if data.len() == 0 {
+        if data.is_empty() {
             return Ok(());
         }
 
