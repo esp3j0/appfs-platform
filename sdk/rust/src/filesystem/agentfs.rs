@@ -342,6 +342,11 @@ impl AgentFSFile {
                 "INSERT OR REPLACE INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
             )
             .await?;
+        let txn = turso::transaction::Transaction::new_unchecked(
+            conn,
+            turso::transaction::TransactionBehavior::Deferred,
+        )
+        .await?;
         while written < data.len() {
             let current_offset = offset + written as u64;
             let chunk_index = (current_offset / chunk_size) as i64;
@@ -393,6 +398,8 @@ impl AgentFSFile {
 
             written += to_write;
         }
+
+        txn.commit().await?;
 
         Ok(())
     }
