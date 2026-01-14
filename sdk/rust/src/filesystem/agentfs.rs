@@ -1676,17 +1676,14 @@ impl AgentFS {
             None => return Ok(None),
         };
 
+        let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime
+            FROM fs_dentry d
+            JOIN fs_inode i ON d.ino = i.ino
+            WHERE d.parent_ino = ?
+            ORDER BY d.name"
+        ).await?;
         // Single JOIN query to get all entry names and their stats (including link count)
-        let mut rows = conn
-            .query(
-                "SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime
-                 FROM fs_dentry d
-                 JOIN fs_inode i ON d.ino = i.ino
-                 WHERE d.parent_ino = ?
-                 ORDER BY d.name",
-                (ino,),
-            )
-            .await?;
+        let mut rows = stmt.query((ino,)).await?;
 
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
