@@ -1039,51 +1039,46 @@ impl AgentFS {
 
         let result: Result<()> = async {
             // Check if file exists (single query using parent_ino we already have)
-            let ino = if let Some(ino) = self.lookup_child(&conn, parent_ino, name).await? {
-                // Delete existing data
-                let mut stmt = conn
-                    .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                    .await?;
-                stmt.execute((ino,)).await?;
-                ino
-            } else {
-                // Create new inode
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-                let mut stmt = conn
+            let (ino, is_new) =
+                if let Some(ino) = self.lookup_child(&conn, parent_ino, name).await? {
+                    // Delete existing data
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
+                        .await?;
+                    stmt.execute((ino,)).await?;
+                    (ino, false)
+                } else {
+                    // Create new inode
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                    let mut stmt = conn
                     .prepare_cached(
-                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
-                        VALUES (?, 0, 0, ?, ?, ?, ?) RETURNING ino",
+                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, nlink)
+                        VALUES (?, 0, 0, ?, ?, ?, ?, 1) RETURNING ino",
                     )
                     .await?;
-                let row = stmt
-                    .query_row((DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now))
-                    .await?;
+                    let row = stmt
+                        .query_row((DEFAULT_FILE_MODE as i64, data.len() as i64, now, now, now))
+                        .await?;
 
-                let ino = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+                    let ino = row
+                        .get_value(0)
+                        .ok()
+                        .and_then(|v| v.as_integer().copied())
+                        .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
 
-                // Create directory entry
-                let mut stmt = conn
-                    .prepare_cached(
-                        "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-                    )
-                    .await?;
-                stmt.execute((name.as_str(), parent_ino, ino)).await?;
+                    // Create directory entry
+                    let mut stmt = conn
+                        .prepare_cached(
+                            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+                        )
+                        .await?;
+                    stmt.execute((name.as_str(), parent_ino, ino)).await?;
 
-                // Increment link count
-                let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
-                    .await?;
-                stmt.execute((ino,)).await?;
+                    // Populate dentry cache for new file
+                    self.dentry_cache.insert(parent_ino, name, ino);
 
-                // Populate dentry cache for new file
-                self.dentry_cache.insert(parent_ino, name, ino);
-
-                ino
-            };
+                    (ino, true)
+                };
 
             // Write data in chunks
             for (chunk_index, chunk) in data.chunks(self.chunk_size).enumerate() {
@@ -1095,12 +1090,16 @@ impl AgentFS {
             }
 
             // Update mode (to regular file), size and mtime
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            let mut stmt = conn
-                .prepare_cached("UPDATE fs_inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?")
-                .await?;
-            stmt.execute((DEFAULT_FILE_MODE as i64, data.len() as i64, now, ino))
-                .await?;
+            if !is_new {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                let mut stmt = conn
+                    .prepare_cached(
+                        "UPDATE fs_inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?",
+                    )
+                    .await?;
+                stmt.execute((DEFAULT_FILE_MODE as i64, data.len() as i64, now, ino))
+                    .await?;
+            }
 
             Ok(())
         }
