@@ -1,13 +1,22 @@
 # Testing AgentFS
 
-## FUSE
-
-On macOS, install prerequisites first:
+## pjdfstest
 
 ```bash
-./scripts/install-deps.sh
-brew install pkg-config libgit2 cmake
+git clone git@github.com:pjd/pjdfstest.git
+cd pjdfstest
+autoreconf -ifs
+./configure
+make pjdfstest
+sudo make install
+sudo dnf install perl-Test-Harness
+mkdir -p ../agentfs-testing
+cd ../agentfs-testing
+agentfs run
+prove -rv ../pjdfstest/tests/
 ```
+
+## xftests
 
 First, build the `agentfs` executable and install it locally including the `mount.fuse.agentfs` helper:
 
