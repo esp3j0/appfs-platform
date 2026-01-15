@@ -49,6 +49,16 @@ pub enum Command {
         #[arg(long)]
         base: Option<PathBuf>,
 
+        /// Hex-encoded encryption key
+        /// Enables local encryption when provided.
+        #[arg(long, env = "AGENTFS_ENCRYPTION_KEY")]
+        encryption_key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --encryption-key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
+
         #[command(flatten)]
         sync: SyncCommandOptions,
     },

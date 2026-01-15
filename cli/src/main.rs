@@ -26,10 +26,26 @@ fn main() {
             id,
             force,
             base,
+            encryption_key,
+            cipher,
             sync,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync, force, base)) {
+            let encryption_opts = match (encryption_key, cipher) {
+                (Some(key), Some(cipher)) => Some(cmd::init::EncryptionOptions { key, cipher }),
+                (Some(_), None) => {
+                    eprintln!("Error: --cipher is required when using --encryption-key");
+                    std::process::exit(1);
+                }
+                (None, Some(_)) => {
+                    eprintln!("Error: --encryption-key is required when using --cipher");
+                    std::process::exit(1);
+                }
+                (None, None) => None,
+            };
+            if let Err(e) =
+                rt.block_on(cmd::init::init_database(id, sync, force, base, encryption_opts))
+            {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
