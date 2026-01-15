@@ -51,5 +51,6 @@ int test_pread_sparse(const char *base_path);
 int test_link(const char *base_path);
 int test_unlink(const char *base_path);
 int test_copyup_inode_stability(const char *base_path);
+int test_rename(const char *base_path);
 
 #endif /* TEST_COMMON_H */
