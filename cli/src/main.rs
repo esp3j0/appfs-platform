@@ -7,6 +7,26 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use tracing_subscriber::prelude::*;
 
+/// Parse and validate encryption key and cipher options.
+/// Both must be provided together or neither.
+fn parse_encryption(
+    encryption_key: Option<String>,
+    cipher: Option<String>,
+) -> Option<(String, String)> {
+    match (encryption_key, cipher) {
+        (Some(key), Some(cipher)) => Some((key, cipher)),
+        (Some(_), None) => {
+            eprintln!("Error: --cipher is required when using --encryption-key");
+            std::process::exit(1);
+        }
+        (None, Some(_)) => {
+            eprintln!("Error: --encryption-key is required when using --cipher");
+            std::process::exit(1);
+        }
+        (None, None) => None,
+    }
+}
+
 fn main() {
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -31,18 +51,8 @@ fn main() {
             sync,
         } => {
             let rt = get_runtime();
-            let encryption_opts = match (encryption_key, cipher) {
-                (Some(key), Some(cipher)) => Some(cmd::init::EncryptionOptions { key, cipher }),
-                (Some(_), None) => {
-                    eprintln!("Error: --cipher is required when using --encryption-key");
-                    std::process::exit(1);
-                }
-                (None, Some(_)) => {
-                    eprintln!("Error: --encryption-key is required when using --cipher");
-                    std::process::exit(1);
-                }
-                (None, None) => None,
-            };
+            let encryption_opts = parse_encryption(encryption_key, cipher)
+                .map(|(key, cipher)| cmd::init::EncryptionOptions { key, cipher });
             if let Err(e) = rt.block_on(cmd::init::init_database(
                 id,
                 sync,
@@ -102,18 +112,7 @@ fn main() {
             command,
             args,
         } => {
-            let encryption = match (encryption_key, cipher) {
-                (Some(key), Some(cipher)) => Some((key, cipher)),
-                (Some(_), None) => {
-                    eprintln!("Error: --cipher is required when using --encryption-key");
-                    std::process::exit(1);
-                }
-                (None, Some(_)) => {
-                    eprintln!("Error: --encryption-key is required when using --cipher");
-                    std::process::exit(1);
-                }
-                (None, None) => None,
-            };
+            let encryption = parse_encryption(encryption_key, cipher);
             let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
@@ -200,18 +199,7 @@ fn main() {
             encryption_key,
             cipher,
         } => {
-            let encryption = match (encryption_key, cipher) {
-                (Some(key), Some(cipher)) => Some((key, cipher)),
-                (Some(_), None) => {
-                    eprintln!("Error: --cipher is required when using --encryption-key");
-                    std::process::exit(1);
-                }
-                (None, Some(_)) => {
-                    eprintln!("Error: --encryption-key is required when using --cipher");
-                    std::process::exit(1);
-                }
-                (None, None) => None,
-            };
+            let encryption = parse_encryption(encryption_key, cipher);
             let rt = get_runtime();
             match command {
                 FsCommand::Ls { fs_path } => {
