@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use agentfs_sdk::AgentFSOptions;
+use agentfs_sdk::{AgentFSOptions, EncryptionConfig};
 use anyhow::{Context, Result as AnyhowResult};
 use turso::Value;
 
@@ -16,8 +16,15 @@ pub async fn ls_filesystem(
     stdout: &mut impl std::io::Write,
     id_or_path: String,
     path: &str,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    let options = AgentFSOptions::resolve(&id_or_path)?;
+    let mut options = AgentFSOptions::resolve(&id_or_path)?;
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key.clone(),
+            cipher: cipher.clone(),
+        });
+    }
     eprintln!("Using agent: {}", id_or_path);
 
     let agentfs = open_agentfs(options).await?;
@@ -99,8 +106,15 @@ pub async fn cat_filesystem(
     stdout: &mut impl std::io::Write,
     id_or_path: String,
     path: &str,
+    encryption: Option<&(String, String)>,
 ) -> AnyhowResult<()> {
-    let options = AgentFSOptions::resolve(&id_or_path)?;
+    let mut options = AgentFSOptions::resolve(&id_or_path)?;
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key.clone(),
+            cipher: cipher.clone(),
+        });
+    }
     let agentfs = open_agentfs(options).await?;
 
     match agentfs.fs.read_file(path).await? {
@@ -112,8 +126,19 @@ pub async fn cat_filesystem(
     }
 }
 
-pub async fn write_filesystem(id_or_path: String, path: &str, content: &str) -> AnyhowResult<()> {
-    let options = AgentFSOptions::resolve(&id_or_path)?;
+pub async fn write_filesystem(
+    id_or_path: String,
+    path: &str,
+    content: &str,
+    encryption: Option<&(String, String)>,
+) -> AnyhowResult<()> {
+    let mut options = AgentFSOptions::resolve(&id_or_path)?;
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key.clone(),
+            cipher: cipher.clone(),
+        });
+    }
     let agentfs = open_agentfs(options).await?;
 
     let mut components = path.split("/").collect::<Vec<_>>();
@@ -263,7 +288,9 @@ mod tests {
     pub async fn cat_file_not_found() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
-        let err = cat_filesystem(&mut buf, path, "test.md").await.unwrap_err();
+        let err = cat_filesystem(&mut buf, path, "test.md", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("File not found"));
     }
 
@@ -277,7 +304,9 @@ mod tests {
             .await
             .unwrap();
         let mut buf = Vec::new();
-        cat_filesystem(&mut buf, path, "test.md").await.unwrap();
+        cat_filesystem(&mut buf, path, "test.md", None)
+            .await
+            .unwrap();
         assert_eq!(buf, content);
     }
 
@@ -291,7 +320,9 @@ mod tests {
             .await
             .unwrap();
         let mut buf = Vec::new();
-        cat_filesystem(&mut buf, path, "test.md").await.unwrap();
+        cat_filesystem(&mut buf, path, "test.md", None)
+            .await
+            .unwrap();
         assert_eq!(buf, content);
     }
 
@@ -299,7 +330,7 @@ mod tests {
     pub async fn ls_empty() {
         let (_agentfs, path, _file) = agentfs().await;
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/", None).await.unwrap();
         assert_eq!(buf, b"");
     }
 
@@ -311,7 +342,7 @@ mod tests {
         let big = vec![100u8; 1024 * 1024];
         agentfs.fs.write_file("3.md", &big, 0, 0).await.unwrap();
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/", None).await.unwrap();
         assert_eq!(
             buf,
             b"f 1.md
@@ -338,7 +369,7 @@ f 3.md
         let big = vec![100u8; 1024 * 1024];
         agentfs.fs.write_file("d/e/3.md", &big, 0, 0).await.unwrap();
         let mut buf = Vec::new();
-        ls_filesystem(&mut buf, path, "/").await.unwrap();
+        ls_filesystem(&mut buf, path, "/", None).await.unwrap();
         assert_eq!(
             buf,
             b"d a

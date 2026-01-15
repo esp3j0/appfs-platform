@@ -13,6 +13,7 @@ pub async fn run(
     _strace: bool,
     _session: Option<String>,
     _system: bool,
+    _encryption: Option<(String, String)>,
     _command: PathBuf,
     _args: Vec<String>,
 ) -> Result<()> {

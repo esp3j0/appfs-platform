@@ -43,9 +43,13 @@ fn main() {
                 }
                 (None, None) => None,
             };
-            if let Err(e) =
-                rt.block_on(cmd::init::init_database(id, sync, force, base, encryption_opts))
-            {
+            if let Err(e) = rt.block_on(cmd::init::init_database(
+                id,
+                sync,
+                force,
+                base,
+                encryption_opts,
+            )) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -93,9 +97,23 @@ fn main() {
             strace,
             session,
             system,
+            encryption_key,
+            cipher,
             command,
             args,
         } => {
+            let encryption = match (encryption_key, cipher) {
+                (Some(key), Some(cipher)) => Some((key, cipher)),
+                (Some(_), None) => {
+                    eprintln!("Error: --cipher is required when using --encryption-key");
+                    std::process::exit(1);
+                }
+                (None, Some(_)) => {
+                    eprintln!("Error: --encryption-key is required when using --cipher");
+                    std::process::exit(1);
+                }
+                (None, None) => None,
+            };
             let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
@@ -105,6 +123,7 @@ fn main() {
                 strace,
                 session,
                 system,
+                encryption,
                 command,
                 args,
             )) {
@@ -178,7 +197,21 @@ fn main() {
         Command::Fs {
             command,
             id_or_path,
+            encryption_key,
+            cipher,
         } => {
+            let encryption = match (encryption_key, cipher) {
+                (Some(key), Some(cipher)) => Some((key, cipher)),
+                (Some(_), None) => {
+                    eprintln!("Error: --cipher is required when using --encryption-key");
+                    std::process::exit(1);
+                }
+                (None, Some(_)) => {
+                    eprintln!("Error: --encryption-key is required when using --cipher");
+                    std::process::exit(1);
+                }
+                (None, None) => None,
+            };
             let rt = get_runtime();
             match command {
                 FsCommand::Ls { fs_path } => {
@@ -186,6 +219,7 @@ fn main() {
                         &mut std::io::stdout(),
                         id_or_path,
                         &fs_path,
+                        encryption.as_ref(),
                     )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -196,15 +230,19 @@ fn main() {
                         &mut std::io::stdout(),
                         id_or_path,
                         &file_path,
+                        encryption.as_ref(),
                     )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
                 }
                 FsCommand::Write { file_path, content } => {
-                    if let Err(e) =
-                        rt.block_on(cmd::fs::write_filesystem(id_or_path, &file_path, &content))
-                    {
+                    if let Err(e) = rt.block_on(cmd::fs::write_filesystem(
+                        id_or_path,
+                        &file_path,
+                        &content,
+                        encryption.as_ref(),
+                    )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }

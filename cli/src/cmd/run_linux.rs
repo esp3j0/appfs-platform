@@ -15,6 +15,7 @@ pub async fn run(
     strace: bool,
     session: Option<String>,
     system: bool,
+    encryption: Option<(String, String)>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -25,6 +26,11 @@ pub async fn run(
         if session.is_some() {
             eprintln!("Warning: --session is not supported with --experimental-sandbox, ignoring");
         }
+        if encryption.is_some() {
+            eprintln!(
+                "Warning: --encryption-key is not supported with --experimental-sandbox, ignoring"
+            );
+        }
         crate::sandbox::linux_ptrace::run_cmd(strace, command, args).await;
     } else {
         if strace {
@@ -32,6 +38,15 @@ pub async fn run(
         }
         crate::sandbox::linux::run_cmd(allow, no_default_allows, session, system, command, args)
             .await?;
+        crate::sandbox::linux::run_cmd(
+            allow,
+            no_default_allows,
+            session,
+            encryption,
+            command,
+            args,
+        )
+        .await?;
     }
     Ok(())
 }

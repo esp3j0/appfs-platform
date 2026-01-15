@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use nfsserve::tcp::NFSTcp;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ pub async fn run(
     _strace: bool,
     session_id: Option<String>,
     _system: bool,
+    encryption: Option<(String, String)>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -63,7 +64,15 @@ pub async fn run(
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
 
-    let agentfs = AgentFS::open(AgentFSOptions::with_path(db_path_str))
+    let encrypted = encryption.is_some();
+    let mut options = AgentFSOptions::with_path(db_path_str);
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key,
+            cipher,
+        });
+    }
+    let agentfs = AgentFS::open(options)
         .await
         .context("Failed to create AgentFS")?;
 
@@ -108,7 +117,7 @@ pub async fn run(
     // Mount the NFS filesystem
     mount_nfs(port, &session.mountpoint)?;
 
-    print_welcome_banner(&session);
+    print_welcome_banner(&session, encrypted);
 
     // Run the command
     let exit_code = run_command_in_mount(&session, command, args)?;
@@ -140,7 +149,7 @@ pub async fn run(
 
 /// Print the welcome banner showing sandbox configuration (macOS).
 #[cfg(target_os = "macos")]
-fn print_welcome_banner(session: &RunSession) {
+fn print_welcome_banner(session: &RunSession, encrypted: bool) {
     use crate::sandbox::group_paths_by_parent;
 
     eprintln!("Welcome to AgentFS!");
@@ -154,6 +163,9 @@ fn print_welcome_banner(session: &RunSession) {
     }
     eprintln!();
     eprintln!("🔒 Everything else is read-only.");
+    if encrypted {
+        eprintln!("🔐 Delta layer is encrypted.");
+    }
     eprintln!();
     eprintln!("To join this session from another terminal:");
     eprintln!();
@@ -163,11 +175,14 @@ fn print_welcome_banner(session: &RunSession) {
 
 /// Print the welcome banner showing sandbox configuration (Linux).
 #[cfg(target_os = "linux")]
-fn print_welcome_banner(session: &RunSession) {
+fn print_welcome_banner(session: &RunSession, encrypted: bool) {
     eprintln!("Welcome to AgentFS!");
     eprintln!();
     eprintln!("  {} (copy-on-write)", session.cwd.display());
     eprintln!("  ⚠️  Everything else is WRITABLE.");
+    if encrypted {
+        eprintln!("🔐 Delta layer is encrypted.");
+    }
     eprintln!();
 }
 

@@ -25,6 +25,7 @@ pub async fn handle_run_command(
     strace: bool,
     session: Option<String>,
     system: bool,
+    encryption: Option<(String, String)>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -35,6 +36,7 @@ pub async fn handle_run_command(
         strace,
         session,
         system,
+        encryption,
         command,
         args,
     )
