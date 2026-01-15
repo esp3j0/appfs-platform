@@ -269,11 +269,13 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use agentfs_sdk::{AgentFS, AgentFSOptions};
+    use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig};
     use tempfile::NamedTempFile;
 
-    use crate::cmd::fs::cat_filesystem;
-    use crate::cmd::fs::ls_filesystem;
+    use crate::cmd::fs::{cat_filesystem, ls_filesystem, write_filesystem};
+
+    const TEST_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_CIPHER: &str = "aes256gcm";
 
     async fn agentfs() -> (AgentFS, String, NamedTempFile) {
         let file = NamedTempFile::new().unwrap();
@@ -281,6 +283,20 @@ mod tests {
         let agentfs = AgentFS::open(AgentFSOptions::with_path(path.to_string()))
             .await
             .unwrap();
+        (agentfs, file.path().to_str().unwrap().to_string(), file)
+    }
+
+    async fn encrypted_agentfs() -> (AgentFS, String, NamedTempFile) {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let agentfs = AgentFS::open(
+            AgentFSOptions::with_path(path.to_string()).with_encryption(EncryptionConfig {
+                hex_key: TEST_KEY.to_string(),
+                cipher: TEST_CIPHER.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
         (agentfs, file.path().to_str().unwrap().to_string(), file)
     }
 
@@ -382,5 +398,53 @@ f a/c/2.md
 f d/e/3.md
 "
         );
+    }
+
+    // Encryption tests
+
+    #[tokio::test]
+    pub async fn encrypted_write_and_cat() {
+        let (agentfs, path, _file) = encrypted_agentfs().await;
+        let content = b"encrypted content";
+        agentfs.fs.write_file("secret.txt", content).await.unwrap();
+        drop(agentfs);
+
+        let encryption = Some((TEST_KEY.to_string(), TEST_CIPHER.to_string()));
+        let mut buf = Vec::new();
+        cat_filesystem(&mut buf, path, "secret.txt", encryption.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(buf, content);
+    }
+
+    #[tokio::test]
+    pub async fn encrypted_ls() {
+        let (agentfs, path, _file) = encrypted_agentfs().await;
+        agentfs.fs.write_file("file1.txt", b"1").await.unwrap();
+        agentfs.fs.write_file("file2.txt", b"2").await.unwrap();
+        drop(agentfs);
+
+        let encryption = Some((TEST_KEY.to_string(), TEST_CIPHER.to_string()));
+        let mut buf = Vec::new();
+        ls_filesystem(&mut buf, path, "/", encryption.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(buf, b"f file1.txt\nf file2.txt\n");
+    }
+
+    #[tokio::test]
+    pub async fn encrypted_write_filesystem() {
+        let (_agentfs, path, _file) = encrypted_agentfs().await;
+
+        let encryption = Some((TEST_KEY.to_string(), TEST_CIPHER.to_string()));
+        write_filesystem(path.clone(), "/new_file.txt", "new content", encryption.as_ref())
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        cat_filesystem(&mut buf, path, "/new_file.txt", encryption.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(buf, b"new content");
     }
 }
