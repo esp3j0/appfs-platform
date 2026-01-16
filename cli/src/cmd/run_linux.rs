@@ -27,21 +27,18 @@ pub async fn run(
             eprintln!("Warning: --session is not supported with --experimental-sandbox, ignoring");
         }
         if encryption.is_some() {
-            eprintln!(
-                "Warning: --encryption-key is not supported with --experimental-sandbox, ignoring"
-            );
+            eprintln!("Warning: --key is not supported with --experimental-sandbox, ignoring");
         }
         crate::sandbox::linux_ptrace::run_cmd(strace, command, args).await;
     } else {
         if strace {
             eprintln!("Warning: --strace is only supported with --experimental-sandbox, ignoring");
         }
-        crate::sandbox::linux::run_cmd(allow, no_default_allows, session, system, command, args)
-            .await?;
         crate::sandbox::linux::run_cmd(
             allow,
             no_default_allows,
             session,
+            system,
             encryption,
             command,
             args,
