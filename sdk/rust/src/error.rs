@@ -57,6 +57,14 @@ pub enum Error {
     #[error("connection pool timeout: no connections available")]
     ConnectionPoolTimeout,
 
+    /// Encryption not supported for this configuration
+    #[error("encryption not supported: {0}")]
+    EncryptionNotSupported(String),
+
+    /// Invalid encryption key
+    #[error("invalid encryption key: {0}")]
+    InvalidEncryptionKey(String),
+
     /// Internal error (for unexpected conditions)
     #[error("{0}")]
     Internal(String),

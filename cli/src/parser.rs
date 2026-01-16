@@ -49,6 +49,16 @@ pub enum Command {
         #[arg(long)]
         base: Option<PathBuf>,
 
+        /// Hex-encoded encryption key.
+        /// Enables local encryption when provided.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
+
         #[command(flatten)]
         sync: SyncCommandOptions,
     },
@@ -66,6 +76,15 @@ pub enum Command {
         /// Agent ID or database path
         #[arg(add = ArgValueCompleter::new(id_or_path_completer))]
         id_or_path: String,
+
+        /// Hex-encoded encryption key for encrypted databases.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
 
         #[command(subcommand)]
         command: FsCommand,
@@ -103,6 +122,16 @@ pub enum Command {
         /// user_allow_other; use cautiously)
         #[arg(long = "system")]
         system: bool,
+
+        /// Hex-encoded encryption key for the delta layer.
+        /// Enables local encryption when provided.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
 
         /// Command to execute (defaults to bash on Linux, zsh on macOS)
         command: Option<PathBuf>,

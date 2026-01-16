@@ -477,12 +477,10 @@ pub async fn handle_linkat<T: Guest<Sandbox>>(
                     // Both paths need translation
                     use std::ffi::CString;
 
-                    let old_cstr =
-                        CString::new(translated_oldpath.to_string_lossy().to_string())
-                            .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
-                    let new_cstr =
-                        CString::new(translated_newpath.to_string_lossy().to_string())
-                            .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                    let old_cstr = CString::new(translated_oldpath.to_string_lossy().to_string())
+                        .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                    let new_cstr = CString::new(translated_newpath.to_string_lossy().to_string())
+                        .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
 
                     // Allocate space for both paths on guest stack
                     let old_bytes = old_cstr.as_bytes_with_nul();
@@ -498,12 +496,10 @@ pub async fn handle_linkat<T: Guest<Sandbox>>(
                     guest.memory().write_exact(old_byte_addr, old_bytes)?;
                     guest.memory().write_exact(new_byte_addr, new_bytes)?;
 
-                    let new_oldpath_ptr: reverie::syscalls::PathPtr = unsafe {
-                        std::mem::transmute(old_byte_addr)
-                    };
-                    let new_newpath_ptr: reverie::syscalls::PathPtr = unsafe {
-                        std::mem::transmute(new_byte_addr)
-                    };
+                    let new_oldpath_ptr: reverie::syscalls::PathPtr =
+                        unsafe { std::mem::transmute(old_byte_addr) };
+                    let new_newpath_ptr: reverie::syscalls::PathPtr =
+                        unsafe { std::mem::transmute(new_byte_addr) };
 
                     let new_syscall = reverie::syscalls::Linkat::new()
                         .with_olddirfd(kernel_olddirfd)

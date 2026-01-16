@@ -2,12 +2,19 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentfs_sdk::{
-    agentfs_dir, AgentFS, AgentFSOptions, OverlayFS, PartialBootstrapStrategy, PartialSyncOpts,
-    SyncOptions,
+    agentfs_dir, AgentFS, AgentFSOptions, EncryptionConfig, OverlayFS, PartialBootstrapStrategy,
+    PartialSyncOpts, SyncOptions,
 };
 use anyhow::{Context, Result as AnyhowResult};
 
 use crate::parser::SyncCommandOptions;
+
+pub struct EncryptionOptions {
+    /// Hex-encoded encryption key
+    pub key: String,
+    /// Cipher algorithm
+    pub cipher: String,
+}
 
 pub async fn open_agentfs(options: AgentFSOptions) -> anyhow::Result<AgentFS> {
     let mut options = options;
@@ -69,6 +76,7 @@ pub async fn init_database(
     sync_options: SyncCommandOptions,
     force: bool,
     base: Option<PathBuf>,
+    encryption: Option<EncryptionOptions>,
 ) -> AnyhowResult<()> {
     // Generate ID if not provided
     let id = id.unwrap_or_else(|| {
@@ -124,6 +132,22 @@ pub async fn init_database(
         open_options = open_options.with_base(base_path);
     }
 
+    let encrypted = if let Some(enc_opts) = encryption {
+        if sync_options.sync_remote_url.is_some() {
+            anyhow::bail!("Local encryption is not supported with cloud sync");
+        }
+        if !enc_opts.key.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!("Encryption key must be a valid hex string");
+        }
+        open_options = open_options.with_encryption(EncryptionConfig {
+            hex_key: enc_opts.key,
+            cipher: enc_opts.cipher,
+        });
+        true
+    } else {
+        false
+    };
+
     // Use the SDK to initialize the database - this ensures consistency
     // The SDK will create .agentfs directory and database file
     let agent = AgentFS::open(open_options)
@@ -151,6 +175,9 @@ pub async fn init_database(
         eprintln!("Created overlay filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
         eprintln!("Base: {}", base_path.display());
+        if encrypted {
+            eprintln!("Encryption: enabled");
+        }
     } else {
         if agent.is_synced() {
             agent.push().await?;
@@ -158,6 +185,9 @@ pub async fn init_database(
 
         eprintln!("Created agent filesystem: {}", db_path.display());
         eprintln!("Agent ID: {}", id);
+        if encrypted {
+            eprintln!("Encryption: enabled");
+        }
     }
 
     Ok(())

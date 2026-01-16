@@ -16,7 +16,7 @@
 //! bypassing the FUSE mount entirely.
 
 use super::group_paths_by_parent;
-use agentfs_sdk::{AgentFS, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -146,6 +146,7 @@ pub async fn run_cmd(
     no_default_allows: bool,
     session_id: Option<String>,
     system: bool,
+    encryption: Option<(String, String)>,
     command: PathBuf,
     args: Vec<String>,
 ) -> Result<()> {
@@ -171,7 +172,7 @@ pub async fn run_cmd(
         );
     }
 
-    print_welcome_banner(&cwd, &allowed_paths, &session.run_id);
+    print_welcome_banner(&cwd, &allowed_paths, &session.run_id, encryption.is_some());
 
     // Open the directory BEFORE mounting FUSE on top of it.
     // This fd lets us access the underlying directory through /proc/self/fd/N,
@@ -184,7 +185,14 @@ pub async fn run_cmd(
         .db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
-    let agentfs = AgentFS::open(AgentFSOptions::with_path(db_path_str))
+    let mut options = AgentFSOptions::with_path(db_path_str);
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key,
+            cipher,
+        });
+    }
+    let agentfs = AgentFS::open(options)
         .await
         .context("Failed to create delta AgentFS")?;
 
@@ -402,7 +410,7 @@ fn run_in_existing_session(
 }
 
 /// Print the welcome banner showing sandbox configuration.
-fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str) {
+fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str, encrypted: bool) {
     eprintln!("Welcome to AgentFS!");
     eprintln!();
     eprintln!("The following directories are writable:");
@@ -413,6 +421,9 @@ fn print_welcome_banner(cwd: &Path, allowed_paths: &[PathBuf], session_id: &str)
     }
     eprintln!();
     eprintln!("🔒 Everything else is read-only.");
+    if encrypted {
+        eprintln!("🔐 Delta layer is encrypted.");
+    }
     eprintln!();
     eprintln!("To join this session from another terminal:");
     eprintln!();

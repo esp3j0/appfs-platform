@@ -9,7 +9,7 @@ use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
 };
-use turso::{Builder, Value};
+use turso::{Builder, EncryptionOpts, Value};
 
 // Re-export turso sync types for CLI usage
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
@@ -87,6 +87,15 @@ pub struct SyncOptions {
     pub partial_sync: Option<PartialSyncOpts>,
 }
 
+/// Configuration options for local encryption
+#[derive(Debug, Clone)]
+pub struct EncryptionConfig {
+    /// Hex-encoded encryption key
+    pub hex_key: String,
+    /// Cipher algorithm (e.g., "aegis256", "aegis128l", "aes256gcm" etc)
+    pub cipher: String,
+}
+
 /// Configuration options for opening an AgentFS instance
 #[derive(Debug, Clone, Default)]
 pub struct AgentFSOptions {
@@ -102,6 +111,8 @@ pub struct AgentFSOptions {
     pub base: Option<PathBuf>,
     /// Sync options for remote database synchronization
     pub sync: SyncOptions,
+    /// Encryption configuration for database at rest
+    pub encryption: Option<EncryptionConfig>,
 }
 
 impl AgentFSOptions {
@@ -142,6 +153,7 @@ impl AgentFSOptions {
             path: None,
             base: None,
             sync: SyncOptions::default(),
+            encryption: None,
         }
     }
 
@@ -152,6 +164,7 @@ impl AgentFSOptions {
             path: None,
             base: None,
             sync: SyncOptions::default(),
+            encryption: None,
         }
     }
 
@@ -162,6 +175,7 @@ impl AgentFSOptions {
             path: Some(path.into()),
             base: None,
             sync: SyncOptions::default(),
+            encryption: None,
         }
     }
 
@@ -174,6 +188,25 @@ impl AgentFSOptions {
     /// Set the base directory for overlay filesystem (copy-on-write)
     pub fn with_base(mut self, base: impl Into<PathBuf>) -> Self {
         self.base = Some(base.into());
+        self
+    }
+
+    /// Enable local encryption with a hex-encoded key and cipher
+    ///
+    /// # Arguments
+    /// * `hex_key` - Hex-encoded encryption key (64 chars for 256-bit ciphers, 32 for 128-bit)
+    /// * `cipher` - Cipher algorithm (e.g., "aegis256", "aes256gcm" etc)
+    pub fn with_encryption_key(mut self, hex_key: &str, cipher: &str) -> Self {
+        self.encryption = Some(EncryptionConfig {
+            hex_key: hex_key.to_string(),
+            cipher: cipher.to_string(),
+        });
+        self
+    }
+
+    /// Set encryption configuration directly
+    pub fn with_encryption(mut self, encryption: EncryptionConfig) -> Self {
+        self.encryption = Some(encryption);
         self
     }
 
@@ -263,13 +296,20 @@ impl AgentFS {
             }
         }
 
+        // Encryption is not supported with sync
+        if options.encryption.is_some() && options.sync.remote_url.is_some() {
+            return Err(Error::EncryptionNotSupported(
+                "Local encryption is not supported with cloud sync".to_string(),
+            ));
+        }
+
         let db_path = options.db_path()?;
         let meta_path = format!("{db_path}-info");
 
         // Determine if this is a synced database:
         // 1. If sync.remote_url is set, create a new synced database
         // 2. If {path}-info file exists, open as existing synced database
-        // 3. Otherwise, open as local database
+        // 3. Otherwise, open as local database (with optional encryption via URI)
         let (sync_db, pool) = if let Some(remote_url) = options.sync.remote_url {
             // Creating a new synced database
             let mut builder =
@@ -284,7 +324,6 @@ impl AgentFS {
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
             (Some(db), pool)
         } else if std::fs::exists(&meta_path).unwrap_or(false) {
-            // Opening existing synced database
             let mut builder = turso::sync::Builder::new_remote(&db_path);
             if let Some(auth_token) = options.sync.auth_token {
                 builder = builder.with_auth_token(auth_token);
@@ -293,8 +332,18 @@ impl AgentFS {
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
             (Some(db), pool)
         } else {
-            // Local database
-            let db = Builder::new_local(&db_path).build().await?;
+            let db = if let Some(ref enc_config) = options.encryption {
+                Builder::new_local(&db_path)
+                    .experimental_encryption(true)
+                    .with_encryption(EncryptionOpts {
+                        cipher: enc_config.cipher.clone(),
+                        hexkey: enc_config.hex_key.clone(),
+                    })
+                    .build()
+                    .await?
+            } else {
+                Builder::new_local(&db_path).build().await?
+            };
             let pool = connection_pool::ConnectionPool::new(db);
             (None, pool)
         };
@@ -777,6 +826,87 @@ mod tests {
 
             // Cleanup
             let _ = std::fs::remove_file(&db_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_database_creation() {
+        let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        let db_path = agentfs_dir().join("test-encrypted-agent.db");
+
+        let file_names = [
+            "test-encrypted-agent.db",
+            "test-encrypted-agent.db-shm",
+            "test-encrypted-agent.db-wal",
+        ];
+        for file_name in file_names {
+            let _ = std::fs::remove_file(agentfs_dir().join(file_name));
+        }
+
+        // create encrypted database and write data
+        {
+            let agentfs = AgentFS::open(
+                AgentFSOptions::with_id("test-encrypted-agent")
+                    .with_encryption_key(hex_key, "aegis256"),
+            )
+            .await
+            .unwrap();
+
+            agentfs
+                .kv
+                .set("test_key", &"encrypted_value")
+                .await
+                .unwrap();
+        }
+
+        // verify database file exists
+        assert!(db_path.exists(), "Database file should exist");
+
+        // reopen with correct key - data should be readable
+        {
+            let agentfs = AgentFS::open(
+                AgentFSOptions::with_path(db_path.to_str().unwrap())
+                    .with_encryption_key(hex_key, "aegis256"),
+            )
+            .await
+            .unwrap();
+
+            let value: Option<String> = agentfs.kv.get("test_key").await.unwrap();
+            assert_eq!(value, Some("encrypted_value".to_string()));
+        }
+
+        // opening with wrong key should panic (turso panics on decryption failure)
+        let wrong_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let path_clone = db_path.clone();
+        let result = std::panic::catch_unwind(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let agentfs = AgentFS::open(
+                    AgentFSOptions::with_path(path_clone.to_str().unwrap())
+                        .with_encryption_key(wrong_key, "aegis256"),
+                )
+                .await
+                .unwrap();
+                let _: Option<String> = agentfs.kv.get("test_key").await.unwrap();
+            })
+        });
+        assert!(result.is_err(), "Opening with wrong key should panic");
+
+        // opening without key should panic (encrypted db read as plaintext)
+        let path_clone = db_path.clone();
+        let result = std::panic::catch_unwind(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let agentfs =
+                    AgentFS::open(AgentFSOptions::with_path(path_clone.to_str().unwrap()))
+                        .await
+                        .unwrap();
+                let _: Option<String> = agentfs.kv.get("test_key").await.unwrap();
+            })
+        });
+        assert!(result.is_err(), "Opening without key should panic");
+
+        // cleanup
+        for file_name in file_names {
+            let _ = std::fs::remove_file(agentfs_dir().join(file_name));
         }
     }
 }

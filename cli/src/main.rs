@@ -7,6 +7,23 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use tracing_subscriber::prelude::*;
 
+/// Parse and validate encryption key and cipher options.
+/// Both must be provided together or neither.
+fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(String, String)> {
+    match (key, cipher) {
+        (Some(key), Some(cipher)) => Some((key, cipher)),
+        (Some(_), None) => {
+            eprintln!("Error: --cipher is required when using --key");
+            std::process::exit(1);
+        }
+        (None, Some(_)) => {
+            eprintln!("Error: --key is required when using --cipher");
+            std::process::exit(1);
+        }
+        (None, None) => None,
+    }
+}
+
 fn main() {
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -26,10 +43,20 @@ fn main() {
             id,
             force,
             base,
+            key,
+            cipher,
             sync,
         } => {
             let rt = get_runtime();
-            if let Err(e) = rt.block_on(cmd::init::init_database(id, sync, force, base)) {
+            let encryption_opts = parse_encryption(key, cipher)
+                .map(|(key, cipher)| cmd::init::EncryptionOptions { key, cipher });
+            if let Err(e) = rt.block_on(cmd::init::init_database(
+                id,
+                sync,
+                force,
+                base,
+                encryption_opts,
+            )) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -77,9 +104,12 @@ fn main() {
             strace,
             session,
             system,
+            key,
+            cipher,
             command,
             args,
         } => {
+            let encryption = parse_encryption(key, cipher);
             let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
@@ -89,6 +119,7 @@ fn main() {
                 strace,
                 session,
                 system,
+                encryption,
                 command,
                 args,
             )) {
@@ -162,7 +193,10 @@ fn main() {
         Command::Fs {
             command,
             id_or_path,
+            key,
+            cipher,
         } => {
+            let encryption = parse_encryption(key, cipher);
             let rt = get_runtime();
             match command {
                 FsCommand::Ls { fs_path } => {
@@ -170,6 +204,7 @@ fn main() {
                         &mut std::io::stdout(),
                         id_or_path,
                         &fs_path,
+                        encryption.as_ref(),
                     )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
@@ -180,15 +215,19 @@ fn main() {
                         &mut std::io::stdout(),
                         id_or_path,
                         &file_path,
+                        encryption.as_ref(),
                     )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
                 }
                 FsCommand::Write { file_path, content } => {
-                    if let Err(e) =
-                        rt.block_on(cmd::fs::write_filesystem(id_or_path, &file_path, &content))
-                    {
+                    if let Err(e) = rt.block_on(cmd::fs::write_filesystem(
+                        id_or_path,
+                        &file_path,
+                        &content,
+                        encryption.as_ref(),
+                    )) {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
