@@ -49,12 +49,12 @@ pub enum Command {
         #[arg(long)]
         base: Option<PathBuf>,
 
-        /// Hex-encoded encryption key
+        /// Hex-encoded encryption key.
         /// Enables local encryption when provided.
-        #[arg(long, env = "AGENTFS_ENCRYPTION_KEY")]
-        encryption_key: Option<String>,
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
 
-        /// Cipher algorithm for encryption (required with --encryption-key).
+        /// Cipher algorithm for encryption (required with --key).
         /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
         #[arg(long, env = "AGENTFS_CIPHER")]
         cipher: Option<String>,
@@ -78,10 +78,10 @@ pub enum Command {
         id_or_path: String,
 
         /// Hex-encoded encryption key for encrypted databases.
-        #[arg(long, env = "AGENTFS_ENCRYPTION_KEY")]
-        encryption_key: Option<String>,
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
 
-        /// Cipher algorithm for encryption (required with --encryption-key).
+        /// Cipher algorithm for encryption (required with --key).
         /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
         #[arg(long, env = "AGENTFS_CIPHER")]
         cipher: Option<String>,
@@ -125,10 +125,10 @@ pub enum Command {
 
         /// Hex-encoded encryption key for the delta layer.
         /// Enables local encryption when provided.
-        #[arg(long, env = "AGENTFS_ENCRYPTION_KEY")]
-        encryption_key: Option<String>,
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
 
-        /// Cipher algorithm for encryption (required with --encryption-key).
+        /// Cipher algorithm for encryption (required with --key).
         /// Options: aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4, aes128gcm, aes256gcm
         #[arg(long, env = "AGENTFS_CIPHER")]
         cipher: Option<String>,

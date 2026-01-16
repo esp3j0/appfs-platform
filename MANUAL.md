@@ -26,8 +26,8 @@ agentfs init [OPTIONS] [ID]
 **Options:**
 - `--force` - Overwrite existing agent filesystem
 - `--base <PATH>` - Base directory for overlay filesystem (copy-on-write)
-- `--encryption-key <KEY>` - Hex-encoded encryption key for local encryption
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--encryption-key`)
+- `--key <KEY>` - Hex-encoded encryption key for local encryption
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 - `--sync-remote-url <URL>` - Remote Turso database URL for sync
 - `--sync-partial-prefetch` - Enable prefetching for partial sync
 - `--sync-partial-segment-size <SIZE>` - Segment size for partial sync
@@ -48,8 +48,8 @@ agentfs run [OPTIONS] <COMMAND> [ARGS]...
 - `--session <ID>` - Named session for persistence across runs
 - `--allow <PATH>` - Allow write access to additional directories (repeatable)
 - `--no-default-allows` - Disable default allowed directories
-- `--encryption-key <KEY>` - Hex-encoded encryption key for delta layer
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--encryption-key`)
+- `--key <KEY>` - Hex-encoded encryption key for delta layer
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 - `--experimental-sandbox` - Use ptrace-based syscall interception (Linux only)
 - `--strace` - Show intercepted syscalls (requires `--experimental-sandbox`)
 
@@ -133,8 +133,8 @@ agentfs sync <ID_OR_PATH> <SUBCOMMAND>
 Filesystem operations on agent databases.
 
 **Common Options:**
-- `--encryption-key <KEY>` - Hex-encoded encryption key for encrypted databases
-- `--cipher <CIPHER>` - Cipher algorithm (required with `--encryption-key`)
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
 
 #### agentfs fs ls
 
@@ -200,7 +200,7 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`
 
 | Variable | Description |
 |----------|-------------|
-| `AGENTFS_ENCRYPTION_KEY` | Default encryption key (hex-encoded) |
+| `AGENTFS_KEY` | Default encryption key (hex-encoded) |
 | `AGENTFS_CIPHER` | Default cipher algorithm |
 | `TURSO_DB_AUTH_TOKEN` | Authentication token for cloud sync |
 
@@ -230,22 +230,22 @@ AgentFS supports encrypting the local SQLite database at rest using libSQL's enc
 KEY=$(openssl rand -hex 32)
 
 # Initialize with encryption
-agentfs init --encryption-key $KEY --cipher aes256gcm my-secure-agent
+agentfs init --key $KEY --cipher aes256gcm my-secure-agent
 
 # Access the filesystem
-agentfs fs my-secure-agent --encryption-key $KEY --cipher aes256gcm ls /
+agentfs fs my-secure-agent --key $KEY --cipher aes256gcm ls /
 ```
 
 **Example: Encrypted sandbox session**
 
 ```bash
-agentfs run --encryption-key $KEY --cipher aes256gcm -- bash
+agentfs run --key $KEY --cipher aes256gcm -- bash
 ```
 
 **Using environment variables:**
 
 ```bash
-export AGENTFS_ENCRYPTION_KEY=$(openssl rand -hex 32)
+export AGENTFS_KEY=$(openssl rand -hex 32)
 export AGENTFS_CIPHER=aes256gcm
 
 agentfs init my-secure-agent

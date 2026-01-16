@@ -289,12 +289,12 @@ mod tests {
     async fn encrypted_agentfs() -> (AgentFS, String, NamedTempFile) {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap();
-        let agentfs = AgentFS::open(
-            AgentFSOptions::with_path(path.to_string()).with_encryption(EncryptionConfig {
+        let agentfs = AgentFS::open(AgentFSOptions::with_path(path.to_string()).with_encryption(
+            EncryptionConfig {
                 hex_key: TEST_KEY.to_string(),
                 cipher: TEST_CIPHER.to_string(),
-            }),
-        )
+            },
+        ))
         .await
         .unwrap();
         (agentfs, file.path().to_str().unwrap().to_string(), file)
@@ -437,9 +437,14 @@ f d/e/3.md
         let (_agentfs, path, _file) = encrypted_agentfs().await;
 
         let encryption = Some((TEST_KEY.to_string(), TEST_CIPHER.to_string()));
-        write_filesystem(path.clone(), "/new_file.txt", "new content", encryption.as_ref())
-            .await
-            .unwrap();
+        write_filesystem(
+            path.clone(),
+            "/new_file.txt",
+            "new content",
+            encryption.as_ref(),
+        )
+        .await
+        .unwrap();
 
         let mut buf = Vec::new();
         cat_filesystem(&mut buf, path, "/new_file.txt", encryption.as_ref())

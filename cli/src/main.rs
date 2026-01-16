@@ -9,18 +9,15 @@ use tracing_subscriber::prelude::*;
 
 /// Parse and validate encryption key and cipher options.
 /// Both must be provided together or neither.
-fn parse_encryption(
-    encryption_key: Option<String>,
-    cipher: Option<String>,
-) -> Option<(String, String)> {
-    match (encryption_key, cipher) {
+fn parse_encryption(key: Option<String>, cipher: Option<String>) -> Option<(String, String)> {
+    match (key, cipher) {
         (Some(key), Some(cipher)) => Some((key, cipher)),
         (Some(_), None) => {
-            eprintln!("Error: --cipher is required when using --encryption-key");
+            eprintln!("Error: --cipher is required when using --key");
             std::process::exit(1);
         }
         (None, Some(_)) => {
-            eprintln!("Error: --encryption-key is required when using --cipher");
+            eprintln!("Error: --key is required when using --cipher");
             std::process::exit(1);
         }
         (None, None) => None,
@@ -46,12 +43,12 @@ fn main() {
             id,
             force,
             base,
-            encryption_key,
+            key,
             cipher,
             sync,
         } => {
             let rt = get_runtime();
-            let encryption_opts = parse_encryption(encryption_key, cipher)
+            let encryption_opts = parse_encryption(key, cipher)
                 .map(|(key, cipher)| cmd::init::EncryptionOptions { key, cipher });
             if let Err(e) = rt.block_on(cmd::init::init_database(
                 id,
@@ -107,12 +104,12 @@ fn main() {
             strace,
             session,
             system,
-            encryption_key,
+            key,
             cipher,
             command,
             args,
         } => {
-            let encryption = parse_encryption(encryption_key, cipher);
+            let encryption = parse_encryption(key, cipher);
             let command = command.unwrap_or_else(default_shell);
             let rt = get_runtime();
             if let Err(e) = rt.block_on(cmd::handle_run_command(
@@ -196,10 +193,10 @@ fn main() {
         Command::Fs {
             command,
             id_or_path,
-            encryption_key,
+            key,
             cipher,
         } => {
-            let encryption = parse_encryption(encryption_key, cipher);
+            let encryption = parse_encryption(key, cipher);
             let rt = get_runtime();
             match command {
                 FsCommand::Ls { fs_path } => {
