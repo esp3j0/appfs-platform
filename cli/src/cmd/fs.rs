@@ -153,10 +153,12 @@ pub async fn write_filesystem(
             agentfs.fs.mkdir(&dir_path, 0, 0).await?;
         }
     }
-    agentfs
-        .fs
-        .write_file(path, content.as_bytes(), 0, 0)
-        .await?;
+    // Remove file if it exists (overwrite behavior)
+    if agentfs.fs.stat(path).await?.is_some() {
+        agentfs.fs.remove(path).await?;
+    }
+    let (_, file) = agentfs.fs.create_file(path, S_IFREG | 0o644, 0, 0).await?;
+    file.pwrite(0, content.as_bytes()).await?;
     Ok(())
 }
 
@@ -300,6 +302,8 @@ mod tests {
         (agentfs, file.path().to_str().unwrap().to_string(), file)
     }
 
+    const S_IFREG: u32 = 0o100000;
+
     #[tokio::test]
     pub async fn cat_file_not_found() {
         let (_agentfs, path, _file) = agentfs().await;
@@ -314,9 +318,7 @@ mod tests {
     pub async fn cat_file_found() {
         let (agentfs, path, _file) = agentfs().await;
         let content = b"hello, agentfs";
-        agentfs
-            .fs
-            .write_file("test.md", content, 0, 0)
+        write_file(&agentfs.fs, "test.md", content, 0, 0)
             .await
             .unwrap();
         let mut buf = Vec::new();
@@ -330,9 +332,7 @@ mod tests {
     pub async fn cat_big_file_found() {
         let (agentfs, path, _file) = agentfs().await;
         let content = vec![100u8; 4 * 1024 * 1024];
-        agentfs
-            .fs
-            .write_file("test.md", &content, 0, 0)
+        write_file(&agentfs.fs, "test.md", &content, 0, 0)
             .await
             .unwrap();
         let mut buf = Vec::new();
@@ -353,10 +353,10 @@ mod tests {
     #[tokio::test]
     pub async fn ls_files_only() {
         let (agentfs, path, _file) = agentfs().await;
-        agentfs.fs.write_file("1.md", b"1", 0, 0).await.unwrap();
-        agentfs.fs.write_file("2.md", b"11", 0, 0).await.unwrap();
+        write_file(&agentfs.fs, "1.md", b"1", 0, 0).await.unwrap();
+        write_file(&agentfs.fs, "2.md", b"11", 0, 0).await.unwrap();
         let big = vec![100u8; 1024 * 1024];
-        agentfs.fs.write_file("3.md", &big, 0, 0).await.unwrap();
+        write_file(&agentfs.fs, "3.md", &big, 0, 0).await.unwrap();
         let mut buf = Vec::new();
         ls_filesystem(&mut buf, path, "/", None).await.unwrap();
         assert_eq!(
@@ -376,14 +376,16 @@ f 3.md
         agentfs.fs.mkdir("a/c", 0, 0).await.unwrap();
         agentfs.fs.mkdir("d", 0, 0).await.unwrap();
         agentfs.fs.mkdir("d/e", 0, 0).await.unwrap();
-        agentfs.fs.write_file("a/b/1.md", b"1", 0, 0).await.unwrap();
-        agentfs
-            .fs
-            .write_file("a/c/2.md", b"11", 0, 0)
+        write_file(&agentfs.fs, "a/b/1.md", b"1", 0, 0)
+            .await
+            .unwrap();
+        write_file(&agentfs.fs, "a/c/2.md", b"11", 0, 0)
             .await
             .unwrap();
         let big = vec![100u8; 1024 * 1024];
-        agentfs.fs.write_file("d/e/3.md", &big, 0, 0).await.unwrap();
+        write_file(&agentfs.fs, "d/e/3.md", &big, 0, 0)
+            .await
+            .unwrap();
         let mut buf = Vec::new();
         ls_filesystem(&mut buf, path, "/", None).await.unwrap();
         assert_eq!(
@@ -406,9 +408,7 @@ f d/e/3.md
     pub async fn encrypted_write_and_cat() {
         let (agentfs, path, _file) = encrypted_agentfs().await;
         let content = b"encrypted content";
-        agentfs
-            .fs
-            .write_file("secret.txt", content, 0, 0)
+        write_file(&agentfs.fs, "secret.txt", content, 0, 0)
             .await
             .unwrap();
         drop(agentfs);
@@ -424,14 +424,10 @@ f d/e/3.md
     #[tokio::test]
     pub async fn encrypted_ls() {
         let (agentfs, path, _file) = encrypted_agentfs().await;
-        agentfs
-            .fs
-            .write_file("file1.txt", b"1", 0, 0)
+        write_file(&agentfs.fs, "file1.txt", b"1", 0, 0)
             .await
             .unwrap();
-        agentfs
-            .fs
-            .write_file("file2.txt", b"2", 0, 0)
+        write_file(&agentfs.fs, "file2.txt", b"2", 0, 0)
             .await
             .unwrap();
         drop(agentfs);
@@ -463,5 +459,20 @@ f d/e/3.md
             .await
             .unwrap();
         assert_eq!(buf, b"new content");
+    }
+
+    async fn write_file(
+        fs: &agentfs_sdk::filesystem::AgentFS,
+        path: &str,
+        data: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> anyhow::Result<()> {
+        if fs.stat(path).await?.is_some() {
+            fs.remove(path).await?;
+        }
+        let (_, file) = fs.create_file(path, S_IFREG | 0o644, uid, gid).await?;
+        file.pwrite(0, data).await?;
+        Ok(())
     }
 }

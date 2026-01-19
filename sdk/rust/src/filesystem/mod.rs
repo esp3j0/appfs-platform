@@ -167,12 +167,6 @@ pub trait FileSystem: Send + Sync {
     /// Returns `Ok(None)` if the file does not exist.
     async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>>;
 
-    /// Write data to a file (creates or overwrites)
-    ///
-    /// If the file doesn't exist, it will be created with the specified uid/gid.
-    /// If the file exists, uid/gid are ignored (existing ownership preserved).
-    async fn write_file(&self, path: &str, data: &[u8], uid: u32, gid: u32) -> Result<()>;
-
     /// List directory contents
     ///
     /// Returns `Ok(None)` if the directory does not exist.

@@ -36,6 +36,11 @@ echo "Hello from test setup!" > test.txt
 mkdir -p subdir
 echo -n "nested content" > subdir/nested.txt
 
+# Create file with executable permissions for copy-up permissions test
+# This tests that copy-up preserves base layer permissions (not DEFAULT_FILE_MODE)
+echo -n "executable content" > executable_base.txt
+chmod 0755 executable_base.txt
+
 # Run syscall tests through FUSE overlay
 # The test binary runs inside the overlay where:
 # - Files from current directory are visible (base layer)
@@ -44,20 +49,20 @@ echo -n "nested content" > subdir/nested.txt
 if ! output=$(cargo run -- run "$DIR/syscall/test-syscalls" . 2>&1); then
     echo "FAILED"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
     exit 1
 fi
 
 echo "$output" | grep -q "All tests passed!" || {
     echo "FAILED: 'All tests passed!' not found"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
     exit 1
 }
 
 # Note: output.txt is created in the delta layer (session-specific) so we can't
 # verify it with a separate agentfs run. The "All tests passed!" check is sufficient.
 
-rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir
+rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
 
 echo "OK"

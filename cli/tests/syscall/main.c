@@ -37,6 +37,7 @@ int main(int argc, char *argv[]) {
         {"rename", test_rename},
         {"mknod", test_mknod},
         {"mkfifo", test_mkfifo},
+        {"copyup_permissions", test_copyup_permissions},
     };
 
     int num_tests = sizeof(tests) / sizeof(tests[0]);

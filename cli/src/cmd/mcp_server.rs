@@ -1,4 +1,6 @@
 use agentfs_sdk::{AgentFS, AgentFSOptions, Stats};
+
+const S_IFREG: u32 = 0o100000;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -673,9 +675,17 @@ impl McpServer {
             Box::pin(self.ensure_parent_dirs(&path)).await?;
         }
 
-        self.agentfs
+        // Remove file if it exists (overwrite behavior)
+        if self.agentfs.fs.stat(&path).await?.is_some() {
+            self.agentfs.fs.remove(&path).await?;
+        }
+        let (_, file) = self
+            .agentfs
             .fs
-            .write_file(&path, &data, 0, 0)
+            .create_file(&path, S_IFREG | 0o644, 0, 0)
+            .await
+            .context("Failed to create file")?;
+        file.pwrite(0, &data)
             .await
             .context("Failed to write file")?;
 

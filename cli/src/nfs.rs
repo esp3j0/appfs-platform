@@ -296,7 +296,8 @@ impl NFSFileSystem for AgentNFS {
         // Create empty file
         {
             let fs = self.fs.lock().await;
-            fs.write_file(&full_path, &[], 0, 0)
+            let _ = fs
+                .create_file(&full_path, S_IFREG | 0o644, 0, 0)
                 .await
                 .map_err(error_to_nfsstat)?;
         }
@@ -328,7 +329,8 @@ impl NFSFileSystem for AgentNFS {
         }
 
         // Create empty file
-        fs.write_file(&full_path, &[], 0, 0)
+        let _ = fs
+            .create_file(&full_path, S_IFREG | 0o644, 0, 0)
             .await
             .map_err(error_to_nfsstat)?;
 

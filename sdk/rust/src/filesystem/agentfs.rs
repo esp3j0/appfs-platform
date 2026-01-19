@@ -1083,121 +1083,6 @@ impl AgentFS {
         Ok(())
     }
 
-    /// Write data to a file
-    ///
-    /// If the file doesn't exist, it will be created with the specified uid/gid.
-    /// If the file exists, uid/gid are ignored (existing ownership preserved).
-    pub async fn write_file(&self, path: &str, data: &[u8], uid: u32, gid: u32) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-        let components = self.split_path(&path);
-
-        if components.is_empty() {
-            return Err(FsError::RootOperation.into());
-        }
-
-        let parent_path = if components.len() == 1 {
-            "/".to_string()
-        } else {
-            format!("/{}", components[..components.len() - 1].join("/"))
-        };
-
-        let parent_ino = self
-            .resolve_path_with_conn(&conn, &parent_path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        let name = components.last().unwrap();
-
-        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
-        let result: Result<()> = async {
-            // Check if file exists (single query using parent_ino we already have)
-            let (ino, is_new) =
-                if let Some(ino) = self.lookup_child(&conn, parent_ino, name).await? {
-                    // Delete existing data
-                    let mut stmt = conn
-                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
-                        .await?;
-                    stmt.execute((ino,)).await?;
-                    (ino, false)
-                } else {
-                    // Create new inode
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-                    let mut stmt = conn
-                    .prepare_cached(
-                        "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, nlink)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING ino",
-                    )
-                    .await?;
-                    let row = stmt
-                        .query_row((
-                            DEFAULT_FILE_MODE as i64,
-                            uid,
-                            gid,
-                            data.len() as i64,
-                            now,
-                            now,
-                            now,
-                        ))
-                        .await?;
-
-                    let ino = row
-                        .get_value(0)
-                        .ok()
-                        .and_then(|v| v.as_integer().copied())
-                        .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
-
-                    // Create directory entry
-                    let mut stmt = conn
-                        .prepare_cached(
-                            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
-                        )
-                        .await?;
-                    stmt.execute((name.as_str(), parent_ino, ino)).await?;
-
-                    // Populate dentry cache for new file
-                    self.dentry_cache.insert(parent_ino, name, ino);
-
-                    (ino, true)
-                };
-
-            // Write data in chunks
-            for (chunk_index, chunk) in data.chunks(self.chunk_size).enumerate() {
-                conn.execute(
-                    "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
-                    (ino, chunk_index as i64, chunk),
-                )
-                .await?;
-            }
-
-            // Update mode (to regular file), size and mtime
-            if !is_new {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-                let mut stmt = conn
-                    .prepare_cached(
-                        "UPDATE fs_inode SET mode = ?, size = ?, mtime = ? WHERE ino = ?",
-                    )
-                    .await?;
-                stmt.execute((DEFAULT_FILE_MODE as i64, data.len() as i64, now, ino))
-                    .await?;
-            }
-
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                txn.commit().await?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = txn.rollback().await;
-                Err(e)
-            }
-        }
-    }
-
     /// Create a new empty file with the specified mode and ownership.
     ///
     /// This is an optimized path for FUSE create() that combines inode creation,
@@ -2522,10 +2407,6 @@ impl FileSystem for AgentFS {
         AgentFS::read_file(self, path).await
     }
 
-    async fn write_file(&self, path: &str, data: &[u8], uid: u32, gid: u32) -> Result<()> {
-        AgentFS::write_file(self, path, data, uid, gid).await
-    }
-
     async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
         AgentFS::readdir(self, path).await
     }
@@ -2609,7 +2490,10 @@ mod tests {
 
         // Write a file smaller than chunk_size (100 bytes)
         let data = vec![0u8; 100];
-        fs.write_file("/small.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/small.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         // Read it back
         let read_data = fs.read_file("/small.txt").await?.unwrap();
@@ -2631,7 +2515,10 @@ mod tests {
         // Write exactly chunk_size bytes
         let chunk_size = fs.chunk_size();
         let data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/exact.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/exact.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         // Read it back
         let read_data = fs.read_file("/exact.txt").await?.unwrap();
@@ -2653,7 +2540,10 @@ mod tests {
         // Write chunk_size + 1 bytes
         let chunk_size = fs.chunk_size();
         let data: Vec<u8> = (0..=chunk_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/overflow.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/overflow.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         // Read it back
         let read_data = fs.read_file("/overflow.txt").await?.unwrap();
@@ -2676,7 +2566,10 @@ mod tests {
         let chunk_size = fs.chunk_size();
         let data_size = chunk_size * 2 + chunk_size / 2;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/multi.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/multi.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         // Read it back
         let read_data = fs.read_file("/multi.txt").await?.unwrap();
@@ -2702,7 +2595,10 @@ mod tests {
         let data_size = chunk_size * 3 + 123; // Odd size spanning 4 chunks
 
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/roundtrip.bin", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/roundtrip.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let read_data = fs.read_file("/roundtrip.bin").await?.unwrap();
         assert_eq!(read_data.len(), data_size);
@@ -2726,7 +2622,10 @@ mod tests {
         data[chunk_size - 2] = 0xFF;
         data[chunk_size + 2] = 0xFF;
 
-        fs.write_file("/nulls.bin", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/nulls.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
         let read_data = fs.read_file("/nulls.bin").await?.unwrap();
 
         assert_eq!(read_data, data, "Null bytes at chunk boundary corrupted");
@@ -2742,7 +2641,10 @@ mod tests {
         // Create sequential bytes spanning multiple chunks
         let data_size = chunk_size * 5;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/sequential.bin", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/sequential.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let read_data = fs.read_file("/sequential.bin").await?.unwrap();
 
@@ -2765,7 +2667,10 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Write empty file
-        fs.write_file("/empty.txt", &[], 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/empty.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &[]).await?;
 
         // Read it back
         let read_data = fs.read_file("/empty.txt").await?.unwrap();
@@ -2791,7 +2696,10 @@ mod tests {
 
         // Write initial large file (3 chunks)
         let initial_data: Vec<u8> = (0..chunk_size * 3).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/overwrite.txt", &initial_data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/overwrite.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &initial_data).await?;
 
         let ino = fs.resolve_path("/overwrite.txt").await?.unwrap();
         let initial_chunk_count = fs.get_chunk_count(ino).await?;
@@ -2799,7 +2707,9 @@ mod tests {
 
         // Overwrite with smaller file (1 chunk)
         let new_data = vec![42u8; 100];
-        fs.write_file("/overwrite.txt", &new_data, 0, 0).await?;
+        fs.truncate("/overwrite.txt", 0).await?;
+        let file = fs.open("/overwrite.txt").await?;
+        file.pwrite(0, &new_data).await?;
 
         // Verify old chunks are gone and new data is correct
         let read_data = fs.read_file("/overwrite.txt").await?.unwrap();
@@ -2823,14 +2733,17 @@ mod tests {
 
         // Write initial small file (1 chunk)
         let initial_data = vec![1u8; 100];
-        fs.write_file("/grow.txt", &initial_data, 0, 0).await?;
+        let (_, file) = fs.create_file("/grow.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &initial_data).await?;
 
         let ino = fs.resolve_path("/grow.txt").await?.unwrap();
         assert_eq!(fs.get_chunk_count(ino).await?, 1);
 
         // Overwrite with larger file (3 chunks)
         let new_data: Vec<u8> = (0..chunk_size * 3).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/grow.txt", &new_data, 0, 0).await?;
+        fs.truncate("/grow.txt", 0).await?;
+        let file = fs.open("/grow.txt").await?;
+        file.pwrite(0, &new_data).await?;
 
         // Verify data is correct
         let read_data = fs.read_file("/grow.txt").await?.unwrap();
@@ -2847,7 +2760,10 @@ mod tests {
         // Write 1MB file
         let data_size = 1024 * 1024;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/large.bin", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/large.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let read_data = fs.read_file("/large.bin").await?.unwrap();
         assert_eq!(read_data.len(), data_size);
@@ -2884,7 +2800,8 @@ mod tests {
 
         // Write data and verify chunks match expected based on chunk_size
         let data = vec![0u8; chunk_size * 2 + 1];
-        fs.write_file("/test.bin", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.bin", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/test.bin").await?.unwrap();
         let chunk_count = fs.get_chunk_count(ino).await?;
@@ -2927,7 +2844,10 @@ mod tests {
         // Write a file to create chunks
         let chunk_size = fs.chunk_size();
         let data = vec![0u8; chunk_size * 2];
-        fs.write_file("/unique.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/unique.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/unique.txt").await?.unwrap();
 
@@ -2953,7 +2873,10 @@ mod tests {
         // Create 5 chunks with identifiable data
         let data_size = chunk_size * 5;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/ordered.bin", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/ordered.bin", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/ordered.bin").await?.unwrap();
 
@@ -2990,7 +2913,10 @@ mod tests {
         let chunk_size = fs.chunk_size();
         // Create multi-chunk file
         let data = vec![0u8; chunk_size * 4];
-        fs.write_file("/deleteme.txt", &data, 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/deleteme.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, &data).await?;
 
         let ino = fs.resolve_path("/deleteme.txt").await?.unwrap();
         assert_eq!(fs.get_chunk_count(ino).await?, 4);
@@ -3032,7 +2958,8 @@ mod tests {
 
         for (path, size) in &files {
             let data: Vec<u8> = (0..*size).map(|i| (i % 256) as u8).collect();
-            fs.write_file(path, &data, 0, 0).await?;
+            let (_, file) = fs.create_file(path, DEFAULT_FILE_MODE, 0, 0).await?;
+            file.pwrite(0, &data).await?;
         }
 
         // Verify each file has correct data and chunk count
@@ -3062,7 +2989,8 @@ mod tests {
 
         // Write a file with known content
         let data: Vec<u8> = (0..100).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Read from the beginning
         let result = fs.pread("/test.txt", 0, 10).await?.unwrap();
@@ -3084,7 +3012,8 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         let data: Vec<u8> = (0..50).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Read starting past EOF should return empty
         let result = fs.pread("/test.txt", 100, 10).await?.unwrap();
@@ -3114,7 +3043,8 @@ mod tests {
 
         // Create data spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Read across chunk boundary
         let start = chunk_size - 10;
@@ -3139,7 +3069,8 @@ mod tests {
 
         // Write initial data
         let data: Vec<u8> = vec![0; 100];
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Overwrite in the middle
         fs.pwrite("/test.txt", 50, &[1, 2, 3, 4, 5]).await?;
@@ -3159,7 +3090,8 @@ mod tests {
 
         // Write initial data
         let data: Vec<u8> = vec![1; 50];
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Write past EOF - should extend with zeros
         fs.pwrite("/test.txt", 100, &[2, 2, 2, 2, 2]).await?;
@@ -3193,7 +3125,8 @@ mod tests {
 
         // Create initial data spanning multiple chunks
         let data: Vec<u8> = vec![0; chunk_size * 3];
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Write across chunk boundary
         let write_data: Vec<u8> = (0..20).collect();
@@ -3220,7 +3153,8 @@ mod tests {
 
         // Create a file
         let initial: Vec<u8> = (0..(chunk_size * 2)).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/test.txt", &initial, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &initial).await?;
 
         // Write some data at various offsets
         let patches = vec![
@@ -3255,7 +3189,8 @@ mod tests {
 
         // Create a file with some data
         let data: Vec<u8> = (0..100).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Truncate to zero
         fs.truncate("/test.txt", 0).await?;
@@ -3277,7 +3212,8 @@ mod tests {
 
         // Create a file smaller than chunk size
         let data: Vec<u8> = (0..100).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Truncate to 50 bytes
         fs.truncate("/test.txt", 50).await?;
@@ -3297,7 +3233,8 @@ mod tests {
 
         // Create a file spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Truncate to middle of second chunk
         let new_size = chunk_size + chunk_size / 2;
@@ -3317,7 +3254,8 @@ mod tests {
 
         // Create a small file
         let data: Vec<u8> = (0..50).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Extend to 100 bytes
         fs.truncate("/test.txt", 100).await?;
@@ -3352,7 +3290,8 @@ mod tests {
 
         // Create a file spanning multiple chunks
         let data: Vec<u8> = (0..(chunk_size * 3)).map(|i| (i % 256) as u8).collect();
-        fs.write_file("/test.txt", &data, 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, &data).await?;
 
         // Truncate exactly at chunk boundary
         fs.truncate("/test.txt", chunk_size as u64).await?;
@@ -3375,7 +3314,8 @@ mod tests {
 
         // Create a file
         let data = b"hello world";
-        fs.write_file("/old.txt", data, 0, 0).await?;
+        let (_, file) = fs.create_file("/old.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, data).await?;
 
         // Rename it
         fs.rename("/old.txt", "/new.txt").await?;
@@ -3397,7 +3337,8 @@ mod tests {
         // Create directory and file
         fs.mkdir("/subdir", 0, 0).await?;
         let data = b"test data";
-        fs.write_file("/file.txt", data, 0, 0).await?;
+        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, data).await?;
 
         // Move file to subdirectory
         fs.rename("/file.txt", "/subdir/file.txt").await?;
@@ -3417,8 +3358,10 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create two files
-        fs.write_file("/src.txt", b"source", 0, 0).await?;
-        fs.write_file("/dst.txt", b"destination", 0, 0).await?;
+        let (_, file) = fs.create_file("/src.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"source").await?;
+        let (_, file) = fs.create_file("/dst.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"destination").await?;
 
         // Rename src to dst (overwrites dst)
         fs.rename("/src.txt", "/dst.txt").await?;
@@ -3437,7 +3380,10 @@ mod tests {
 
         // Create directory with a file inside
         fs.mkdir("/olddir", 0, 0).await?;
-        fs.write_file("/olddir/file.txt", b"content", 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/olddir/file.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"content").await?;
 
         // Rename directory
         fs.rename("/olddir", "/newdir").await?;
@@ -3487,7 +3433,8 @@ mod tests {
     async fn test_rename_to_root_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
 
-        fs.write_file("/file.txt", b"data", 0, 0).await?;
+        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"data").await?;
 
         // Try to rename to root - should fail
         let result = fs.rename("/file.txt", "/").await;
@@ -3514,7 +3461,10 @@ mod tests {
         // Create source directory and target directory with content
         fs.mkdir("/src", 0, 0).await?;
         fs.mkdir("/dst", 0, 0).await?;
-        fs.write_file("/dst/file.txt", b"content", 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/dst/file.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"content").await?;
 
         // Try to rename src to dst (dst is not empty) - should fail
         let result = fs.rename("/src", "/dst").await;
@@ -3533,7 +3483,8 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create a file and an empty directory
-        fs.write_file("/file.txt", b"data", 0, 0).await?;
+        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"data").await?;
         fs.mkdir("/dir", 0, 0).await?;
 
         // Try to rename file over directory - should fail
@@ -3549,7 +3500,8 @@ mod tests {
 
         // Create a directory and a file
         fs.mkdir("/dir", 0, 0).await?;
-        fs.write_file("/file.txt", b"data", 0, 0).await?;
+        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"data").await?;
 
         // Try to rename directory over file - should fail
         let result = fs.rename("/dir", "/file.txt").await;
@@ -3563,7 +3515,8 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create a file
-        fs.write_file("/old.txt", b"data", 0, 0).await?;
+        let (_, file) = fs.create_file("/old.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"data").await?;
         let stats_before = fs.stat("/old.txt").await?.unwrap();
 
         // Small delay to ensure time changes
@@ -3580,44 +3533,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_file_updates_mode_to_regular_file() -> Result<()> {
-        let (fs, _dir) = create_test_fs().await?;
-
-        // Create a target file for the symlink
-        fs.write_file("/target.txt", b"target content", 0, 0)
-            .await?;
-
-        // Create a symlink
-        fs.symlink("/target.txt", "/link.txt", 0, 0).await?;
-
-        // Verify it's a symlink
-        let stats = fs.lstat("/link.txt").await?.unwrap();
-        assert!(stats.is_symlink(), "Should be a symlink before write_file");
-
-        // Overwrite the symlink with write_file
-        fs.write_file("/link.txt", b"new content", 0, 0).await?;
-
-        // Verify it's now a regular file with DEFAULT_FILE_MODE
-        let stats = fs.lstat("/link.txt").await?.unwrap();
-        assert!(stats.is_file(), "Should be a regular file after write_file");
-        assert_eq!(
-            stats.mode, DEFAULT_FILE_MODE,
-            "Mode should be DEFAULT_FILE_MODE after write_file"
-        );
-
-        // Verify the content
-        let content = fs.read_file("/link.txt").await?.unwrap();
-        assert_eq!(content, b"new content");
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_chmod_regular_file() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create a file with default permissions
-        fs.write_file("/test.txt", b"content", 0, 0).await?;
+        let (_, file) = fs.create_file("/test.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"content").await?;
 
         let stats = fs.stat("/test.txt").await?.unwrap();
         assert_eq!(
@@ -3655,7 +3576,8 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create a regular file
-        fs.write_file("/file.txt", b"content", 0, 0).await?;
+        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        file.pwrite(0, b"content").await?;
         fs.chmod("/file.txt", 0o755).await?;
         let stats = fs.stat("/file.txt").await?.unwrap();
         assert!(stats.is_file(), "Should remain a regular file after chmod");
@@ -3688,7 +3610,10 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create target and symlink
-        fs.write_file("/target.txt", b"content", 0, 0).await?;
+        let (_, file) = fs
+            .create_file("/target.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"content").await?;
         fs.symlink("/target.txt", "/link.txt", 0, 0).await?;
 
         // chmod the symlink path (should work on the symlink inode)

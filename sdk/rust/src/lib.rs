@@ -697,11 +697,12 @@ mod tests {
 
         // Write a file
         let data = b"Hello, AgentFS!";
-        agentfs
+        let (_, file) = agentfs
             .fs
-            .write_file("/test_dir/test.txt", data, 0, 0)
+            .create_file("/test_dir/test.txt", DEFAULT_FILE_MODE, 0, 0)
             .await
             .unwrap();
+        file.pwrite(0, data).await.unwrap();
 
         // Read the file
         let read_data = agentfs
