@@ -391,10 +391,16 @@ impl FileOps for SqliteFileOps {
         let data = self.data.lock().unwrap().clone();
 
         // Write the data to the database
-        self.fs
-            .write_file(&self.path, &data, 0, 0)
+        let file = self.fs
+            .open(&self.path)
+            .await
+            .map_err(|e| VfsError::Other(format!("Failed to open file: {}", e)))?;
+        file.pwrite(0, &data)
             .await
             .map_err(|e| VfsError::Other(format!("Failed to write file: {}", e)))?;
+        file.truncate(data.len() as u64)
+            .await
+            .map_err(|e| VfsError::Other(format!("Failed to truncate file: {}", e)))?;
 
         // Clear dirty flag after successful write
         *self.dirty.lock().unwrap() = false;
