@@ -6,11 +6,12 @@
 
 use agentfs_sdk::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
-use nfsserve::tcp::NFSTcp;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use zerofs_nfsserve::tcp::NFSTcp;
 
 use crate::cmd::init::open_agentfs;
 use crate::nfs::AgentNFS;
@@ -46,24 +47,23 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         Arc::new(Mutex::new(agentfs.fs))
     };
 
-    // Get current user/group for NFS file ownership
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
     // Create NFS adapter
-    let nfs = AgentNFS::new(fs, uid, gid);
+    let nfs = AgentNFS::new(fs);
 
     // Bind NFS server
-    let bind_addr = format!("{}:{}", bind, port);
-    let listener = nfsserve::tcp::NFSTcpListener::bind(&bind_addr, nfs)
+    let bind_addr_str = format!("{}:{}", bind, port);
+    let bind_addr: std::net::SocketAddr = bind_addr_str
+        .parse()
+        .with_context(|| format!("Invalid bind address: {}", bind_addr_str))?;
+    let listener = zerofs_nfsserve::tcp::NFSTcpListener::bind(bind_addr, nfs)
         .await
-        .with_context(|| format!("Failed to bind NFS server to {}", bind_addr))?;
+        .with_context(|| format!("Failed to bind NFS server to {}", bind_addr_str))?;
 
     // Print server info
     eprintln!();
     eprintln!("AgentFS NFS Server");
     eprintln!("  Database: {}", db_path.display());
-    eprintln!("  Listening: {}", bind_addr);
+    eprintln!("  Listening: {}", bind_addr_str);
     eprintln!("  Export: /");
     eprintln!();
     eprintln!("Mount from client:");
@@ -75,9 +75,11 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     eprintln!("Press Ctrl+C to stop.");
     eprintln!();
 
-    // Spawn the NFS server task
+    // Spawn the NFS server task with shutdown token
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
+        if let Err(e) = listener.handle_with_shutdown(shutdown_clone).await {
             eprintln!("NFS server error: {}", e);
         }
     });
@@ -90,8 +92,9 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     eprintln!();
     eprintln!("Shutting down...");
 
-    // Stop the server
-    server_handle.abort();
+    // Stop the server gracefully
+    shutdown.cancel();
+    let _ = server_handle.await;
 
     Ok(())
 }

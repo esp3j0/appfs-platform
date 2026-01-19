@@ -11,11 +11,12 @@
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
-use nfsserve::tcp::NFSTcp;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use zerofs_nfsserve::tcp::NFSTcp;
 
 use crate::nfs::AgentNFS;
 
@@ -89,24 +90,25 @@ pub async fn run(
 
     let fs: Arc<Mutex<dyn FileSystem>> = Arc::new(Mutex::new(overlay));
 
-    // Get current user/group
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
     // Create NFS adapter
-    let nfs = AgentNFS::new(fs, uid, gid);
+    let nfs = AgentNFS::new(fs);
 
     // Find an available port
     let port = find_available_port(DEFAULT_NFS_PORT)?;
 
     // Start NFS server in background
-    let listener = nfsserve::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{}", port), nfs)
+    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
+        .context("Invalid bind address")?;
+    let listener = zerofs_nfsserve::tcp::NFSTcpListener::bind(bind_addr, nfs)
         .await
         .context("Failed to bind NFS server")?;
 
-    // Spawn the NFS server task
+    // Spawn the NFS server task with shutdown token
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
+        if let Err(e) = listener.handle_with_shutdown(shutdown_clone).await {
             eprintln!("NFS server error: {}", e);
         }
     });
@@ -125,8 +127,9 @@ pub async fn run(
     // Unmount
     unmount(&session.mountpoint)?;
 
-    // Stop the server
-    server_handle.abort();
+    // Stop the server gracefully
+    shutdown.cancel();
+    let _ = server_handle.await;
 
     // Clean up mountpoint directory (but keep the delta database)
     if let Err(e) = std::fs::remove_dir(&session.mountpoint) {

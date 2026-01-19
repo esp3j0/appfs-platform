@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use turso::value::Value;
 
 use crate::nfs::AgentNFS;
-use nfsserve::tcp::NFSTcp;
+use tokio_util::sync::CancellationToken;
+use zerofs_nfsserve::tcp::NFSTcp;
 
 #[cfg(target_os = "linux")]
 use agentfs_sdk::{get_mounts, Mount};
@@ -219,26 +220,27 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         }
     };
 
-    // Get current user/group
-    let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
-    let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
-
     // Create NFS adapter
-    let nfs = AgentNFS::new(fs, uid, gid);
+    let nfs = AgentNFS::new(fs);
 
     // Find an available port
     let port = find_available_port(DEFAULT_NFS_PORT)?;
 
     // Start NFS server
-    let listener = nfsserve::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{}", port), nfs)
+    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
+        .context("Invalid bind address")?;
+    let listener = zerofs_nfsserve::tcp::NFSTcpListener::bind(bind_addr, nfs)
         .await
         .context("Failed to bind NFS server")?;
 
     eprintln!("Starting NFS server on 127.0.0.1:{}", port);
 
-    // Spawn the NFS server task
+    // Spawn the NFS server task with shutdown token
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_forever().await {
+        if let Err(e) = listener.handle_with_shutdown(shutdown_clone).await {
             eprintln!("NFS server error: {}", e);
         }
     });
@@ -259,8 +261,9 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         // Unmount
         nfs_unmount(&mountpoint)?;
 
-        // Stop the server
-        server_handle.abort();
+        // Stop the server gracefully
+        shutdown.cancel();
+        let _ = server_handle.await;
     } else {
         // Daemon mode: detach and keep running
         // The mount is persistent, user will need to unmount manually
