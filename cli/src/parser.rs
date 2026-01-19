@@ -6,6 +6,39 @@ use clap_complete::{
 };
 use std::path::{Path, PathBuf};
 
+/// Mount backend type
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum MountBackend {
+    /// FUSE filesystem (Linux only)
+    Fuse,
+    /// NFS over localhost
+    Nfs,
+}
+
+// Platform-specific default: FUSE on Linux, NFS elsewhere
+#[allow(clippy::derivable_impls)]
+impl Default for MountBackend {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            MountBackend::Fuse
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            MountBackend::Nfs
+        }
+    }
+}
+
+impl std::fmt::Display for MountBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountBackend::Fuse => write!(f, "fuse"),
+            MountBackend::Nfs => write!(f, "nfs"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "agentfs")]
 #[command(version = env!("AGENTFS_VERSION"))]
@@ -174,6 +207,10 @@ pub enum Command {
         /// Group ID to report for all files (defaults to current group)
         #[arg(long)]
         gid: Option<u32>,
+
+        /// Backend to use for mounting
+        #[arg(long, default_value_t = MountBackend::default())]
+        backend: MountBackend,
     },
     /// Show differences between base filesystem and delta (overlay mode only)
     Diff {
