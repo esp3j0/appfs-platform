@@ -1,15 +1,33 @@
-use agentfs_sdk::{get_mounts, AgentFSOptions, FileSystem, HostFS, Mount, OverlayFS};
-use anyhow::Result;
+use agentfs_sdk::{AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use anyhow::{Context, Result};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+};
+use tokio::sync::Mutex;
+use turso::value::Value;
+
+use crate::nfs::AgentNFS;
+use nfsserve::tcp::NFSTcp;
+
+#[cfg(target_os = "linux")]
+use agentfs_sdk::{get_mounts, Mount};
+#[cfg(target_os = "linux")]
 use std::{
     io::{self, Write},
     os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-    sync::Arc,
 };
-use turso::value::Value;
 
 #[cfg(target_os = "linux")]
-use crate::{cmd::init::open_agentfs, fuse::FuseMountOptions};
+use crate::cmd::init::open_agentfs;
+#[cfg(target_os = "linux")]
+use crate::fuse::FuseMountOptions;
+
+pub use crate::parser::MountBackend;
+
+/// Default NFS port to try (use a high port to avoid needing root)
+const DEFAULT_NFS_PORT: u32 = 11111;
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
@@ -30,11 +48,42 @@ pub struct MountArgs {
     pub uid: Option<u32>,
     /// Group ID to report for all files (defaults to current group).
     pub gid: Option<u32>,
+    /// The mount backend to use (fuse or nfs).
+    pub backend: MountBackend,
 }
 
-/// Mount the agent filesystem using FUSE.
+/// Mount the agent filesystem (Linux).
 #[cfg(target_os = "linux")]
 pub fn mount(args: MountArgs) -> Result<()> {
+    match args.backend {
+        MountBackend::Fuse => mount_fuse(args),
+        MountBackend::Nfs => {
+            let rt = crate::get_runtime();
+            rt.block_on(mount_nfs_backend(args))
+        }
+    }
+}
+
+/// Mount the agent filesystem (macOS).
+#[cfg(target_os = "macos")]
+pub fn mount(args: MountArgs) -> Result<()> {
+    match args.backend {
+        MountBackend::Fuse => {
+            anyhow::bail!(
+                "FUSE mounting is not supported on macOS.\n\
+                 Use --backend nfs (default) or `agentfs nfs` instead."
+            );
+        }
+        MountBackend::Nfs => {
+            let rt = crate::get_runtime();
+            rt.block_on(mount_nfs_backend(args))
+        }
+    }
+}
+
+/// Mount the agent filesystem using FUSE (Linux only).
+#[cfg(target_os = "linux")]
+fn mount_fuse(args: MountArgs) -> Result<()> {
     let opts = AgentFSOptions::resolve(&args.id_or_path)?;
 
     let fsname = format!(
@@ -50,20 +99,10 @@ pub fn mount(args: MountArgs) -> Result<()> {
 
     let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
     let mountpoint_ino = {
-        #[cfg(target_family = "unix")]
-        {
-            use anyhow::Context as _;
-            std::fs::metadata(mountpoint.clone())
-                .context("Failed to get mountpoint inode")?
-                .ino()
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            // Should be impossible to reach this path
-            return Err(anyhow::anyhow!(
-                "FUSE mountpoint inode is not supported on this platform"
-            ));
-        }
+        use anyhow::Context as _;
+        std::fs::metadata(mountpoint.clone())
+            .context("Failed to get mountpoint inode")?
+            .ino()
     };
 
     let fuse_opts = FuseMountOptions {
@@ -107,8 +146,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
                 // Create OverlayFS with HostFS base
                 eprintln!("Using overlay filesystem with base: {}", base_path);
                 let hostfs = HostFS::new(&base_path)?;
-                #[cfg(target_family = "unix")]
-                let hostfs = { hostfs.with_fuse_mountpoint(mountpoint_ino) };
+                let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
                 let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
                 Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
             } else {
@@ -131,13 +169,231 @@ pub fn mount(args: MountArgs) -> Result<()> {
     }
 }
 
-/// Mount the agent filesystem using FUSE (macOS - not supported).
-#[cfg(target_os = "macos")]
-pub fn mount(_args: MountArgs) -> Result<()> {
+/// Mount the agent filesystem using NFS over localhost.
+async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
+    use crate::cmd::init::open_agentfs;
+
+    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+
+    if !args.mountpoint.exists() {
+        anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
+    }
+
+    let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
+
+    // Open AgentFS
+    let agentfs = open_agentfs(opts).await?;
+
+    // Check for overlay configuration
+    let fs: Arc<Mutex<dyn FileSystem>> = {
+        let conn = agentfs.get_connection().await?;
+
+        // Check if fs_overlay_config table exists and has base_path
+        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
+        let base_path: Option<String> = match conn.query(query, ()).await {
+            Ok(mut rows) => {
+                if let Ok(Some(row)) = rows.next().await {
+                    row.get_value(0).ok().and_then(|v| {
+                        if let Value::Text(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None, // Table doesn't exist or query failed
+        };
+
+        if let Some(base_path) = base_path {
+            // Create OverlayFS with HostFS base
+            eprintln!("Using overlay filesystem with base: {}", base_path);
+            let hostfs = HostFS::new(&base_path)?;
+            let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem>>
+        } else {
+            // Plain AgentFS
+            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem>>
+        }
+    };
+
+    // Get current user/group
+    let uid = args.uid.unwrap_or_else(|| unsafe { libc::getuid() });
+    let gid = args.gid.unwrap_or_else(|| unsafe { libc::getgid() });
+
+    // Create NFS adapter
+    let nfs = AgentNFS::new(fs, uid, gid);
+
+    // Find an available port
+    let port = find_available_port(DEFAULT_NFS_PORT)?;
+
+    // Start NFS server
+    let listener = nfsserve::tcp::NFSTcpListener::bind(&format!("127.0.0.1:{}", port), nfs)
+        .await
+        .context("Failed to bind NFS server")?;
+
+    eprintln!("Starting NFS server on 127.0.0.1:{}", port);
+
+    // Spawn the NFS server task
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = listener.handle_forever().await {
+            eprintln!("NFS server error: {}", e);
+        }
+    });
+
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Mount the NFS filesystem
+    nfs_mount(port, &mountpoint)?;
+
+    eprintln!("Mounted at {}", mountpoint.display());
+
+    if args.foreground {
+        // Wait for Ctrl+C
+        eprintln!("Press Ctrl+C to unmount and exit.");
+        tokio::signal::ctrl_c().await?;
+
+        // Unmount
+        nfs_unmount(&mountpoint)?;
+
+        // Stop the server
+        server_handle.abort();
+    } else {
+        // Daemon mode: detach and keep running
+        // The mount is persistent, user will need to unmount manually
+        eprintln!(
+            "Running in background. Use 'umount {}' to unmount.",
+            mountpoint.display()
+        );
+
+        // Block forever (server runs in background task)
+        std::future::pending::<()>().await;
+    }
+
+    Ok(())
+}
+
+/// Find an available TCP port starting from the given port.
+fn find_available_port(start_port: u32) -> Result<u32> {
+    for port in start_port..start_port + 100 {
+        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
+            return Ok(port);
+        }
+    }
     anyhow::bail!(
-        "FUSE mounting is not supported on macOS in this version.\n\
-         Use `agentfs nfs` to mount via NFS instead."
+        "Could not find an available port in range {}-{}",
+        start_port,
+        start_port + 100
     );
+}
+
+/// Mount the NFS filesystem (Linux version).
+#[cfg(target_os = "linux")]
+fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
+    let output = Command::new("mount")
+        .args([
+            "-t",
+            "nfs",
+            "-o",
+            &format!(
+                "vers=3,tcp,port={},mountport={},nolock,soft,timeo=10,retrans=2",
+                port, port
+            ),
+            "127.0.0.1:/",
+            mountpoint.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute mount command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to mount NFS: {}. Make sure NFS client tools are installed (nfs-common on Debian/Ubuntu, nfs-utils on Fedora/RHEL) and you have permission to mount (try running with sudo).",
+            stderr.trim()
+        );
+    }
+
+    Ok(())
+}
+
+/// Mount the NFS filesystem (macOS version).
+#[cfg(target_os = "macos")]
+fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
+    let output = Command::new("/sbin/mount_nfs")
+        .args([
+            "-o",
+            &format!(
+                "locallocks,vers=3,tcp,port={},mountport={},soft,timeo=10,retrans=2",
+                port, port
+            ),
+            "127.0.0.1:/",
+            mountpoint.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute mount_nfs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to mount NFS: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Unmount the NFS filesystem (Linux version).
+#[cfg(target_os = "linux")]
+fn nfs_unmount(mountpoint: &Path) -> Result<()> {
+    let output = Command::new("umount")
+        .arg(mountpoint)
+        .output()
+        .context("Failed to execute umount")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Try lazy unmount
+        let output2 = Command::new("umount").arg("-l").arg(mountpoint).output()?;
+
+        if !output2.status.success() {
+            anyhow::bail!(
+                "Failed to unmount: {}. You may need to manually unmount with: umount -l {}",
+                stderr.trim(),
+                mountpoint.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Unmount the NFS filesystem (macOS version).
+#[cfg(target_os = "macos")]
+fn nfs_unmount(mountpoint: &Path) -> Result<()> {
+    let output = Command::new("/sbin/umount")
+        .arg(mountpoint)
+        .output()
+        .context("Failed to execute umount")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Try force unmount
+        let output2 = Command::new("/sbin/umount")
+            .arg("-f")
+            .arg(mountpoint)
+            .output()?;
+
+        if !output2.status.success() {
+            anyhow::bail!(
+                "Failed to unmount: {}. You may need to manually unmount with: umount -f {}",
+                stderr.trim(),
+                mountpoint.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if a path is a mountpoint by comparing device IDs
@@ -162,7 +418,8 @@ fn is_mounted(path: &std::path::Path) -> bool {
     path_meta.dev() != parent_meta.dev()
 }
 
-/// List all currently mounted agentfs filesystems
+/// List all currently mounted agentfs filesystems (Linux)
+#[cfg(target_os = "linux")]
 pub fn list_mounts<W: Write>(out: &mut W) {
     let mounts = get_mounts();
 
@@ -203,10 +460,17 @@ pub fn list_mounts<W: Write>(out: &mut W) {
     }
 }
 
+/// List all currently mounted agentfs filesystems (macOS stub)
+#[cfg(target_os = "macos")]
+pub fn list_mounts<W: std::io::Write>(out: &mut W) {
+    let _ = writeln!(out, "Mount listing is only available on Linux.");
+}
+
 /// Check if a mount point is in use by any process.
 ///
 /// Scans /proc to find processes with open files or current working directory
 /// on the given mountpoint.
+#[cfg(target_os = "linux")]
 fn is_mount_in_use(mountpoint: &Path) -> bool {
     let mountpoint = match mountpoint.canonicalize() {
         Ok(p) => p,
@@ -255,6 +519,7 @@ fn is_mount_in_use(mountpoint: &Path) -> bool {
 /// Unmount a FUSE filesystem.
 ///
 /// Tries fusermount3 first, then falls back to fusermount.
+#[cfg(target_os = "linux")]
 fn unmount_fuse(mountpoint: &Path) -> Result<()> {
     const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
 
@@ -279,6 +544,7 @@ fn unmount_fuse(mountpoint: &Path) -> Result<()> {
 }
 
 /// Ask for user confirmation.
+#[cfg(target_os = "linux")]
 fn confirm(prompt: &str) -> bool {
     eprint!("{} ", prompt);
     let _ = io::stderr().flush();
@@ -295,6 +561,7 @@ fn confirm(prompt: &str) -> bool {
 ///
 /// Finds all mounted agentfs filesystems that are not in use by any process
 /// and unmounts them.
+#[cfg(target_os = "linux")]
 pub fn prune_mounts(force: bool) -> Result<()> {
     let mounts = get_mounts();
 
@@ -351,4 +618,10 @@ pub fn prune_mounts(force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prune unused agentfs mount points (macOS stub).
+#[cfg(target_os = "macos")]
+pub fn prune_mounts(_force: bool) -> Result<()> {
+    anyhow::bail!("Mount pruning is only available on Linux")
 }

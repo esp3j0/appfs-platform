@@ -6,9 +6,9 @@ pub mod ps;
 pub mod sync;
 pub mod timeline;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod mount;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 #[path = "mount_stub.rs"]
 pub mod mount;
 
@@ -18,5 +18,5 @@ mod run;
 #[cfg(unix)]
 pub mod nfs;
 
-pub use mount::{mount, MountArgs};
+pub use mount::{mount, MountArgs, MountBackend};
 pub use run::handle_run_command;
