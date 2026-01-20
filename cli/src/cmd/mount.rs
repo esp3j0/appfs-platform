@@ -8,6 +8,7 @@ use std::{
 use tokio::sync::Mutex;
 use turso::value::Value;
 
+use crate::mount::{mount_fs, MountOpts};
 use crate::nfs::AgentNFS;
 use tokio_util::sync::CancellationToken;
 use zerofs_nfsserve::tcp::NFSTcp;
@@ -182,11 +183,18 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
 
     let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
 
+    let fsname = format!(
+        "agentfs:{}",
+        std::fs::canonicalize(&args.id_or_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| args.id_or_path.clone())
+    );
+
     // Open AgentFS
     let agentfs = open_agentfs(opts).await?;
 
     // Check for overlay configuration
-    let fs: Arc<Mutex<dyn FileSystem>> = {
+    let fs: Arc<Mutex<dyn FileSystem + Send>> = {
         let conn = agentfs.get_connection().await?;
 
         // Check if fs_overlay_config table exists and has base_path
@@ -213,60 +221,61 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
             eprintln!("Using overlay filesystem with base: {}", base_path);
             let hostfs = HostFS::new(&base_path)?;
             let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem>>
+            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
         } else {
             // Plain AgentFS
-            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem>>
+            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
         }
     };
 
-    // Create NFS adapter
-    let nfs = AgentNFS::new(fs);
-
-    // Find an available port
-    let port = find_available_port(DEFAULT_NFS_PORT)?;
-
-    // Start NFS server
-    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
-        .parse()
-        .context("Invalid bind address")?;
-    let listener = zerofs_nfsserve::tcp::NFSTcpListener::bind(bind_addr, nfs)
-        .await
-        .context("Failed to bind NFS server")?;
-
-    eprintln!("Starting NFS server on 127.0.0.1:{}", port);
-
-    // Spawn the NFS server task with shutdown token
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = listener.handle_with_shutdown(shutdown_clone).await {
-            eprintln!("NFS server error: {}", e);
-        }
-    });
-
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Mount the NFS filesystem
-    nfs_mount(port, &mountpoint)?;
-
-    eprintln!("Mounted at {}", mountpoint.display());
-
     if args.foreground {
-        // Wait for Ctrl+C
+        // Use the unified mount API for foreground mode
+        let mount_opts = MountOpts {
+            mountpoint: mountpoint.clone(),
+            backend: MountBackend::Nfs,
+            fsname,
+            uid: args.uid,
+            gid: args.gid,
+            allow_other: args.allow_other,
+            allow_root: args.allow_root,
+            auto_unmount: args.auto_unmount,
+            lazy_unmount: true,
+            timeout: std::time::Duration::from_secs(10),
+        };
+
+        let _mount_handle = mount_fs(fs, mount_opts).await?;
+
+        eprintln!("Mounted at {}", mountpoint.display());
         eprintln!("Press Ctrl+C to unmount and exit.");
         tokio::signal::ctrl_c().await?;
 
-        // Unmount
-        nfs_unmount(&mountpoint)?;
-
-        // Stop the server gracefully
-        shutdown.cancel();
-        let _ = server_handle.await;
+        // Handle drops automatically when we exit this scope
     } else {
-        // Daemon mode: detach and keep running
-        // The mount is persistent, user will need to unmount manually
+        // Daemon mode: use manual NFS server setup for persistent background operation
+        let nfs = AgentNFS::new(fs);
+        let port = find_available_port(DEFAULT_NFS_PORT)?;
+
+        let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+            .parse()
+            .context("Invalid bind address")?;
+        let listener = zerofs_nfsserve::tcp::NFSTcpListener::bind(bind_addr, nfs)
+            .await
+            .context("Failed to bind NFS server")?;
+
+        eprintln!("Starting NFS server on 127.0.0.1:{}", port);
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listener.handle_with_shutdown(shutdown_clone).await {
+                eprintln!("NFS server error: {}", e);
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        nfs_mount(port, &mountpoint)?;
+
+        eprintln!("Mounted at {}", mountpoint.display());
         eprintln!(
             "Running in background. Use 'umount {}' to unmount.",
             mountpoint.display()
@@ -341,59 +350,6 @@ fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to mount NFS: {}", stderr.trim());
-    }
-
-    Ok(())
-}
-
-/// Unmount the NFS filesystem (Linux version).
-#[cfg(target_os = "linux")]
-fn nfs_unmount(mountpoint: &Path) -> Result<()> {
-    let output = Command::new("umount")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to execute umount")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Try lazy unmount
-        let output2 = Command::new("umount").arg("-l").arg(mountpoint).output()?;
-
-        if !output2.status.success() {
-            anyhow::bail!(
-                "Failed to unmount: {}. You may need to manually unmount with: umount -l {}",
-                stderr.trim(),
-                mountpoint.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Unmount the NFS filesystem (macOS version).
-#[cfg(target_os = "macos")]
-fn nfs_unmount(mountpoint: &Path) -> Result<()> {
-    let output = Command::new("/sbin/umount")
-        .arg(mountpoint)
-        .output()
-        .context("Failed to execute umount")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Try force unmount
-        let output2 = Command::new("/sbin/umount")
-            .arg("-f")
-            .arg(mountpoint)
-            .output()?;
-
-        if !output2.status.success() {
-            anyhow::bail!(
-                "Failed to unmount: {}. You may need to manually unmount with: umount -f {}",
-                stderr.trim(),
-                mountpoint.display()
-            );
-        }
     }
 
     Ok(())

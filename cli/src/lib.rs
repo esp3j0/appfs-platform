@@ -14,6 +14,9 @@ pub mod fuser;
 #[cfg(unix)]
 pub mod nfs;
 
+#[cfg(unix)]
+pub mod mount;
+
 pub fn get_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("Internal error: failed to initialize runtime")
 }
