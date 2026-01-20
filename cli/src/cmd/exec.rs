@@ -63,7 +63,7 @@ pub async fn handle_exec_command(
         if let Some(base_path) = base_path {
             eprintln!("Using overlay filesystem with base: {}", base_path);
             let hostfs = HostFS::new(&base_path)?;
-            let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+            let overlay = OverlayFS::open(Arc::new(hostfs), agentfs.fs).await?;
             Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
         } else {
             Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>

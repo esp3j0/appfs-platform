@@ -444,7 +444,10 @@ impl File for OverlayFile {
 }
 
 impl OverlayFS {
-    /// Create a new overlay filesystem
+    /// Create a new overlay filesystem.
+    ///
+    /// This is a synchronous constructor that creates an uninitialized overlay.
+    /// For most use cases, prefer `open()` which loads whiteouts automatically.
     pub fn new(base: Arc<dyn FileSystem>, delta: AgentFS) -> Self {
         Self {
             base,
@@ -452,6 +455,16 @@ impl OverlayFS {
             whiteout_cache: WhiteoutCache::new(),
             delta_dir_cache: DeltaDirCache::new(),
         }
+    }
+
+    /// Open an overlay filesystem, loading any existing whiteouts from the database.
+    ///
+    /// This is the preferred constructor for mounting an existing overlay.
+    /// It automatically loads whiteouts so deleted files remain hidden.
+    pub async fn open(base: Arc<dyn FileSystem>, delta: AgentFS) -> Result<Self> {
+        let overlay = Self::new(base, delta);
+        overlay.load_whiteouts().await?;
+        Ok(overlay)
     }
 
     /// Load all whiteouts from the database into the in-memory cache.
@@ -543,6 +556,17 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         Self::init_schema(&conn, base_path).await?;
         // Load existing whiteouts into the in-memory cache
+        self.load_whiteouts_into_cache(&conn).await?;
+        Ok(())
+    }
+
+    /// Load existing whiteouts from the database into the in-memory cache.
+    ///
+    /// This should be called when mounting an existing overlay filesystem
+    /// to ensure deleted files remain hidden. Unlike `init()`, this does not
+    /// re-initialize the schema.
+    pub async fn load_whiteouts(&self) -> Result<()> {
+        let conn = self.delta.get_connection().await?;
         self.load_whiteouts_into_cache(&conn).await?;
         Ok(())
     }
@@ -1867,6 +1891,67 @@ mod tests {
         assert_eq!(stats0.ino, original_ino);
         assert_eq!(stats1.ino, original_ino);
         assert_eq!(stats2.ino, original_ino);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_whiteout_persistence_across_instances() -> Result<()> {
+        // This test verifies that whiteouts are persisted in the database
+        // and can be loaded when creating a new overlay instance (simulating remount)
+
+        // Create base directory with a file
+        let base_dir = tempdir()?;
+        std::fs::write(base_dir.path().join("base.txt"), b"base content")?;
+
+        // Create delta database in a persistent location
+        let delta_dir = tempdir()?;
+        let db_path = delta_dir.path().join("delta.db");
+
+        // First overlay instance: delete the file
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
+
+            // File should be visible
+            assert!(overlay.stat("/base.txt").await?.is_some());
+
+            // Delete it (creates whiteout in database)
+            overlay.remove("/base.txt").await?;
+
+            // File should no longer be visible
+            assert!(overlay.stat("/base.txt").await?.is_none());
+        }
+
+        // Second overlay instance: verify whiteout is loaded from database
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+
+            // Use open() which automatically loads whiteouts (simulates remount)
+            let overlay = OverlayFS::open(base, delta).await?;
+
+            // File should still be hidden (whiteout was persisted and loaded)
+            assert!(
+                overlay.stat("/base.txt").await?.is_none(),
+                "Whiteout should persist across overlay instances"
+            );
+
+            // Readdir should not include the deleted file
+            let entries = overlay.readdir("/").await?.unwrap();
+            assert!(
+                !entries.contains(&"base.txt".to_string()),
+                "Deleted file should not appear in readdir after reload"
+            );
+        }
+
+        // Verify base file still exists (overlay never modifies base)
+        assert!(
+            base_dir.path().join("base.txt").exists(),
+            "Base file should be untouched"
+        );
 
         Ok(())
     }
