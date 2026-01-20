@@ -127,6 +127,28 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(unix)]
+        Command::Exec {
+            id_or_path,
+            command,
+            args,
+            backend,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher);
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::exec::handle_exec_command(
+                id_or_path,
+                command,
+                args,
+                backend,
+                encryption,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
+        }
         Command::Mount {
             id_or_path,
             mountpoint,

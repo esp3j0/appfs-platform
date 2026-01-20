@@ -18,5 +18,9 @@ mod run;
 #[cfg(unix)]
 pub mod nfs;
 
+// Exec command (Unix only)
+#[cfg(unix)]
+pub mod exec;
+
 pub use mount::{mount, MountArgs, MountBackend};
 pub use run::handle_run_command;

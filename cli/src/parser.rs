@@ -173,6 +173,38 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Execute a command with an AgentFS filesystem mounted.
+    ///
+    /// Mounts the specified AgentFS to a temporary directory, runs the command
+    /// with that directory as the working directory, then automatically unmounts.
+    /// This is useful for running tools that need filesystem access without
+    /// a persistent mount.
+    #[cfg(unix)]
+    Exec {
+        /// Agent ID or database path
+        #[arg(value_name = "ID_OR_PATH", add = ArgValueCompleter::new(id_or_path_completer))]
+        id_or_path: String,
+
+        /// Command to execute
+        #[arg(value_name = "COMMAND")]
+        command: PathBuf,
+
+        /// Arguments for the command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Backend to use for mounting (default: fuse on Linux, nfs on macOS)
+        #[arg(long, default_value_t = MountBackend::default())]
+        backend: MountBackend,
+
+        /// Hex-encoded encryption key for encrypted databases.
+        #[arg(long, env = "AGENTFS_KEY")]
+        key: Option<String>,
+
+        /// Cipher algorithm for encryption (required with --key).
+        #[arg(long, env = "AGENTFS_CIPHER")]
+        cipher: Option<String>,
+    },
     /// Mount an agent filesystem using FUSE (or list mounts if no args)
     Mount {
         /// Agent ID or database path (if omitted, lists current mounts)
