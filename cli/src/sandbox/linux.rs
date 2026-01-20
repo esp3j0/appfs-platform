@@ -16,7 +16,7 @@
 //! bypassing the FUSE mount entirely.
 
 use super::group_paths_by_parent;
-use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -32,6 +32,7 @@ use std::{
         Arc,
     },
 };
+use tokio::sync::Mutex;
 
 /// Global child PID for signal forwarding.
 /// Set by the parent before installing signal handlers.
@@ -41,7 +42,7 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// First signal forwards to child, second signal sends SIGKILL.
 static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
-use crate::fuse::FuseMountOptions;
+use crate::mount::{is_mountpoint, mount_fs, MountBackend, MountHandle, MountOpts};
 
 /// Exit code returned when exec fails (standard shell convention for "command not found")
 const EXIT_COMMAND_NOT_FOUND: i32 = 127;
@@ -69,10 +70,6 @@ const DEFAULT_ALLOWED_DIRS: &[&str] = &[
 /// Field index for mount point in /proc/self/mountinfo.
 /// Format: ID PARENT_ID MAJOR:MINOR ROOT MOUNT_POINT OPTIONS ...
 const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
-
-/// Commands to try for FUSE unmounting, in order of preference.
-/// fusermount3 is from fuse3 package; fusermount is the legacy fallback.
-const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
 
 /// Signal handler that forwards signals to the child process.
 ///
@@ -225,35 +222,25 @@ pub async fn run_cmd(
     std::fs::write(&session.base_path_file, cwd_str)
         .context("Failed to write session base path")?;
 
-    let overlay: Arc<dyn FileSystem> = Arc::new(overlay);
-
     // SAFETY: getuid/getgid are always safe
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let fuse_opts = FuseMountOptions {
+    let mount_opts = MountOpts {
         mountpoint: session.fuse_mountpoint.clone(),
-        auto_unmount: false,
-        allow_root: false,
-        allow_other: system,
+        backend: MountBackend::Fuse,
         fsname: format!("agentfs:{}", session.run_id),
         uid: Some(uid),
         gid: Some(gid),
+        allow_other: system,
+        allow_root: false,
+        auto_unmount: false,
+        lazy_unmount: true,
+        timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    // Start FUSE in a separate thread
-    let fuse_handle = std::thread::spawn(move || {
-        let rt = crate::get_runtime();
-        crate::fuse::mount(overlay, fuse_opts, rt)
-    });
-
-    // Wait for FUSE mount to be ready
-    if !wait_for_mount(&session.fuse_mountpoint, FUSE_MOUNT_TIMEOUT) {
-        bail!(
-            "FUSE mount did not become ready within {:?}",
-            FUSE_MOUNT_TIMEOUT
-        );
-    }
+    // Mount the overlay filesystem
+    let mount_handle = mount_fs(Arc::new(Mutex::new(overlay)), mount_opts).await?;
 
     // Create pipes for parent-child coordination.
     // The parent needs to write uid_map/gid_map for the child after unshare.
@@ -322,8 +309,7 @@ pub async fn run_cmd(
         run_parent(
             child_pid,
             cwd_fd,
-            &session.fuse_mountpoint,
-            fuse_handle,
+            mount_handle,
             &session.db_path,
             &session.run_id,
         );
@@ -900,41 +886,14 @@ fn unescape_mountinfo(s: &str) -> String {
     result
 }
 
-/// Attempt to unmount a FUSE filesystem using fusermount.
-///
-/// Tries commands from FUSERMOUNT_COMMANDS in order until one succeeds.
-/// Uses lazy unmount (-uz) to handle lingering references from the FUSE thread.
-///
-/// Returns true if unmount succeeded or mount was already gone.
-fn unmount_fuse(mountpoint: &Path) -> bool {
-    for cmd in FUSERMOUNT_COMMANDS {
-        let success = std::process::Command::new(cmd)
-            .args(["-uz"])
-            .arg(mountpoint.as_os_str())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if success {
-            return true;
-        }
-    }
-
-    // Check if it's actually still mounted
-    !is_mountpoint(mountpoint)
-}
-
 /// Parent process: wait for child to exit, then clean up.
 ///
-/// The FUSE thread handle is intentionally dropped without joining. We perform
-/// a lazy unmount (fusermount -uz) which safely detaches the filesystem even
-/// while the FUSE thread may still be processing requests. The thread will
-/// terminate naturally when the mount is gone.
+/// The MountHandle automatically unmounts when dropped. We explicitly drop it
+/// before calling exit() to ensure cleanup happens.
 fn run_parent(
     child_pid: i32,
     cwd_fd: std::fs::File,
-    fuse_mountpoint: &Path,
-    _fuse_handle: std::thread::JoinHandle<anyhow::Result<()>>,
+    mount_handle: MountHandle,
     db_path: &Path,
     session_id: &str,
 ) -> ! {
@@ -948,27 +907,17 @@ fn run_parent(
     // Clean up proc file
     crate::cmd::ps::remove_proc_file(session_id);
 
-    // Move away from mountpoint before unmounting to avoid EBUSY
-    let _ = std::env::set_current_dir("/");
+    // Get mountpoint before dropping handle
+    let fuse_mountpoint = mount_handle.mountpoint().to_path_buf();
 
     // Release the underlying directory fd (was kept alive for HostFS)
     drop(cwd_fd);
 
-    // Unmount the FUSE filesystem
-    if !unmount_fuse(fuse_mountpoint) {
-        eprintln!(
-            "Warning: Failed to unmount FUSE filesystem at {}",
-            fuse_mountpoint.display()
-        );
-        eprintln!(
-            "You may need to manually unmount with: fusermount -uz {}",
-            fuse_mountpoint.display()
-        );
-        std::process::exit(exit_code);
-    }
+    // Drop the mount handle to unmount (this also moves away from mountpoint)
+    drop(mount_handle);
 
     // Clean up the FUSE mountpoint directory (but keep the delta database)
-    if let Err(e) = std::fs::remove_dir_all(fuse_mountpoint) {
+    if let Err(e) = std::fs::remove_dir_all(&fuse_mountpoint) {
         eprintln!(
             "Warning: Failed to clean up mountpoint {}: {}",
             fuse_mountpoint.display(),
@@ -988,42 +937,6 @@ fn run_parent(
     eprintln!("  agentfs diff {}", db_path.display());
 
     std::process::exit(exit_code);
-}
-
-/// Wait for a path to become a mountpoint
-fn wait_for_mount(path: &Path, timeout: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    let interval = std::time::Duration::from_millis(50);
-
-    while start.elapsed() < timeout {
-        if is_mountpoint(path) {
-            return true;
-        }
-        std::thread::sleep(interval);
-    }
-    false
-}
-
-/// Check if a path is a mountpoint by comparing device IDs with parent.
-fn is_mountpoint(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let path_meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("/"),
-    };
-
-    let parent_meta = match std::fs::metadata(parent) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    path_meta.dev() != parent_meta.dev()
 }
 
 /// Execute the command, replacing the current process.

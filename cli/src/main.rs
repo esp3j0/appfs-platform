@@ -45,6 +45,8 @@ fn main() {
             base,
             key,
             cipher,
+            command,
+            backend,
             sync,
         } => {
             let rt = get_runtime();
@@ -56,6 +58,8 @@ fn main() {
                 force,
                 base,
                 encryption_opts,
+                command,
+                backend,
             )) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -122,6 +126,24 @@ fn main() {
                 encryption,
                 command,
                 args,
+            )) {
+                eprintln!("Error: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(unix)]
+        Command::Exec {
+            id_or_path,
+            command,
+            args,
+            backend,
+            key,
+            cipher,
+        } => {
+            let encryption = parse_encryption(key, cipher);
+            let rt = get_runtime();
+            if let Err(e) = rt.block_on(cmd::exec::handle_exec_command(
+                id_or_path, command, args, backend, encryption,
             )) {
                 eprintln!("Error: {e:?}");
                 std::process::exit(1);
