@@ -7,7 +7,7 @@ use agentfs_sdk::{
 };
 use anyhow::{Context, Result as AnyhowResult};
 
-use crate::parser::SyncCommandOptions;
+use crate::parser::{MountBackend, SyncCommandOptions};
 
 pub struct EncryptionOptions {
     /// Hex-encoded encryption key
@@ -77,6 +77,8 @@ pub async fn init_database(
     force: bool,
     base: Option<PathBuf>,
     encryption: Option<EncryptionOptions>,
+    command: Option<String>,
+    backend: MountBackend,
 ) -> AnyhowResult<()> {
     // Generate ID if not provided
     let id = id.unwrap_or_else(|| {
@@ -155,7 +157,7 @@ pub async fn init_database(
         .context("Failed to initialize database")?;
 
     // If base is provided, initialize the overlay schema using the SDK
-    if let Some(base_path) = base {
+    if let Some(ref base_path) = base {
         let base_path_str = base_path
             .canonicalize()
             .context("Failed to canonicalize base path")?
@@ -190,5 +192,83 @@ pub async fn init_database(
         }
     }
 
+    // If a command was provided, mount the filesystem and execute it
+    if let Some(cmd_str) = command {
+        run_init_cmd(&id, cmd_str, backend, base, agent).await?;
+    }
+
     Ok(())
+}
+
+#[cfg(unix)]
+async fn run_init_cmd(
+    id: &str,
+    cmd_str: String,
+    backend: MountBackend,
+    base: Option<PathBuf>,
+    agent: AgentFS,
+) -> AnyhowResult<()> {
+    use crate::mount::{mount_fs, MountOpts};
+    use agentfs_sdk::{FileSystem, HostFS};
+    use std::process::Command;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(ref base_path) = base {
+        let canonical = base_path
+            .canonicalize()
+            .context("Failed to canonicalize base path")?;
+        let hostfs = HostFS::new(&canonical)?;
+        let overlay = OverlayFS::new(Arc::new(hostfs), agent.fs);
+        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+    } else {
+        Arc::new(Mutex::new(agent.fs)) as Arc<Mutex<dyn FileSystem + Send>>
+    };
+
+    let exec_id = uuid::Uuid::new_v4().to_string();
+    let mountpoint = std::env::temp_dir().join(format!("agentfs-init-{}", exec_id));
+    std::fs::create_dir_all(&mountpoint).context("Failed to create mount directory")?;
+
+    let mount_opts = MountOpts {
+        mountpoint: mountpoint.clone(),
+        backend,
+        fsname: format!("agentfs:{}", id),
+        uid: None,
+        gid: None,
+        allow_other: false,
+        allow_root: false,
+        auto_unmount: false,
+        lazy_unmount: true,
+        timeout: std::time::Duration::from_secs(10),
+    };
+
+    let mount_handle = mount_fs(fs, mount_opts).await?;
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .current_dir(&mountpoint)
+        .status()
+        .with_context(|| format!("Failed to execute: {}", cmd_str))?;
+
+    drop(mount_handle);
+
+    let _ = std::fs::remove_dir_all(&mountpoint);
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_init_cmd(
+    _id: &str,
+    _cmd_str: String,
+    _backend: MountBackend,
+    _base: Option<PathBuf>,
+    _agent: AgentFS,
+) -> AnyhowResult<()> {
+    anyhow::bail!("The -c option is not supported on Windows")
 }

@@ -92,6 +92,14 @@ pub enum Command {
         #[arg(long, env = "AGENTFS_CIPHER")]
         cipher: Option<String>,
 
+        /// Command to execute after initialization (mounts the filesystem, runs command, unmounts)
+        #[arg(short = 'c', long = "command")]
+        command: Option<String>,
+
+        /// Backend to use for mounting when using -c (default: fuse on Linux, nfs on macOS)
+        #[arg(long, default_value_t = MountBackend::default())]
+        backend: MountBackend,
+
         #[command(flatten)]
         sync: SyncCommandOptions,
     },
