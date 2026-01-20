@@ -6,7 +6,7 @@
 //! for filesystem operations under its mount point.
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{info, warn};
+use log::{debug, warn};
 use nix::unistd::geteuid;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -82,7 +82,7 @@ impl<FS: Filesystem> Session<FS> {
         options: &[MountOption],
     ) -> io::Result<Session<FS>> {
         let mountpoint = mountpoint.as_ref();
-        info!("Mounting {}", mountpoint.display());
+        debug!("Mounting {}", mountpoint.display());
         // If AutoUnmount is requested, but not AllowRoot or AllowOther we enforce the ACL
         // ourself and implicitly set AllowOther because fusermount needs allow_root or allow_other
         // to handle the auto_unmount option
@@ -231,7 +231,7 @@ impl<FS: Filesystem> Drop for Session<FS> {
         }
 
         if let Some((mountpoint, _mount)) = std::mem::take(&mut *self.mount.lock().unwrap()) {
-            info!("unmounting session at {}", mountpoint.display());
+            debug!("unmounting session at {}", mountpoint.display());
         }
     }
 }
