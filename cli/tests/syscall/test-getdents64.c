@@ -16,29 +16,32 @@ struct linux_dirent64 {
 
 int test_getdents64(const char *base_path) {
     int fd, nread;
-    char buf[1024];
+    char buf[4096];  /* Larger buffer to handle more directory entries */
     struct linux_dirent64 *d;
     int found_test = 0;
+    int total_entries = 0;
 
     /* Test 1: Open directory */
     fd = open(base_path, O_RDONLY | O_DIRECTORY);
     TEST_ASSERT_ERRNO(fd >= 0, "open directory should succeed");
 
-    /* Test 2: Call getdents64 */
-    nread = syscall(SYS_getdents64, fd, buf, sizeof(buf));
-    TEST_ASSERT_ERRNO(nread > 0, "getdents64 should return entries");
+    /* Test 2: Call getdents64 - loop until all entries are read */
+    while ((nread = syscall(SYS_getdents64, fd, buf, sizeof(buf))) > 0) {
+        /* Test 3: Parse directory entries */
+        for (int pos = 0; pos < nread;) {
+            d = (struct linux_dirent64 *) (buf + pos);
+            total_entries++;
 
-    /* Test 3: Parse directory entries */
-    for (int pos = 0; pos < nread;) {
-        d = (struct linux_dirent64 *) (buf + pos);
+            if (strcmp(d->d_name, "test.txt") == 0) {
+                found_test = 1;
+                TEST_ASSERT(d->d_type == DT_REG, "test.txt should be a regular file");
+            }
 
-        if (strcmp(d->d_name, "test.txt") == 0) {
-            found_test = 1;
-            TEST_ASSERT(d->d_type == DT_REG, "test.txt should be a regular file");
+            pos += d->d_reclen;
         }
-
-        pos += d->d_reclen;
     }
+    TEST_ASSERT_ERRNO(nread == 0, "getdents64 should return 0 at end of directory");
+    TEST_ASSERT(total_entries > 0, "getdents64 should return at least one entry");
 
     TEST_ASSERT(found_test, "should find test.txt in directory listing");
 

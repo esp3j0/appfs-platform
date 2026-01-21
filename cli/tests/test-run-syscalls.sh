@@ -41,6 +41,19 @@ echo -n "nested content" > subdir/nested.txt
 echo -n "executable content" > executable_base.txt
 chmod 0755 executable_base.txt
 
+# Create files for copy-up inode stability tests
+# Each file will be used to test inode stability when a specific syscall triggers copy-up
+# These files exist in the base layer; copy-up happens when modified through overlay
+echo -n "content for write copyup test" > copyup_write_test.txt
+echo -n "content for truncate copyup test" > copyup_truncate_test.txt
+echo -n "content for chmod copyup test" > copyup_chmod_test.txt
+echo -n "content for chown copyup test" > copyup_chown_test.txt
+echo -n "content for rename copyup test" > copyup_rename_test.txt
+echo -n "content for link copyup test" > copyup_link_test.txt
+echo -n "content for utimes copyup test" > copyup_utimes_test.txt
+echo -n "content for xattr copyup test" > copyup_xattr_test.txt
+echo -n "content for fallocate copyup test" > copyup_fallocate_test.txt
+
 # Run syscall tests through FUSE overlay
 # The test binary runs inside the overlay where:
 # - Files from current directory are visible (base layer)
@@ -49,20 +62,20 @@ chmod 0755 executable_base.txt
 if ! output=$(cargo run -- run "$DIR/syscall/test-syscalls" . 2>&1); then
     echo "FAILED"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
     exit 1
 fi
 
 echo "$output" | grep -q "All tests passed!" || {
     echo "FAILED: 'All tests passed!' not found"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
     exit 1
 }
 
 # Note: output.txt is created in the delta layer (session-specific) so we can't
 # verify it with a separate agentfs run. The "All tests passed!" check is sufficient.
 
-rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt
+rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
 
 echo "OK"
