@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::parser::MountBackend;
+pub use crate::opts::MountBackend;
 
 /// Default timeout for mount to become ready.
 const DEFAULT_MOUNT_TIMEOUT: Duration = Duration::from_secs(10);

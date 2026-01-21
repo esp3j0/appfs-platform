@@ -1,5 +1,5 @@
 pub mod cmd;
-pub mod parser;
+pub mod opts;
 pub mod sandbox;
 
 #[cfg(target_os = "linux")]

@@ -7,7 +7,7 @@ use agentfs_sdk::{
 };
 use anyhow::{Context, Result as AnyhowResult};
 
-use crate::parser::{MountBackend, SyncCommandOptions};
+use crate::opts::{MountBackend, SyncCommandOptions};
 
 pub struct EncryptionOptions {
     /// Hex-encoded encryption key

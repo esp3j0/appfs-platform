@@ -26,7 +26,7 @@ use crate::cmd::init::open_agentfs;
 #[cfg(target_os = "linux")]
 use crate::fuse::FuseMountOptions;
 
-pub use crate::parser::MountBackend;
+pub use crate::opts::MountBackend;
 
 /// Default NFS port to try (use a high port to avoid needing root)
 const DEFAULT_NFS_PORT: u32 = 11111;

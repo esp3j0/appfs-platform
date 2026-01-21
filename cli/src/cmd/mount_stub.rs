@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::{io::Write, path::PathBuf};
 
-pub use crate::parser::MountBackend;
+pub use crate::opts::MountBackend;
 
 /// Arguments for the mount command.
 #[derive(Debug, Clone)]
