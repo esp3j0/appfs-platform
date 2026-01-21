@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 
-use crate::parser::CompletionsCommand;
+use crate::opts::CompletionsCommand;
 
 /// Current shell completions supported by `clap_complete`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

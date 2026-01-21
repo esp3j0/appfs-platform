@@ -1,7 +1,7 @@
 use agentfs::{
     cmd::{self, completions::handle_completions},
     get_runtime,
-    parser::{Args, Command, FsCommand, PruneCommand, ServeCommand, SyncCommand},
+    opts::{Args, Command, FsCommand, PruneCommand, ServeCommand, SyncCommand},
 };
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
