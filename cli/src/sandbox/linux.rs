@@ -306,13 +306,7 @@ pub async fn run_cmd(
         }
 
         // Keep cwd_fd alive - it's needed by HostFS in the FUSE thread
-        run_parent(
-            child_pid,
-            cwd_fd,
-            mount_handle,
-            &session.db_path,
-            &session.run_id,
-        );
+        run_parent(child_pid, cwd_fd, mount_handle, &session.run_id);
     }
 }
 
@@ -894,7 +888,6 @@ fn run_parent(
     child_pid: i32,
     cwd_fd: std::fs::File,
     mount_handle: MountHandle,
-    db_path: &Path,
     session_id: &str,
 ) -> ! {
     // Store child PID and install signal handlers before waiting
@@ -929,12 +922,15 @@ fn run_parent(
     let procs_dir = crate::cmd::ps::procs_dir(session_id);
     let _ = std::fs::remove_dir(&procs_dir);
 
-    // Print the location of the delta layer for the user
+    // Print session info for the user
     eprintln!();
-    eprintln!("Delta layer saved to: {}", db_path.display());
+    eprintln!("Session: {}", session_id);
+    eprintln!();
+    eprintln!("To resume this session:");
+    eprintln!("  agentfs run --session {}", session_id);
     eprintln!();
     eprintln!("To see what changed:");
-    eprintln!("  agentfs diff {}", db_path.display());
+    eprintln!("  agentfs diff {}", session_id);
 
     std::process::exit(exit_code);
 }
