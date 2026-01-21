@@ -140,12 +140,15 @@ pub async fn run(
         );
     }
 
-    // Print the location of the delta layer for the user
+    // Print session info for the user
     eprintln!();
-    eprintln!("Delta layer saved to: {}", session.db_path.display());
+    eprintln!("Session: {}", session.session_id);
+    eprintln!();
+    eprintln!("To resume this session:");
+    eprintln!("  agentfs run --session {}", session.session_id);
     eprintln!();
     eprintln!("To see what changed:");
-    eprintln!("  agentfs diff {}", session.db_path.display());
+    eprintln!("  agentfs diff {}", session.session_id);
 
     std::process::exit(exit_code);
 }
