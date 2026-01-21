@@ -36,6 +36,57 @@ agentfs init [OPTIONS] [ID]
 
 **Note:** Local encryption and cloud sync cannot be used together.
 
+**Options (continued):**
+- `-c, --command <CMD>` - Command to execute after initialization (see below)
+- `--backend <BACKEND>` - Mount backend for `-c` option (`fuse` or `nfs`)
+
+**Running a command after init:**
+
+The `-c` option initializes the filesystem, mounts it to a temporary directory, runs the specified command with that directory as the working directory, then automatically unmounts.
+
+```bash
+# Initialize and run a command in the new filesystem
+agentfs init my-agent -c "touch hello.txt && ls -la"
+
+# With overlay filesystem
+agentfs init my-overlay --base /path/to/project -c "make build"
+```
+
+### agentfs exec
+
+Execute a command with an AgentFS filesystem mounted (Unix only).
+
+```
+agentfs exec [OPTIONS] <ID_OR_PATH> <COMMAND> [ARGS]...
+```
+
+Mounts the specified AgentFS to a temporary directory, runs the command with that directory as the working directory, then automatically unmounts. This is useful for running tools that need filesystem access without a persistent mount.
+
+If the AgentFS was initialized with `--base` (overlay mode), the overlay filesystem is used automatically.
+
+**Arguments:**
+- `ID_OR_PATH` - Agent identifier or database path
+- `COMMAND` - Command to execute
+- `ARGS` - Arguments for the command
+
+**Options:**
+- `--backend <BACKEND>` - Mount backend (`fuse` on Linux, `nfs` on macOS by default)
+- `--key <KEY>` - Hex-encoded encryption key for encrypted databases
+- `--cipher <CIPHER>` - Cipher algorithm (required with `--key`)
+
+**Examples:**
+
+```bash
+# Run ls in the AgentFS root
+agentfs exec my-agent ls -la
+
+# Run a build command
+agentfs exec my-overlay make build
+
+# With encryption
+agentfs exec my-agent --key $KEY --cipher aes256gcm cat /config.json
+```
+
 ### agentfs run
 
 Execute a program in a sandboxed environment with copy-on-write filesystem.
