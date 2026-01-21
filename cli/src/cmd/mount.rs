@@ -123,33 +123,34 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
 
         // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
-            let conn = agentfs.get_connection().await?;
-
-            // Check if fs_overlay_config table exists and has base_path
-            let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-            let base_path: Option<String> = match conn.query(query, ()).await {
-                Ok(mut rows) => {
-                    if let Ok(Some(row)) = rows.next().await {
-                        row.get_value(0).ok().and_then(|v| {
-                            if let Value::Text(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
+            // Query base_path in a separate scope so connection is released
+            let base_path: Option<String> = {
+                let conn = agentfs.get_connection().await?;
+                let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
+                match conn.query(query, ()).await {
+                    Ok(mut rows) => {
+                        if let Ok(Some(row)) = rows.next().await {
+                            row.get_value(0).ok().and_then(|v| {
+                                if let Value::Text(s) = v {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
                     }
+                    Err(_) => None, // Table doesn't exist or query failed
                 }
-                Err(_) => None, // Table doesn't exist or query failed
-            };
+            }; // conn is dropped here
 
             if let Some(base_path) = base_path {
-                // Create OverlayFS with HostFS base
+                // Create OverlayFS with HostFS base, loading existing whiteouts
                 eprintln!("Using overlay filesystem with base: {}", base_path);
                 let hostfs = HostFS::new(&base_path)?;
                 let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
-                let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+                let overlay = OverlayFS::open(Arc::new(hostfs), agentfs.fs).await?;
                 Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
             } else {
                 // Plain AgentFS
@@ -194,12 +195,11 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
     let agentfs = open_agentfs(opts).await?;
 
     // Check for overlay configuration
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = {
+    // Query base_path in a separate scope so connection is released before load_whiteouts
+    let base_path: Option<String> = {
         let conn = agentfs.get_connection().await?;
-
-        // Check if fs_overlay_config table exists and has base_path
         let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-        let base_path: Option<String> = match conn.query(query, ()).await {
+        match conn.query(query, ()).await {
             Ok(mut rows) => {
                 if let Ok(Some(row)) = rows.next().await {
                     row.get_value(0).ok().and_then(|v| {
@@ -214,18 +214,18 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
                 }
             }
             Err(_) => None, // Table doesn't exist or query failed
-        };
-
-        if let Some(base_path) = base_path {
-            // Create OverlayFS with HostFS base
-            eprintln!("Using overlay filesystem with base: {}", base_path);
-            let hostfs = HostFS::new(&base_path)?;
-            let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
-        } else {
-            // Plain AgentFS
-            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
         }
+    }; // conn is dropped here
+
+    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(base_path) = base_path {
+        // Create OverlayFS with HostFS base, loading existing whiteouts
+        eprintln!("Using overlay filesystem with base: {}", base_path);
+        let hostfs = HostFS::new(&base_path)?;
+        let overlay = OverlayFS::open(Arc::new(hostfs), agentfs.fs).await?;
+        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+    } else {
+        // Plain AgentFS
+        Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
     };
 
     if args.foreground {
