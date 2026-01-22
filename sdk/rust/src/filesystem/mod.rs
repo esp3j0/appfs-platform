@@ -1,6 +1,8 @@
 pub mod agentfs;
-#[cfg(unix)]
-pub mod hostfs;
+#[cfg(target_os = "macos")]
+pub mod hostfs_darwin;
+#[cfg(target_os = "linux")]
+pub mod hostfs_linux;
 pub mod overlayfs;
 
 use crate::error::Result;
@@ -10,8 +12,10 @@ use thiserror::Error;
 
 // Re-export implementations
 pub use agentfs::AgentFS;
-#[cfg(unix)]
-pub use hostfs::HostFS;
+#[cfg(target_os = "macos")]
+pub use hostfs_darwin::HostFS;
+#[cfg(target_os = "linux")]
+pub use hostfs_linux::HostFS;
 pub use overlayfs::OverlayFS;
 
 /// Filesystem-specific errors with errno semantics
@@ -153,95 +157,130 @@ pub trait File: Send + Sync {
 /// A boxed File trait object for dynamic dispatch.
 pub type BoxedFile = Arc<dyn File>;
 
-/// A trait defining filesystem operations.
+/// A trait defining filesystem operations using inode semantics.
+///
+/// This trait uses inode-based operations rather than path-based operations,
+/// matching POSIX and FUSE semantics more closely.
 #[async_trait]
 pub trait FileSystem: Send + Sync {
-    /// Get file statistics, following symlinks
-    async fn stat(&self, path: &str) -> Result<Option<Stats>>;
-
-    /// Get file statistics without following symlinks
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>>;
-
-    /// Read entire file contents
+    /// Look up a directory entry by name within a parent directory.
     ///
-    /// Returns `Ok(None)` if the file does not exist.
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>>;
-
-    /// List directory contents
+    /// This is the primary method for resolving names to inodes. Given a parent
+    /// directory inode and a child name, returns the stats for the child entry
+    /// (without following symlinks, like lstat).
     ///
+    /// Returns `Ok(None)` if the entry does not exist.
+    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>>;
+
+    /// Get file attributes for an inode.
+    ///
+    /// Returns stats for the inode itself (does not follow symlinks).
+    /// Returns `Ok(None)` if the inode does not exist.
+    async fn getattr(&self, ino: i64) -> Result<Option<Stats>>;
+
+    /// Read the target of a symbolic link inode.
+    ///
+    /// Returns `Ok(None)` if the inode does not exist or is not a symlink.
+    async fn readlink(&self, ino: i64) -> Result<Option<String>>;
+
+    /// List directory contents by inode.
+    ///
+    /// Returns entry names (not full paths) for the directory.
     /// Returns `Ok(None)` if the directory does not exist.
-    async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>>;
+    async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>>;
 
-    /// List directory contents with full statistics for each entry
+    /// List directory contents with full statistics for each entry.
     ///
     /// This is an optimized version of readdir that returns both entry names
     /// and their statistics in a single call, avoiding N+1 queries.
     ///
     /// Returns `Ok(None)` if the directory does not exist.
-    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>>;
+    async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>>;
 
-    /// Create a directory with the specified ownership
-    async fn mkdir(&self, path: &str, uid: u32, gid: u32) -> Result<()>;
+    /// Change file mode/permissions by inode.
+    async fn chmod(&self, ino: i64, mode: u32) -> Result<()>;
 
-    /// Remove a file or empty directory
-    async fn remove(&self, path: &str) -> Result<()>;
+    /// Change file ownership by inode.
+    async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
 
-    /// Change file mode/permissions
+    /// Open a file by inode and return a file handle for I/O operations.
+    async fn open(&self, ino: i64) -> Result<BoxedFile>;
+
+    /// Create a directory with the specified ownership.
     ///
-    /// The mode parameter contains the full mode including file type bits,
-    /// but only the permission bits (lower 12 bits) will be modified.
-    async fn chmod(&self, path: &str, mode: u32) -> Result<()>;
-
-    /// Change file ownership
-    ///
-    /// Changes the user and/or group ownership of a file.
-    /// Pass None for uid or gid to leave that value unchanged.
-    async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()>;
-
-    /// Rename/move a file or directory
-    async fn rename(&self, from: &str, to: &str) -> Result<()>;
-
-    /// Create a symbolic link with the specified ownership
-    async fn symlink(&self, target: &str, linkpath: &str, uid: u32, gid: u32) -> Result<()>;
-
-    /// Create a hard link
-    ///
-    /// Creates a new directory entry `newpath` that refers to the same inode as `oldpath`.
-    /// Both paths will share the same file data and metadata (except for the name).
-    /// The link count (nlink) of the inode is incremented.
-    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()>;
-
-    /// Read the target of a symbolic link
-    ///
-    /// Returns `Ok(None)` if the path does not exist.
-    async fn readlink(&self, path: &str) -> Result<Option<String>>;
-
-    /// Get filesystem statistics
-    async fn statfs(&self) -> Result<FilesystemStats>;
-
-    /// Open a file and return a file handle for I/O operations.
-    ///
-    /// The returned file handle can be used for efficient read/write/fsync
-    /// operations without requiring path lookups on each operation.
-    async fn open(&self, path: &str) -> Result<BoxedFile>;
-
-    /// Create a special file node (FIFO, device, socket, or regular file).
-    ///
-    /// The mode parameter specifies both the file type (S_IFIFO, S_IFCHR, S_IFBLK,
-    /// S_IFSOCK, S_IFREG) and the permissions.
-    /// The rdev parameter is the device number for character and block devices.
-    async fn mknod(&self, path: &str, mode: u32, rdev: u64, uid: u32, gid: u32) -> Result<()>;
+    /// Returns the stats of the newly created directory.
+    async fn mkdir(&self, parent_ino: i64, name: &str, uid: u32, gid: u32) -> Result<Stats>;
 
     /// Create a new empty file with the specified mode and ownership.
     ///
     /// Returns both the file stats and an open file handle in a single operation.
-    /// This is optimized for FUSE create() which needs both atomically.
-    /// Fails with AlreadyExists if the file exists.
     async fn create_file(
         &self,
-        path: &str,
+        parent_ino: i64,
+        name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
     ) -> Result<(Stats, BoxedFile)>;
+
+    /// Create a special file node (FIFO, device, socket, or regular file).
+    ///
+    /// Returns the stats of the newly created node.
+    async fn mknod(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Stats>;
+
+    /// Create a symbolic link with the specified ownership.
+    ///
+    /// Returns the stats of the newly created symlink.
+    async fn symlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Stats>;
+
+    /// Remove a file (non-directory) from a directory.
+    async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()>;
+
+    /// Remove an empty directory.
+    async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()>;
+
+    /// Create a hard link.
+    ///
+    /// Creates a new directory entry `newname` under `newparent_ino` that refers
+    /// to the same inode as `ino`. Returns the stats of the linked inode.
+    async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats>;
+
+    /// Rename/move a file or directory.
+    async fn rename(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> Result<()>;
+
+    /// Get filesystem statistics.
+    async fn statfs(&self) -> Result<FilesystemStats>;
+
+    /// Forget about an inode (called when kernel drops inode from cache).
+    ///
+    /// The `nlookup` parameter indicates how many lookups the kernel is forgetting.
+    /// For passthrough filesystems that cache file descriptors per inode, this
+    /// should decrement a reference count and close the fd when it reaches zero.
+    ///
+    /// The default implementation is a no-op, suitable for filesystems that don't
+    /// cache any resources per inode (like database-backed filesystems).
+    async fn forget(&self, _ino: i64, _nlookup: u64) {
+        // Default: no-op
+    }
 }

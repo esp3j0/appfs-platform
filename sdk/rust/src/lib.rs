@@ -15,7 +15,7 @@ use turso::{Builder, EncryptionOpts, Value};
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
 
 // Re-export filesystem types
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, Stats,
@@ -693,7 +693,8 @@ mod tests {
         // Check directory exists
         let stats = agentfs.fs.stat("/test_dir").await.unwrap();
         assert!(stats.is_some());
-        assert!(stats.unwrap().is_directory());
+        let dir_stats = stats.unwrap();
+        assert!(dir_stats.is_directory());
 
         // Write a file
         let data = b"Hello, AgentFS!";
@@ -714,7 +715,7 @@ mod tests {
         assert_eq!(read_data, data);
 
         // List directory
-        let entries = agentfs.fs.readdir("/test_dir").await.unwrap().unwrap();
+        let entries = agentfs.fs.readdir(dir_stats.ino).await.unwrap().unwrap();
         assert_eq!(entries, vec!["test.txt"]);
     }
 

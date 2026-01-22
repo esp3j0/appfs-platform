@@ -3,9 +3,9 @@ use crate::fuser::{
         FUSE_ASYNC_READ, FUSE_CACHE_SYMLINKS, FUSE_NO_OPENDIR_SUPPORT, FUSE_PARALLEL_DIROPS,
         FUSE_WRITEBACK_CACHE,
     },
-    FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    Request,
+    fuse_forget_one, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyStatfs, ReplyWrite, Request,
 };
 use agentfs_sdk::error::Error as SdkError;
 use agentfs_sdk::filesystem::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -37,6 +37,34 @@ fn error_to_errno(e: &SdkError) -> i32 {
         SdkError::Database(turso::Error::Busy(_)) => libc::EAGAIN,
         SdkError::ConnectionPoolTimeout => libc::EAGAIN,
         _ => libc::EIO,
+    }
+}
+
+/// Maximize the file descriptor limit by raising the soft limit to the hard limit.
+///
+/// This helps avoid "too many open files" errors when passthrough filesystems
+/// cache O_PATH file descriptors for inode handles. Unlike raising the hard limit,
+/// this does not require root privileges.
+fn maximize_fd_limit() {
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    if result == 0 {
+        let old_soft = lim.rlim_cur;
+        lim.rlim_cur = lim.rlim_max;
+        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+        if result == 0 {
+            tracing::debug!("Raised fd limit from {} to {}", old_soft, lim.rlim_max);
+        } else {
+            tracing::warn!(
+                "Failed to raise fd limit: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Failed to get fd limit: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -73,18 +101,10 @@ struct OpenFile {
 struct AgentFSFuse {
     fs: Arc<dyn FileSystem>,
     runtime: Runtime,
-    path_cache: Arc<Mutex<HashMap<u64, String>>>,
     /// Maps file handle -> open file state
     open_files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     /// Next file handle to allocate
     next_fh: AtomicU64,
-    /// Lossy string representation of the absolute mountpoint path.
-    /// This is used to avoid looking up ourselves inside ourselves,
-    /// e.g., when we mount an under filesystem `/` at /mntpnt,
-    /// we do not want to look up `/mntpnt/mntpnt`, because the handler will then try
-    /// to lookup `/mntpnt` from he under filesystem, which will hit our mountpoint again,
-    /// causing a deadlock.
-    mountpoint_path: String,
 }
 
 impl Filesystem for AgentFSFuse {
@@ -118,23 +138,24 @@ impl Filesystem for AgentFSFuse {
 
     /// Looks up a directory entry by name within a parent directory.
     ///
-    /// Resolves `name` under the directory identified by `parent` inode, stats the
-    /// resulting path, and caches the inode-to-path mapping on success.
+    /// Resolves `name` under the directory identified by `parent` inode.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         tracing::debug!("FUSE::lookup: parent={}, name={:?}", parent, name);
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
+
         let fs = self.fs.clone();
-        let (result, path) = self.runtime.block_on(async move {
-            let result = fs.lstat(&path).await;
-            (result, path)
-        });
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.lookup(parent as i64, &name_owned).await });
+
         match result {
             Ok(Some(stats)) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -148,13 +169,11 @@ impl Filesystem for AgentFSFuse {
     /// directory identified by `ino`. Root inode (1) is handled specially.
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         tracing::debug!("FUSE::getattr: ino={}", ino);
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
         let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move { fs.lstat(&path).await });
+        let result = self
+            .runtime
+            .block_on(async move { fs.getattr(ino as i64).await });
 
         match result {
             Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
@@ -169,15 +188,11 @@ impl Filesystem for AgentFSFuse {
     /// like `ls -l` to display symlink targets.
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
         tracing::debug!("FUSE::readlink: ino={}", ino);
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
         let fs = self.fs.clone();
         let result = self
             .runtime
-            .block_on(async move { fs.readlink(&path).await });
+            .block_on(async move { fs.readlink(ino as i64).await });
 
         match result {
             Ok(Some(target)) => reply.data(target.as_bytes()),
@@ -216,17 +231,13 @@ impl Filesystem for AgentFSFuse {
             gid,
             size
         );
+
         // Handle chmod
         if let Some(new_mode) = mode {
-            let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
-                reply.error(libc::ENOENT);
-                return;
-            };
-
             let fs = self.fs.clone();
             let result = self
                 .runtime
-                .block_on(async move { fs.chmod(&path, new_mode).await });
+                .block_on(async move { fs.chmod(ino as i64, new_mode).await });
 
             if let Err(e) = result {
                 reply.error(error_to_errno(&e));
@@ -236,15 +247,10 @@ impl Filesystem for AgentFSFuse {
 
         // Handle chown
         if uid.is_some() || gid.is_some() {
-            let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
-                reply.error(libc::ENOENT);
-                return;
-            };
-
             let fs = self.fs.clone();
             let result = self
                 .runtime
-                .block_on(async move { fs.chown(&path, uid, gid).await });
+                .block_on(async move { fs.chown(ino as i64, uid, gid).await });
 
             if let Err(e) = result {
                 reply.error(error_to_errno(&e));
@@ -270,14 +276,9 @@ impl Filesystem for AgentFSFuse {
                 }
             } else {
                 // Open file and truncate via file handle
-                let Some(path) = self.path_cache.lock().get(&ino).cloned() else {
-                    reply.error(libc::ENOENT);
-                    return;
-                };
-
                 let fs = self.fs.clone();
                 self.runtime.block_on(async move {
-                    let file = fs.open(&path).await?;
+                    let file = fs.open(ino as i64).await?;
                     file.truncate(new_size).await
                 })
             };
@@ -289,13 +290,10 @@ impl Filesystem for AgentFSFuse {
         }
 
         // Return updated attributes
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-
         let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move { fs.stat(&path).await });
+        let result = self
+            .runtime
+            .block_on(async move { fs.getattr(ino as i64).await });
 
         match result {
             Ok(Some(stats)) => reply.attr(&TTL, &fillattr(&stats)),
@@ -324,16 +322,11 @@ impl Filesystem for AgentFSFuse {
         mut reply: ReplyDirectory,
     ) {
         tracing::debug!("FUSE::readdir: ino={}, offset={}", ino, offset);
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
         let fs = self.fs.clone();
-        let (entries_result, path) = self.runtime.block_on(async move {
-            let result = fs.readdir_plus(&path).await;
-            (result, path)
-        });
+        let entries_result = self
+            .runtime
+            .block_on(async move { fs.readdir_plus(ino as i64).await });
 
         let entries = match entries_result {
             Ok(Some(entries)) => entries,
@@ -348,34 +341,11 @@ impl Filesystem for AgentFSFuse {
         };
 
         // Determine parent inode for ".." entry
-        let parent_ino = if ino == 1 {
-            1 // Root's parent is itself
-        } else {
-            let parent_path = Path::new(&path)
-                .parent()
-                .map(|p| {
-                    let s = p.to_string_lossy().to_string();
-                    if s.is_empty() {
-                        "/".to_string()
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_else(|| "/".to_string());
-
-            if parent_path == "/" {
-                1
-            } else {
-                let fs = self.fs.clone();
-                match self
-                    .runtime
-                    .block_on(async move { fs.stat(&parent_path).await })
-                {
-                    Ok(Some(stats)) => stats.ino as u64,
-                    _ => 1, // Fallback to root if parent lookup fails
-                }
-            }
-        };
+        // In the inode-based API we don't track parent relationships directly.
+        // The kernel tracks this information and will resolve ".." correctly.
+        // We use 1 (root) as a fallback which is safe since the kernel
+        // won't actually use this value for path resolution.
+        let parent_ino = 1u64;
 
         let mut all_entries = vec![
             (ino, FileType::Directory, "."),
@@ -384,12 +354,6 @@ impl Filesystem for AgentFSFuse {
 
         // Process entries with stats already available (no N+1 queries!)
         for entry in &entries {
-            let entry_path = if path == "/" {
-                format!("/{}", entry.name)
-            } else {
-                format!("{}/{}", path, entry.name)
-            };
-
             let kind = if entry.stats.is_directory() {
                 FileType::Directory
             } else if entry.stats.is_symlink() {
@@ -398,7 +362,6 @@ impl Filesystem for AgentFSFuse {
                 FileType::RegularFile
             };
 
-            self.add_path(entry.stats.ino as u64, entry_path);
             all_entries.push((entry.stats.ino as u64, kind, entry.name.as_str()));
         }
 
@@ -424,16 +387,11 @@ impl Filesystem for AgentFSFuse {
         mut reply: ReplyDirectoryPlus,
     ) {
         tracing::debug!("FUSE::readdirplus: ino={}, offset={}", ino, offset);
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
         let fs = self.fs.clone();
-        let (entries_result, path) = self.runtime.block_on(async move {
-            let result = fs.readdir_plus(&path).await;
-            (result, path)
-        });
+        let entries_result = self
+            .runtime
+            .block_on(async move { fs.readdir_plus(ino as i64).await });
 
         let entries = match entries_result {
             Ok(Some(entries)) => entries,
@@ -449,47 +407,26 @@ impl Filesystem for AgentFSFuse {
 
         // Get current directory stats for "."
         let fs = self.fs.clone();
-        let path_for_stat = path.clone();
         let dir_stats = self
             .runtime
-            .block_on(async move { fs.stat(&path_for_stat).await })
+            .block_on(async move { fs.getattr(ino as i64).await })
             .ok()
             .flatten();
 
         // Determine parent inode and stats for ".." entry
+        // In the inode-based API we don't track parent relationships directly.
+        // Use root's stats for ".." as a fallback - the kernel handles proper ".." resolution.
         let (parent_ino, parent_stats) = if ino == 1 {
             (1u64, dir_stats.clone()) // Root's parent is itself
         } else {
-            let parent_path = Path::new(&path)
-                .parent()
-                .map(|p| {
-                    let s = p.to_string_lossy().to_string();
-                    if s.is_empty() {
-                        "/".to_string()
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_else(|| "/".to_string());
-
-            if parent_path == "/" {
-                let fs = self.fs.clone();
-                let parent_stats = self
-                    .runtime
-                    .block_on(async move { fs.stat(&parent_path).await })
-                    .ok()
-                    .flatten();
-                (1u64, parent_stats)
-            } else {
-                let fs = self.fs.clone();
-                let parent_stats = self
-                    .runtime
-                    .block_on(async move { fs.stat(&parent_path).await })
-                    .ok()
-                    .flatten();
-                let parent_ino = parent_stats.as_ref().map(|s| s.ino as u64).unwrap_or(1);
-                (parent_ino, parent_stats)
-            }
+            // Use root inode as fallback for parent
+            let fs = self.fs.clone();
+            let parent_stats = self
+                .runtime
+                .block_on(async move { fs.getattr(1).await })
+                .ok()
+                .flatten();
+            (1u64, parent_stats)
         };
 
         // Build the entries list with full attributes
@@ -522,14 +459,7 @@ impl Filesystem for AgentFSFuse {
         // Add directory entries with their attributes
         for entry in &entries {
             if offset <= offset_counter {
-                let entry_path = if path == "/" {
-                    format!("/{}", entry.name)
-                } else {
-                    format!("{}/{}", path, entry.name)
-                };
-
                 let attr = fillattr(&entry.stats);
-                self.add_path(entry.stats.ino as u64, entry_path);
 
                 if reply.add(
                     entry.stats.ino as u64,
@@ -570,39 +500,25 @@ impl Filesystem for AgentFSFuse {
             mode,
             rdev
         );
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
-        let (result, path) = self.runtime.block_on(async move {
-            let result = fs.mknod(&path, mode, rdev as u64, uid, gid).await;
-            (result, path)
+        let name_owned = name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.mknod(parent as i64, &name_owned, mode, rdev as u64, uid, gid)
+                .await
         });
 
-        if let Err(e) = result {
-            reply.error(error_to_errno(&e));
-            return;
-        }
-
-        // Get the new node's stats
-        let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.stat(&path).await;
-            (result, path)
-        });
-
-        match stat_result {
-            Ok(Some(stats)) => {
+        match result {
+            Ok(stats) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -624,39 +540,24 @@ impl Filesystem for AgentFSFuse {
         reply: ReplyEntry,
     ) {
         tracing::debug!("FUSE::mkdir: parent={}, name={:?}", parent, name);
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
-        let (result, path) = self.runtime.block_on(async move {
-            let result = fs.mkdir(&path, uid, gid).await;
-            (result, path)
-        });
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.mkdir(parent as i64, &name_owned, uid, gid).await });
 
-        if let Err(e) = result {
-            reply.error(error_to_errno(&e));
-            return;
-        }
-
-        // Get the new directory's stats
-        let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.stat(&path).await;
-            (result, path)
-        });
-
-        match stat_result {
-            Ok(Some(stats)) => {
+        match result {
+            Ok(stats) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -670,66 +571,20 @@ impl Filesystem for AgentFSFuse {
     /// Returns `ENOTDIR` if not a directory, `ENOTEMPTY` if not empty.
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::rmdir: parent={}, name={:?}", parent, name);
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
-        // Verify target is a directory
         let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.lstat(&path).await;
-            (result, path)
-        });
-
-        let stats = match stat_result {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-            Err(e) => {
-                reply.error(error_to_errno(&e));
-                return;
-            }
-        };
-
-        if !stats.is_directory() {
-            reply.error(libc::ENOTDIR);
-            return;
-        }
-
-        // Verify directory is empty
-        let fs = self.fs.clone();
-        let (readdir_result, path) = self.runtime.block_on(async move {
-            let result = fs.readdir(&path).await;
-            (result, path)
-        });
-
-        match readdir_result {
-            Ok(Some(entries)) if !entries.is_empty() => {
-                reply.error(libc::ENOTEMPTY);
-                return;
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-            Err(e) => {
-                reply.error(error_to_errno(&e));
-                return;
-            }
-            Ok(Some(_)) => {} // Empty directory, proceed
-        }
-
-        // Remove the directory
-        let ino = stats.ino as u64;
-        let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move { fs.remove(&path).await });
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.rmdir(parent as i64, &name_owned).await });
 
         match result {
             Ok(()) => {
-                self.drop_path(ino);
                 reply.ok();
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -760,8 +615,9 @@ impl Filesystem for AgentFSFuse {
             name,
             mode
         );
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
@@ -769,15 +625,15 @@ impl Filesystem for AgentFSFuse {
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
-        let path_for_create = path.clone();
-        let result = self
-            .runtime
-            .block_on(async move { fs.create_file(&path_for_create, mode, uid, gid).await });
+        let name_owned = name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.create_file(parent as i64, &name_owned, mode, uid, gid)
+                .await
+        });
 
         match result {
             Ok((stats, file)) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, path);
 
                 let fh = self.alloc_fh();
                 self.open_files.lock().insert(fh, OpenFile { file });
@@ -798,7 +654,7 @@ impl Filesystem for AgentFSFuse {
         req: &Request,
         parent: u64,
         link_name: &OsStr,
-        target: &Path,
+        target: &std::path::Path,
         reply: ReplyEntry,
     ) {
         tracing::debug!(
@@ -807,8 +663,9 @@ impl Filesystem for AgentFSFuse {
             link_name,
             target
         );
-        let Some(path) = self.lookup_path(parent, link_name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = link_name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
@@ -820,32 +677,17 @@ impl Filesystem for AgentFSFuse {
         let uid = req.uid();
         let gid = req.gid();
         let fs = self.fs.clone();
+        let name_owned = name_str.to_string();
         let target_owned = target_str.to_string();
-        let (result, path) = self.runtime.block_on(async move {
-            let result = fs.symlink(&target_owned, &path, uid, gid).await;
-            (result, path)
+        let result = self.runtime.block_on(async move {
+            fs.symlink(parent as i64, &name_owned, &target_owned, uid, gid)
+                .await
         });
 
-        if let Err(e) = result {
-            reply.error(error_to_errno(&e));
-            return;
-        }
-
-        // Get the new symlink's stats
-        let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.lstat(&path).await;
-            (result, path)
-        });
-
-        match stat_result {
-            Ok(Some(stats)) => {
+        match result {
+            Ok(stats) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, path);
                 reply.entry(&TTL, &attr, 0);
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -871,44 +713,22 @@ impl Filesystem for AgentFSFuse {
             newparent,
             newname
         );
-        // Get the path for the source inode
-        let Some(oldpath) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
-        // Get the path for the new link
-        let Some(newpath) = self.lookup_path(newparent, newname) else {
-            reply.error(libc::ENOENT);
+        let Some(name_str) = newname.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
         let fs = self.fs.clone();
-        let (result, newpath) = self.runtime.block_on(async move {
-            let result = fs.link(&oldpath, &newpath).await;
-            (result, newpath)
-        });
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.link(ino as i64, newparent as i64, &name_owned).await });
 
-        if let Err(e) = result {
-            reply.error(error_to_errno(&e));
-            return;
-        }
-
-        // Get the new link's stats
-        let fs = self.fs.clone();
-        let (stat_result, newpath) = self.runtime.block_on(async move {
-            let result = fs.lstat(&newpath).await;
-            (result, newpath)
-        });
-
-        match stat_result {
-            Ok(Some(stats)) => {
+        match result {
+            Ok(stats) => {
                 let attr = fillattr(&stats);
-                self.add_path(attr.ino, newpath);
                 reply.entry(&TTL, &attr, 0);
-            }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
             }
             Err(e) => {
                 reply.error(error_to_errno(&e));
@@ -921,49 +741,20 @@ impl Filesystem for AgentFSFuse {
     /// Gets the file's inode before removal to clean up the path cache.
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         tracing::debug!("FUSE::unlink: parent={}, name={:?}", parent, name);
-        let Some(path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
-        // Get inode before removing so we can uncache
         let fs = self.fs.clone();
-        let (stat_result, path) = self.runtime.block_on(async move {
-            let result = fs.lstat(&path).await;
-            (result, path)
-        });
-
-        let stats = match &stat_result {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-            Err(e) => {
-                reply.error(error_to_errno(e));
-                return;
-            }
-        };
-
-        if stats.is_directory() {
-            reply.error(libc::EISDIR);
-            return;
-        }
-
-        let ino = stats.ino as u64;
-        let nlink = stats.nlink;
-
-        let fs = self.fs.clone();
-        let result = self.runtime.block_on(async move { fs.remove(&path).await });
+        let name_owned = name_str.to_string();
+        let result = self
+            .runtime
+            .block_on(async move { fs.unlink(parent as i64, &name_owned).await });
 
         match result {
             Ok(()) => {
-                // Only drop from path_cache if this was the last link.
-                // If nlink > 1, there are other hard links that still reference
-                // this inode, and the path_cache entry points to one of them.
-                if nlink <= 1 {
-                    self.drop_path(ino);
-                }
                 reply.ok();
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -972,8 +763,7 @@ impl Filesystem for AgentFSFuse {
 
     /// Renames a file or directory.
     ///
-    /// Moves `name` from `parent` to `newname` under `newparent`. Updates the
-    /// path cache accordingly, removing any replaced destination entry.
+    /// Moves `name` from `parent` to `newname` under `newparent`.
     fn rename(
         &mut self,
         _req: &Request,
@@ -991,52 +781,32 @@ impl Filesystem for AgentFSFuse {
             newparent,
             newname
         );
-        let Some(from_path) = self.lookup_path(parent, name) else {
-            reply.error(libc::ENOENT);
+
+        let Some(old_name_str) = name.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
-        let Some(to_path) = self.lookup_path(newparent, newname) else {
-            reply.error(libc::ENOENT);
+        let Some(new_name_str) = newname.to_str() else {
+            reply.error(libc::EINVAL);
             return;
         };
 
-        // Get source inode before rename so we can update cache
         let fs = self.fs.clone();
-        let (src_stat, from_path) = self.runtime.block_on(async move {
-            let result = fs.stat(&from_path).await;
-            (result, from_path)
-        });
-
-        let src_ino = src_stat.ok().flatten().map(|s| s.ino as u64);
-
-        // Check if destination exists and get its inode for cache cleanup
-        let fs = self.fs.clone();
-        let (dst_stat, to_path) = self.runtime.block_on(async move {
-            let result = fs.stat(&to_path).await;
-            (result, to_path)
-        });
-
-        let dst_ino = dst_stat.ok().flatten().map(|s| s.ino as u64);
-
-        // Perform the rename
-        let fs = self.fs.clone();
-        let (result, to_path) = self.runtime.block_on(async move {
-            let result = fs.rename(&from_path, &to_path).await;
-            (result, to_path)
+        let old_name_owned = old_name_str.to_string();
+        let new_name_owned = new_name_str.to_string();
+        let result = self.runtime.block_on(async move {
+            fs.rename(
+                parent as i64,
+                &old_name_owned,
+                newparent as i64,
+                &new_name_owned,
+            )
+            .await
         });
 
         match result {
             Ok(()) => {
-                // Update path cache: remove old path, add new path
-                if let Some(ino) = src_ino {
-                    self.drop_path(ino);
-                    self.add_path(ino, to_path);
-                }
-                // Remove destination from cache if it was replaced
-                if let Some(ino) = dst_ino {
-                    self.drop_path(ino);
-                }
                 reply.ok();
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -1052,16 +822,11 @@ impl Filesystem for AgentFSFuse {
     /// Allocates a file handle and opens the file in the filesystem layer.
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         tracing::debug!("FUSE::open: ino={}", ino);
-        let Some(path) = self.get_path(ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
 
         let fs = self.fs.clone();
-        let path_clone = path.clone();
         let result = self
             .runtime
-            .block_on(async move { fs.open(&path_clone).await });
+            .block_on(async move { fs.open(ino as i64).await });
 
         match result {
             Ok(file) => {
@@ -1238,6 +1003,38 @@ impl Filesystem for AgentFSFuse {
             BLOCK_SIZE as u32, // frsize: fragment size
         );
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Inode Lifecycle
+    // ─────────────────────────────────────────────────────────────
+
+    /// Forget about an inode.
+    ///
+    /// Called when the kernel removes an inode from its cache. For passthrough
+    /// filesystems (like HostFS), this allows releasing O_PATH file descriptors
+    /// that were cached for the inode, preventing file descriptor exhaustion.
+    fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
+        tracing::debug!("FUSE::forget: ino={}, nlookup={}", ino, nlookup);
+        let fs = self.fs.clone();
+        self.runtime.block_on(async move {
+            fs.forget(ino as i64, nlookup).await;
+        });
+    }
+
+    /// Batch forget multiple inodes at once.
+    ///
+    /// This is an optimization over calling forget() individually for each inode.
+    fn batch_forget(&mut self, _req: &Request, nodes: &[fuse_forget_one]) {
+        tracing::debug!("FUSE::batch_forget: {} nodes", nodes.len());
+        let fs = self.fs.clone();
+        let nodes_vec: Vec<(i64, u64)> =
+            nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
+        self.runtime.block_on(async move {
+            for (ino, nlookup) in nodes_vec {
+                fs.forget(ino, nlookup).await;
+            }
+        });
+    }
 }
 
 impl AgentFSFuse {
@@ -1245,71 +1042,13 @@ impl AgentFSFuse {
     ///
     /// The provided Tokio runtime is used to execute async FileSystem operations
     /// from within synchronous FUSE callbacks via `block_on`.
-    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime, mountpoint_path: PathBuf) -> Self {
+    fn new(fs: Arc<dyn FileSystem>, runtime: Runtime) -> Self {
         Self {
             fs,
             runtime,
-            path_cache: Arc::new(Mutex::new(HashMap::new())),
             open_files: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
-            mountpoint_path: mountpoint_path.as_os_str().to_string_lossy().to_string(),
         }
-    }
-
-    /// Resolve a full path from a parent inode and child name.
-    ///
-    /// Similar to the Linux kernel's dentry lookup (`d_lookup`), this method
-    /// reconstructs the full pathname by looking up the parent's path in our
-    /// inode-to-path cache and appending the child name.
-    ///
-    /// Returns `None` if the parent inode is not in the cache or the name
-    /// contains invalid UTF-8.
-    fn lookup_path(&self, parent_ino: u64, name: &OsStr) -> Option<String> {
-        let path_cache = self.path_cache.lock();
-        let parent_path = path_cache.get(&parent_ino)?;
-        let name_str = name.to_str()?;
-
-        let path = if parent_path == "/" {
-            format!("/{}", name_str)
-        } else {
-            format!("{}/{}", parent_path, name_str)
-        };
-
-        if path.starts_with(&self.mountpoint_path) {
-            // Cut the head off here so we never try to lookup anything that falls within
-            // our own mount inside our handlers by immediately returning ENOENT.
-            None
-        } else {
-            Some(path)
-        }
-    }
-
-    /// Retrieve a path from an inode number.
-    ///
-    /// Similar to the Linux kernel's `d_path()`, this performs the reverse
-    /// lookup from inode to pathname.
-    ///
-    /// Returns `None` if the inode is not in the cache.
-    fn get_path(&self, ino: u64) -> Option<String> {
-        self.path_cache.lock().get(&ino).cloned()
-    }
-
-    /// Add an inode → path mapping to the path cache.
-    ///
-    /// Similar to the Linux kernel's `d_add()`, this associates an inode
-    /// with its full pathname for later lookup.
-    fn add_path(&self, ino: u64, path: String) {
-        let mut path_cache = self.path_cache.lock();
-        path_cache.insert(ino, path);
-    }
-
-    /// Remove an inode from the path cache.
-    ///
-    /// Similar to the Linux kernel's `d_drop()`, this removes the inode's
-    /// pathname mapping when the file or directory is deleted or renamed.
-    fn drop_path(&self, ino: u64) {
-        let mut path_cache = self.path_cache.lock();
-        path_cache.remove(&ino);
     }
 
     /// Allocate a new file handle for tracking open files.
@@ -1401,9 +1140,11 @@ pub fn mount(
     opts: FuseMountOptions,
     runtime: Runtime,
 ) -> anyhow::Result<()> {
-    let fs = AgentFSFuse::new(fs, runtime, opts.mountpoint.clone());
+    // Raise fd limit to hard limit to prevent "too many open files" errors
+    // when passthrough filesystems cache O_PATH file descriptors
+    maximize_fd_limit();
 
-    fs.add_path(1, "/".to_string());
+    let fs = AgentFSFuse::new(fs, runtime);
 
     let mut mount_opts = vec![
         MountOption::FSName(opts.fsname),

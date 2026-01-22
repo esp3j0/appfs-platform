@@ -91,58 +91,84 @@ struct MutexFsAdapter {
 
 #[async_trait::async_trait]
 impl agentfs_sdk::FileSystem for MutexFsAdapter {
-    async fn stat(
+    async fn lookup(
         &self,
-        path: &str,
+        parent_ino: i64,
+        name: &str,
     ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.stat(path).await
+        self.inner.lock().await.lookup(parent_ino, name).await
     }
 
-    async fn lstat(
+    async fn getattr(
         &self,
-        path: &str,
+        ino: i64,
     ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.lstat(path).await
-    }
-
-    async fn read_file(
-        &self,
-        path: &str,
-    ) -> std::result::Result<Option<Vec<u8>>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.read_file(path).await
-    }
-
-    async fn readdir(
-        &self,
-        path: &str,
-    ) -> std::result::Result<Option<Vec<String>>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.readdir(path).await
-    }
-
-    async fn readdir_plus(
-        &self,
-        path: &str,
-    ) -> std::result::Result<Option<Vec<agentfs_sdk::DirEntry>>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.readdir_plus(path).await
+        self.inner.lock().await.getattr(ino).await
     }
 
     async fn readlink(
         &self,
-        path: &str,
+        ino: i64,
     ) -> std::result::Result<Option<String>, agentfs_sdk::error::Error> {
-        self.inner.lock().await.readlink(path).await
+        self.inner.lock().await.readlink(ino).await
+    }
+
+    async fn readdir(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<String>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir(ino).await
+    }
+
+    async fn readdir_plus(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<agentfs_sdk::DirEntry>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir_plus(ino).await
+    }
+
+    async fn chmod(
+        &self,
+        ino: i64,
+        mode: u32,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chmod(ino, mode).await
+    }
+
+    async fn chown(
+        &self,
+        ino: i64,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chown(ino, uid, gid).await
     }
 
     async fn open(
         &self,
-        path: &str,
+        ino: i64,
     ) -> std::result::Result<agentfs_sdk::BoxedFile, agentfs_sdk::error::Error> {
-        self.inner.lock().await.open(path).await
+        self.inner.lock().await.open(ino).await
+    }
+
+    async fn mkdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .mkdir(parent_ino, name, uid, gid)
+            .await
     }
 
     async fn create_file(
         &self,
-        path: &str,
+        parent_ino: i64,
+        name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
@@ -151,83 +177,82 @@ impl agentfs_sdk::FileSystem for MutexFsAdapter {
         self.inner
             .lock()
             .await
-            .create_file(path, mode, uid, gid)
+            .create_file(parent_ino, name, mode, uid, gid)
             .await
-    }
-
-    async fn mkdir(
-        &self,
-        path: &str,
-        uid: u32,
-        gid: u32,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.mkdir(path, uid, gid).await
     }
 
     async fn mknod(
         &self,
-        path: &str,
+        parent_ino: i64,
+        name: &str,
         mode: u32,
         rdev: u64,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
         self.inner
             .lock()
             .await
-            .mknod(path, mode, rdev, uid, gid)
+            .mknod(parent_ino, name, mode, rdev, uid, gid)
             .await
-    }
-
-    async fn remove(&self, path: &str) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.remove(path).await
-    }
-
-    async fn rename(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.rename(from, to).await
     }
 
     async fn symlink(
         &self,
+        parent_ino: i64,
+        name: &str,
         target: &str,
-        link_path: &str,
         uid: u32,
         gid: u32,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
         self.inner
             .lock()
             .await
-            .symlink(target, link_path, uid, gid)
+            .symlink(parent_ino, name, target, uid, gid)
             .await
+    }
+
+    async fn unlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.unlink(parent_ino, name).await
+    }
+
+    async fn rmdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.rmdir(parent_ino, name).await
     }
 
     async fn link(
         &self,
-        old_path: &str,
-        new_path: &str,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.link(old_path, new_path).await
+        ino: i64,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .link(ino, newparent_ino, newname)
+            .await
     }
 
-    async fn chmod(
+    async fn rename(
         &self,
-        path: &str,
-        mode: u32,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
     ) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.chmod(path, mode).await
-    }
-
-    async fn chown(
-        &self,
-        path: &str,
-        uid: Option<u32>,
-        gid: Option<u32>,
-    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
-        self.inner.lock().await.chown(path, uid, gid).await
+        self.inner
+            .lock()
+            .await
+            .rename(oldparent_ino, oldname, newparent_ino, newname)
+            .await
     }
 
     async fn statfs(
