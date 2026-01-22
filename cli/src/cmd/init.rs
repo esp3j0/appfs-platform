@@ -219,7 +219,7 @@ async fn run_init_cmd(
             .canonicalize()
             .context("Failed to canonicalize base path")?;
         let hostfs = HostFS::new(&canonical)?;
-        let overlay = OverlayFS::open(Arc::new(hostfs), agent.fs).await?;
+        let overlay = OverlayFS::new(Arc::new(hostfs), agent.fs);
         Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
     } else {
         Arc::new(Mutex::new(agent.fs)) as Arc<Mutex<dyn FileSystem + Send>>

@@ -19,6 +19,8 @@ use zerofs_nfsserve::vfs::{AuthContext, DirEntry, NFSFileSystem, ReadDirResult, 
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
+/// Filesystem root inode (for underlying filesystem operations)
+const FS_ROOT_INO: i64 = 1;
 
 /// Convert an SDK error to an NFS status code.
 ///
@@ -41,11 +43,13 @@ pub struct AgentNFS {
 
 /// Bidirectional mapping between inodes and paths.
 struct InodeMap {
-    /// Path to inode
+    /// Path to NFS inode
     path_to_ino: HashMap<String, fileid3>,
-    /// Inode to path
+    /// NFS inode to path
     ino_to_path: HashMap<fileid3, String>,
-    /// Next available inode number
+    /// NFS inode to underlying filesystem inode
+    ino_to_fs_ino: HashMap<fileid3, i64>,
+    /// Next available NFS inode number
     next_ino: fileid3,
 }
 
@@ -54,22 +58,27 @@ impl InodeMap {
         let mut map = InodeMap {
             path_to_ino: HashMap::new(),
             ino_to_path: HashMap::new(),
+            ino_to_fs_ino: HashMap::new(),
             next_ino: ROOT_INO + 1,
         };
         // Root directory is always inode 1
         map.path_to_ino.insert("/".to_string(), ROOT_INO);
         map.ino_to_path.insert(ROOT_INO, "/".to_string());
+        map.ino_to_fs_ino.insert(ROOT_INO, FS_ROOT_INO);
         map
     }
 
-    fn get_or_create_ino(&mut self, path: &str) -> fileid3 {
+    fn get_or_create_ino(&mut self, path: &str, fs_ino: i64) -> fileid3 {
         if let Some(&ino) = self.path_to_ino.get(path) {
+            // Update fs_ino mapping in case it changed
+            self.ino_to_fs_ino.insert(ino, fs_ino);
             return ino;
         }
         let ino = self.next_ino;
         self.next_ino += 1;
         self.path_to_ino.insert(path.to_string(), ino);
         self.ino_to_path.insert(ino, path.to_string());
+        self.ino_to_fs_ino.insert(ino, fs_ino);
         ino
     }
 
@@ -77,9 +86,14 @@ impl InodeMap {
         self.ino_to_path.get(&ino).cloned()
     }
 
+    fn get_fs_ino(&self, ino: fileid3) -> Option<i64> {
+        self.ino_to_fs_ino.get(&ino).copied()
+    }
+
     fn remove_path(&mut self, path: &str) {
         if let Some(ino) = self.path_to_ino.remove(path) {
             self.ino_to_path.remove(&ino);
+            self.ino_to_fs_ino.remove(&ino);
         }
     }
 
@@ -106,6 +120,29 @@ impl AgentNFS {
             fs,
             inode_map: RwLock::new(InodeMap::new()),
         }
+    }
+
+    /// Resolve a path to a filesystem inode by walking from root.
+    async fn resolve_path_to_fs_ino(
+        &self,
+        fs: &tokio::sync::MutexGuard<'_, dyn FileSystem>,
+        path: &str,
+    ) -> Result<i64, nfsstat3> {
+        if path == "/" {
+            return Ok(FS_ROOT_INO);
+        }
+
+        let mut current_ino = FS_ROOT_INO;
+        for component in path.split('/').filter(|s| !s.is_empty()) {
+            let stats = fs
+                .lookup(current_ino, component)
+                .await
+                .map_err(error_to_nfsstat)?
+                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            current_ino = stats.ino;
+        }
+
+        Ok(current_ino)
     }
 
     /// Check if the given auth context has the requested permission on a file.
@@ -184,12 +221,21 @@ impl AgentNFS {
         }
     }
 
-    /// Get path for an inode, returning NOENT error if not found.
+    /// Get path for an NFS inode, returning NOENT error if not found.
     async fn get_path(&self, ino: fileid3) -> Result<String, nfsstat3> {
         self.inode_map
             .read()
             .await
             .get_path(ino)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)
+    }
+
+    /// Get filesystem inode for an NFS inode.
+    async fn get_fs_ino(&self, ino: fileid3) -> Result<i64, nfsstat3> {
+        self.inode_map
+            .read()
+            .await
+            .get_fs_ino(ino)
             .ok_or(nfsstat3::NFS3ERR_NOENT)
     }
 
@@ -238,6 +284,7 @@ impl NFSFileSystem for AgentNFS {
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
         // Handle . and ..
@@ -246,43 +293,53 @@ impl NFSFileSystem for AgentNFS {
         }
         if name == ".." {
             let parent_path = Self::parent_path(&dir_path);
-            return Ok(self.inode_map.write().await.get_or_create_ino(&parent_path));
+            let fs = self.fs.lock().await;
+            let parent_fs_ino = self.resolve_path_to_fs_ino(&fs, &parent_path).await?;
+            drop(fs);
+            return Ok(self
+                .inode_map
+                .write()
+                .await
+                .get_or_create_ino(&parent_path, parent_fs_ino));
         }
 
         let full_path = Self::join_path(&dir_path, name);
 
-        // Lock filesystem for the duration of these operations
+        // Lock filesystem for the lookup
         let fs = self.fs.lock().await;
-
-        // Check if path exists
-        let stats = fs
-            .lstat(&full_path)
-            .await
-            .map_err(error_to_nfsstat)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         // Verify parent is a directory
         let dir_stats = fs
-            .lstat(&dir_path)
+            .getattr(dir_fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-
-        drop(fs); // Release lock before acquiring inode_map lock
 
         if !dir_stats.is_directory() {
             return Err(nfsstat3::NFS3ERR_NOTDIR);
         }
 
-        let _ = stats; // We just needed to verify it exists
-        Ok(self.inode_map.write().await.get_or_create_ino(&full_path))
+        // Lookup the entry
+        let stats = fs
+            .lookup(dir_fs_ino, name)
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        drop(fs);
+
+        Ok(self
+            .inode_map
+            .write()
+            .await
+            .get_or_create_ino(&full_path, stats.ino))
     }
 
     async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let path = self.get_path(id).await?;
+        let fs_ino = self.get_fs_ino(id).await?;
         let fs = self.fs.lock().await;
         let stats = fs
-            .lstat(&path)
+            .getattr(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -296,12 +353,12 @@ impl NFSFileSystem for AgentNFS {
         id: fileid3,
         setattr: sattr3,
     ) -> Result<fattr3, nfsstat3> {
-        let path = self.get_path(id).await?;
+        let fs_ino = self.get_fs_ino(id).await?;
         let fs = self.fs.lock().await;
 
         // Get current stats for permission checking
         let stats = fs
-            .lstat(&path)
+            .getattr(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -311,7 +368,7 @@ impl NFSFileSystem for AgentNFS {
             if !Self::can_modify_attrs(auth, &stats) {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
-            fs.chmod(&path, mode).await.map_err(error_to_nfsstat)?;
+            fs.chmod(fs_ino, mode).await.map_err(error_to_nfsstat)?;
         }
 
         // Handle chown (uid/gid change) - only root can change uid, owner can change gid to own group
@@ -339,7 +396,7 @@ impl NFSFileSystem for AgentNFS {
                     return Err(nfsstat3::NFS3ERR_ACCES);
                 }
             }
-            fs.chown(&path, new_uid, new_gid)
+            fs.chown(fs_ino, new_uid, new_gid)
                 .await
                 .map_err(error_to_nfsstat)?;
         }
@@ -349,7 +406,7 @@ impl NFSFileSystem for AgentNFS {
             if !Self::check_permission(auth, &stats, Permission::Write) {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
-            let file = fs.open(&path).await.map_err(error_to_nfsstat)?;
+            let file = fs.open(fs_ino).await.map_err(error_to_nfsstat)?;
             file.truncate(size).await.map_err(error_to_nfsstat)?;
         }
 
@@ -364,12 +421,12 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let path = self.get_path(id).await?;
+        let fs_ino = self.get_fs_ino(id).await?;
         let fs = self.fs.lock().await;
 
         // Check read permission
         let stats = fs
-            .lstat(&path)
+            .getattr(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -378,7 +435,7 @@ impl NFSFileSystem for AgentNFS {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
 
-        let file = fs.open(&path).await.map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let file = fs.open(fs_ino).await.map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         let data = file
             .pread(offset, count as u64)
             .await
@@ -398,14 +455,14 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3> {
-        let path = self.get_path(id).await?;
+        let fs_ino = self.get_fs_ino(id).await?;
 
         {
             let fs = self.fs.lock().await;
 
             // Check write permission
             let stats = fs
-                .lstat(&path)
+                .getattr(fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -414,7 +471,7 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            let file = fs.open(&path).await.map_err(error_to_nfsstat)?;
+            let file = fs.open(fs_ino).await.map_err(error_to_nfsstat)?;
             file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
         }
 
@@ -429,14 +486,15 @@ impl NFSFileSystem for AgentNFS {
         _attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let full_path = Self::join_path(&dir_path, name);
 
         // Check write permission on parent directory
-        {
+        let new_fs_ino = {
             let fs = self.fs.lock().await;
             let dir_stats = fs
-                .lstat(&dir_path)
+                .getattr(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -446,13 +504,18 @@ impl NFSFileSystem for AgentNFS {
             }
 
             // Create file with caller's uid/gid
-            let _ = fs
-                .create_file(&full_path, S_IFREG | 0o644, auth.uid, auth.gid)
+            let (stats, _file) = fs
+                .create_file(dir_fs_ino, name, S_IFREG | 0o644, auth.uid, auth.gid)
                 .await
                 .map_err(error_to_nfsstat)?;
-        }
+            stats.ino
+        };
 
-        let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
+        let ino = self
+            .inode_map
+            .write()
+            .await
+            .get_or_create_ino(&full_path, new_fs_ino);
         let attr = self.getattr(auth, ino).await?;
         Ok((ino, attr))
     }
@@ -464,6 +527,7 @@ impl NFSFileSystem for AgentNFS {
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let full_path = Self::join_path(&dir_path, name);
 
@@ -471,7 +535,7 @@ impl NFSFileSystem for AgentNFS {
 
         // Check write permission on parent directory
         let dir_stats = fs
-            .lstat(&dir_path)
+            .getattr(dir_fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -482,7 +546,7 @@ impl NFSFileSystem for AgentNFS {
 
         // Check if file already exists
         if fs
-            .lstat(&full_path)
+            .lookup(dir_fs_ino, name)
             .await
             .map_err(error_to_nfsstat)?
             .is_some()
@@ -491,13 +555,17 @@ impl NFSFileSystem for AgentNFS {
         }
 
         // Create file with caller's uid/gid
-        let _ = fs
-            .create_file(&full_path, S_IFREG | 0o644, auth.uid, auth.gid)
+        let (stats, _file) = fs
+            .create_file(dir_fs_ino, name, S_IFREG | 0o644, auth.uid, auth.gid)
             .await
             .map_err(error_to_nfsstat)?;
 
         drop(fs);
-        Ok(self.inode_map.write().await.get_or_create_ino(&full_path))
+        Ok(self
+            .inode_map
+            .write()
+            .await
+            .get_or_create_ino(&full_path, stats.ino))
     }
 
     async fn mkdir(
@@ -508,15 +576,16 @@ impl NFSFileSystem for AgentNFS {
         _attrs: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(dirname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let full_path = Self::join_path(&dir_path, name);
 
-        {
+        let new_fs_ino = {
             let fs = self.fs.lock().await;
 
             // Check write permission on parent directory
             let dir_stats = fs
-                .lstat(&dir_path)
+                .getattr(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -525,12 +594,18 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            fs.mkdir(&full_path, auth.uid, auth.gid)
+            let stats = fs
+                .mkdir(dir_fs_ino, name, auth.uid, auth.gid)
                 .await
                 .map_err(error_to_nfsstat)?;
-        }
+            stats.ino
+        };
 
-        let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
+        let ino = self
+            .inode_map
+            .write()
+            .await
+            .get_or_create_ino(&full_path, new_fs_ino);
         let attr = self.getattr(auth, ino).await?;
         Ok((ino, attr))
     }
@@ -542,6 +617,7 @@ impl NFSFileSystem for AgentNFS {
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let full_path = Self::join_path(&dir_path, name);
 
@@ -550,7 +626,7 @@ impl NFSFileSystem for AgentNFS {
 
             // Check write permission on parent directory
             let dir_stats = fs
-                .lstat(&dir_path)
+                .getattr(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -559,7 +635,20 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            fs.remove(&full_path).await.map_err(error_to_nfsstat)?;
+            // Check if it's a file or directory and use appropriate method
+            let stats = fs
+                .lookup(dir_fs_ino, name)
+                .await
+                .map_err(error_to_nfsstat)?
+                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+            if stats.is_directory() {
+                fs.rmdir(dir_fs_ino, name).await.map_err(error_to_nfsstat)?;
+            } else {
+                fs.unlink(dir_fs_ino, name)
+                    .await
+                    .map_err(error_to_nfsstat)?;
+            }
         }
 
         self.inode_map.write().await.remove_path(&full_path);
@@ -575,7 +664,9 @@ impl NFSFileSystem for AgentNFS {
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
         let from_dir = self.get_path(from_dirid).await?;
+        let from_dir_fs_ino = self.get_fs_ino(from_dirid).await?;
         let to_dir = self.get_path(to_dirid).await?;
+        let to_dir_fs_ino = self.get_fs_ino(to_dirid).await?;
         let from_name = std::str::from_utf8(from_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let to_name = std::str::from_utf8(to_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
@@ -587,7 +678,7 @@ impl NFSFileSystem for AgentNFS {
 
             // Check write permission on source directory
             let from_dir_stats = fs
-                .lstat(&from_dir)
+                .getattr(from_dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -598,7 +689,7 @@ impl NFSFileSystem for AgentNFS {
 
             // Check write permission on destination directory
             let to_dir_stats = fs
-                .lstat(&to_dir)
+                .getattr(to_dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -607,7 +698,7 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            fs.rename(&from_path, &to_path)
+            fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
                 .await
                 .map_err(error_to_nfsstat)?;
         }
@@ -627,13 +718,14 @@ impl NFSFileSystem for AgentNFS {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
 
         let entries = {
             let fs = self.fs.lock().await;
 
             // Check read+execute permission on directory
             let dir_stats = fs
-                .lstat(&dir_path)
+                .getattr(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -644,7 +736,7 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            fs.readdir_plus(&dir_path)
+            fs.readdir_plus(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?
@@ -661,7 +753,11 @@ impl NFSFileSystem for AgentNFS {
 
         for (idx, entry) in entries.iter().enumerate() {
             let entry_path = Self::join_path(&dir_path, &entry.name);
-            let ino = self.inode_map.write().await.get_or_create_ino(&entry_path);
+            let ino = self
+                .inode_map
+                .write()
+                .await
+                .get_or_create_ino(&entry_path, entry.stats.ino);
 
             if skip {
                 if ino == start_after {
@@ -698,16 +794,17 @@ impl NFSFileSystem for AgentNFS {
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dir_path = self.get_path(dirid).await?;
+        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(linkname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let target = std::str::from_utf8(symlink).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let full_path = Self::join_path(&dir_path, name);
 
-        {
+        let new_fs_ino = {
             let fs = self.fs.lock().await;
 
             // Check write permission on parent directory
             let dir_stats = fs
-                .lstat(&dir_path)
+                .getattr(dir_fs_ino)
                 .await
                 .map_err(error_to_nfsstat)?
                 .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -716,24 +813,30 @@ impl NFSFileSystem for AgentNFS {
                 return Err(nfsstat3::NFS3ERR_ACCES);
             }
 
-            fs.symlink(target, &full_path, auth.uid, auth.gid)
+            let stats = fs
+                .symlink(dir_fs_ino, name, target, auth.uid, auth.gid)
                 .await
                 .map_err(error_to_nfsstat)?;
-        }
+            stats.ino
+        };
 
-        let ino = self.inode_map.write().await.get_or_create_ino(&full_path);
+        let ino = self
+            .inode_map
+            .write()
+            .await
+            .get_or_create_ino(&full_path, new_fs_ino);
         let attr = self.getattr(auth, ino).await?;
         Ok((ino, attr))
     }
 
     async fn readlink(&self, auth: &AuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let path = self.get_path(id).await?;
+        let fs_ino = self.get_fs_ino(id).await?;
 
         let fs = self.fs.lock().await;
 
         // Check read permission on the symlink
         let stats = fs
-            .lstat(&path)
+            .getattr(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -743,7 +846,7 @@ impl NFSFileSystem for AgentNFS {
         }
 
         let target = fs
-            .readlink(&path)
+            .readlink(fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -771,8 +874,9 @@ impl NFSFileSystem for AgentNFS {
         linkdirid: fileid3,
         linkname: &filename3,
     ) -> Result<(), nfsstat3> {
-        let file_path = self.get_path(fileid).await?;
+        let file_fs_ino = self.get_fs_ino(fileid).await?;
         let link_dir_path = self.get_path(linkdirid).await?;
+        let link_dir_fs_ino = self.get_fs_ino(linkdirid).await?;
         let name = std::str::from_utf8(linkname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let link_path = Self::join_path(&link_dir_path, name);
 
@@ -780,7 +884,7 @@ impl NFSFileSystem for AgentNFS {
 
         // Check write permission on target directory
         let dir_stats = fs
-            .lstat(&link_dir_path)
+            .getattr(link_dir_fs_ino)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -789,12 +893,16 @@ impl NFSFileSystem for AgentNFS {
             return Err(nfsstat3::NFS3ERR_ACCES);
         }
 
-        fs.link(&file_path, &link_path)
+        let stats = fs
+            .link(file_fs_ino, link_dir_fs_ino, name)
             .await
             .map_err(error_to_nfsstat)?;
 
         drop(fs);
-        self.inode_map.write().await.get_or_create_ino(&link_path);
+        self.inode_map
+            .write()
+            .await
+            .get_or_create_ino(&link_path, stats.ino);
         Ok(())
     }
 }

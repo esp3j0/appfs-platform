@@ -86,6 +86,29 @@ pub struct AgentFSFile {
 impl File for AgentFSFile {
     async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
         let conn = self.pool.get_connection().await?;
+
+        // Get the file size to avoid returning data beyond EOF
+        let mut size_stmt = conn
+            .prepare_cached("SELECT size FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut size_rows = size_stmt.query((self.ino,)).await?;
+        let file_size = if let Some(row) = size_rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        // If offset is at or beyond EOF, return empty
+        if offset >= file_size {
+            return Ok(Vec::new());
+        }
+
+        // Limit size to not exceed EOF
+        let size = std::cmp::min(size, file_size - offset);
+
         let chunk_size = self.chunk_size as u64;
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + size).saturating_sub(1) / chunk_size;
@@ -681,6 +704,21 @@ impl AgentFS {
             Ok(nlink as u32)
         } else {
             Ok(0)
+        }
+    }
+
+    /// Get file attributes by inode using an existing connection
+    async fn getattr_with_conn(&self, conn: &Connection, ino: i64) -> Result<Option<Stats>> {
+        let mut stmt = conn
+            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let stats = Self::build_stats_from_row(&row)?;
+            Ok(Some(stats))
+        } else {
+            Ok(None)
         }
     }
 
@@ -1599,13 +1637,8 @@ impl AgentFS {
     }
 
     /// List directory contents
-    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
+    pub async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
         let conn = self.pool.get_connection().await?;
-        let ino = match self.resolve_path_with_conn(&conn, path).await? {
-            Some(ino) => ino,
-            None => return Ok(None),
-        };
-
         let mut rows = conn
             .query(
                 "SELECT name FROM fs_dentry WHERE parent_ino = ? ORDER BY name",
@@ -1637,13 +1670,8 @@ impl AgentFS {
     /// List directory contents with full statistics (optimized batch query)
     ///
     /// Returns entries with their stats in a single JOIN query, avoiding N+1 queries.
-    pub async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
+    pub async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
         let conn = self.pool.get_connection().await?;
-        let ino = match self.resolve_path_with_conn(&conn, path).await? {
-            Some(ino) => ino,
-            None => return Ok(None),
-        };
-
         let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev
             FROM fs_dentry d
             JOIN fs_inode i ON d.ino = i.ino
@@ -2041,60 +2069,16 @@ impl AgentFS {
         Ok(())
     }
 
-    /// Change file mode/permissions.
-    ///
-    /// Only modifies the permission bits (lower 12 bits), preserving the file type.
-    pub async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
-        let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-
-        let ino = self
-            .resolve_path_with_conn(&conn, &path)
-            .await?
-            .ok_or(FsError::NotFound)?;
-
-        // Get current mode to preserve file type bits
-        let mut stmt = conn
-            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
-            .await?;
-        let mut rows = stmt.query((ino,)).await?;
-
-        let current_mode = if let Some(row) = rows.next().await? {
-            row.get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32
-        } else {
-            return Err(FsError::NotFound.into());
-        };
-
-        // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
-        let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
-
-        let mut stmt = conn
-            .prepare_cached("UPDATE fs_inode SET mode = ? WHERE ino = ?")
-            .await?;
-        stmt.execute((new_mode as i64, ino)).await?;
-
-        Ok(())
-    }
-
     /// Change file ownership
     ///
     /// Changes the user and/or group ownership of a file.
     /// Pass None for uid or gid to leave that value unchanged.
-    pub async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    pub async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
         if uid.is_none() && gid.is_none() {
             return Ok(());
         }
 
         let conn = self.pool.get_connection().await?;
-        let path = self.normalize_path(path);
-
-        let ino = self
-            .resolve_path_with_conn(&conn, &path)
-            .await?
-            .ok_or(FsError::NotFound)?;
 
         // Build the update query dynamically based on which values are provided
         let mut updates = Vec::new();
@@ -2395,78 +2379,922 @@ impl AgentFS {
 
 #[async_trait]
 impl FileSystem for AgentFS {
-    async fn stat(&self, path: &str) -> Result<Option<Stats>> {
-        AgentFS::stat(self, path).await
+    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
+        let conn = self.pool.get_connection().await?;
+
+        // Look up the child inode
+        let child_ino = match self.lookup_child(&conn, parent_ino, name).await? {
+            Some(ino) => ino,
+            None => return Ok(None),
+        };
+
+        // Get stats for the child inode
+        let mut stmt = conn
+            .prepare_cached("SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((child_ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let stats = Self::build_stats_from_row(&row)?;
+            // Cache the lookup result
+            self.dentry_cache.insert(parent_ino, name, child_ino);
+            Ok(Some(stats))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn lstat(&self, path: &str) -> Result<Option<Stats>> {
-        AgentFS::lstat(self, path).await
+    async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
+        let conn = self.pool.get_connection().await?;
+        self.getattr_with_conn(&conn, ino).await
     }
 
-    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        AgentFS::read_file(self, path).await
+    async fn readlink(&self, ino: i64) -> Result<Option<String>> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if the inode exists and is a symlink
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) != S_IFLNK {
+                return Err(FsError::NotASymlink.into());
+            }
+        } else {
+            return Ok(None);
+        }
+
+        // Read target from fs_symlink table
+        let mut stmt = conn
+            .prepare_cached("SELECT target FROM fs_symlink WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let target = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| match v {
+                    Value::Text(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .ok_or(FsError::InvalidPath)?;
+            Ok(Some(target))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn readdir(&self, path: &str) -> Result<Option<Vec<String>>> {
-        AgentFS::readdir(self, path).await
+    async fn readdir(&self, ino: i64) -> Result<Option<Vec<String>>> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if inode exists and is a directory
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) != super::S_IFDIR {
+                return Err(FsError::NotADirectory.into());
+            }
+        } else {
+            return Ok(None);
+        }
+
+        let mut stmt = conn
+            .prepare_cached("SELECT name FROM fs_dentry WHERE parent_ino = ? ORDER BY name")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            if !name.is_empty() {
+                entries.push(name);
+            }
+        }
+
+        Ok(Some(entries))
     }
 
-    async fn readdir_plus(&self, path: &str) -> Result<Option<Vec<DirEntry>>> {
-        AgentFS::readdir_plus(self, path).await
+    async fn readdir_plus(&self, ino: i64) -> Result<Option<Vec<DirEntry>>> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if inode exists and is a directory
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) != super::S_IFDIR {
+                return Err(FsError::NotADirectory.into());
+            }
+        } else {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare_cached("SELECT d.name, i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime, i.rdev
+            FROM fs_dentry d
+            JOIN fs_inode i ON d.ino = i.ino
+            WHERE d.parent_ino = ?
+            ORDER BY d.name"
+        ).await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            let entry_ino = row
+                .get_value(1)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+
+            let stats = Stats {
+                ino: entry_ino,
+                mode: row
+                    .get_value(2)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                nlink: row
+                    .get_value(3)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(1) as u32,
+                uid: row
+                    .get_value(4)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                gid: row
+                    .get_value(5)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u32,
+                size: row
+                    .get_value(6)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                atime: row
+                    .get_value(7)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                mtime: row
+                    .get_value(8)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                ctime: row
+                    .get_value(9)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+                rdev: row
+                    .get_value(10)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0) as u64,
+            };
+
+            entries.push(DirEntry { name, stats });
+        }
+
+        Ok(Some(entries))
     }
 
-    async fn mkdir(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
-        AgentFS::mkdir(self, path, uid, gid).await
+    async fn chmod(&self, ino: i64, mode: u32) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+
+        // Get current mode to preserve file type bits
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        let current_mode = if let Some(row) = rows.next().await? {
+            row.get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32
+        } else {
+            return Err(FsError::NotFound.into());
+        };
+
+        // Preserve file type bits (upper bits), replace permission bits (lower 12 bits)
+        let new_mode = (current_mode & S_IFMT) | (mode & 0o7777);
+
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET mode = ? WHERE ino = ?")
+            .await?;
+        stmt.execute((new_mode as i64, ino)).await?;
+
+        Ok(())
     }
 
-    async fn remove(&self, path: &str) -> Result<()> {
-        AgentFS::remove(self, path).await
+    async fn chown(&self, ino: i64, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        if uid.is_none() && gid.is_none() {
+            return Ok(());
+        }
+
+        let conn = self.pool.get_connection().await?;
+
+        // Verify inode exists
+        let mut stmt = conn
+            .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if rows.next().await?.is_none() {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Build the update query dynamically based on which values are provided
+        let mut updates = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
+        if let Some(uid) = uid {
+            updates.push("uid = ?");
+            values.push(Value::Integer(uid as i64));
+        }
+        if let Some(gid) = gid {
+            updates.push("gid = ?");
+            values.push(Value::Integer(gid as i64));
+        }
+
+        values.push(Value::Integer(ino));
+        let sql = format!("UPDATE fs_inode SET {} WHERE ino = ?", updates.join(", "));
+        conn.execute(&sql, values).await?;
+
+        Ok(())
     }
 
-    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
-        AgentFS::chmod(self, path, mode).await
+    async fn open(&self, ino: i64) -> Result<BoxedFile> {
+        let conn = self.pool.get_connection().await?;
+
+        // Verify inode exists
+        let mut stmt = conn
+            .prepare_cached("SELECT ino FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if rows.next().await?.is_none() {
+            return Err(FsError::NotFound.into());
+        }
+
+        Ok(Arc::new(AgentFSFile {
+            pool: self.pool.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+        }))
     }
 
-    async fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-        AgentFS::chown(self, path, uid, gid).await
-    }
+    async fn mkdir(&self, parent_ino: i64, name: &str, uid: u32, gid: u32) -> Result<Stats> {
+        let conn = self.pool.get_connection().await?;
 
-    async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        AgentFS::rename(self, from, to).await
-    }
+        // Check if already exists
+        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
 
-    async fn symlink(&self, target: &str, linkpath: &str, uid: u32, gid: u32) -> Result<()> {
-        AgentFS::symlink(self, target, linkpath, uid, gid).await
-    }
+        // Create inode
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
+                VALUES (?, ?, ?, 0, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let row = stmt
+            .query_row((DEFAULT_DIR_MODE as i64, uid, gid, now, now, now))
+            .await?;
 
-    async fn link(&self, oldpath: &str, newpath: &str) -> Result<()> {
-        AgentFS::link(self, oldpath, newpath).await
-    }
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
 
-    async fn readlink(&self, path: &str) -> Result<Option<String>> {
-        AgentFS::readlink(self, path).await
-    }
+        // Create directory entry
+        let mut stmt = conn
+            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+            .await?;
+        stmt.execute((name, parent_ino, ino)).await?;
 
-    async fn statfs(&self) -> Result<FilesystemStats> {
-        AgentFS::statfs(self).await
-    }
+        // Increment link count
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
+            .await?;
+        stmt.execute((ino,)).await?;
 
-    async fn mknod(&self, path: &str, mode: u32, rdev: u64, uid: u32, gid: u32) -> Result<()> {
-        AgentFS::mknod(self, path, mode, rdev, uid, gid).await
-    }
+        // Populate dentry cache
+        self.dentry_cache.insert(parent_ino, name, ino);
 
-    async fn open(&self, path: &str) -> Result<BoxedFile> {
-        AgentFS::open(self, path).await
+        Ok(Stats {
+            ino,
+            mode: DEFAULT_DIR_MODE,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            rdev: 0,
+        })
     }
 
     async fn create_file(
         &self,
-        path: &str,
+        parent_ino: i64,
+        name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
     ) -> Result<(Stats, BoxedFile)> {
-        AgentFS::create_file(self, path, mode, uid, gid).await
+        let conn = self.pool.get_connection().await?;
+
+        // Check if already exists
+        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
+
+        // Prepare statements before starting the transaction
+        let mut inode_stmt = conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime)
+                 VALUES (?, 1, ?, ?, 0, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let mut dentry_stmt = conn
+            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+            .await?;
+
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let file_mode = S_IFREG | (mode & 0o7777);
+
+        let row = inode_stmt
+            .query_row((file_mode as i64, uid, gid, now, now, now))
+            .await?;
+
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+        dentry_stmt.execute((name, parent_ino, ino)).await?;
+
+        txn.commit().await?;
+
+        self.dentry_cache.insert(parent_ino, name, ino);
+
+        let stats = Stats {
+            ino,
+            mode: file_mode,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            rdev: 0,
+        };
+
+        let file: BoxedFile = Arc::new(AgentFSFile {
+            pool: self.pool.clone(),
+            ino,
+            chunk_size: self.chunk_size,
+        });
+
+        Ok((stats, file))
+    }
+
+    async fn mknod(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Stats> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if already exists
+        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
+
+        // Create inode with mode and rdev
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime, rdev)
+                VALUES (?, ?, ?, 0, ?, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let row = stmt
+            .query_row((mode as i64, uid, gid, now, now, now, rdev as i64))
+            .await?;
+
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+        // Create directory entry
+        let mut stmt = conn
+            .prepare_cached("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)")
+            .await?;
+        stmt.execute((name, parent_ino, ino)).await?;
+
+        // Increment link count
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?")
+            .await?;
+        stmt.execute((ino,)).await?;
+
+        // Populate dentry cache
+        self.dentry_cache.insert(parent_ino, name, ino);
+
+        Ok(Stats {
+            ino,
+            mode,
+            nlink: 1,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            rdev,
+        })
+    }
+
+    async fn symlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Stats> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if entry already exists
+        if self.lookup_child(&conn, parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
+
+        // Create inode for symlink
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let mode = S_IFLNK | 0o777; // Symlinks typically have 777 permissions
+        let size = target.len() as i64;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
+                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING ino",
+            )
+            .await?;
+        let row = stmt
+            .query_row((mode, uid, gid, size, now, now, now))
+            .await?;
+
+        let ino = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .ok_or_else(|| Error::Internal("failed to get inode".to_string()))?;
+
+        // Store symlink target
+        conn.execute(
+            "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)",
+            (ino, target),
+        )
+        .await?;
+
+        // Create directory entry
+        conn.execute(
+            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+            (name, parent_ino, ino),
+        )
+        .await?;
+
+        // Increment link count
+        conn.execute(
+            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+            (ino,),
+        )
+        .await?;
+
+        // Populate dentry cache
+        self.dentry_cache.insert(parent_ino, name, ino);
+
+        Ok(Stats {
+            ino,
+            mode,
+            nlink: 1,
+            uid,
+            gid,
+            size,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            rdev: 0,
+        })
+    }
+
+    async fn unlink(&self, parent_ino: i64, name: &str) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+
+        // Look up the child inode
+        let ino = self
+            .lookup_child(&conn, parent_ino, name)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        // Check if it's a directory (use rmdir for directories)
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) == super::S_IFDIR {
+                return Err(FsError::IsADirectory.into());
+            }
+        }
+
+        // Delete the directory entry
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+            .await?;
+        stmt.execute((parent_ino, name)).await?;
+
+        // Invalidate cache
+        self.dentry_cache.remove(parent_ino, name);
+
+        // Decrement link count
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+            .await?;
+        stmt.execute((ino,)).await?;
+
+        // Check if this was the last link to the inode
+        let link_count = self.get_link_count(&conn, ino).await?;
+        if link_count == 0 {
+            // Delete data blocks
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+
+            // Delete symlink if exists
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+
+            // Delete inode
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+
+        // Look up the child inode
+        let ino = self
+            .lookup_child(&conn, parent_ino, name)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        if ino == ROOT_INO {
+            return Err(FsError::RootOperation.into());
+        }
+
+        // Check if it's a directory
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) != super::S_IFDIR {
+                return Err(FsError::NotADirectory.into());
+            }
+        } else {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Check if directory is empty
+        let mut stmt = conn
+            .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let count = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            if count > 0 {
+                return Err(FsError::NotEmpty.into());
+            }
+        }
+
+        // Delete the directory entry
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+            .await?;
+        stmt.execute((parent_ino, name)).await?;
+
+        // Invalidate cache
+        self.dentry_cache.remove(parent_ino, name);
+
+        // Decrement link count
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+            .await?;
+        stmt.execute((ino,)).await?;
+
+        // Delete inode (directories have nlink = 1 when empty)
+        let link_count = self.get_link_count(&conn, ino).await?;
+        if link_count == 0 {
+            let mut stmt = conn
+                .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                .await?;
+            stmt.execute((ino,)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn link(&self, ino: i64, newparent_ino: i64, newname: &str) -> Result<Stats> {
+        let conn = self.pool.get_connection().await?;
+
+        // Check if source inode exists and is not a directory
+        let mut stmt = conn
+            .prepare_cached("SELECT mode FROM fs_inode WHERE ino = ?")
+            .await?;
+        let mut rows = stmt.query((ino,)).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mode = row
+                .get_value(0)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0) as u32;
+
+            if (mode & S_IFMT) == super::S_IFDIR {
+                return Err(FsError::IsADirectory.into());
+            }
+        } else {
+            return Err(FsError::NotFound.into());
+        }
+
+        // Check if destination already exists
+        if self
+            .lookup_child(&conn, newparent_ino, newname)
+            .await?
+            .is_some()
+        {
+            return Err(FsError::AlreadyExists.into());
+        }
+
+        // Create directory entry pointing to the same inode
+        conn.execute(
+            "INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, ?, ?)",
+            (newname, newparent_ino, ino),
+        )
+        .await?;
+
+        // Increment link count
+        conn.execute(
+            "UPDATE fs_inode SET nlink = nlink + 1 WHERE ino = ?",
+            (ino,),
+        )
+        .await?;
+
+        // Populate dentry cache
+        self.dentry_cache.insert(newparent_ino, newname, ino);
+
+        // Return updated stats
+        self.getattr_with_conn(&conn, ino)
+            .await?
+            .ok_or(FsError::NotFound.into())
+    }
+
+    async fn rename(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> Result<()> {
+        let conn = self.pool.get_connection().await?;
+
+        // Get source inode
+        let src_ino = self
+            .lookup_child(&conn, oldparent_ino, oldname)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        if src_ino == ROOT_INO {
+            return Err(FsError::RootOperation.into());
+        }
+
+        // Get source stats to check if it's a directory
+        let src_stats = self
+            .getattr_with_conn(&conn, src_ino)
+            .await?
+            .ok_or(FsError::NotFound)?;
+
+        let txn = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+
+        let result: Result<()> = async {
+            // Check if destination exists
+            if let Some(dst_ino) = self.lookup_child(&conn, newparent_ino, newname).await? {
+                let dst_stats = self.getattr_with_conn(&conn, dst_ino).await?.ok_or(FsError::NotFound)?;
+
+                // Can't replace directory with non-directory
+                if dst_stats.is_directory() && !src_stats.is_directory() {
+                    return Err(FsError::IsADirectory.into());
+                }
+
+                // Can't replace non-directory with directory
+                if !dst_stats.is_directory() && src_stats.is_directory() {
+                    return Err(FsError::NotADirectory.into());
+                }
+
+                // If destination is directory, it must be empty
+                if dst_stats.is_directory() {
+                    let mut stmt = conn
+                        .prepare_cached("SELECT COUNT(*) FROM fs_dentry WHERE parent_ino = ?")
+                        .await?;
+                    let mut rows = stmt.query((dst_ino,)).await?;
+
+                    if let Some(row) = rows.next().await? {
+                        let count = row
+                            .get_value(0)
+                            .ok()
+                            .and_then(|v| v.as_integer().copied())
+                            .unwrap_or(0);
+                        if count > 0 {
+                            return Err(FsError::NotEmpty.into());
+                        }
+                    }
+                }
+
+                // Remove destination entry
+                let mut stmt = conn
+                    .prepare_cached("DELETE FROM fs_dentry WHERE parent_ino = ? AND name = ?")
+                    .await?;
+                stmt.execute((newparent_ino, newname)).await?;
+
+                // Decrement link count
+                let mut stmt = conn
+                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+                    .await?;
+                stmt.execute((dst_ino,)).await?;
+
+                // Clean up destination inode if no more links
+                let link_count = self.get_link_count(&conn, dst_ino).await?;
+                if link_count == 0 {
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_data WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_ino,)).await?;
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_symlink WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_ino,)).await?;
+                    let mut stmt = conn
+                        .prepare_cached("DELETE FROM fs_inode WHERE ino = ?")
+                        .await?;
+                    stmt.execute((dst_ino,)).await?;
+                }
+            }
+
+            // Update the dentry: change parent and/or name
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?",
+                )
+                .await?;
+            stmt.execute((newparent_ino, newname, oldparent_ino, oldname))
+                .await?;
+
+            // Update ctime of the inode
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET ctime = ? WHERE ino = ?")
+                .await?;
+            stmt.execute((now, src_ino)).await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+
+                // Invalidate cache for source and destination
+                self.dentry_cache.remove(oldparent_ino, oldname);
+                self.dentry_cache.remove(newparent_ino, newname);
+
+                // Add new entry to cache (source inode is now at destination)
+                self.dentry_cache.insert(newparent_ino, newname, src_ino);
+
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn statfs(&self) -> Result<FilesystemStats> {
+        AgentFS::statfs(self).await
     }
 }
 
@@ -3541,6 +4369,7 @@ mod tests {
         file.pwrite(0, b"content").await?;
 
         let stats = fs.stat("/test.txt").await?.unwrap();
+        let ino = stats.ino;
         assert_eq!(
             stats.mode & 0o7777,
             0o644,
@@ -3548,7 +4377,7 @@ mod tests {
         );
 
         // Change to executable
-        fs.chmod("/test.txt", 0o755).await?;
+        fs.chmod(ino, 0o755).await?;
 
         let stats = fs.stat("/test.txt").await?.unwrap();
         assert_eq!(
@@ -3559,7 +4388,7 @@ mod tests {
         assert!(stats.is_file(), "Should still be a regular file");
 
         // Change to read-only
-        fs.chmod("/test.txt", 0o444).await?;
+        fs.chmod(ino, 0o444).await?;
 
         let stats = fs.stat("/test.txt").await?.unwrap();
         assert_eq!(
@@ -3576,15 +4405,16 @@ mod tests {
         let (fs, _dir) = create_test_fs().await?;
 
         // Create a regular file
-        let (_, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
+        let (file_stats, file) = fs.create_file("/file.txt", DEFAULT_FILE_MODE, 0, 0).await?;
         file.pwrite(0, b"content").await?;
-        fs.chmod("/file.txt", 0o755).await?;
+        fs.chmod(file_stats.ino, 0o755).await?;
         let stats = fs.stat("/file.txt").await?.unwrap();
         assert!(stats.is_file(), "Should remain a regular file after chmod");
 
         // Create a directory
         fs.mkdir("/dir", 0, 0).await?;
-        fs.chmod("/dir", 0o700).await?;
+        let dir_stats = fs.stat("/dir").await?.unwrap();
+        fs.chmod(dir_stats.ino, 0o700).await?;
         let stats = fs.stat("/dir").await?.unwrap();
         assert!(
             stats.is_directory(),
@@ -3599,8 +4429,9 @@ mod tests {
     async fn test_chmod_nonexistent_fails() -> Result<()> {
         let (fs, _dir) = create_test_fs().await?;
 
-        let result = fs.chmod("/nonexistent.txt", 0o755).await;
-        assert!(result.is_err(), "chmod on nonexistent file should fail");
+        // Use a non-existent inode
+        let result = fs.chmod(999999, 0o755).await;
+        assert!(result.is_err(), "chmod on nonexistent inode should fail");
 
         Ok(())
     }
@@ -3615,9 +4446,10 @@ mod tests {
             .await?;
         file.pwrite(0, b"content").await?;
         fs.symlink("/target.txt", "/link.txt", 0, 0).await?;
+        let link_stats = fs.lstat("/link.txt").await?.unwrap();
 
-        // chmod the symlink path (should work on the symlink inode)
-        fs.chmod("/link.txt", 0o755).await?;
+        // chmod the symlink (should work on the symlink inode)
+        fs.chmod(link_stats.ino, 0o755).await?;
 
         let stats = fs.lstat("/link.txt").await?.unwrap();
         assert!(stats.is_symlink(), "Should still be a symlink");

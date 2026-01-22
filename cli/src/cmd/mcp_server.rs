@@ -730,10 +730,18 @@ impl McpServer {
     async fn handle_readdir(&self, params: ReaddirParams) -> Result<String> {
         let path = normalize_path(&params.path)?;
 
+        let stats = self
+            .agentfs
+            .fs
+            .stat(&path)
+            .await
+            .context("Failed to stat directory")?
+            .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
+
         let entries = self
             .agentfs
             .fs
-            .readdir(&path)
+            .readdir(stats.ino)
             .await
             .context("Failed to read directory")?
             .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
@@ -853,7 +861,12 @@ impl McpServer {
         resources: &'a mut Vec<JsonValue>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let entries = match self.agentfs.fs.readdir(path).await? {
+            let dir_stats = match self.agentfs.fs.stat(path).await? {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            let entries = match self.agentfs.fs.readdir(dir_stats.ino).await? {
                 Some(entries) => entries,
                 None => return Ok(()),
             };
