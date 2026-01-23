@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agentfs-sandbox"
-version = "0.6.0-pre.1"
+version = "0.6.0-pre.2"
 dependencies = [
  "agentfs-sdk",
  "anyhow",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agentfs-sdk"
-version = "0.6.0-pre.1"
+version = "0.6.0-pre.2"
 dependencies = [
  "aegis",
  "async-trait",
@@ -321,9 +321,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.52"
+version = "1.2.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4932aefd12402b36c60956a4fe0035421f544799057659ff86f923657aada3"
+checksum = "755d2fce177175ffca841e9a06afdb2c4ab0f593d53b4dee48147dfaade85932"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -668,9 +668,9 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f449e6c6c08c865631d4890cfacf252b3d396c9bcc83adb6623cdb02a8336c41"
+checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
 
 [[package]]
 name = "flate2"
@@ -1896,9 +1896,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.105"
+version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
@@ -1968,9 +1968,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quote"
-version = "1.0.43"
+version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc74d9a594b72ae6656596548f56f667211f8a97b3d4c3d467150794690dc40a"
+checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
 dependencies = [
  "proc-macro2",
 ]
@@ -2087,7 +2087,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 [[package]]
 name = "reverie"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -2107,14 +2107,14 @@ dependencies = [
  "reverie-syscalls",
  "serde",
  "syscalls",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "typed-arena",
 ]
 
 [[package]]
 name = "reverie-memory"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "syscalls",
 ]
@@ -2122,7 +2122,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "bincode",
  "bitflags 2.10.0",
@@ -2132,14 +2132,14 @@ dependencies = [
  "nix",
  "serde",
  "syscalls",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
 [[package]]
 name = "reverie-ptrace"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2160,7 +2160,7 @@ dependencies = [
  "reverie",
  "safeptrace",
  "serde",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2171,7 +2171,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "bitflags 2.10.0",
  "derive_more",
@@ -2186,7 +2186,7 @@ dependencies = [
 [[package]]
 name = "reverie-util"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2324,7 +2324,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 [[package]]
 name = "safeptrace"
 version = "0.1.0"
-source = "git+https://github.com/facebookexperimental/reverie#6f5a50bb940c9b3c85b1885f3f5bfe4794ab08f0"
+source = "git+https://github.com/facebookexperimental/reverie#48f45f8ece31bcaf183082cdf9e9baa2c3c01d82"
 dependencies = [
  "bitflags 2.10.0",
  "futures 0.3.31",
@@ -2335,7 +2335,7 @@ dependencies = [
  "reverie-memory",
  "reverie-process",
  "syscalls",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2682,11 +2682,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.17"
+version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63587ca0f12b72a0600bcba1d40081f830876000bb46dd2337a3051618f4fc8"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.17",
+ "thiserror-impl 2.0.18",
 ]
 
 [[package]]
@@ -2702,9 +2702,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.17"
+version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2851,7 +2851,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
 dependencies = [
  "crossbeam-channel",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "time",
  "tracing-subscriber",
 ]
@@ -2940,7 +2940,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "mimalloc",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2992,7 +2992,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
  "turso_ext",
@@ -3036,7 +3036,7 @@ dependencies = [
  "miette",
  "strum",
  "strum_macros",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "turso_macros",
 ]
 
@@ -3081,7 +3081,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tracing",
  "turso_core",
  "turso_parser",
@@ -3859,6 +3859,6 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.14"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8f3f50b848df28f887acb68e41201b5aea6bc8a8dacc00fb40635ff9a72fea"
+checksum = "dfcd145825aace48cff44a8844de64bf75feec3080e0aa5cdbde72961ae51a65"
