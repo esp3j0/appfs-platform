@@ -11,6 +11,7 @@ make pjdfstest
 sudo make install
 sudo dnf install perl-Test-Harness
 mkdir -p ../agentfs-testing
+cd ../agentfs-testing
 agentfs init testing
 mkdir mnt
 sudo su
