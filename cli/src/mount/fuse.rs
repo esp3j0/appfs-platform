@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 use super::{wait_for_mount, MountBackend, MountHandle, MountHandleInner, MountOpts};
 
 /// FUSE unmount implementation using fusermount.
-#[cfg(target_os = "linux")]
 pub(super) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
     const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
     let args: &[&str] = if lazy { &["-uz"] } else { &["-u"] };
@@ -34,14 +33,7 @@ pub(super) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
     )
 }
 
-/// FUSE unmount is not available on macOS.
-#[cfg(target_os = "macos")]
-pub(super) fn unmount_fuse(_mountpoint: &Path, _lazy: bool) -> Result<()> {
-    anyhow::bail!("FUSE unmount is not supported on macOS")
-}
-
 /// Internal FUSE mount implementation.
-#[cfg(target_os = "linux")]
 pub(super) fn mount_fuse(
     fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>>,
     opts: MountOpts,
