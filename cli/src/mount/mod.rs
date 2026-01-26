@@ -14,6 +14,7 @@
 //! drop(handle); // auto-unmounts
 //! ```
 
+#[cfg(target_os = "linux")]
 mod fuse;
 mod nfs;
 
@@ -149,7 +150,10 @@ impl Drop for MountHandle {
 /// If `lazy` is true, uses lazy unmount which detaches immediately even if busy.
 pub fn unmount(mountpoint: &Path, backend: MountBackend, lazy: bool) -> Result<()> {
     match backend {
+        #[cfg(target_os = "linux")]
         MountBackend::Fuse => fuse::unmount_fuse(mountpoint, lazy),
+        #[cfg(not(target_os = "linux"))]
+        MountBackend::Fuse => anyhow::bail!("FUSE is not supported on this platform"),
         MountBackend::Nfs => nfs::unmount_nfs(mountpoint, lazy),
     }
 }
