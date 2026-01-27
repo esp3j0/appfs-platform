@@ -4,7 +4,6 @@
 //! FileSystem trait, enabling systems to mount AgentFS via NFS without requiring
 //! FUSE or other system extensions.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::nfsserve::nfs::{
@@ -18,12 +17,15 @@ use agentfs_sdk::{
     FileSystem, Stats, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
 };
 use async_trait::async_trait;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 /// Root directory inode number
 const ROOT_INO: fileid3 = 1;
-/// Filesystem root inode (for underlying filesystem operations)
-const FS_ROOT_INO: i64 = 1;
+
+/// Convert a fileid3 to a filesystem inode number.
+fn id_to_fs_ino(id: fileid3) -> i64 {
+    id as i64
+}
 
 /// Convert an SDK error to an NFS status code.
 ///
@@ -50,108 +52,16 @@ fn error_to_nfsstat(e: SdkError) -> nfsstat3 {
 pub struct AgentNFS {
     /// The underlying filesystem (wrapped in Mutex to serialize operations)
     fs: Arc<Mutex<dyn FileSystem>>,
-    /// Inode-to-path mapping (async RwLock for use in async methods)
-    inode_map: RwLock<InodeMap>,
-}
-
-/// Bidirectional mapping between inodes and paths.
-struct InodeMap {
-    /// Path to NFS inode
-    path_to_ino: HashMap<String, fileid3>,
-    /// NFS inode to path
-    ino_to_path: HashMap<fileid3, String>,
-    /// NFS inode to underlying filesystem inode
-    ino_to_fs_ino: HashMap<fileid3, i64>,
-    /// Next available NFS inode number
-    next_ino: fileid3,
-}
-
-impl InodeMap {
-    fn new() -> Self {
-        let mut map = InodeMap {
-            path_to_ino: HashMap::new(),
-            ino_to_path: HashMap::new(),
-            ino_to_fs_ino: HashMap::new(),
-            next_ino: ROOT_INO + 1,
-        };
-        // Root directory is always inode 1
-        map.path_to_ino.insert("/".to_string(), ROOT_INO);
-        map.ino_to_path.insert(ROOT_INO, "/".to_string());
-        map.ino_to_fs_ino.insert(ROOT_INO, FS_ROOT_INO);
-        map
-    }
-
-    fn get_or_create_ino(&mut self, path: &str, fs_ino: i64) -> fileid3 {
-        if let Some(&ino) = self.path_to_ino.get(path) {
-            // Update fs_ino mapping in case it changed
-            self.ino_to_fs_ino.insert(ino, fs_ino);
-            return ino;
-        }
-        let ino = self.next_ino;
-        self.next_ino += 1;
-        self.path_to_ino.insert(path.to_string(), ino);
-        self.ino_to_path.insert(ino, path.to_string());
-        self.ino_to_fs_ino.insert(ino, fs_ino);
-        ino
-    }
-
-    fn get_path(&self, ino: fileid3) -> Option<String> {
-        self.ino_to_path.get(&ino).cloned()
-    }
-
-    fn get_fs_ino(&self, ino: fileid3) -> Option<i64> {
-        self.ino_to_fs_ino.get(&ino).copied()
-    }
-
-    fn remove_path(&mut self, path: &str) {
-        if let Some(ino) = self.path_to_ino.remove(path) {
-            self.ino_to_path.remove(&ino);
-            self.ino_to_fs_ino.remove(&ino);
-        }
-    }
-
-    fn rename_path(&mut self, from: &str, to: &str) {
-        if let Some(ino) = self.path_to_ino.remove(from) {
-            self.ino_to_path.insert(ino, to.to_string());
-            self.path_to_ino.insert(to.to_string(), ino);
-        }
-    }
 }
 
 impl AgentNFS {
     /// Create a new NFS adapter wrapping the given filesystem.
     pub fn new(fs: Arc<Mutex<dyn FileSystem>>) -> Self {
-        AgentNFS {
-            fs,
-            inode_map: RwLock::new(InodeMap::new()),
-        }
-    }
-
-    /// Resolve a path to a filesystem inode by walking from root.
-    async fn resolve_path_to_fs_ino(
-        &self,
-        fs: &tokio::sync::MutexGuard<'_, dyn FileSystem>,
-        path: &str,
-    ) -> Result<i64, nfsstat3> {
-        if path == "/" {
-            return Ok(FS_ROOT_INO);
-        }
-
-        let mut current_ino = FS_ROOT_INO;
-        for component in path.split('/').filter(|s| !s.is_empty()) {
-            let stats = fs
-                .lookup(current_ino, component)
-                .await
-                .map_err(error_to_nfsstat)?
-                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-            current_ino = stats.ino;
-        }
-
-        Ok(current_ino)
+        AgentNFS { fs }
     }
 
     /// Convert AgentFS Stats to NFS fattr3.
-    fn stats_to_fattr(&self, stats: &Stats, ino: fileid3) -> fattr3 {
+    fn stats_to_fattr(&self, stats: &Stats) -> fattr3 {
         let ftype = match stats.mode & S_IFMT {
             S_IFREG => ftype3::NF3REG,
             S_IFDIR => ftype3::NF3DIR,
@@ -179,7 +89,7 @@ impl AgentNFS {
             used: stats.size as u64,
             rdev,
             fsid: 0,
-            fileid: ino,
+            fileid: stats.ino as fileid3,
             atime: nfstime3 {
                 seconds: stats.atime as u32,
                 nseconds: 0,
@@ -194,51 +104,6 @@ impl AgentNFS {
             },
         }
     }
-
-    /// Get path for an NFS inode, returning NOENT error if not found.
-    async fn get_path(&self, ino: fileid3) -> Result<String, nfsstat3> {
-        self.inode_map
-            .read()
-            .await
-            .get_path(ino)
-            .ok_or(nfsstat3::NFS3ERR_NOENT)
-    }
-
-    /// Get filesystem inode for an NFS inode.
-    async fn get_fs_ino(&self, ino: fileid3) -> Result<i64, nfsstat3> {
-        self.inode_map
-            .read()
-            .await
-            .get_fs_ino(ino)
-            .ok_or(nfsstat3::NFS3ERR_NOENT)
-    }
-
-    /// Join parent path and filename into a full path.
-    fn join_path(parent: &str, name: &str) -> String {
-        if parent == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", parent, name)
-        }
-    }
-
-    /// Get parent directory path.
-    fn parent_path(path: &str) -> String {
-        if path == "/" {
-            return "/".to_string();
-        }
-        std::path::Path::new(path)
-            .parent()
-            .map(|p| {
-                let s = p.to_string_lossy().to_string();
-                if s.is_empty() {
-                    "/".to_string()
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_else(|| "/".to_string())
-    }
 }
 
 #[async_trait]
@@ -252,34 +117,28 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        // Handle . and ..
+        // Handle .
         if name == "." {
             return Ok(dirid);
         }
-        if name == ".." {
-            let parent_path = Self::parent_path(&dir_path);
-            let fs = self.fs.lock().await;
-            let parent_fs_ino = self.resolve_path_to_fs_ino(&fs, &parent_path).await?;
-            drop(fs);
-            return Ok(self
-                .inode_map
-                .write()
-                .await
-                .get_or_create_ino(&parent_path, parent_fs_ino));
-        }
 
-        let full_path = Self::join_path(&dir_path, name);
-
-        // Lock filesystem for the lookup
         let fs = self.fs.lock().await;
+
+        // Handle .. via filesystem lookup
+        if name == ".." {
+            let stats = fs
+                .lookup(id_to_fs_ino(dirid), "..")
+                .await
+                .map_err(error_to_nfsstat)?
+                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            return Ok(stats.ino as fileid3);
+        }
 
         // Verify parent is a directory
         let dir_stats = fs
-            .getattr(dir_fs_ino)
+            .getattr(id_to_fs_ino(dirid))
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -290,34 +149,27 @@ impl NFSFileSystem for AgentNFS {
 
         // Lookup the entry
         let stats = fs
-            .lookup(dir_fs_ino, name)
+            .lookup(id_to_fs_ino(dirid), name)
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        drop(fs);
-
-        Ok(self
-            .inode_map
-            .write()
-            .await
-            .get_or_create_ino(&full_path, stats.ino))
+        Ok(stats.ino as fileid3)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
         let fs = self.fs.lock().await;
         let stats = fs
-            .getattr(fs_ino)
+            .getattr(id_to_fs_ino(id))
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        Ok(self.stats_to_fattr(&stats, id))
+        Ok(self.stats_to_fattr(&stats))
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
+        let fs_ino = id_to_fs_ino(id);
         let fs = self.fs.lock().await;
 
         // Handle chmod (mode change)
@@ -355,7 +207,7 @@ impl NFSFileSystem for AgentNFS {
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        Ok(self.stats_to_fattr(&stats, id))
+        Ok(self.stats_to_fattr(&stats))
     }
 
     async fn read(
@@ -364,10 +216,12 @@ impl NFSFileSystem for AgentNFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
         let fs = self.fs.lock().await;
 
-        let file = fs.open(fs_ino).await.map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let file = fs
+            .open(id_to_fs_ino(id))
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         let data = file
             .pread(offset, count as u64)
             .await
@@ -381,16 +235,18 @@ impl NFSFileSystem for AgentNFS {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
+        let fs = self.fs.lock().await;
 
-        {
-            let fs = self.fs.lock().await;
+        let file = fs.open(id_to_fs_ino(id)).await.map_err(error_to_nfsstat)?;
+        file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
 
-            let file = fs.open(fs_ino).await.map_err(error_to_nfsstat)?;
-            file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
-        }
+        let stats = fs
+            .getattr(id_to_fs_ino(id))
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        self.getattr(id).await
+        Ok(self.stats_to_fattr(&stats))
     }
 
     async fn create(
@@ -400,10 +256,8 @@ impl NFSFileSystem for AgentNFS {
         attr: sattr3,
         auth: &auth_unix,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
         // Use mode from sattr3 if provided, otherwise default to 0o644
         let mode = match attr.mode {
@@ -411,23 +265,15 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o644,
         };
 
-        // Create file with caller's uid/gid and requested mode
-        let new_fs_ino = {
-            let fs = self.fs.lock().await;
-            let (stats, _file) = fs
-                .create_file(dir_fs_ino, name, S_IFREG | mode, auth.uid, auth.gid)
-                .await
-                .map_err(error_to_nfsstat)?;
-            stats.ino
-        };
-
-        let ino = self
-            .inode_map
-            .write()
+        let fs = self.fs.lock().await;
+        let (stats, _file) = fs
+            .create_file(dir_fs_ino, name, S_IFREG | mode, auth.uid, auth.gid)
             .await
-            .get_or_create_ino(&full_path, new_fs_ino);
-        let attr = self.getattr(ino).await?;
-        Ok((ino, attr))
+            .map_err(error_to_nfsstat)?;
+
+        let ino = stats.ino as fileid3;
+        let fattr = self.stats_to_fattr(&stats);
+        Ok((ino, fattr))
     }
 
     async fn create_exclusive(
@@ -436,10 +282,8 @@ impl NFSFileSystem for AgentNFS {
         filename: &filename3,
         auth: &auth_unix,
     ) -> Result<fileid3, nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
         let fs = self.fs.lock().await;
 
@@ -459,12 +303,7 @@ impl NFSFileSystem for AgentNFS {
             .await
             .map_err(error_to_nfsstat)?;
 
-        drop(fs);
-        Ok(self
-            .inode_map
-            .write()
-            .await
-            .get_or_create_ino(&full_path, stats.ino))
+        Ok(stats.ino as fileid3)
     }
 
     async fn mkdir(
@@ -474,10 +313,8 @@ impl NFSFileSystem for AgentNFS {
         attr: sattr3,
         auth: &auth_unix,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(dirname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
         // Use mode from sattr3 if provided, otherwise default to 0o755
         let mode = match attr.mode {
@@ -485,29 +322,27 @@ impl NFSFileSystem for AgentNFS {
             set_mode3::Void => 0o755,
         };
 
-        let new_fs_ino = {
-            let fs = self.fs.lock().await;
+        let fs = self.fs.lock().await;
 
-            let stats = fs
-                .mkdir(dir_fs_ino, name, auth.uid, auth.gid)
-                .await
-                .map_err(error_to_nfsstat)?;
-
-            // Set the mode after creation (SDK mkdir doesn't take mode)
-            fs.chmod(stats.ino, S_IFDIR | mode)
-                .await
-                .map_err(error_to_nfsstat)?;
-
-            stats.ino
-        };
-
-        let ino = self
-            .inode_map
-            .write()
+        let stats = fs
+            .mkdir(dir_fs_ino, name, auth.uid, auth.gid)
             .await
-            .get_or_create_ino(&full_path, new_fs_ino);
-        let attr = self.getattr(ino).await?;
-        Ok((ino, attr))
+            .map_err(error_to_nfsstat)?;
+
+        // Set the mode after creation (SDK mkdir doesn't take mode)
+        fs.chmod(stats.ino, S_IFDIR | mode)
+            .await
+            .map_err(error_to_nfsstat)?;
+
+        let stats = fs
+            .getattr(stats.ino)
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        let ino = stats.ino as fileid3;
+        let fattr = self.stats_to_fattr(&stats);
+        Ok((ino, fattr))
     }
 
     async fn mknod(
@@ -519,10 +354,8 @@ impl NFSFileSystem for AgentNFS {
         rdev: specdata3,
         auth: &auth_unix,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
         // Use mode from sattr3 if provided, otherwise default to 0o644
         let perm_mode = match attr.mode {
@@ -542,59 +375,46 @@ impl NFSFileSystem for AgentNFS {
         // Convert rdev from specdata3 (major/minor) to u64
         let rdev_val = libc::makedev(rdev.specdata1 as _, rdev.specdata2 as _) as u64;
 
-        let new_fs_ino = {
-            let fs = self.fs.lock().await;
+        let fs = self.fs.lock().await;
 
-            let stats = fs
-                .mknod(
-                    dir_fs_ino,
-                    name,
-                    type_mode | perm_mode,
-                    rdev_val,
-                    auth.uid,
-                    auth.gid,
-                )
-                .await
-                .map_err(error_to_nfsstat)?;
-
-            stats.ino
-        };
-
-        let ino = self
-            .inode_map
-            .write()
+        let stats = fs
+            .mknod(
+                dir_fs_ino,
+                name,
+                type_mode | perm_mode,
+                rdev_val,
+                auth.uid,
+                auth.gid,
+            )
             .await
-            .get_or_create_ino(&full_path, new_fs_ino);
-        let attr = self.getattr(ino).await?;
-        Ok((ino, attr))
+            .map_err(error_to_nfsstat)?;
+
+        let ino = stats.ino as fileid3;
+        let fattr = self.stats_to_fattr(&stats);
+        Ok((ino, fattr))
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
-        {
-            let fs = self.fs.lock().await;
+        let fs = self.fs.lock().await;
 
-            // Check if it's a file or directory and use appropriate method
-            let stats = fs
-                .lookup(dir_fs_ino, name)
+        // Check if it's a file or directory and use appropriate method
+        let stats = fs
+            .lookup(dir_fs_ino, name)
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        if stats.is_directory() {
+            fs.rmdir(dir_fs_ino, name).await.map_err(error_to_nfsstat)?;
+        } else {
+            fs.unlink(dir_fs_ino, name)
                 .await
-                .map_err(error_to_nfsstat)?
-                .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-
-            if stats.is_directory() {
-                fs.rmdir(dir_fs_ino, name).await.map_err(error_to_nfsstat)?;
-            } else {
-                fs.unlink(dir_fs_ino, name)
-                    .await
-                    .map_err(error_to_nfsstat)?;
-            }
+                .map_err(error_to_nfsstat)?;
         }
 
-        self.inode_map.write().await.remove_path(&full_path);
         Ok(())
     }
 
@@ -605,28 +425,17 @@ impl NFSFileSystem for AgentNFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let from_dir = self.get_path(from_dirid).await?;
-        let from_dir_fs_ino = self.get_fs_ino(from_dirid).await?;
-        let to_dir = self.get_path(to_dirid).await?;
-        let to_dir_fs_ino = self.get_fs_ino(to_dirid).await?;
+        let from_dir_fs_ino = id_to_fs_ino(from_dirid);
+        let to_dir_fs_ino = id_to_fs_ino(to_dirid);
         let from_name = std::str::from_utf8(from_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let to_name = std::str::from_utf8(to_filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
 
-        let from_path = Self::join_path(&from_dir, from_name);
-        let to_path = Self::join_path(&to_dir, to_name);
+        let fs = self.fs.lock().await;
 
-        {
-            let fs = self.fs.lock().await;
-
-            fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
-                .await
-                .map_err(error_to_nfsstat)?;
-        }
-
-        self.inode_map
-            .write()
+        fs.rename(from_dir_fs_ino, from_name, to_dir_fs_ino, to_name)
             .await
-            .rename_path(&from_path, &to_path);
+            .map_err(error_to_nfsstat)?;
+
         Ok(())
     }
 
@@ -636,27 +445,17 @@ impl NFSFileSystem for AgentNFS {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fattr3, nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let fs_ino = id_to_fs_ino(id);
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(filename).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
 
-        let stats = {
-            let fs = self.fs.lock().await;
-            fs.link(fs_ino, dir_fs_ino, name)
-                .await
-                .map_err(error_to_nfsstat)?
-        };
-
-        // The link creates a new directory entry pointing to the same inode
-        // We need to add the new path to our inode map
-        self.inode_map
-            .write()
+        let fs = self.fs.lock().await;
+        let stats = fs
+            .link(fs_ino, dir_fs_ino, name)
             .await
-            .get_or_create_ino(&full_path, stats.ino);
+            .map_err(error_to_nfsstat)?;
 
-        Ok(self.stats_to_fattr(&stats, id))
+        Ok(self.stats_to_fattr(&stats))
     }
 
     async fn readdir(
@@ -665,17 +464,17 @@ impl NFSFileSystem for AgentNFS {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
 
-        let entries = {
-            let fs = self.fs.lock().await;
+        let fs = self.fs.lock().await;
 
-            fs.readdir_plus(dir_fs_ino)
-                .await
-                .map_err(error_to_nfsstat)?
-                .ok_or(nfsstat3::NFS3ERR_NOENT)?
-        };
+        let entries = fs
+            .readdir_plus(dir_fs_ino)
+            .await
+            .map_err(error_to_nfsstat)?
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+
+        drop(fs);
 
         let mut result = ReadDirResult {
             entries: Vec::new(),
@@ -687,12 +486,7 @@ impl NFSFileSystem for AgentNFS {
         let mut skipped_count = 0;
 
         for entry in entries.iter() {
-            let entry_path = Self::join_path(&dir_path, &entry.name);
-            let ino = self
-                .inode_map
-                .write()
-                .await
-                .get_or_create_ino(&entry_path, entry.stats.ino);
+            let ino = entry.stats.ino as fileid3;
 
             if skip {
                 if ino == start_after {
@@ -709,7 +503,7 @@ impl NFSFileSystem for AgentNFS {
             result.entries.push(DirEntry {
                 fileid: ino,
                 name: entry.name.as_bytes().into(),
-                attr: self.stats_to_fattr(&entry.stats, ino),
+                attr: self.stats_to_fattr(&entry.stats),
             });
         }
 
@@ -727,38 +521,27 @@ impl NFSFileSystem for AgentNFS {
         _attr: &sattr3,
         auth: &auth_unix,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let dir_path = self.get_path(dirid).await?;
-        let dir_fs_ino = self.get_fs_ino(dirid).await?;
+        let dir_fs_ino = id_to_fs_ino(dirid);
         let name = std::str::from_utf8(linkname).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let target = std::str::from_utf8(symlink).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-        let full_path = Self::join_path(&dir_path, name);
-
-        let new_fs_ino = {
-            let fs = self.fs.lock().await;
-
-            let stats = fs
-                .symlink(dir_fs_ino, name, target, auth.uid, auth.gid)
-                .await
-                .map_err(error_to_nfsstat)?;
-            stats.ino
-        };
-
-        let ino = self
-            .inode_map
-            .write()
-            .await
-            .get_or_create_ino(&full_path, new_fs_ino);
-        let attr = self.getattr(ino).await?;
-        Ok((ino, attr))
-    }
-
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        let fs_ino = self.get_fs_ino(id).await?;
 
         let fs = self.fs.lock().await;
 
+        let stats = fs
+            .symlink(dir_fs_ino, name, target, auth.uid, auth.gid)
+            .await
+            .map_err(error_to_nfsstat)?;
+
+        let ino = stats.ino as fileid3;
+        let fattr = self.stats_to_fattr(&stats);
+        Ok((ino, fattr))
+    }
+
+    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        let fs = self.fs.lock().await;
+
         let target = fs
-            .readlink(fs_ino)
+            .readlink(id_to_fs_ino(id))
             .await
             .map_err(error_to_nfsstat)?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
