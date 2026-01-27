@@ -2298,6 +2298,20 @@ impl AgentFS {
                 .await?;
             stmt.execute((now, src_ino)).await?;
 
+            // Update source parent directory timestamps
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ? WHERE ino = ?")
+                .await?;
+            stmt.execute((now, now, src_parent_ino)).await?;
+
+            // Update destination parent directory timestamps
+            if dst_parent_ino != src_parent_ino {
+                let mut stmt = conn
+                    .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ? WHERE ino = ?")
+                    .await?;
+                stmt.execute((now, now, dst_parent_ino)).await?;
+            }
+
             Ok(())
         }
         .await;
@@ -3423,6 +3437,20 @@ impl FileSystem for AgentFS {
                 .prepare_cached("UPDATE fs_inode SET ctime = ? WHERE ino = ?")
                 .await?;
             stmt.execute((now, src_ino)).await?;
+
+            // Update source parent directory timestamps
+            let mut stmt = conn
+                .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ? WHERE ino = ?")
+                .await?;
+            stmt.execute((now, now, oldparent_ino)).await?;
+
+            // Update destination parent directory timestamps
+            if newparent_ino != oldparent_ino {
+                let mut stmt = conn
+                    .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ? WHERE ino = ?")
+                    .await?;
+                stmt.execute((now, now, newparent_ino)).await?;
+            }
 
             Ok(())
         }
