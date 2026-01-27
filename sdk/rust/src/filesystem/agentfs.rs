@@ -2727,7 +2727,14 @@ impl FileSystem for AgentFS {
         }))
     }
 
-    async fn mkdir(&self, parent_ino: i64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<Stats> {
+    async fn mkdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Stats> {
         if name.len() > MAX_NAME_LEN {
             return Err(FsError::NameTooLong.into());
         }

@@ -586,7 +586,14 @@ impl FileSystem for HostFS {
         Ok(Arc::new(HostFSFile { fd: real_fd }))
     }
 
-    async fn mkdir(&self, parent_ino: i64, name: &str, mode: u32, _uid: u32, _gid: u32) -> Result<Stats> {
+    async fn mkdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<Stats> {
         let parent_path = self.get_inode_path(parent_ino)?;
         let new_path = parent_path.join(name);
         let c_path = CString::new(new_path.as_os_str().as_bytes())
