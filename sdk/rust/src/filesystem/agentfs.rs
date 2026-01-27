@@ -3313,11 +3313,15 @@ impl FileSystem for AgentFS {
                     .await?;
                 stmt.execute((newparent_ino, newname)).await?;
 
-                // Decrement link count
+                // Decrement link count and update ctime on destination inode
+                let now_dec = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
                 let mut stmt = conn
-                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1 WHERE ino = ?")
+                    .prepare_cached("UPDATE fs_inode SET nlink = nlink - 1, ctime = ? WHERE ino = ?")
                     .await?;
-                stmt.execute((dst_ino,)).await?;
+                stmt.execute((now_dec, dst_ino)).await?;
 
                 // Clean up destination inode if no more links
                 let link_count = self.get_link_count(&conn, dst_ino).await?;
