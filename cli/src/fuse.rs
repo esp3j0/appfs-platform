@@ -1098,7 +1098,7 @@ fn fillattr(stats: &Stats) -> FileAttr {
         ctime: UNIX_EPOCH + Duration::from_secs(stats.ctime as u64),
         crtime: UNIX_EPOCH,
         kind,
-        perm: (stats.mode & 0o777) as u16,
+        perm: (stats.mode & 0o7777) as u16,
         nlink: stats.nlink,
         uid: stats.uid,
         gid: stats.gid,
