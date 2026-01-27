@@ -2385,6 +2385,27 @@ impl FileSystem for AgentFS {
         }
         let conn = self.pool.get_connection().await?;
 
+        // Handle ".." by finding the parent of parent_ino
+        if name == ".." {
+            if parent_ino == ROOT_INO {
+                // Root's parent is itself
+                return self.getattr_with_conn(&conn, ROOT_INO).await;
+            }
+            let mut stmt = conn
+                .prepare_cached("SELECT parent_ino FROM fs_dentry WHERE ino = ? LIMIT 1")
+                .await?;
+            let mut rows = stmt.query((parent_ino,)).await?;
+            let parent = if let Some(row) = rows.next().await? {
+                row.get_value(0)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(ROOT_INO)
+            } else {
+                ROOT_INO
+            };
+            return self.getattr_with_conn(&conn, parent).await;
+        }
+
         // Look up the child inode
         let child_ino = match self.lookup_child(&conn, parent_ino, name).await? {
             Some(ino) => ino,
