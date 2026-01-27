@@ -2769,6 +2769,12 @@ impl FileSystem for AgentFS {
             .await?;
         stmt.execute((ino,)).await?;
 
+        // Update parent directory ctime and mtime
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET ctime = ?, mtime = ? WHERE ino = ?")
+            .await?;
+        stmt.execute((now, now, parent_ino)).await?;
+
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
 
