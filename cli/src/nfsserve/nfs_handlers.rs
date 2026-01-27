@@ -2133,7 +2133,21 @@ pub async fn nfsproc3_rename(
         match context.vfs.lookup(from_dirid, &fromdirops.name).await {
             Ok(entry_id) => match context.vfs.getattr(entry_id).await {
                 Ok(entry_attr) => {
-                    permissions::can_delete_entry(&context.auth, &from_dir_attr, &entry_attr)
+                    let basic =
+                        permissions::can_delete_entry(&context.auth, &from_dir_attr, &entry_attr);
+                    // For directory entries being renamed across parents, the caller
+                    // must own the entry (not just the sticky directory), because the
+                    // operation modifies the directory's ".." link.
+                    if basic
+                        && matches!(entry_attr.ftype, nfs::ftype3::NF3DIR)
+                        && from_dirid != to_dirid
+                        && context.auth.uid != 0
+                        && context.auth.uid != entry_attr.uid
+                    {
+                        false
+                    } else {
+                        basic
+                    }
                 }
                 Err(_) => permissions::can_modify_directory(&context.auth, &from_dir_attr),
             },
