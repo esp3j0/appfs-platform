@@ -376,11 +376,12 @@ impl OverlayFS {
 
             // Not in delta, check base (using the base inode, not delta inode)
             let base_stats = self.base.lookup(current_base_ino, component).await?;
-            let (dir_uid, dir_gid) = if let Some(s) = &base_stats {
-                current_base_ino = s.ino;
-                (s.uid, s.gid)
+            let (dir_uid, dir_gid, origin_base_ino) = if let Some(s) = &base_stats {
+                let base_ino = s.ino;
+                current_base_ino = base_ino;
+                (s.uid, s.gid, Some(base_ino))
             } else {
-                (uid, gid)
+                (uid, gid, None)
             };
 
             // Create directory in delta
@@ -394,6 +395,12 @@ impl OverlayFS {
             )
             .await?;
             current_delta_ino = new_stats.ino;
+
+            // Create origin mapping if directory exists in base, so that
+            // lookups return consistent overlay inodes
+            if let Some(base_ino) = origin_base_ino {
+                self.add_origin_mapping(new_stats.ino, base_ino).await?;
+            }
         }
 
         Ok(())
