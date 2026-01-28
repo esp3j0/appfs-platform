@@ -3303,6 +3303,13 @@ impl FileSystem for AgentFS {
         )
         .await?;
 
+        // Update parent directory ctime and mtime
+        conn.execute(
+            "UPDATE fs_inode SET ctime = ?, mtime = ?, ctime_nsec = ?, mtime_nsec = ? WHERE ino = ?",
+            (now_secs, now_secs, now_nsec, now_nsec, parent_ino),
+        )
+        .await?;
+
         // Populate dentry cache
         self.dentry_cache.insert(parent_ino, name, ino);
 
