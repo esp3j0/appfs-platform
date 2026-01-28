@@ -213,8 +213,8 @@ impl Filesystem for AgentFSFuse {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<crate::fuser::TimeOrNow>,
-        _mtime: Option<crate::fuser::TimeOrNow>,
+        atime: Option<crate::fuser::TimeOrNow>,
+        mtime: Option<crate::fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -282,6 +282,39 @@ impl Filesystem for AgentFSFuse {
                     file.truncate(new_size).await
                 })
             };
+
+            if let Err(e) = result {
+                reply.error(error_to_errno(&e));
+                return;
+            }
+        }
+
+        // Handle atime/mtime (utimensat)
+        if atime.is_some() || mtime.is_some() {
+            let atime_secs = atime.map(|t| match t {
+                crate::fuser::TimeOrNow::SpecificTime(st) => st
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                crate::fuser::TimeOrNow::Now => SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            });
+            let mtime_secs = mtime.map(|t| match t {
+                crate::fuser::TimeOrNow::SpecificTime(st) => st
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                crate::fuser::TimeOrNow::Now => SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            });
+            let fs = self.fs.clone();
+            let result = self
+                .runtime
+                .block_on(async move { fs.set_times(ino as i64, atime_secs, mtime_secs).await });
 
             if let Err(e) = result {
                 reply.error(error_to_errno(&e));
