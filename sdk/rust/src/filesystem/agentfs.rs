@@ -3169,6 +3169,13 @@ impl FileSystem for AgentFS {
             .await?;
         stmt.execute((ino,)).await?;
 
+        // Update parent directory timestamps
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let mut stmt = conn
+            .prepare_cached("UPDATE fs_inode SET mtime = ?, ctime = ? WHERE ino = ?")
+            .await?;
+        stmt.execute((now, now, parent_ino)).await?;
+
         // Check if this was the last link to the inode
         let link_count = self.get_link_count(&conn, ino).await?;
         if link_count == 0 {
