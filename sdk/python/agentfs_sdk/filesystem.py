@@ -121,7 +121,11 @@ class Filesystem:
                 size INTEGER NOT NULL DEFAULT 0,
                 atime INTEGER NOT NULL,
                 mtime INTEGER NOT NULL,
-                ctime INTEGER NOT NULL
+                ctime INTEGER NOT NULL,
+                rdev INTEGER NOT NULL DEFAULT 0,
+                atime_nsec INTEGER NOT NULL DEFAULT 0,
+                mtime_nsec INTEGER NOT NULL DEFAULT 0,
+                ctime_nsec INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS fs_dentry (
