@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use libc::{O_RDONLY, O_RDWR};
+
 use crate::nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3,
     set_mode3, set_mtime, set_size3, set_uid3, specdata3,
@@ -197,7 +199,7 @@ impl NFSFileSystem for AgentNFS {
 
         // Handle size change (truncate)
         if let set_size3::size(size) = setattr.size {
-            let file = fs.open(fs_ino).await.map_err(error_to_nfsstat)?;
+            let file = fs.open(fs_ino, O_RDWR).await.map_err(error_to_nfsstat)?;
             file.truncate(size).await.map_err(error_to_nfsstat)?;
         }
 
@@ -237,7 +239,7 @@ impl NFSFileSystem for AgentNFS {
         let fs = self.fs.lock().await;
 
         let file = fs
-            .open(id_to_fs_ino(id))
+            .open(id_to_fs_ino(id), O_RDONLY)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         let data = file
@@ -255,7 +257,10 @@ impl NFSFileSystem for AgentNFS {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let fs = self.fs.lock().await;
 
-        let file = fs.open(id_to_fs_ino(id)).await.map_err(error_to_nfsstat)?;
+        let file = fs
+            .open(id_to_fs_ino(id), O_RDWR)
+            .await
+            .map_err(error_to_nfsstat)?;
         file.pwrite(offset, data).await.map_err(error_to_nfsstat)?;
 
         let stats = fs

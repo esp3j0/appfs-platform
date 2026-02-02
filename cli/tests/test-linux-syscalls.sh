@@ -26,6 +26,10 @@ echo "Hello from test setup!" > "$TEST_DIR/test.txt"
 mkdir -p "$TEST_DIR/subdir"
 echo -n "nested content" > "$TEST_DIR/subdir/nested.txt"
 
+# Create read-only file (mode 0444) to test open flags handling
+echo -n "readonly content" > "$TEST_DIR/readonly.txt"
+chmod 0444 "$TEST_DIR/readonly.txt"
+
 # Run syscall tests directly on Linux
 if ! output=$("$DIR/syscall/test-syscalls" "$TEST_DIR" 2>&1); then
     echo "FAILED"

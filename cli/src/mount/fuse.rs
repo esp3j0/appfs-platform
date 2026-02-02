@@ -148,8 +148,9 @@ impl agentfs_sdk::FileSystem for MutexFsAdapter {
     async fn open(
         &self,
         ino: i64,
+        flags: i32,
     ) -> std::result::Result<agentfs_sdk::BoxedFile, agentfs_sdk::error::Error> {
-        self.inner.lock().await.open(ino).await
+        self.inner.lock().await.open(ino, flags).await
     }
 
     async fn mkdir(

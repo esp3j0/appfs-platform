@@ -56,5 +56,6 @@ int test_chown(const char *base_path);
 int test_mknod(const char *base_path);
 int test_mkfifo(const char *base_path);
 int test_copyup_permissions(const char *base_path);
+int test_open_readonly(const char *base_path);
 
 #endif /* TEST_COMMON_H */
