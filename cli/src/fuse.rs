@@ -278,7 +278,7 @@ impl Filesystem for AgentFSFuse {
                 // Open file and truncate via file handle
                 let fs = self.fs.clone();
                 self.runtime.block_on(async move {
-                    let file = fs.open(ino as i64).await?;
+                    let file = fs.open(ino as i64, libc::O_RDWR).await?;
                     file.truncate(new_size).await
                 })
             };
@@ -853,13 +853,13 @@ impl Filesystem for AgentFSFuse {
     /// Opens a file for reading or writing.
     ///
     /// Allocates a file handle and opens the file in the filesystem layer.
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        tracing::debug!("FUSE::open: ino={}", ino);
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        tracing::debug!("FUSE::open: ino={}, flags={}", ino, flags);
 
         let fs = self.fs.clone();
         let result = self
             .runtime
-            .block_on(async move { fs.open(ino as i64).await });
+            .block_on(async move { fs.open(ino as i64, flags).await });
 
         match result {
             Ok(file) => {

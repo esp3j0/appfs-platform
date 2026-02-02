@@ -660,11 +660,11 @@ impl FileSystem for HostFS {
         Ok(())
     }
 
-    async fn open(&self, ino: i64) -> Result<BoxedFile> {
+    async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
         let fd = self.get_inode_fd(ino)?;
 
-        // Open real fd via /proc/self/fd for read/write
-        let real_fd = Self::open_real_fd(fd, libc::O_RDWR)?;
+        // Open real fd via /proc/self/fd with the requested flags
+        let real_fd = Self::open_real_fd(fd, flags)?;
 
         Ok(Arc::new(HostFSFile { fd: real_fd }))
     }
@@ -977,7 +977,7 @@ mod tests {
         let stats = fs.lookup(ROOT_INO, "test.txt").await?.unwrap();
         assert!(stats.is_file());
 
-        let file = fs.open(stats.ino).await?;
+        let file = fs.open(stats.ino, libc::O_RDONLY).await?;
         let data = file.pread(0, 100).await?;
         assert_eq!(data, b"hello world");
 

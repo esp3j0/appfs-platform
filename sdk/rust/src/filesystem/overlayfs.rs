@@ -485,7 +485,7 @@ impl OverlayFS {
             stats.ino
         } else {
             // Regular file - read content and create
-            let base_file = self.base.open(base_ino).await?;
+            let base_file = self.base.open(base_ino, libc::O_RDONLY).await?;
             let content = base_file.pread(0, base_stats.size as u64).await?;
 
             let (stats, delta_file) = FileSystem::create_file(
@@ -842,7 +842,7 @@ impl FileSystem for OverlayFS {
         self.delta.utimens(delta_ino, atime, mtime).await
     }
 
-    async fn open(&self, ino: i64) -> Result<BoxedFile> {
+    async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile> {
         trace!("OverlayFS::open: ino={}", ino);
 
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
@@ -852,7 +852,7 @@ impl FileSystem for OverlayFS {
             Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
         };
 
-        FileSystem::open(&self.delta, delta_ino).await
+        FileSystem::open(&self.delta, delta_ino, flags).await
     }
 
     async fn mkdir(
@@ -1373,7 +1373,7 @@ mod tests {
         assert!(stats.is_file());
 
         // Open and write to it (should trigger copy-up)
-        let file = overlay.open(stats.ino).await?;
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
         file.pwrite(0, b"modified content").await?;
 
         // Verify base file is UNCHANGED
@@ -1402,7 +1402,7 @@ mod tests {
         let ino_before = stats_before.ino;
 
         // Open triggers copy-up
-        let file = overlay.open(stats_before.ino).await?;
+        let file = overlay.open(stats_before.ino, libc::O_RDWR).await?;
         file.pwrite(0, b"modified").await?;
 
         // Lookup again - inode should be the same
@@ -1460,7 +1460,7 @@ mod tests {
         assert_eq!(stats.size, 12); // "base content"
 
         // Open and truncate (triggers copy-up via open)
-        let file = overlay.open(stats.ino).await?;
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
         file.truncate(5).await?;
 
         // Verify base file is UNCHANGED
@@ -1510,7 +1510,7 @@ mod tests {
         assert!(renamed_stats.is_file());
 
         // Content should be preserved
-        let file = overlay.open(renamed_stats.ino).await?;
+        let file = overlay.open(renamed_stats.ino, libc::O_RDONLY).await?;
         let content = file.pread(0, 100).await?;
         assert_eq!(
             content, b"base content",
@@ -1532,7 +1532,7 @@ mod tests {
             .unwrap();
 
         // Open and modify (triggers copy-up, should also create parent dir in delta)
-        let file = overlay.open(nested_stats.ino).await?;
+        let file = overlay.open(nested_stats.ino, libc::O_RDWR).await?;
         file.pwrite(0, b"modified nested").await?;
 
         // Verify base file is UNCHANGED
@@ -1634,7 +1634,7 @@ mod tests {
 
         // Verify the existing file in base is still accessible
         let existing_stats = overlay.lookup(c_stats.ino, "existing.txt").await?.unwrap();
-        let existing_file = overlay.open(existing_stats.ino).await?;
+        let existing_file = overlay.open(existing_stats.ino, libc::O_RDONLY).await?;
         let existing_content = existing_file.pread(0, 100).await?;
         assert_eq!(existing_content, b"existing");
 
@@ -1900,7 +1900,7 @@ mod tests {
         assert!(file_stats.is_file());
 
         // Read the file to verify correct traversal
-        let file = overlay.open(file_stats.ino).await?;
+        let file = overlay.open(file_stats.ino, libc::O_RDONLY).await?;
         let content = file.pread(0, 100).await?;
         assert_eq!(content, b"deep content");
 
@@ -1936,7 +1936,7 @@ mod tests {
         let sdk_stats = overlay.lookup(ROOT_INO, "sdk").await?.unwrap();
         let rust_stats = overlay.lookup(sdk_stats.ino, "rust").await?.unwrap();
         let lib_stats = overlay.lookup(rust_stats.ino, "lib.rs").await?.unwrap();
-        let lib_file = overlay.open(lib_stats.ino).await?;
+        let lib_file = overlay.open(lib_stats.ino, libc::O_RDWR).await?;
         lib_file
             .pwrite(0, b"fn main() { println!(\"hello\"); }")
             .await?;
@@ -1951,7 +1951,7 @@ mod tests {
         // And sdk/python/main.py must be accessible
         let main_py = overlay.lookup(python_stats.ino, "main.py").await?.unwrap();
         assert!(main_py.is_file());
-        let file = overlay.open(main_py.ino).await?;
+        let file = overlay.open(main_py.ino, libc::O_RDONLY).await?;
         let content = file.pread(0, 100).await?;
         assert_eq!(content, b"print('hi')");
 
@@ -2010,7 +2010,7 @@ mod tests {
         assert!(toml_stats.is_file(), "Cargo.toml must be a file");
 
         // Also verify reading the file works
-        let file = overlay.open(toml_stats.ino).await?;
+        let file = overlay.open(toml_stats.ino, libc::O_RDONLY).await?;
         let content = file.pread(0, 100).await?;
         assert_eq!(content, b"[package]\nname = \"sdk\"");
 

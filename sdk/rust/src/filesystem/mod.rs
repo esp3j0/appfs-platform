@@ -228,7 +228,11 @@ pub trait FileSystem: Send + Sync {
     async fn utimens(&self, ino: i64, atime: TimeChange, mtime: TimeChange) -> Result<()>;
 
     /// Open a file by inode and return a file handle for I/O operations.
-    async fn open(&self, ino: i64) -> Result<BoxedFile>;
+    ///
+    /// The `flags` parameter specifies the access mode (e.g., `libc::O_RDONLY`,
+    /// `libc::O_RDWR`). Implementations should use these flags to open the file
+    /// with the appropriate permissions.
+    async fn open(&self, ino: i64, flags: i32) -> Result<BoxedFile>;
 
     /// Create a directory with the specified ownership.
     ///

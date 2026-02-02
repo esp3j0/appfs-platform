@@ -160,7 +160,7 @@ impl Vfs for SqliteVfs {
                         Vec::new()
                     } else {
                         // Read file content using open + pread
-                        let file = self.fs.open(stats.ino).await
+                        let file = self.fs.open(stats.ino, libc::O_RDONLY).await
                             .map_err(|e| VfsError::Other(format!("Failed to open file: {}", e)))?;
                         file.pread(0, stats.size as u64).await
                             .map_err(|e| VfsError::Other(format!("Failed to read file: {}", e)))?
@@ -485,7 +485,7 @@ impl FileOps for SqliteFileOps {
 
         // Write the data to the database
         let file = self.fs
-            .open(ino)
+            .open(ino, libc::O_RDWR)
             .await
             .map_err(|e| VfsError::Other(format!("Failed to open file: {}", e)))?;
         file.pwrite(0, &data)

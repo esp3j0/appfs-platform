@@ -41,6 +41,11 @@ echo -n "nested content" > subdir/nested.txt
 echo -n "executable content" > executable_base.txt
 chmod 0755 executable_base.txt
 
+# Create read-only file (mode 0444) to test open flags handling
+# This tests that O_RDONLY works but O_RDWR fails with EACCES
+echo -n "readonly content" > readonly.txt
+chmod 0444 readonly.txt
+
 # Create files for copy-up inode stability tests
 # Each file will be used to test inode stability when a specific syscall triggers copy-up
 # These files exist in the base layer; copy-up happens when modified through overlay
@@ -62,20 +67,20 @@ echo -n "content for fallocate copyup test" > copyup_fallocate_test.txt
 if ! output=$(cargo run -- run "$DIR/syscall/test-syscalls" . 2>&1); then
     echo "FAILED"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
     exit 1
 fi
 
 echo "$output" | grep -q "All tests passed!" || {
     echo "FAILED: 'All tests passed!' not found"
     echo "Output was: $output"
-    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
+    rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
     exit 1
 }
 
 # Note: output.txt is created in the delta layer (session-specific) so we can't
 # verify it with a separate agentfs run. The "All tests passed!" check is sufficient.
 
-rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt
+rm -rf "$TEST_DB" "${TEST_DB}-wal" "${TEST_DB}-shm" existing.txt test.txt subdir executable_base.txt copyup_*_test.txt readonly.txt
 
 echo "OK"

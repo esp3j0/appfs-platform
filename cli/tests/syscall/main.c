@@ -38,6 +38,7 @@ int main(int argc, char *argv[]) {
         {"mknod", test_mknod},
         {"mkfifo", test_mkfifo},
         {"copyup_permissions", test_copyup_permissions},
+        {"open_readonly", test_open_readonly},
     };
 
     int num_tests = sizeof(tests) / sizeof(tests[0]);

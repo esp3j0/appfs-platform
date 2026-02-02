@@ -2946,7 +2946,7 @@ impl FileSystem for AgentFS {
         Ok(())
     }
 
-    async fn open(&self, ino: i64) -> Result<BoxedFile> {
+    async fn open(&self, ino: i64, _flags: i32) -> Result<BoxedFile> {
         let conn = self.pool.get_connection().await?;
 
         // Verify inode exists
