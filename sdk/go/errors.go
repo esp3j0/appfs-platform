@@ -170,6 +170,15 @@ func IsExist(err error) bool {
 	return false
 }
 
+// IsLoop returns true if the error indicates too many symbolic links were encountered
+func IsLoop(err error) bool {
+	var fsErr *FSError
+	if errors.As(err, &fsErr) {
+		return fsErr.Code == ELOOP
+	}
+	return false
+}
+
 // IsPermission returns true if the error indicates a permission problem
 func IsPermission(err error) bool {
 	var fsErr *FSError

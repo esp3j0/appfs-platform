@@ -7,15 +7,12 @@ import (
 	"path"
 	"strings"
 	"time"
-
-	"github.com/tursodatabase/agentfs/sdk/go/internal/cache"
 )
 
 // Filesystem provides POSIX-like file operations backed by SQLite.
 type Filesystem struct {
 	db        *sql.DB
 	chunkSize int
-	cache     cache.PathCache // nil if caching disabled
 }
 
 // ChunkSize returns the configured chunk size for file data.
@@ -24,10 +21,12 @@ func (fs *Filesystem) ChunkSize() int {
 }
 
 // Stat returns file/directory metadata for the given path.
+// If the path refers to a symlink, Stat follows the symlink and returns
+// the target's stats. Use Lstat to get the symlink's own stats.
 func (fs *Filesystem) Stat(ctx context.Context, p string) (*Stats, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +38,7 @@ func (fs *Filesystem) Stat(ctx context.Context, p string) (*Stats, error) {
 func (fs *Filesystem) Readdir(ctx context.Context, p string) ([]string, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +74,7 @@ func (fs *Filesystem) Readdir(ctx context.Context, p string) ([]string, error) {
 func (fs *Filesystem) ReaddirPlus(ctx context.Context, p string) ([]DirEntry, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +122,7 @@ func (fs *Filesystem) Mkdir(ctx context.Context, p string, mode int64) error {
 		return err
 	}
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -202,7 +201,7 @@ func (fs *Filesystem) MkdirAll(ctx context.Context, p string, mode int64) error 
 func (fs *Filesystem) ReadFile(ctx context.Context, p string) ([]byte, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +256,7 @@ func (fs *Filesystem) WriteFile(ctx context.Context, p string, data []byte, mode
 		return err
 	}
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -332,7 +331,7 @@ func (fs *Filesystem) Unlink(ctx context.Context, p string) error {
 	parentPath, name := path.Split(p)
 	parentPath = normalizePath(parentPath)
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -378,11 +377,6 @@ func (fs *Filesystem) Unlink(ctx context.Context, p string) error {
 		}
 	}
 
-	// Invalidate cache
-	if fs.cache != nil {
-		fs.cache.Delete(p)
-	}
-
 	return nil
 }
 
@@ -396,7 +390,7 @@ func (fs *Filesystem) Rmdir(ctx context.Context, p string) error {
 	parentPath, name := path.Split(p)
 	parentPath = normalizePath(parentPath)
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -436,12 +430,6 @@ func (fs *Filesystem) Rmdir(ctx context.Context, p string) error {
 		return err
 	}
 
-	// Invalidate cache (directory and any cached children paths)
-	if fs.cache != nil {
-		fs.cache.Delete(p)
-		fs.cache.DeletePrefix(p + "/")
-	}
-
 	return nil
 }
 
@@ -469,7 +457,7 @@ func (fs *Filesystem) Rename(ctx context.Context, oldPath, newPath string) error
 		return ErrInvalidRename("rename", oldPath)
 	}
 
-	oldParentIno, err := fs.resolvePath(ctx, oldParentPath)
+	oldParentIno, err := fs.resolvePathFollow(ctx, oldParentPath, true)
 	if err != nil {
 		return err
 	}
@@ -484,7 +472,7 @@ func (fs *Filesystem) Rename(ctx context.Context, oldPath, newPath string) error
 		return err
 	}
 
-	newParentIno, err := fs.resolvePath(ctx, newParentPath)
+	newParentIno, err := fs.resolvePathFollow(ctx, newParentPath, true)
 	if err != nil {
 		return err
 	}
@@ -526,14 +514,6 @@ func (fs *Filesystem) Rename(ctx context.Context, oldPath, newPath string) error
 		return err
 	}
 
-	// Invalidate cache for both old and new paths (and children if directory)
-	if fs.cache != nil {
-		fs.cache.Delete(oldPath)
-		fs.cache.DeletePrefix(oldPath + "/")
-		fs.cache.Delete(newPath)
-		fs.cache.DeletePrefix(newPath + "/")
-	}
-
 	return nil
 }
 
@@ -547,7 +527,7 @@ func (fs *Filesystem) Link(ctx context.Context, existingPath, newPath string) er
 		return err
 	}
 
-	ino, err := fs.resolvePath(ctx, existingPath)
+	ino, err := fs.resolvePathFollow(ctx, existingPath, true)
 	if err != nil {
 		return err
 	}
@@ -568,7 +548,7 @@ func (fs *Filesystem) Link(ctx context.Context, existingPath, newPath string) er
 		return err
 	}
 
-	newParentIno, err := fs.resolvePath(ctx, newParentPath)
+	newParentIno, err := fs.resolvePathFollow(ctx, newParentPath, true)
 	if err != nil {
 		return err
 	}
@@ -608,7 +588,7 @@ func (fs *Filesystem) Symlink(ctx context.Context, target, linkPath string) erro
 		return err
 	}
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -648,10 +628,11 @@ func (fs *Filesystem) Symlink(ctx context.Context, target, linkPath string) erro
 }
 
 // Readlink returns the target of a symbolic link.
+// Intermediate symlinks in the path are followed, but the final component is not.
 func (fs *Filesystem) Readlink(ctx context.Context, p string) (string, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, false)
 	if err != nil {
 		return "", err
 	}
@@ -664,21 +645,21 @@ func (fs *Filesystem) Readlink(ctx context.Context, p string) (string, error) {
 		return "", ErrNotSymlink("readlink", p)
 	}
 
-	var target string
-	if err := fs.db.QueryRowContext(ctx, querySymlinkTarget, ino).Scan(&target); err != nil {
-		return "", err
-	}
-
-	return target, nil
+	return fs.readSymlinkTarget(ctx, ino)
 }
 
-// Lstat returns file/directory metadata without following symlinks.
-//
-// Since the current path resolution does not follow symlinks, Lstat is
-// functionally identical to Stat. It is provided for API parity with the
-// Rust SDK and POSIX convention.
+// Lstat returns file/directory metadata without following the final symlink.
+// Intermediate symlinks in the path are still followed.
+// If the path refers to a symlink, Lstat returns the symlink's own stats.
 func (fs *Filesystem) Lstat(ctx context.Context, p string) (*Stats, error) {
-	return fs.Stat(ctx, p)
+	p = normalizePath(p)
+
+	ino, err := fs.resolvePathFollow(ctx, p, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return fs.statInode(ctx, ino)
 }
 
 // Statfs returns aggregate filesystem statistics.
@@ -705,7 +686,7 @@ func (fs *Filesystem) Chown(ctx context.Context, p string, uid, gid int64) error
 
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return err
 	}
@@ -758,7 +739,7 @@ func (fs *Filesystem) Mknod(ctx context.Context, p string, mode, rdev int64) err
 		return ErrInval("mknod", p, "mode must include S_IFIFO, S_IFCHR, S_IFBLK, or S_IFSOCK")
 	}
 
-	parentIno, err := fs.resolvePath(ctx, parentPath)
+	parentIno, err := fs.resolvePathFollow(ctx, parentPath, true)
 	if err != nil {
 		return err
 	}
@@ -806,7 +787,7 @@ func (fs *Filesystem) Mknod(ctx context.Context, p string, mode, rdev int64) err
 func (fs *Filesystem) Chmod(ctx context.Context, p string, mode int64) error {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return err
 	}
@@ -837,7 +818,7 @@ func (fs *Filesystem) Utimes(ctx context.Context, p string, atime, mtime int64) 
 func (fs *Filesystem) UtimesNano(ctx context.Context, p string, atimeSec, atimeNsec, mtimeSec, mtimeNsec int64) error {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return err
 	}
@@ -854,14 +835,14 @@ func (fs *Filesystem) UtimesNano(ctx context.Context, p string, atimeSec, atimeN
 func (fs *Filesystem) Open(ctx context.Context, p string, flags int) (*File, error) {
 	p = normalizePath(p)
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		if IsNotExist(err) && (flags&O_CREATE) != 0 {
 			// Create the file
 			if err := fs.WriteFile(ctx, p, nil, 0o644); err != nil {
 				return nil, err
 			}
-			ino, err = fs.resolvePath(ctx, p)
+			ino, err = fs.resolvePathFollow(ctx, p, true)
 			if err != nil {
 				return nil, err
 			}
@@ -911,7 +892,7 @@ func (fs *Filesystem) Create(ctx context.Context, p string, mode int64) (*File, 
 		return nil, err
 	}
 
-	ino, err := fs.resolvePath(ctx, p)
+	ino, err := fs.resolvePathFollow(ctx, p, true)
 	if err != nil {
 		return nil, err
 	}
@@ -955,41 +936,6 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
-// resolvePath resolves a path to an inode number
-func (fs *Filesystem) resolvePath(ctx context.Context, p string) (int64, error) {
-	p = normalizePath(p)
-
-	if p == "/" {
-		return RootIno, nil
-	}
-
-	// Check cache first
-	if fs.cache != nil {
-		if ino, ok := fs.cache.Get(p); ok {
-			return ino, nil
-		}
-	}
-
-	// Cache miss - do database lookup
-	components := splitPath(p)
-	currentIno := int64(RootIno)
-
-	for _, component := range components {
-		ino, err := fs.lookupDentry(ctx, currentIno, component)
-		if err != nil {
-			return 0, ErrNoent("resolve", p)
-		}
-		currentIno = ino
-	}
-
-	// Cache the result
-	if fs.cache != nil {
-		fs.cache.Set(p, currentIno)
-	}
-
-	return currentIno, nil
-}
-
 // lookupDentry looks up a directory entry
 func (fs *Filesystem) lookupDentry(ctx context.Context, parentIno int64, name string) (int64, error) {
 	var ino int64
@@ -998,6 +944,109 @@ func (fs *Filesystem) lookupDentry(ctx context.Context, parentIno int64, name st
 		return 0, ErrNoent("lookup", name)
 	}
 	return ino, err
+}
+
+// lookupDentryWithMode looks up a directory entry and returns its inode number and mode
+// in a single query (avoids two round-trips per path component).
+func (fs *Filesystem) lookupDentryWithMode(ctx context.Context, parentIno int64, name string) (int64, int64, error) {
+	var ino, mode int64
+	err := fs.db.QueryRowContext(ctx, queryDentryWithMode, parentIno, name).Scan(&ino, &mode)
+	if err == sql.ErrNoRows {
+		return 0, 0, ErrNoent("lookup", name)
+	}
+	return ino, mode, err
+}
+
+// readSymlinkTarget reads the target of a symlink by inode number.
+func (fs *Filesystem) readSymlinkTarget(ctx context.Context, ino int64) (string, error) {
+	var target string
+	if err := fs.db.QueryRowContext(ctx, querySymlinkTarget, ino).Scan(&target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+// resolvePathFollow resolves a path to an inode number, following symlinks.
+// If followLast is true, the final component is followed if it is a symlink.
+// Returns ELOOP if more than MaxSymlinkDepth symlinks are encountered.
+func (fs *Filesystem) resolvePathFollow(ctx context.Context, p string, followLast bool) (int64, error) {
+	p = normalizePath(p)
+
+	if p == "/" {
+		return RootIno, nil
+	}
+
+	symlinkCount := 0
+
+	for {
+		components := splitPath(p)
+		currentIno := int64(RootIno)
+		resolvedDir := "/"
+
+		allResolved := true
+		for i, component := range components {
+			isLast := i == len(components)-1
+
+			childIno, childMode, err := fs.lookupDentryWithMode(ctx, currentIno, component)
+			if err != nil {
+				return 0, ErrNoent("resolve", p)
+			}
+
+			isSymlink := (childMode & S_IFMT) == S_IFLNK
+
+			if isSymlink && (!isLast || followLast) {
+				symlinkCount++
+				if symlinkCount > MaxSymlinkDepth {
+					return 0, ErrLoop("resolve", p)
+				}
+
+				target, err := fs.readSymlinkTarget(ctx, childIno)
+				if err != nil {
+					return 0, err
+				}
+
+				// Build the remaining path after this component
+				remaining := strings.Join(components[i+1:], "/")
+
+				if strings.HasPrefix(target, "/") {
+					// Absolute symlink target
+					if remaining != "" {
+						p = target + "/" + remaining
+					} else {
+						p = target
+					}
+				} else {
+					// Relative symlink target: resolve against parent directory
+					if remaining != "" {
+						p = resolvedDir + "/" + target + "/" + remaining
+					} else {
+						p = resolvedDir + "/" + target
+					}
+				}
+				p = normalizePath(p)
+				allResolved = false
+				break
+			}
+
+			if !isLast {
+				isDir := (childMode & S_IFMT) == S_IFDIR
+				if !isDir && !isSymlink {
+					return 0, ErrNotDir("resolve", p)
+				}
+			}
+
+			currentIno = childIno
+			if resolvedDir == "/" {
+				resolvedDir = "/" + component
+			} else {
+				resolvedDir = resolvedDir + "/" + component
+			}
+		}
+
+		if allResolved {
+			return currentIno, nil
+		}
+	}
 }
 
 // statInode retrieves stats for an inode
@@ -1030,21 +1079,4 @@ func (fs *Filesystem) writeChunks(ctx context.Context, ino int64, data []byte) e
 		chunkIndex++
 	}
 	return nil
-}
-
-// CacheStats returns cache statistics, or nil if caching is disabled.
-func (fs *Filesystem) CacheStats() *cache.Stats {
-	if fs.cache == nil {
-		return nil
-	}
-	stats := fs.cache.Stats()
-	return &stats
-}
-
-// ClearCache clears all cached path resolutions.
-// This is useful when external changes may have occurred.
-func (fs *Filesystem) ClearCache() {
-	if fs.cache != nil {
-		fs.cache.Clear()
-	}
 }

@@ -26,7 +26,7 @@ sdk/go/
 ├── spec_test.go           # Spec compliance tests
 ├── agentfs_test.go        # Implementation/behavior tests
 ├── overlay_test.go        # Overlay implementation tests
-├── cache_test.go          # Cache behavior tests
+├── symlink_test.go        # Symlink resolution tests
 └── SPEC_TESTS.md          # Spec element tracking (this file)
 ```
 
@@ -54,7 +54,7 @@ sdk/go/
 | `spec_test.go` | Spec compliance | Minimal verification of each spec element |
 | `agentfs_test.go` | Implementation | Detailed behavior, edge cases, integration |
 | `overlay_test.go` | Overlay behavior | Copy-up, caching, complex scenarios |
-| `cache_test.go` | Cache correctness | Consistency with/without cache |
+| `symlink_test.go` | Symlink resolution | Follow, ELOOP, intermediate traversal |
 
 ### Running Spec Tests
 
@@ -397,7 +397,7 @@ Tests for these elements can be found in:
 
 - `agentfs_test.go` - Core filesystem operations
 - `overlay_test.go` - Overlay filesystem operations
-- `cache_test.go` - Path cache behavior
+- `symlink_test.go` - Symlink resolution behavior
 
 ### Overlay Consistency Rules (OV-18 to OV-23)
 

@@ -2040,7 +2040,10 @@ func TestSpec_FS67_SymlinkStored(t *testing.T) {
 		t.Fatalf("Failed to symlink: %v", err)
 	}
 
-	stats, _ := afs.FS.Stat(ctx, "/mylink")
+	stats, err := afs.FS.Lstat(ctx, "/mylink")
+	if err != nil {
+		t.Fatalf("Failed to lstat: %v", err)
+	}
 
 	// Verify entry in fs_symlink
 	var target string
@@ -2099,9 +2102,9 @@ func TestSpec_FS69_SymlinkMode(t *testing.T) {
 		t.Fatalf("Failed to symlink: %v", err)
 	}
 
-	stats, err := afs.FS.Stat(ctx, "/symlink")
+	stats, err := afs.FS.Lstat(ctx, "/symlink")
 	if err != nil {
-		t.Fatalf("Failed to stat: %v", err)
+		t.Fatalf("Failed to lstat: %v", err)
 	}
 
 	if stats.Mode&S_IFMT != S_IFLNK {

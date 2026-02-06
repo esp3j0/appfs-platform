@@ -11,8 +11,6 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/tursodatabase/agentfs/sdk/go/internal/cache"
-
 	_ "modernc.org/sqlite"
 )
 
@@ -120,7 +118,6 @@ func OpenWith(ctx context.Context, db *sql.DB, opts ...OpenWithOption) (*AgentFS
 
 	afsOpts := AgentFSOptions{
 		ChunkSize: o.chunkSize,
-		Cache:     o.cache,
 	}
 
 	afs, err := initAgentFS(ctx, db, "", false, afsOpts)
@@ -136,20 +133,12 @@ type OpenWithOption func(*openWithOptions)
 
 type openWithOptions struct {
 	chunkSize int
-	cache     CacheOptions
 }
 
 // WithChunkSize sets the chunk size for file data storage.
 func WithChunkSize(size int) OpenWithOption {
 	return func(o *openWithOptions) {
 		o.chunkSize = size
-	}
-}
-
-// WithCache enables and configures the path resolution cache.
-func WithCache(opts CacheOptions) OpenWithOption {
-	return func(o *openWithOptions) {
-		o.cache = opts
 	}
 }
 
@@ -205,19 +194,6 @@ func initAgentFS(ctx context.Context, db *sql.DB, dbPath string, ownsDB bool, op
 		return nil, fmt.Errorf("invalid chunk_size value: %w", err)
 	}
 
-	// Initialize cache if enabled
-	var pathCache cache.PathCache
-	if opts.Cache.Enabled {
-		maxEntries := opts.Cache.MaxEntries
-		if maxEntries <= 0 {
-			maxEntries = 10000 // Default
-		}
-		pathCache, err = cache.NewLRU(maxEntries, opts.Cache.TTL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize cache: %w", err)
-		}
-	}
-
 	afs := &AgentFS{
 		db:     db,
 		ownsDB: ownsDB,
@@ -228,7 +204,6 @@ func initAgentFS(ctx context.Context, db *sql.DB, dbPath string, ownsDB bool, op
 	afs.FS = &Filesystem{
 		db:        db,
 		chunkSize: actualChunkSize,
-		cache:     pathCache,
 	}
 	afs.KV = &KVStore{db: db}
 	afs.Tools = &ToolCalls{db: db}

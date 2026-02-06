@@ -526,12 +526,16 @@ func TestIOFS_FileMode(t *testing.T) {
 		}
 	})
 
-	t.Run("Symlink mode", func(t *testing.T) {
+	t.Run("Symlink mode via Stat (follows symlink)", func(t *testing.T) {
 		info, _ := iofs.Stat("symlink")
 		mode := info.Mode()
 
-		if mode&fs.ModeSymlink == 0 {
-			t.Error("Symlink should have ModeSymlink bit set")
+		// Stat follows the symlink, so we should see the target's mode (regular file)
+		if mode&fs.ModeSymlink != 0 {
+			t.Error("Stat on symlink should follow to target, not show ModeSymlink")
+		}
+		if mode.IsDir() {
+			t.Error("Symlink target is a regular file, not a directory")
 		}
 	})
 }

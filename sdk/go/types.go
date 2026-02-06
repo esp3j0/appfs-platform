@@ -19,9 +19,6 @@ type AgentFSOptions struct {
 	// Only used when creating a new database; ignored for existing databases.
 	ChunkSize int
 
-	// Cache configures the optional path resolution cache.
-	Cache CacheOptions
-
 	// Pool configures the database connection pool.
 	Pool PoolOptions
 }
@@ -44,22 +41,6 @@ type PoolOptions struct {
 	// ConnMaxIdleTime sets the maximum amount of time a connection may be idle.
 	// Default: 0 (connections are never closed due to idle time).
 	ConnMaxIdleTime time.Duration
-}
-
-// CacheOptions configures the optional LRU cache for path resolution.
-type CacheOptions struct {
-	// Enabled turns caching on/off (default: false)
-	Enabled bool
-
-	// MaxEntries is the maximum number of path->inode mappings to cache.
-	// Default: 10000 when enabled.
-	MaxEntries int
-
-	// TTL is an optional time-to-live for cache entries.
-	// Use 0 for no expiration (recommended for single-process usage).
-	// Use a short TTL (e.g., 5s) for multi-process scenarios where
-	// external changes may occur.
-	TTL time.Duration
 }
 
 // Stats represents file/directory metadata (matches POSIX stat)

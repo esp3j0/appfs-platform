@@ -161,6 +161,12 @@ const (
 	queryDentryByParentAndName = `
 		SELECT ino FROM fs_dentry WHERE parent_ino = ? AND name = ?`
 
+	// Combined dentry + inode lookup (avoids two round-trips per component)
+	queryDentryWithMode = `
+		SELECT d.ino, i.mode FROM fs_dentry d
+		JOIN fs_inode i ON d.ino = i.ino
+		WHERE d.parent_ino = ? AND d.name = ?`
+
 	// Inode operations
 	queryInodeByIno = `
 		SELECT ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,

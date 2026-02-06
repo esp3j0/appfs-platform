@@ -318,12 +318,22 @@ func TestFilesystem(t *testing.T) {
 			t.Fatalf("Symlink failed: %v", err)
 		}
 
+		// Stat follows the symlink to /hello.txt (a regular file)
 		stats, err := fs.Stat(ctx, "/symlink.txt")
 		if err != nil {
 			t.Fatalf("Stat failed: %v", err)
 		}
-		if !stats.IsSymlink() {
-			t.Error("Not a symlink")
+		if !stats.IsRegularFile() {
+			t.Error("Stat on symlink should follow to target (regular file)")
+		}
+
+		// Lstat returns the symlink's own stats
+		lstats, err := fs.Lstat(ctx, "/symlink.txt")
+		if err != nil {
+			t.Fatalf("Lstat failed: %v", err)
+		}
+		if !lstats.IsSymlink() {
+			t.Error("Lstat should return symlink stats")
 		}
 
 		target, err := fs.Readlink(ctx, "/symlink.txt")
@@ -1061,28 +1071,6 @@ func TestOpenWith(t *testing.T) {
 
 		if afs.FS.ChunkSize() != 8192 {
 			t.Errorf("ChunkSize() = %d, want 8192", afs.FS.ChunkSize())
-		}
-	})
-
-	t.Run("with cache option", func(t *testing.T) {
-		db, err := sql.Open("sqlite", ":memory:")
-		if err != nil {
-			t.Fatalf("sql.Open failed: %v", err)
-		}
-		defer db.Close()
-
-		afs, err := OpenWith(ctx, db, WithCache(CacheOptions{
-			Enabled:    true,
-			MaxEntries: 500,
-		}))
-		if err != nil {
-			t.Fatalf("OpenWith failed: %v", err)
-		}
-
-		// Cache should be active
-		stats := afs.FS.CacheStats()
-		if stats == nil {
-			t.Fatal("CacheStats() returned nil, cache should be enabled")
 		}
 	})
 

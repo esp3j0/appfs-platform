@@ -59,7 +59,8 @@ const (
 
 // Filesystem limits
 const (
-	MaxNameLen = 255 // Maximum filename length in bytes
+	MaxNameLen      = 255 // Maximum filename length in bytes
+	MaxSymlinkDepth = 40  // Maximum number of symlinks followed during path resolution
 )
 
 // Open flags (matching os package)

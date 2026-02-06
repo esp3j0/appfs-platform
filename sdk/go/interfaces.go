@@ -3,8 +3,6 @@ package agentfs
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/tursodatabase/agentfs/sdk/go/internal/cache"
 )
 
 // FileSystem defines the interface for filesystem operations.
@@ -12,7 +10,11 @@ import (
 // but users can program against this interface for testability and mocking.
 type FileSystem interface {
 	// Stat returns file/directory metadata for the given path.
+	// If the path refers to a symlink, Stat follows the symlink.
 	Stat(ctx context.Context, path string) (*Stats, error)
+
+	// Lstat returns file/directory metadata without following the final symlink.
+	Lstat(ctx context.Context, path string) (*Stats, error)
 
 	// Readdir returns the names of entries in a directory.
 	Readdir(ctx context.Context, path string) ([]string, error)
@@ -64,12 +66,6 @@ type FileSystem interface {
 
 	// ChunkSize returns the configured chunk size for file data.
 	ChunkSize() int
-
-	// CacheStats returns cache statistics, or nil if caching is disabled.
-	CacheStats() *cache.Stats
-
-	// ClearCache clears all cached path resolutions.
-	ClearCache()
 }
 
 // KVStoreInterface defines the interface for key-value store operations.
