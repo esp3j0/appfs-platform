@@ -3,6 +3,7 @@ package agentfs
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path"
 	"strings"
 	"time"
@@ -669,6 +670,136 @@ func (fs *Filesystem) Readlink(ctx context.Context, p string) (string, error) {
 	}
 
 	return target, nil
+}
+
+// Lstat returns file/directory metadata without following symlinks.
+//
+// Since the current path resolution does not follow symlinks, Lstat is
+// functionally identical to Stat. It is provided for API parity with the
+// Rust SDK and POSIX convention.
+func (fs *Filesystem) Lstat(ctx context.Context, p string) (*Stats, error) {
+	return fs.Stat(ctx, p)
+}
+
+// Statfs returns aggregate filesystem statistics.
+func (fs *Filesystem) Statfs(ctx context.Context) (*FilesystemStats, error) {
+	var stats FilesystemStats
+
+	if err := fs.db.QueryRowContext(ctx, statfsInodeCount).Scan(&stats.Inodes); err != nil {
+		return nil, fmt.Errorf("statfs: failed to count inodes: %w", err)
+	}
+
+	if err := fs.db.QueryRowContext(ctx, statfsBytesUsed).Scan(&stats.BytesUsed); err != nil {
+		return nil, fmt.Errorf("statfs: failed to sum bytes: %w", err)
+	}
+
+	return &stats, nil
+}
+
+// Chown changes file ownership.
+// Pass -1 for uid or gid to leave that field unchanged.
+func (fs *Filesystem) Chown(ctx context.Context, p string, uid, gid int64) error {
+	if uid == -1 && gid == -1 {
+		return nil
+	}
+
+	p = normalizePath(p)
+
+	ino, err := fs.resolvePath(ctx, p)
+	if err != nil {
+		return err
+	}
+
+	var setClauses []string
+	var args []any
+
+	if uid != -1 {
+		setClauses = append(setClauses, "uid = ?")
+		args = append(args, uid)
+	}
+	if gid != -1 {
+		setClauses = append(setClauses, "gid = ?")
+		args = append(args, gid)
+	}
+
+	now := time.Now()
+	setClauses = append(setClauses, "ctime = ?", "ctime_nsec = ?")
+	args = append(args, now.Unix(), int64(now.Nanosecond()))
+
+	args = append(args, ino)
+	query := fmt.Sprintf("UPDATE fs_inode SET %s WHERE ino = ?", strings.Join(setClauses, ", "))
+
+	if _, err := fs.db.ExecContext(ctx, query, args...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Mknod creates a special file (FIFO, character device, block device, or socket).
+// The mode parameter must include one of S_IFIFO, S_IFCHR, S_IFBLK, or S_IFSOCK.
+// The rdev parameter specifies the device number (used for character and block devices).
+func (fs *Filesystem) Mknod(ctx context.Context, p string, mode, rdev int64) error {
+	p = normalizePath(p)
+	if p == "/" {
+		return ErrRootOperation("mknod", p)
+	}
+
+	parentPath, name := path.Split(p)
+	parentPath = normalizePath(parentPath)
+
+	if err := validateName("mknod", name); err != nil {
+		return err
+	}
+
+	// Validate that mode includes a special file type
+	ft := mode & S_IFMT
+	if ft != S_IFIFO && ft != S_IFCHR && ft != S_IFBLK && ft != S_IFSOCK {
+		return ErrInval("mknod", p, "mode must include S_IFIFO, S_IFCHR, S_IFBLK, or S_IFSOCK")
+	}
+
+	parentIno, err := fs.resolvePath(ctx, parentPath)
+	if err != nil {
+		return err
+	}
+
+	// Check parent is a directory
+	parentStats, err := fs.statInode(ctx, parentIno)
+	if err != nil {
+		return err
+	}
+	if !parentStats.IsDir() {
+		return ErrNotDir("mknod", parentPath)
+	}
+
+	// Check if entry already exists
+	_, err = fs.lookupDentry(ctx, parentIno, name)
+	if err == nil {
+		return ErrExist("mknod", p)
+	}
+
+	// Create inode
+	now := time.Now()
+	nowSec := now.Unix()
+	nowNsec := int64(now.Nanosecond())
+
+	var ino int64
+	err = fs.db.QueryRowContext(ctx, insertInode, mode, 0, 0, 0, nowSec, nowSec, nowSec, rdev, nowNsec, nowNsec, nowNsec).Scan(&ino)
+	if err != nil {
+		return err
+	}
+
+	// Create dentry
+	if _, err := fs.db.ExecContext(ctx, insertDentry, name, parentIno, ino); err != nil {
+		return err
+	}
+
+	// Increment nlink
+	if _, err := fs.db.ExecContext(ctx, incrementNlink, ino); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Chmod changes file permissions.

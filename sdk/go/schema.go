@@ -247,6 +247,13 @@ const (
 
 	deleteSymlink = `
 		DELETE FROM fs_symlink WHERE ino = ?`
+
+	// Filesystem statistics
+	statfsInodeCount = `
+		SELECT COUNT(*) FROM fs_inode`
+
+	statfsBytesUsed = `
+		SELECT COALESCE(SUM(size), 0) FROM fs_inode`
 )
 
 // Key-value store queries

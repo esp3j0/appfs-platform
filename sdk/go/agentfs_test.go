@@ -1600,6 +1600,563 @@ func TestReadlinkOnNonSymlink(t *testing.T) {
 	})
 }
 
+func TestLstat(t *testing.T) {
+	ctx := context.Background()
+	afs := setupTestDB(t)
+	defer afs.Close()
+	fs := afs.FS
+
+	t.Run("regular file", func(t *testing.T) {
+		if err := fs.WriteFile(ctx, "/lstat_file.txt", []byte("hello"), 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		stats, err := fs.Lstat(ctx, "/lstat_file.txt")
+		if err != nil {
+			t.Fatalf("Lstat failed: %v", err)
+		}
+
+		if !stats.IsRegularFile() {
+			t.Errorf("expected regular file, got mode %o", stats.Mode)
+		}
+		if stats.Size != 5 {
+			t.Errorf("Size = %d, want 5", stats.Size)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		if err := fs.Mkdir(ctx, "/lstat_dir", 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		stats, err := fs.Lstat(ctx, "/lstat_dir")
+		if err != nil {
+			t.Fatalf("Lstat failed: %v", err)
+		}
+
+		if !stats.IsDir() {
+			t.Errorf("expected directory, got mode %o", stats.Mode)
+		}
+	})
+
+	t.Run("symlink returns symlink stats", func(t *testing.T) {
+		if err := fs.Symlink(ctx, "/some_target", "/lstat_link"); err != nil {
+			t.Fatalf("Symlink failed: %v", err)
+		}
+
+		stats, err := fs.Lstat(ctx, "/lstat_link")
+		if err != nil {
+			t.Fatalf("Lstat failed: %v", err)
+		}
+
+		if !stats.IsSymlink() {
+			t.Errorf("expected symlink, got mode %o", stats.Mode)
+		}
+	})
+
+	t.Run("nonexistent path", func(t *testing.T) {
+		_, err := fs.Lstat(ctx, "/no_such_file")
+		if err == nil {
+			t.Fatal("Expected error for nonexistent path")
+		}
+		if !IsNotExist(err) {
+			t.Errorf("Expected ENOENT, got: %v", err)
+		}
+	})
+
+	t.Run("matches Stat for regular files", func(t *testing.T) {
+		statResult, err := fs.Stat(ctx, "/lstat_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		lstatResult, err := fs.Lstat(ctx, "/lstat_file.txt")
+		if err != nil {
+			t.Fatalf("Lstat failed: %v", err)
+		}
+
+		if statResult.Ino != lstatResult.Ino {
+			t.Errorf("Ino mismatch: Stat=%d, Lstat=%d", statResult.Ino, lstatResult.Ino)
+		}
+		if statResult.Mode != lstatResult.Mode {
+			t.Errorf("Mode mismatch: Stat=%o, Lstat=%o", statResult.Mode, lstatResult.Mode)
+		}
+	})
+}
+
+func TestStatfs(t *testing.T) {
+	ctx := context.Background()
+	afs := setupTestDB(t)
+	defer afs.Close()
+	fs := afs.FS
+
+	t.Run("empty filesystem has root inode", func(t *testing.T) {
+		stats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		// At minimum, root inode exists
+		if stats.Inodes < 1 {
+			t.Errorf("Inodes = %d, want >= 1", stats.Inodes)
+		}
+
+		if stats.BytesUsed != 0 {
+			t.Errorf("BytesUsed = %d, want 0 for empty filesystem", stats.BytesUsed)
+		}
+	})
+
+	t.Run("counts inodes correctly", func(t *testing.T) {
+		initialStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		// Create a directory and a file
+		if err := fs.Mkdir(ctx, "/statfs_dir", 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+		if err := fs.WriteFile(ctx, "/statfs_file.txt", []byte("content"), 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		afterStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		expectedInodes := initialStats.Inodes + 2
+		if afterStats.Inodes != expectedInodes {
+			t.Errorf("Inodes = %d, want %d", afterStats.Inodes, expectedInodes)
+		}
+	})
+
+	t.Run("tracks bytes used", func(t *testing.T) {
+		if err := fs.WriteFile(ctx, "/statfs_data.bin", []byte("1234567890"), 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		stats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		// BytesUsed should include the 10 bytes we just wrote plus the 7 from "content"
+		if stats.BytesUsed < 17 {
+			t.Errorf("BytesUsed = %d, want >= 17", stats.BytesUsed)
+		}
+	})
+
+	t.Run("bytes decrease after unlink", func(t *testing.T) {
+		beforeStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if err := fs.Unlink(ctx, "/statfs_data.bin"); err != nil {
+			t.Fatalf("Unlink failed: %v", err)
+		}
+
+		afterStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if afterStats.Inodes >= beforeStats.Inodes {
+			t.Errorf("Inodes should decrease after unlink: before=%d, after=%d", beforeStats.Inodes, afterStats.Inodes)
+		}
+		if afterStats.BytesUsed >= beforeStats.BytesUsed {
+			t.Errorf("BytesUsed should decrease after unlink: before=%d, after=%d", beforeStats.BytesUsed, afterStats.BytesUsed)
+		}
+	})
+
+	t.Run("symlinks count as inodes", func(t *testing.T) {
+		beforeStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if err := fs.Symlink(ctx, "/target", "/statfs_symlink"); err != nil {
+			t.Fatalf("Symlink failed: %v", err)
+		}
+
+		afterStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if afterStats.Inodes != beforeStats.Inodes+1 {
+			t.Errorf("Inodes = %d, want %d", afterStats.Inodes, beforeStats.Inodes+1)
+		}
+	})
+}
+
+func TestChown(t *testing.T) {
+	ctx := context.Background()
+	afs := setupTestDB(t)
+	defer afs.Close()
+	fs := afs.FS
+
+	t.Run("change uid and gid", func(t *testing.T) {
+		if err := fs.WriteFile(ctx, "/chown_file.txt", []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		if err := fs.Chown(ctx, "/chown_file.txt", 1000, 2000); err != nil {
+			t.Fatalf("Chown failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if stats.UID != 1000 {
+			t.Errorf("UID = %d, want 1000", stats.UID)
+		}
+		if stats.GID != 2000 {
+			t.Errorf("GID = %d, want 2000", stats.GID)
+		}
+	})
+
+	t.Run("change uid only", func(t *testing.T) {
+		if err := fs.Chown(ctx, "/chown_file.txt", 500, -1); err != nil {
+			t.Fatalf("Chown failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if stats.UID != 500 {
+			t.Errorf("UID = %d, want 500", stats.UID)
+		}
+		if stats.GID != 2000 {
+			t.Errorf("GID = %d, want 2000 (unchanged)", stats.GID)
+		}
+	})
+
+	t.Run("change gid only", func(t *testing.T) {
+		if err := fs.Chown(ctx, "/chown_file.txt", -1, 999); err != nil {
+			t.Fatalf("Chown failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if stats.UID != 500 {
+			t.Errorf("UID = %d, want 500 (unchanged)", stats.UID)
+		}
+		if stats.GID != 999 {
+			t.Errorf("GID = %d, want 999", stats.GID)
+		}
+	})
+
+	t.Run("both -1 is a no-op", func(t *testing.T) {
+		beforeStats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		if err := fs.Chown(ctx, "/chown_file.txt", -1, -1); err != nil {
+			t.Fatalf("Chown(-1, -1) failed: %v", err)
+		}
+
+		afterStats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		if afterStats.UID != beforeStats.UID {
+			t.Errorf("UID changed: %d -> %d", beforeStats.UID, afterStats.UID)
+		}
+		if afterStats.GID != beforeStats.GID {
+			t.Errorf("GID changed: %d -> %d", beforeStats.GID, afterStats.GID)
+		}
+	})
+
+	t.Run("updates ctime", func(t *testing.T) {
+		beforeStats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+
+		if err := fs.Chown(ctx, "/chown_file.txt", 42, 42); err != nil {
+			t.Fatalf("Chown failed: %v", err)
+		}
+
+		afterStats, err := fs.Stat(ctx, "/chown_file.txt")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		if afterStats.Ctime < beforeStats.Ctime {
+			t.Errorf("Ctime should not decrease: before=%d, after=%d", beforeStats.Ctime, afterStats.Ctime)
+		}
+		if afterStats.Ctime == beforeStats.Ctime && afterStats.CtimeNsec <= beforeStats.CtimeNsec {
+			t.Error("Ctime should have been updated")
+		}
+	})
+
+	t.Run("chown on directory", func(t *testing.T) {
+		if err := fs.Mkdir(ctx, "/chown_dir", 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		if err := fs.Chown(ctx, "/chown_dir", 100, 200); err != nil {
+			t.Fatalf("Chown on directory failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/chown_dir")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if stats.UID != 100 || stats.GID != 200 {
+			t.Errorf("UID=%d GID=%d, want UID=100 GID=200", stats.UID, stats.GID)
+		}
+	})
+
+	t.Run("chown on nonexistent file", func(t *testing.T) {
+		err := fs.Chown(ctx, "/no_such_chown_file", 1, 1)
+		if err == nil {
+			t.Fatal("Expected error for nonexistent file")
+		}
+		if !IsNotExist(err) {
+			t.Errorf("Expected ENOENT, got: %v", err)
+		}
+	})
+}
+
+func TestMknod(t *testing.T) {
+	ctx := context.Background()
+	afs := setupTestDB(t)
+	defer afs.Close()
+	fs := afs.FS
+
+	t.Run("create FIFO", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/my_fifo", S_IFIFO|0o644, 0)
+		if err != nil {
+			t.Fatalf("Mknod FIFO failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/my_fifo")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if !stats.IsFIFO() {
+			t.Errorf("expected FIFO, got mode %o", stats.Mode)
+		}
+		if stats.Permissions() != 0o644 {
+			t.Errorf("Permissions = %o, want 644", stats.Permissions())
+		}
+		if stats.Nlink != 1 {
+			t.Errorf("Nlink = %d, want 1", stats.Nlink)
+		}
+	})
+
+	t.Run("create character device", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/my_chardev", S_IFCHR|0o660, 0x0501) // major=5, minor=1
+		if err != nil {
+			t.Fatalf("Mknod char device failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/my_chardev")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if !stats.IsCharDevice() {
+			t.Errorf("expected char device, got mode %o", stats.Mode)
+		}
+		if stats.Rdev != 0x0501 {
+			t.Errorf("Rdev = %d, want %d", stats.Rdev, 0x0501)
+		}
+	})
+
+	t.Run("create block device", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/my_blkdev", S_IFBLK|0o660, 0x0800) // major=8, minor=0
+		if err != nil {
+			t.Fatalf("Mknod block device failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/my_blkdev")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if !stats.IsBlockDevice() {
+			t.Errorf("expected block device, got mode %o", stats.Mode)
+		}
+		if stats.Rdev != 0x0800 {
+			t.Errorf("Rdev = %d, want %d", stats.Rdev, 0x0800)
+		}
+	})
+
+	t.Run("create socket", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/my_sock", S_IFSOCK|0o755, 0)
+		if err != nil {
+			t.Fatalf("Mknod socket failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/my_sock")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if !stats.IsSocket() {
+			t.Errorf("expected socket, got mode %o", stats.Mode)
+		}
+	})
+
+	t.Run("rejects invalid mode without special file type", func(t *testing.T) {
+		// S_IFREG is not valid for mknod
+		err := fs.Mknod(ctx, "/bad_mode", S_IFREG|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected error for invalid mode")
+		}
+		var fsErr *FSError
+		if !errors.As(err, &fsErr) {
+			t.Fatalf("Expected FSError, got: %T", err)
+		}
+		if fsErr.Code != EINVAL {
+			t.Errorf("Code = %d, want %d (EINVAL)", fsErr.Code, EINVAL)
+		}
+	})
+
+	t.Run("rejects directory mode", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/bad_dir", S_IFDIR|0o755, 0)
+		if err == nil {
+			t.Fatal("Expected error for directory mode")
+		}
+	})
+
+	t.Run("rejects symlink mode", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/bad_symlink", S_IFLNK|0o777, 0)
+		if err == nil {
+			t.Fatal("Expected error for symlink mode")
+		}
+	})
+
+	t.Run("rejects plain permission bits (no file type)", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/no_type", 0o644, 0)
+		if err == nil {
+			t.Fatal("Expected error when no file type in mode")
+		}
+	})
+
+	t.Run("already exists", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/my_fifo", S_IFIFO|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected EEXIST error")
+		}
+		if !IsExist(err) {
+			t.Errorf("Expected EEXIST, got: %v", err)
+		}
+	})
+
+	t.Run("parent not found", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/no_parent/fifo", S_IFIFO|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected error for nonexistent parent")
+		}
+		if !IsNotExist(err) {
+			t.Errorf("Expected ENOENT, got: %v", err)
+		}
+	})
+
+	t.Run("parent not a directory", func(t *testing.T) {
+		if err := fs.WriteFile(ctx, "/mknod_file", []byte("data"), 0o644); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		err := fs.Mknod(ctx, "/mknod_file/fifo", S_IFIFO|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected error when parent is not a directory")
+		}
+	})
+
+	t.Run("root path rejected", func(t *testing.T) {
+		err := fs.Mknod(ctx, "/", S_IFIFO|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected error for root path")
+		}
+		var fsErr *FSError
+		if !errors.As(err, &fsErr) {
+			t.Fatalf("Expected FSError, got: %T", err)
+		}
+		if fsErr.Code != EPERM {
+			t.Errorf("Code = %d, want %d (EPERM)", fsErr.Code, EPERM)
+		}
+	})
+
+	t.Run("name too long", func(t *testing.T) {
+		longName := strings.Repeat("x", MaxNameLen+1)
+		err := fs.Mknod(ctx, "/"+longName, S_IFIFO|0o644, 0)
+		if err == nil {
+			t.Fatal("Expected ENAMETOOLONG")
+		}
+		if !IsNameTooLong(err) {
+			t.Errorf("Expected ENAMETOOLONG, got: %v", err)
+		}
+	})
+
+	t.Run("create in subdirectory", func(t *testing.T) {
+		if err := fs.Mkdir(ctx, "/mknod_subdir", 0o755); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+
+		err := fs.Mknod(ctx, "/mknod_subdir/pipe", S_IFIFO|0o644, 0)
+		if err != nil {
+			t.Fatalf("Mknod in subdir failed: %v", err)
+		}
+
+		stats, err := fs.Stat(ctx, "/mknod_subdir/pipe")
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+		if !stats.IsFIFO() {
+			t.Errorf("expected FIFO, got mode %o", stats.Mode)
+		}
+	})
+
+	t.Run("visible in readdir", func(t *testing.T) {
+		entries, err := fs.Readdir(ctx, "/mknod_subdir")
+		if err != nil {
+			t.Fatalf("Readdir failed: %v", err)
+		}
+
+		found := false
+		for _, name := range entries {
+			if name == "pipe" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("mknod entry 'pipe' not found in readdir results: %v", entries)
+		}
+	})
+
+	t.Run("statfs counts mknod inodes", func(t *testing.T) {
+		beforeStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if err := fs.Mknod(ctx, "/counted_fifo", S_IFIFO|0o644, 0); err != nil {
+			t.Fatalf("Mknod failed: %v", err)
+		}
+
+		afterStats, err := fs.Statfs(ctx)
+		if err != nil {
+			t.Fatalf("Statfs failed: %v", err)
+		}
+
+		if afterStats.Inodes != beforeStats.Inodes+1 {
+			t.Errorf("Inodes = %d, want %d", afterStats.Inodes, beforeStats.Inodes+1)
+		}
+	})
+}
+
 // setupTestDB creates a temporary database for testing
 func setupTestDB(t *testing.T) *AgentFS {
 	t.Helper()

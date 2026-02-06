@@ -139,6 +139,12 @@ func (s *Stats) CtimeTime() time.Time {
 	return time.Unix(s.Ctime, s.CtimeNsec)
 }
 
+// FilesystemStats represents aggregate filesystem statistics returned by Statfs.
+type FilesystemStats struct {
+	Inodes    int64 `json:"inodes"`     // Total number of inodes (files, directories, symlinks, etc.)
+	BytesUsed int64 `json:"bytes_used"` // Total bytes used by file contents
+}
+
 // DirEntry represents a directory entry returned by ReaddirPlus
 type DirEntry struct {
 	Name  string `json:"name"`
