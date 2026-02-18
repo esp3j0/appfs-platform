@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.1] - 2026-02-18
+
+### Added
+
+- Go SDK for AgentFS with overlay filesystem, connection pooling, streaming I/O, `io/fs` implementation, typesafe generic KV support, symlink support, and inode LRU cache.
+
+### Changed
+
+- Update pyturso dependency version.
+
+### Fixed
+
+- Rust SDK: Overlayfs whiteout for base files in promoted directories.
+- Rust SDK: Stale base inodes after remount in overlayfs.
+- CLI: FUSE kernel cache serving stale directory listings.
+
 ## [0.6.0] - 2026-02-05
 
 AgentFS is now beta!
@@ -293,6 +309,7 @@ AgentFS is now beta!
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.6.1]: https://github.com/tursodatabase/agentfs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/tursodatabase/agentfs/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/tursodatabase/agentfs/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/tursodatabase/agentfs/compare/v0.5.1...v0.5.2
