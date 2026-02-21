@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.2] - 2026-02-21
+
+### Fixed
+
+- Update native-tls 0.2.17 -> 0.2.18 to fix nightly build.
+
 ## [0.6.1] - 2026-02-18
 
 ### Added
@@ -309,6 +315,7 @@ AgentFS is now beta!
 - Cross-platform builds (Linux, macOS).
 - Example agent implementations.
 
+[0.6.2]: https://github.com/tursodatabase/agentfs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/tursodatabase/agentfs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/tursodatabase/agentfs/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/tursodatabase/agentfs/compare/v0.5.2...v0.5.3
