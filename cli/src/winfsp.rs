@@ -20,9 +20,10 @@ use std::{
 };
 use tokio::runtime::Handle;
 use tracing;
+use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, FileInfo, FileSecurity, FileSystemContext,
-    OpenFileInfo, VolumeInfo, WideNameInfo,
+    DirInfo, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
+    VolumeInfo, WideNameInfo,
 };
 use winfsp::{FspError, U16CStr};
 
@@ -34,6 +35,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
 
 // Windows create options flags
 const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
 
 // NTSTATUS error codes (these are negative values when interpreted as i32)
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
@@ -155,7 +157,6 @@ pub struct AgentFSWinFsp {
     handle: Handle,
     open_files: Mutex<HashMap<u64, OpenFile>>,
     next_fh: AtomicU64,
-    dir_buffer: DirBuffer,
 }
 
 impl AgentFSWinFsp {
@@ -166,7 +167,6 @@ impl AgentFSWinFsp {
             handle,
             open_files: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
-            dir_buffer: DirBuffer::new(),
         }
     }
 
@@ -247,6 +247,25 @@ impl AgentFSWinFsp {
             fs.lock().lookup(parent_ino, &name).await
         })?)
     }
+
+    /// Delete a file or directory by path.
+    fn delete_path(&self, path: &str, is_dir: bool) -> Result<()> {
+        let (parent_ino, name) = self.parse_path(path)?;
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("Cannot delete root directory"));
+        }
+
+        let fs = self.fs.clone();
+        self.block_on(async move {
+            let fs_guard = fs.lock();
+            if is_dir {
+                fs_guard.rmdir(parent_ino, &name).await
+            } else {
+                fs_guard.unlink(parent_ino, &name).await
+            }
+        })?;
+        Ok(())
+    }
 }
 
 /// File context for WinFsp - represents an open file handle.
@@ -285,13 +304,20 @@ impl FileSystemContext for AgentFSWinFsp {
     fn open(
         &self,
         file_name: &U16CStr,
-        _create_options: u32,
-        _granted_access: u32,
+        create_options: u32,
+        granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let path = Self::win_path_to_unix(file_name);
+        let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
 
-        tracing::debug!("WinFsp::open: {}", path);
+        tracing::debug!(
+            "WinFsp::open: path={} create_options=0x{:x} granted_access=0x{:x} delete_on_close={}",
+            path,
+            create_options,
+            granted_access,
+            delete_on_close
+        );
 
         match self.path_lookup(&path) {
             Ok(Some(stats)) => {
@@ -307,7 +333,7 @@ impl FileSystemContext for AgentFSWinFsp {
                         file: None,
                         ino: stats.ino,
                         is_dir: true,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                         path: path_owned,
                     });
                     Ok(FileContext { fh })
@@ -325,7 +351,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                 file: Some(file),
                                 ino: stats.ino,
                                 is_dir: false,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                                 path: path_owned,
                             });
                             Ok(FileContext { fh })
@@ -353,6 +379,7 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<Self::FileContext> {
         let path = Self::win_path_to_unix(file_name);
         let is_dir = (create_options & FILE_DIRECTORY_FILE) != 0;
+        let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
 
         tracing::debug!("WinFsp::create: {} (is_dir={})", path, is_dir);
 
@@ -384,7 +411,7 @@ impl FileSystemContext for AgentFSWinFsp {
                         file: None,
                         ino: stats.ino,
                         is_dir: true,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                         path: path_owned,
                     });
                     Ok(FileContext { fh })
@@ -401,7 +428,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                 file: Some(file),
                                 ino: stats.ino,
                                 is_dir: false,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                                 path: path_owned,
                             });
                             Ok(FileContext { fh })
@@ -447,7 +474,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                 file: None,
                                 ino: stats.ino,
                                 is_dir: true,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                                 path: path_owned,
                             });
                             Ok(FileContext { fh })
@@ -465,7 +492,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                         file: Some(file),
                                         ino: stats.ino,
                                         is_dir: false,
-                                        delete_on_close: std::sync::atomic::AtomicBool::new(false),
+                                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                                         path: path_owned,
                                     });
                                     Ok(FileContext { fh })
@@ -482,36 +509,57 @@ impl FileSystemContext for AgentFSWinFsp {
     }
 
     fn close(&self, context: Self::FileContext) {
-        // Check if this file/directory is marked for deletion
-        let open_file = self.open_files.lock().remove(&context.fh);
-        if let Some(open_file) = open_file {
-            if open_file.delete_on_close.load(std::sync::atomic::Ordering::SeqCst) {
-                // Delete the file/directory now using the stored path
-                let path = open_file.path;
-                let is_dir = open_file.is_dir;
+        // WinFsp performs deletions during cleanup(FspCleanupDelete), not close().
+        self.open_files.lock().remove(&context.fh);
+    }
 
-                // Parse path to get parent_ino and name
-                match self.parse_path(&path) {
-                    Ok((parent_ino, name)) => {
-                        let fs = self.fs.clone();
-                        let result = self.block_on(async move {
-                            let fs_guard = fs.lock();
-                            if is_dir {
-                                fs_guard.rmdir(parent_ino, &name).await
-                            } else {
-                                fs_guard.unlink(parent_ino, &name).await
-                            }
-                        });
+    fn cleanup(
+        &self,
+        context: &Self::FileContext,
+        file_name: Option<&U16CStr>,
+        flags: u32,
+    ) {
+        let (should_delete, is_dir, fallback_path) = {
+            let open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get(&context.fh) else {
+                return;
+            };
 
-                        if let Err(e) = result {
-                            tracing::warn!("Failed to delete {} on close: {}", path, e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse path for deletion: {}", e);
-                    }
-                }
-            }
+            let delete_flag = FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
+            let pending_delete = open_file.delete_on_close.load(Ordering::SeqCst);
+            (
+                delete_flag || pending_delete,
+                open_file.is_dir,
+                open_file.path.clone(),
+            )
+        };
+
+        tracing::debug!(
+            "WinFsp::cleanup: fh={} flags=0x{:x} should_delete={} is_dir={} path={}",
+            context.fh,
+            flags,
+            should_delete,
+            is_dir,
+            fallback_path
+        );
+
+        if !should_delete {
+            return;
+        }
+
+        let path = file_name
+            .map(Self::win_path_to_unix)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(fallback_path);
+
+        if path.trim_matches('/').is_empty() {
+            tracing::warn!("Refusing to delete root during cleanup");
+            return;
+        }
+
+        if let Err(e) = self.delete_path(&path, is_dir) {
+            // Windows cleanup cannot report failure; log for diagnosis.
+            tracing::warn!("Failed to delete {} during cleanup: {}", path, e);
         }
     }
 
@@ -545,10 +593,26 @@ impl FileSystemContext for AgentFSWinFsp {
 
     fn get_security(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         _security_descriptor: Option<&mut [c_void]>,
     ) -> winfsp::Result<u64> {
+        tracing::debug!("WinFsp::get_security: fh={}", context.fh);
         Ok(0)
+    }
+
+    fn set_security(
+        &self,
+        context: &Self::FileContext,
+        security_information: u32,
+        _modification_descriptor: winfsp::filesystem::ModificationDescriptor,
+    ) -> winfsp::Result<()> {
+        tracing::debug!(
+            "WinFsp::set_security: fh={} security_information=0x{:x}",
+            context.fh,
+            security_information
+        );
+        // AgentFS currently does not persist Windows ACLs; accept and ignore.
+        Ok(())
     }
 
     fn set_basic_info(
@@ -564,6 +628,13 @@ impl FileSystemContext for AgentFSWinFsp {
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
             let ino = open_file.ino;
+            tracing::debug!(
+                "WinFsp::set_basic_info: fh={} ino={} last_access_time={} last_write_time={}",
+                context.fh,
+                ino,
+                last_access_time,
+                last_write_time
+            );
             drop(open_files);
 
             let atime = if last_access_time == 0 {
@@ -606,17 +677,48 @@ impl FileSystemContext for AgentFSWinFsp {
     fn set_delete(
         &self,
         context: &Self::FileContext,
-        _file_name: &U16CStr,
+        file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        // Mark the file for deletion on close (Unix unlink semantics)
-        // The actual deletion happens in close()
+        let path = Self::win_path_to_unix(file_name);
+        let (ino, is_dir) = {
+            let open_files = self.open_files.lock();
+            let Some(open_file) = open_files.get(&context.fh) else {
+                return Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER));
+            };
+            (open_file.ino, open_file.is_dir)
+        };
+
+        tracing::debug!(
+            "WinFsp::set_delete: fh={} path={} delete_file={} is_dir={} ino={}",
+            context.fh,
+            path,
+            delete_file,
+            is_dir,
+            ino
+        );
+
+        // Validate directory emptiness during SetDelete so Remove-Item can fail correctly.
+        if delete_file && is_dir {
+            let fs = self.fs.clone();
+            let entries = self.block_on(async move {
+                fs.lock().readdir_plus(ino).await
+            });
+
+            match entries {
+                Ok(Some(entries)) => {
+                    if !entries.is_empty() {
+                        return Err(FspError::NTSTATUS(STATUS_DIRECTORY_NOT_EMPTY));
+                    }
+                }
+                Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+            }
+        }
+
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
-            open_file.delete_on_close.store(
-                delete_file,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            open_file.delete_on_close.store(delete_file, Ordering::SeqCst);
             Ok(())
         } else {
             Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER))
@@ -632,6 +734,7 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<()> {
         let old_path = Self::win_path_to_unix(file_name);
         let new_path = Self::win_path_to_unix(new_file_name);
+        tracing::debug!("WinFsp::rename: {} -> {}", old_path, new_path);
         let (old_parent, old_name) = self.parse_path(&old_path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
         let (new_parent, new_name) = self.parse_path(&new_path)
@@ -655,11 +758,23 @@ impl FileSystemContext for AgentFSWinFsp {
         marker: winfsp::filesystem::DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        // Get the directory inode from the open file handle
-        let dir_ino = {
+        let marker_str = marker
+            .inner_as_cstr()
+            .map(|m| m.to_string_lossy())
+            .unwrap_or_else(|| "<none>".to_string());
+        tracing::debug!(
+            "WinFsp::read_directory: fh={} marker={} is_none={} is_current={} is_parent={}",
+            context.fh,
+            marker_str,
+            marker.is_none(),
+            marker.is_current(),
+            marker.is_parent()
+        );
+        // Get the directory inode/path from the open file handle
+        let (dir_ino, dir_path) = {
             let open_files = self.open_files.lock();
             match open_files.get(&context.fh) {
-                Some(open_file) => open_file.ino,
+                Some(open_file) => (open_file.ino, open_file.path.clone()),
                 None => return Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER)),
             }
         };
@@ -671,14 +786,55 @@ impl FileSystemContext for AgentFSWinFsp {
 
         match entries {
             Ok(Some(entries)) => {
+                let fs = self.fs.clone();
+                let dir_stats = self.block_on(async move {
+                    fs.lock().getattr(dir_ino).await
+                });
+                let dir_stats = match dir_stats {
+                    Ok(Some(stats)) => stats,
+                    Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                };
+
+                let parent_ino = if dir_path == "/" {
+                    1
+                } else {
+                    match self.parse_path(&dir_path) {
+                        Ok((pino, _)) => pino,
+                        Err(e) => return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e))),
+                    }
+                };
+                let fs = self.fs.clone();
+                let parent_stats = self.block_on(async move {
+                    fs.lock().getattr(parent_ino).await
+                });
+                let parent_stats = match parent_stats {
+                    Ok(Some(stats)) => stats,
+                    Ok(None) => dir_stats.clone(),
+                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                };
+
+                let mut all_entries: Vec<(String, Stats)> = Vec::with_capacity(entries.len() + 2);
+                all_entries.push((".".to_string(), dir_stats));
+                all_entries.push(("..".to_string(), parent_stats));
+                for entry in entries {
+                    all_entries.push((entry.name, entry.stats));
+                }
+                tracing::debug!(
+                    "WinFsp::read_directory: fh={} entry_count={} entries={:?}",
+                    context.fh,
+                    all_entries.len(),
+                    all_entries.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+                );
+
                 // Determine starting index based on marker.
                 // The marker is the filename (U16CStr) of the last entry returned
                 // in the previous call. We need to find it and skip past it.
                 let start_idx = if let Some(marker_name) = marker.inner_as_cstr() {
                     let marker_str = marker_name.to_string_lossy();
                     let mut idx = 0usize;
-                    for (i, entry) in entries.iter().enumerate() {
-                        if entry.name == marker_str {
+                    for (i, (name, _stats)) in all_entries.iter().enumerate() {
+                        if name == &marker_str {
                             idx = i + 1;
                             break;
                         }
@@ -689,12 +845,12 @@ impl FileSystemContext for AgentFSWinFsp {
                 };
                 let mut cursor = 0u32;
 
-                for entry in entries.iter().skip(start_idx) {
+                for (name, stats) in all_entries.iter().skip(start_idx) {
                     let mut dir_info: DirInfo<255> = DirInfo::default();
-                    fill_file_info(&entry.stats, dir_info.file_info_mut());
+                    fill_file_info(stats, dir_info.file_info_mut());
 
                     // Set the name using WideNameInfo trait
-                    if dir_info.set_name(&entry.name).is_ok() {
+                    if dir_info.set_name(name).is_ok() {
                         // Use the proper WinFsp API to append to buffer
                         // This handles variable-length entries correctly
                         if !dir_info.append_to_buffer(buffer, &mut cursor) {
@@ -754,7 +910,7 @@ impl FileSystemContext for AgentFSWinFsp {
         context: &Self::FileContext,
         buffer: &[u8],
         offset: u64,
-        _write_to_eof: bool,
+        write_to_eof: bool,
         _constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
@@ -762,6 +918,14 @@ impl FileSystemContext for AgentFSWinFsp {
         if let Some(open_file) = open_files.get(&context.fh) {
             let file = open_file.file.clone();
             let ino = open_file.ino;
+            tracing::debug!(
+                "WinFsp::write: fh={} ino={} len={} offset={} write_to_eof={}",
+                context.fh,
+                ino,
+                buffer.len(),
+                offset,
+                write_to_eof
+            );
             drop(open_files);
 
             // file is Option<BoxedFile>, need to handle None case
@@ -770,8 +934,21 @@ impl FileSystemContext for AgentFSWinFsp {
                 None => return Err(FspError::NTSTATUS(STATUS_FILE_IS_A_DIRECTORY)),
             };
 
+            let write_offset = if write_to_eof {
+                let fs = self.fs.clone();
+                match self.block_on(async move {
+                    fs.lock().getattr(ino).await
+                }) {
+                    Ok(Some(stats)) => stats.size as u64,
+                    Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                }
+            } else {
+                offset
+            };
+
             let result = self.block_on(async move {
-                file.pwrite(offset, buffer).await
+                file.pwrite(write_offset, buffer).await
             });
 
             match result {
@@ -801,6 +978,14 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<()> {
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
+            tracing::debug!(
+                "WinFsp::set_file_size: fh={} ino={} new_size={} set_allocation_size={} is_dir={}",
+                context.fh,
+                open_file.ino,
+                new_size,
+                set_allocation_size,
+                open_file.is_dir
+            );
             // For directories, just return success (no-op)
             if open_file.is_dir {
                 return Ok(());
@@ -815,35 +1000,23 @@ impl FileSystemContext for AgentFSWinFsp {
                 None => return Ok(()), // Should not happen, but handle gracefully
             };
 
-            if set_allocation_size {
-                // allocation_size: pre-allocate space
-                // For simplicity, we treat this as a no-op since SQLite handles allocation
-                // Just update the file info
-                let fs = self.fs.clone();
-                if let Ok(Some(stats)) = self.block_on(async move {
-                    fs.lock().getattr(ino).await
-                }) {
-                    fill_file_info(&stats, file_info);
-                }
-                Ok(())
-            } else {
-                // file_size: truncate or extend the file
-                let result = self.block_on(async move {
-                    file.truncate(new_size).await
-                });
+            // AgentFS has no separate allocation-size primitive, so we keep
+            // Windows behavior simple and treat both size requests as truncate/extend.
+            let result = self.block_on(async move {
+                file.truncate(new_size).await
+            });
 
-                match result {
-                    Ok(()) => {
-                        let fs = self.fs.clone();
-                        if let Ok(Some(stats)) = self.block_on(async move {
-                            fs.lock().getattr(ino).await
-                        }) {
-                            fill_file_info(&stats, file_info);
-                        }
-                        Ok(())
+            match result {
+                Ok(()) => {
+                    let fs = self.fs.clone();
+                    if let Ok(Some(stats)) = self.block_on(async move {
+                        fs.lock().getattr(ino).await
+                    }) {
+                        fill_file_info(&stats, file_info);
                     }
-                    Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                    Ok(())
                 }
+                Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
             }
         } else {
             Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER))
@@ -863,6 +1036,12 @@ impl FileSystemContext for AgentFSWinFsp {
         // Truncate the file to zero length
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
+            tracing::debug!(
+                "WinFsp::overwrite: fh={} ino={} is_dir={}",
+                context.fh,
+                open_file.ino,
+                open_file.is_dir
+            );
             if open_file.is_dir {
                 return Ok(());
             }
@@ -984,6 +1163,10 @@ pub fn mount(
     let mut volume_params = winfsp::host::VolumeParams::default();
     volume_params.case_sensitive_search(true);
     volume_params.filesystem_name(&opts.fsname);
+    volume_params.supports_posix_unlink_rename(true);
+    // Always post disposition requests to user mode so delete semantics are
+    // handled by set_delete/cleanup instead of kernel prechecks.
+    volume_params.post_disposition_only_when_necessary(false);
 
     let mut host = winfsp::host::FileSystemHost::new(volume_params, adapter)?;
 
