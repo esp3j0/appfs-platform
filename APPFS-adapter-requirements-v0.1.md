@@ -278,7 +278,8 @@ Evidence sources used:
 1. Build + static + live run log: `/home/yxy/rep/agentfs/cli/appfs-phase1-validation.log`
 2. Live harness script: `cli/tests/appfs/run-live-with-adapter.sh`
 3. Runtime implementation: `cli/src/cmd/appfs.rs`
-4. Live contract additions: `cli/tests/appfs/test-streaming-lifecycle.sh`, `cli/tests/appfs/test-submit-reject.sh`, `cli/tests/appfs/test-submit-order.sh`, `cli/tests/appfs/test-paging-errors.sh`, `cli/tests/appfs/test-submit-atomicity.sh`, `cli/tests/appfs/test-submit-interrupt.sh`, `cli/tests/appfs/test-path-safety.sh`, `cli/tests/appfs/test-duplicate-consumption.sh`
+4. Live contract additions: `cli/tests/appfs/test-streaming-lifecycle.sh`, `cli/tests/appfs/test-submit-reject.sh`, `cli/tests/appfs/test-submit-order.sh`, `cli/tests/appfs/test-paging-errors.sh`, `cli/tests/appfs/test-submit-atomicity.sh`, `cli/tests/appfs/test-submit-interrupt.sh`, `cli/tests/appfs/test-path-safety.sh`, `cli/tests/appfs/test-duplicate-consumption.sh`, `cli/tests/appfs/test-concurrent-submit-stress.sh`
+5. Harness lifecycle probe: `cli/tests/appfs/run-live-with-adapter.sh` (stop/restart adapter + post-restart submit)
 
 | Item | Status | Evidence | Note |
 |---|---|---|---|
@@ -294,10 +295,10 @@ Evidence sources used:
 | 10 | PASS | `CT-013` in validation log | Same event is consumable from both live stream and replay surface; consumer dedupe is required |
 | 11 | PASS | `CT-009` in validation log + `cli/src/cmd/appfs.rs` | malformed/unknown/expired/closed/cross-session paging errors are mapped and asserted |
 | 12 | PASS | `CT-010/CT-011` in validation log + `cli/src/cmd/appfs.rs` stable-submit gate | In-progress and interrupted write scenarios are covered; no side effect before valid completed submit |
-| 13 | PARTIAL | `CT-008` in validation log | Same-path ordered multi-submit + single terminal validated; high-concurrency stress still missing |
+| 13 | PASS | `CT-014` in validation log | Concurrent submit stress validates single terminal per submit and distinct request ids |
 | 14 | PASS | `CT-003` + publish sequence in code | `events/cursor/from-seq` consistency validated for normal publish path |
 | 15 | PASS | `CT-002/CT-003` + seq-based `event_id` | `event_id` present and replay-stable |
-| 16 | FAIL | No lifecycle integration case yet | Readiness/liveness/recovery checks pending |
+| 16 | PARTIAL | lifecycle probe in `run-live-with-adapter.sh` + validation log | start/alive/graceful-stop/restart-post-submit validated; accepted-but-not-terminal reconciliation still pending |
 
 ## 9. Delivery Plan
 

@@ -32,6 +32,7 @@ else
     $DIR/appfs/test-submit-interrupt.sh
     $DIR/appfs/test-path-safety.sh
     $DIR/appfs/test-duplicate-consumption.sh
+    $DIR/appfs/test-concurrent-submit-stress.sh
     "
 fi
 
