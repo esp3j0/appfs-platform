@@ -1,4 +1,5 @@
 pub mod appfs_adapter;
+pub mod appfs_demo_adapter;
 pub mod connection_pool;
 pub mod error;
 pub mod filesystem;
@@ -22,6 +23,7 @@ pub use appfs_adapter::{
     AdapterInputModeV1, AdapterStreamingPlanV1, AdapterSubmitOutcomeV1, AppAdapterV1,
     RequestContextV1,
 };
+pub use appfs_demo_adapter::DemoAppAdapterV1;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{

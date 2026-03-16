@@ -273,6 +273,7 @@ Where:
 2. error case matrix
 2. Different adapter implementations SHOULD be pluggable into the same fixture matrix without changing runtime logic.
 3. Current Rust SDK reference includes matrix-style trait tests in `sdk/rust/src/appfs_adapter.rs`.
+4. Current Rust SDK reference demo implementation is published at `sdk/rust/src/appfs_demo_adapter.rs`.
 
 ## 7. Security Requirements
 

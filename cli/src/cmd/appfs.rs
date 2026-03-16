@@ -1,7 +1,7 @@
 use agentfs_sdk::{
     AdapterControlActionV1, AdapterControlOutcomeV1, AdapterErrorV1, AdapterExecutionModeV1,
     AdapterInputModeV1, AdapterStreamingPlanV1, AdapterSubmitOutcomeV1, AppAdapterV1,
-    RequestContextV1,
+    DemoAppAdapterV1, RequestContextV1,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -15,10 +15,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use uuid::Uuid;
-
-mod demo_adapter;
-
-use demo_adapter::DemoAppAdapterV1;
 
 const DEFAULT_RETENTION_HINT_SEC: i64 = 86400;
 const MIN_POLL_MS: u64 = 50;
