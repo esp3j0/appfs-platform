@@ -976,7 +976,7 @@ fn validate_payload(spec: &ActionSpec, payload: &str) -> std::result::Result<(),
     }
 
     match spec.input_mode {
-        InputMode::Text => Ok(()),
+        InputMode::Text => validate_text_payload_complete(payload),
         InputMode::Json => {
             serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_PAYLOAD)?;
             Ok(())
@@ -985,10 +985,19 @@ fn validate_payload(spec: &ActionSpec, payload: &str) -> std::result::Result<(),
             let trimmed = payload.trim_start();
             if trimmed.starts_with('{') || trimmed.starts_with('[') {
                 serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_PAYLOAD)?;
+            } else {
+                validate_text_payload_complete(payload)?;
             }
             Ok(())
         }
     }
+}
+
+fn validate_text_payload_complete(payload: &str) -> std::result::Result<(), &'static str> {
+    if !payload.ends_with('\n') {
+        return Err(ERR_INVALID_PAYLOAD);
+    }
+    Ok(())
 }
 
 fn action_template_matches(template: &str, rel_path: &str) -> bool {
