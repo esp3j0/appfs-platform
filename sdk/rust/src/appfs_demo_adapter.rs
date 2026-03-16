@@ -1,16 +1,20 @@
-use agentfs_sdk::{
+use crate::{
     AdapterControlActionV1, AdapterControlOutcomeV1, AdapterErrorV1, AdapterExecutionModeV1,
     AdapterInputModeV1, AdapterStreamingPlanV1, AdapterSubmitOutcomeV1, AppAdapterV1,
     RequestContextV1,
 };
 use serde_json::{json, Value as JsonValue};
 
-pub(super) struct DemoAppAdapterV1 {
+/// Reference demo adapter implementation for AppFS v0.1.
+///
+/// This adapter is intentionally simple and deterministic so runtime and
+/// conformance flows can be validated without app-specific backends.
+pub struct DemoAppAdapterV1 {
     app_id: String,
 }
 
 impl DemoAppAdapterV1 {
-    pub(super) fn new(app_id: String) -> Self {
+    pub fn new(app_id: String) -> Self {
         Self { app_id }
     }
 }

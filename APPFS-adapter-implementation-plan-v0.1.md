@@ -32,11 +32,10 @@
 2. Runtime covers long-handle normalization and restart reconciliation for in-flight streaming requests.
 3. Task 9 core refactor is implemented: runtime action path and paging control path now dispatch through a frozen SDK trait (`AppAdapterV1`) in `sdk/rust/src/appfs_adapter.rs`.
 4. SDK module now includes reusable matrix-style conformance tests (required-case matrix + error-case matrix), with multiple adapter implementations plugged into the same fixture runner.
-5. Demo adapter behavior has been split out of `cli/src/cmd/appfs.rs` into a dedicated module (`cli/src/cmd/appfs/demo_adapter.rs`) to keep runtime orchestration separate from business logic.
+5. Demo adapter behavior has been split out of `cli/src/cmd/appfs.rs` into a reusable SDK module (`sdk/rust/src/appfs_demo_adapter.rs`) to keep runtime orchestration separate from business logic.
 6. Requirements checklist item 1-17 are marked `PASS` in `APPFS-adapter-requirements-v0.1.md`.
 2. Remaining:
-1. Optional: lift demo adapter module into standalone crate/package boundary for external reuse and independent versioning.
-2. Optional: add language-bridge reference implementation (e.g., gRPC/HTTP) mapped to frozen `AppAdapterV1` semantics.
+1. Optional: add language-bridge reference implementation (e.g., gRPC/HTTP) mapped to frozen `AppAdapterV1` semantics.
 
 ## Task 1: Add `serve appfs` Command Skeleton
 
