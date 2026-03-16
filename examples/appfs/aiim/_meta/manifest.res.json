@@ -2,6 +2,22 @@
   "app_id": "aiim",
   "display_name": "AIIM",
   "contract_version": "0.1",
+  "conformance": {
+    "appfs_version": "0.1",
+    "profiles": [
+      "core"
+    ],
+    "recommended": [
+      "observer",
+      "progress_policy"
+    ],
+    "extensions": [],
+    "implementation": {
+      "name": "aiim-adapter",
+      "version": "0.1.0",
+      "language": "rust"
+    }
+  },
   "stream": {
     "path": "_stream/events.evt.jsonl",
     "line_schema": "_meta/schemas/events.evt.schema.json",

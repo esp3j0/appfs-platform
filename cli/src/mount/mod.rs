@@ -24,14 +24,14 @@ mod fuse;
 #[cfg(unix)]
 mod nfs;
 
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 #[cfg(unix)]
 use tokio::sync::Mutex;
 #[cfg(unix)]
 use tokio_util::sync::CancellationToken;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use anyhow::Result;
 
 /// Default timeout for mount to become ready.
 const DEFAULT_MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,9 +110,7 @@ pub(crate) enum MountHandleInner {
         _server_handle: tokio::task::JoinHandle<()>,
     },
     #[cfg(target_os = "windows")]
-    WinFsp {
-        host_ptr: *mut (),
-    },
+    WinFsp { host_ptr: *mut () },
 }
 
 impl MountHandle {
@@ -181,9 +179,7 @@ pub fn unmount(mountpoint: &Path, backend: MountBackend, lazy: bool) -> Result<(
         #[cfg(unix)]
         MountBackend::Nfs => nfs::unmount_nfs(mountpoint, lazy),
         #[cfg(not(unix))]
-        MountBackend::Nfs => anyhow::bail!(
-            "NFS mounting is not supported on this platform."
-        ),
+        MountBackend::Nfs => anyhow::bail!("NFS mounting is not supported on this platform."),
         #[cfg(target_os = "windows")]
         MountBackend::Winfsp => {
             // WinFsp unmounting is handled by dropping the MountHandle
@@ -194,9 +190,7 @@ pub fn unmount(mountpoint: &Path, backend: MountBackend, lazy: bool) -> Result<(
             );
         }
         #[cfg(not(target_os = "windows"))]
-        MountBackend::Winfsp => anyhow::bail!(
-            "WinFsp is only supported on Windows."
-        ),
+        MountBackend::Winfsp => anyhow::bail!("WinFsp is only supported on Windows."),
         #[cfg(not(any(unix, target_os = "windows")))]
         _ => anyhow::bail!("Unsupported mount backend for this platform"),
     }
@@ -214,9 +208,7 @@ pub async fn mount_fs(
     match opts.backend {
         MountBackend::Fuse => fuse::mount_fuse(fs, opts),
         MountBackend::Nfs => nfs::mount_nfs(fs, opts).await,
-        MountBackend::Winfsp => anyhow::bail!(
-            "WinFsp mounting is only supported on Windows."
-        ),
+        MountBackend::Winfsp => anyhow::bail!("WinFsp mounting is only supported on Windows."),
     }
 }
 
@@ -235,9 +227,7 @@ pub async fn mount_fs(
         }
         MountBackend::Nfs => nfs::mount_nfs(fs, opts).await,
         MountBackend::Winfsp => {
-            anyhow::bail!(
-                "WinFsp mounting is only supported on Windows."
-            );
+            anyhow::bail!("WinFsp mounting is only supported on Windows.");
         }
     }
 }
@@ -268,7 +258,7 @@ pub async fn mount_fs(
 /// Wait for a path to become a mountpoint.
 pub fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
-    let interval = Duration:: from_millis(50);
+    let interval = Duration::from_millis(50);
 
     while start.elapsed() < timeout {
         if is_mountpoint(path) {

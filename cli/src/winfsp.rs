@@ -22,8 +22,7 @@ use tokio::runtime::Handle;
 use tracing;
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
-    DirInfo, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
-    VolumeInfo, WideNameInfo,
+    DirInfo, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo, WideNameInfo,
 };
 use winfsp::{FspError, U16CStr};
 
@@ -58,31 +57,27 @@ const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023u32 as i32;
 /// Convert an SDK error to a WinFsp error code.
 fn error_to_ntstatus(e: &SdkError) -> i32 {
     match e {
-        SdkError::Fs(fs_err) => {
-            match fs_err {
-                agentfs_sdk::filesystem::FsError::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
-                agentfs_sdk::filesystem::FsError::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
-                agentfs_sdk::filesystem::FsError::NotADirectory => STATUS_NOT_A_DIRECTORY,
-                agentfs_sdk::filesystem::FsError::IsADirectory => STATUS_FILE_IS_A_DIRECTORY,
-                agentfs_sdk::filesystem::FsError::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
-                agentfs_sdk::filesystem::FsError::InvalidPath => STATUS_OBJECT_NAME_INVALID,
-                agentfs_sdk::filesystem::FsError::RootOperation => STATUS_ACCESS_DENIED,
-                agentfs_sdk::filesystem::FsError::SymlinkLoop => STATUS_INVALID_PARAMETER,
-                agentfs_sdk::filesystem::FsError::InvalidRename => STATUS_INVALID_PARAMETER,
-                agentfs_sdk::filesystem::FsError::NameTooLong => STATUS_OBJECT_NAME_INVALID,
-                agentfs_sdk::filesystem::FsError::NotASymlink => STATUS_INVALID_PARAMETER,
-            }
-        }
-        SdkError::Io(io_err) => {
-            match io_err.kind() {
-                std::io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
-                std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
-                std::io::ErrorKind::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
-                std::io::ErrorKind::InvalidInput => STATUS_INVALID_PARAMETER,
-                std::io::ErrorKind::StorageFull => STATUS_DISK_FULL,
-                _ => STATUS_INVALID_PARAMETER,
-            }
-        }
+        SdkError::Fs(fs_err) => match fs_err {
+            agentfs_sdk::filesystem::FsError::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+            agentfs_sdk::filesystem::FsError::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
+            agentfs_sdk::filesystem::FsError::NotADirectory => STATUS_NOT_A_DIRECTORY,
+            agentfs_sdk::filesystem::FsError::IsADirectory => STATUS_FILE_IS_A_DIRECTORY,
+            agentfs_sdk::filesystem::FsError::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
+            agentfs_sdk::filesystem::FsError::InvalidPath => STATUS_OBJECT_NAME_INVALID,
+            agentfs_sdk::filesystem::FsError::RootOperation => STATUS_ACCESS_DENIED,
+            agentfs_sdk::filesystem::FsError::SymlinkLoop => STATUS_INVALID_PARAMETER,
+            agentfs_sdk::filesystem::FsError::InvalidRename => STATUS_INVALID_PARAMETER,
+            agentfs_sdk::filesystem::FsError::NameTooLong => STATUS_OBJECT_NAME_INVALID,
+            agentfs_sdk::filesystem::FsError::NotASymlink => STATUS_INVALID_PARAMETER,
+        },
+        SdkError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::NotFound => STATUS_OBJECT_NAME_NOT_FOUND,
+            std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
+            std::io::ErrorKind::AlreadyExists => STATUS_OBJECT_NAME_COLLISION,
+            std::io::ErrorKind::InvalidInput => STATUS_INVALID_PARAMETER,
+            std::io::ErrorKind::StorageFull => STATUS_DISK_FULL,
+            _ => STATUS_INVALID_PARAMETER,
+        },
         _ => STATUS_INVALID_PARAMETER,
     }
 }
@@ -224,9 +219,8 @@ impl AgentFSWinFsp {
         for component in &components[..components.len() - 1] {
             let fs = self.fs.clone();
             let component_owned = component.to_string();
-            let result = self.block_on(async move {
-                fs.lock().lookup(current_ino, &component_owned).await
-            });
+            let result =
+                self.block_on(async move { fs.lock().lookup(current_ino, &component_owned).await });
 
             match result {
                 Ok(Some(stats)) => {
@@ -249,16 +243,12 @@ impl AgentFSWinFsp {
         let path = path.trim_start_matches('/');
         if path.is_empty() {
             let fs = self.fs.clone();
-            return Ok(self.block_on(async move {
-                fs.lock().getattr(1).await
-            })?);
+            return Ok(self.block_on(async move { fs.lock().getattr(1).await })?);
         }
 
         let (parent_ino, name) = self.parse_path(path)?;
         let fs = self.fs.clone();
-        Ok(self.block_on(async move {
-            fs.lock().lookup(parent_ino, &name).await
-        })?)
+        Ok(self.block_on(async move { fs.lock().lookup(parent_ino, &name).await })?)
     }
 
     /// Delete a file or directory by path.
@@ -282,9 +272,7 @@ impl AgentFSWinFsp {
 
     fn readlink_by_ino(&self, ino: i64) -> Result<String> {
         let fs = self.fs.clone();
-        let target = self.block_on(async move {
-            fs.lock().readlink(ino).await
-        })?;
+        let target = self.block_on(async move { fs.lock().readlink(ino).await })?;
         target.ok_or_else(|| anyhow::anyhow!("Not a symlink"))
     }
 
@@ -320,7 +308,11 @@ impl AgentFSWinFsp {
         } else {
             Self::to_substitute_symlink_target(&print_name)
         };
-        let flags = if is_relative { SYMLINK_FLAG_RELATIVE } else { 0 };
+        let flags = if is_relative {
+            SYMLINK_FLAG_RELATIVE
+        } else {
+            0
+        };
 
         let substitute_u16: Vec<u16> = substitute_name.encode_utf16().collect();
         let print_u16: Vec<u16> = print_name.encode_utf16().collect();
@@ -439,7 +431,8 @@ impl AgentFSWinFsp {
     }
 
     fn write_symlink_reparse_to_buffer(&self, ino: i64, buffer: &mut [u8]) -> winfsp::Result<u64> {
-        let target = self.readlink_by_ino(ino)
+        let target = self
+            .readlink_by_ino(ino)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
         let encoded = Self::build_symlink_reparse_buffer(&target)
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_REPARSE_DATA_INVALID))?;
@@ -523,43 +516,52 @@ impl FileSystemContext for AgentFSWinFsp {
 
                 if is_dir {
                     // For directories, we don't need a file handle, just track the inode
-                    self.open_files.lock().insert(fh, OpenFile {
-                        file: None,
-                        ino: stats.ino,
-                        is_dir: true,
-                        is_symlink: false,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                        path: path_owned,
-                    });
+                    self.open_files.lock().insert(
+                        fh,
+                        OpenFile {
+                            file: None,
+                            ino: stats.ino,
+                            is_dir: true,
+                            is_symlink: false,
+                            delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            path: path_owned,
+                        },
+                    );
                     Ok(FileContext { fh })
                 } else if stats.is_symlink() {
-                    self.open_files.lock().insert(fh, OpenFile {
-                        file: None,
-                        ino: stats.ino,
-                        is_dir: false,
-                        is_symlink: true,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                        path: path_owned,
-                    });
+                    self.open_files.lock().insert(
+                        fh,
+                        OpenFile {
+                            file: None,
+                            ino: stats.ino,
+                            is_dir: false,
+                            is_symlink: true,
+                            delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            path: path_owned,
+                        },
+                    );
                     Ok(FileContext { fh })
                 } else {
                     // For files, open the file handle
                     let fs = self.fs.clone();
                     let ino = stats.ino;
-                    let file = self.block_on(async move {
-                        fs.lock().open(ino, 0).await
-                    });
+                    let file = self.block_on(async move { fs.lock().open(ino, 0).await });
 
                     match file {
                         Ok(file) => {
-                            self.open_files.lock().insert(fh, OpenFile {
-                                file: Some(file),
-                                ino: stats.ino,
-                                is_dir: false,
-                                is_symlink: false,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                                path: path_owned,
-                            });
+                            self.open_files.lock().insert(
+                                fh,
+                                OpenFile {
+                                    file: Some(file),
+                                    ino: stats.ino,
+                                    is_dir: false,
+                                    is_symlink: false,
+                                    delete_on_close: std::sync::atomic::AtomicBool::new(
+                                        delete_on_close,
+                                    ),
+                                    path: path_owned,
+                                },
+                            );
                             Ok(FileContext { fh })
                         }
                         Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -595,65 +597,77 @@ impl FileSystemContext for AgentFSWinFsp {
         );
 
         // Parse path to get parent_ino and name
-        let (parent_ino, name) = self.parse_path(&path)
+        let (parent_ino, name) = self
+            .parse_path(&path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
 
         // First, check if the file already exists
         let existing = {
             let fs = self.fs.clone();
             let name_clone = name.clone();
-            self.block_on(async move {
-                fs.lock().lookup(parent_ino, &name_clone).await
-            })
+            self.block_on(async move { fs.lock().lookup(parent_ino, &name_clone).await })
         };
 
         match existing {
             Ok(Some(stats)) => {
                 // File already exists - open it directly
                 // WinFsp will call overwrite() if truncation is needed
-                tracing::debug!("WinFsp::create: file exists, opening {} (ino={})", path, stats.ino);
+                tracing::debug!(
+                    "WinFsp::create: file exists, opening {} (ino={})",
+                    path,
+                    stats.ino
+                );
                 fill_file_info(&stats, file_info.as_mut());
 
                 let fh = self.alloc_fh();
                 let path_owned = path.clone();
 
                 if stats.is_directory() {
-                    self.open_files.lock().insert(fh, OpenFile {
-                        file: None,
-                        ino: stats.ino,
-                        is_dir: true,
-                        is_symlink: false,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                        path: path_owned,
-                    });
+                    self.open_files.lock().insert(
+                        fh,
+                        OpenFile {
+                            file: None,
+                            ino: stats.ino,
+                            is_dir: true,
+                            is_symlink: false,
+                            delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            path: path_owned,
+                        },
+                    );
                     Ok(FileContext { fh })
                 } else if stats.is_symlink() {
-                    self.open_files.lock().insert(fh, OpenFile {
-                        file: None,
-                        ino: stats.ino,
-                        is_dir: false,
-                        is_symlink: true,
-                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                        path: path_owned,
-                    });
+                    self.open_files.lock().insert(
+                        fh,
+                        OpenFile {
+                            file: None,
+                            ino: stats.ino,
+                            is_dir: false,
+                            is_symlink: true,
+                            delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            path: path_owned,
+                        },
+                    );
                     Ok(FileContext { fh })
                 } else {
                     let fs = self.fs.clone();
                     let ino = stats.ino;
-                    let file = self.block_on(async move {
-                        fs.lock().open(ino, 0).await
-                    });
+                    let file = self.block_on(async move { fs.lock().open(ino, 0).await });
 
                     match file {
                         Ok(file) => {
-                            self.open_files.lock().insert(fh, OpenFile {
-                                file: Some(file),
-                                ino: stats.ino,
-                                is_dir: false,
-                                is_symlink: false,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                                path: path_owned,
-                            });
+                            self.open_files.lock().insert(
+                                fh,
+                                OpenFile {
+                                    file: Some(file),
+                                    ino: stats.ino,
+                                    is_dir: false,
+                                    is_symlink: false,
+                                    delete_on_close: std::sync::atomic::AtomicBool::new(
+                                        delete_on_close,
+                                    ),
+                                    path: path_owned,
+                                },
+                            );
                             Ok(FileContext { fh })
                         }
                         Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -673,23 +687,29 @@ impl FileSystemContext for AgentFSWinFsp {
                 let gid = 0u32;
 
                 let result = if extra_buffer_is_reparse_point {
-                    let reparse_buffer = extra_buffer
-                        .ok_or(FspError::NTSTATUS(STATUS_IO_REPARSE_DATA_INVALID))?;
+                    let reparse_buffer =
+                        extra_buffer.ok_or(FspError::NTSTATUS(STATUS_IO_REPARSE_DATA_INVALID))?;
                     let target = Self::parse_symlink_reparse_buffer(reparse_buffer)
                         .map_err(|_| FspError::NTSTATUS(STATUS_IO_REPARSE_DATA_INVALID))?;
                     let target_owned = target.clone();
                     self.block_on(async move {
-                        fs.lock().symlink(parent_ino, &name_owned, &target_owned, uid, gid).await
+                        fs.lock()
+                            .symlink(parent_ino, &name_owned, &target_owned, uid, gid)
+                            .await
                     })
                 } else if is_dir {
                     // Create directory with mode 0755 (rwxr-xr-x)
                     self.block_on(async move {
-                        fs.lock().mkdir(parent_ino, &name_owned, 0o755, uid, gid).await
+                        fs.lock()
+                            .mkdir(parent_ino, &name_owned, 0o755, uid, gid)
+                            .await
                     })
                 } else {
                     // Create file with mode 0644 (rw-r--r--)
                     self.block_on(async move {
-                        fs.lock().mknod(parent_ino, &name_owned, 0o100644, 0, uid, gid).await
+                        fs.lock()
+                            .mknod(parent_ino, &name_owned, 0o100644, 0, uid, gid)
+                            .await
                     })
                 };
 
@@ -702,43 +722,56 @@ impl FileSystemContext for AgentFSWinFsp {
 
                         if stats.is_directory() {
                             // For directories, we don't need a file handle
-                            self.open_files.lock().insert(fh, OpenFile {
-                                file: None,
-                                ino: stats.ino,
-                                is_dir: true,
-                                is_symlink: false,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                                path: path_owned,
-                            });
+                            self.open_files.lock().insert(
+                                fh,
+                                OpenFile {
+                                    file: None,
+                                    ino: stats.ino,
+                                    is_dir: true,
+                                    is_symlink: false,
+                                    delete_on_close: std::sync::atomic::AtomicBool::new(
+                                        delete_on_close,
+                                    ),
+                                    path: path_owned,
+                                },
+                            );
                             Ok(FileContext { fh })
                         } else if stats.is_symlink() {
-                            self.open_files.lock().insert(fh, OpenFile {
-                                file: None,
-                                ino: stats.ino,
-                                is_dir: false,
-                                is_symlink: true,
-                                delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                                path: path_owned,
-                            });
+                            self.open_files.lock().insert(
+                                fh,
+                                OpenFile {
+                                    file: None,
+                                    ino: stats.ino,
+                                    is_dir: false,
+                                    is_symlink: true,
+                                    delete_on_close: std::sync::atomic::AtomicBool::new(
+                                        delete_on_close,
+                                    ),
+                                    path: path_owned,
+                                },
+                            );
                             Ok(FileContext { fh })
                         } else {
                             // For files, open the newly created file
                             let fs = self.fs.clone();
                             let ino = stats.ino;
-                            let file = self.block_on(async move {
-                                fs.lock().open(ino, 0).await
-                            });
+                            let file = self.block_on(async move { fs.lock().open(ino, 0).await });
 
                             match file {
                                 Ok(file) => {
-                                    self.open_files.lock().insert(fh, OpenFile {
-                                        file: Some(file),
-                                        ino: stats.ino,
-                                        is_dir: false,
-                                        is_symlink: false,
-                                        delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
-                                        path: path_owned,
-                                    });
+                                    self.open_files.lock().insert(
+                                        fh,
+                                        OpenFile {
+                                            file: Some(file),
+                                            ino: stats.ino,
+                                            is_dir: false,
+                                            is_symlink: false,
+                                            delete_on_close: std::sync::atomic::AtomicBool::new(
+                                                delete_on_close,
+                                            ),
+                                            path: path_owned,
+                                        },
+                                    );
                                     Ok(FileContext { fh })
                                 }
                                 Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -757,12 +790,7 @@ impl FileSystemContext for AgentFSWinFsp {
         self.open_files.lock().remove(&context.fh);
     }
 
-    fn cleanup(
-        &self,
-        context: &Self::FileContext,
-        file_name: Option<&U16CStr>,
-        flags: u32,
-    ) {
+    fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         let (should_delete, is_dir, fallback_path) = {
             let open_files = self.open_files.lock();
             let Some(open_file) = open_files.get(&context.fh) else {
@@ -818,9 +846,7 @@ impl FileSystemContext for AgentFSWinFsp {
             drop(open_files);
 
             let fs = self.fs.clone();
-            let stats = self.block_on(async move {
-                fs.lock().getattr(ino).await
-            });
+            let stats = self.block_on(async move { fs.lock().getattr(ino).await });
 
             match stats {
                 Ok(Some(stats)) => {
@@ -893,16 +919,12 @@ impl FileSystemContext for AgentFSWinFsp {
             };
 
             let fs = self.fs.clone();
-            let result = self.block_on(async move {
-                fs.lock().utimens(ino, atime, mtime).await
-            });
+            let result = self.block_on(async move { fs.lock().utimens(ino, atime, mtime).await });
 
             match result {
                 Ok(()) => {
                     let fs = self.fs.clone();
-                    let stats = self.block_on(async move {
-                        fs.lock().getattr(ino).await
-                    });
+                    let stats = self.block_on(async move { fs.lock().getattr(ino).await });
                     match stats {
                         Ok(Some(stats)) => {
                             fill_file_info(&stats, file_info);
@@ -945,9 +967,7 @@ impl FileSystemContext for AgentFSWinFsp {
         // Validate directory emptiness during SetDelete so Remove-Item can fail correctly.
         if delete_file && is_dir {
             let fs = self.fs.clone();
-            let entries = self.block_on(async move {
-                fs.lock().readdir_plus(ino).await
-            });
+            let entries = self.block_on(async move { fs.lock().readdir_plus(ino).await });
 
             match entries {
                 Ok(Some(entries)) => {
@@ -962,7 +982,9 @@ impl FileSystemContext for AgentFSWinFsp {
 
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
-            open_file.delete_on_close.store(delete_file, Ordering::SeqCst);
+            open_file
+                .delete_on_close
+                .store(delete_file, Ordering::SeqCst);
             Ok(())
         } else {
             Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER))
@@ -979,14 +1001,18 @@ impl FileSystemContext for AgentFSWinFsp {
         let old_path = Self::win_path_to_unix(file_name);
         let new_path = Self::win_path_to_unix(new_file_name);
         tracing::debug!("WinFsp::rename: {} -> {}", old_path, new_path);
-        let (old_parent, old_name) = self.parse_path(&old_path)
+        let (old_parent, old_name) = self
+            .parse_path(&old_path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
-        let (new_parent, new_name) = self.parse_path(&new_path)
+        let (new_parent, new_name) = self
+            .parse_path(&new_path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
 
         let fs = self.fs.clone();
         let result = self.block_on(async move {
-            fs.lock().rename(old_parent, &old_name, new_parent, &new_name).await
+            fs.lock()
+                .rename(old_parent, &old_name, new_parent, &new_name)
+                .await
         });
 
         match result {
@@ -1024,16 +1050,12 @@ impl FileSystemContext for AgentFSWinFsp {
         };
 
         let fs = self.fs.clone();
-        let entries = self.block_on(async move {
-            fs.lock().readdir_plus(dir_ino).await
-        });
+        let entries = self.block_on(async move { fs.lock().readdir_plus(dir_ino).await });
 
         match entries {
             Ok(Some(entries)) => {
                 let fs = self.fs.clone();
-                let dir_stats = self.block_on(async move {
-                    fs.lock().getattr(dir_ino).await
-                });
+                let dir_stats = self.block_on(async move { fs.lock().getattr(dir_ino).await });
                 let dir_stats = match dir_stats {
                     Ok(Some(stats)) => stats,
                     Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
@@ -1049,9 +1071,8 @@ impl FileSystemContext for AgentFSWinFsp {
                     }
                 };
                 let fs = self.fs.clone();
-                let parent_stats = self.block_on(async move {
-                    fs.lock().getattr(parent_ino).await
-                });
+                let parent_stats =
+                    self.block_on(async move { fs.lock().getattr(parent_ino).await });
                 let parent_stats = match parent_stats {
                     Ok(Some(stats)) => stats,
                     Ok(None) => dir_stats.clone(),
@@ -1068,7 +1089,10 @@ impl FileSystemContext for AgentFSWinFsp {
                     "WinFsp::read_directory: fh={} entry_count={} entries={:?}",
                     context.fh,
                     all_entries.len(),
-                    all_entries.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+                    all_entries
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
                 );
 
                 // Determine starting index based on marker.
@@ -1142,9 +1166,7 @@ impl FileSystemContext for AgentFSWinFsp {
                 }
             };
 
-            let result = self.block_on(async move {
-                file.pread(offset, buf_len as u64).await
-            });
+            let result = self.block_on(async move { file.pread(offset, buf_len as u64).await });
 
             match result {
                 Ok(data) => {
@@ -1200,9 +1222,7 @@ impl FileSystemContext for AgentFSWinFsp {
 
             let write_offset = if write_to_eof {
                 let fs = self.fs.clone();
-                match self.block_on(async move {
-                    fs.lock().getattr(ino).await
-                }) {
+                match self.block_on(async move { fs.lock().getattr(ino).await }) {
                     Ok(Some(stats)) => stats.size as u64,
                     Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
                     Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -1211,16 +1231,12 @@ impl FileSystemContext for AgentFSWinFsp {
                 offset
             };
 
-            let result = self.block_on(async move {
-                file.pwrite(write_offset, buffer).await
-            });
+            let result = self.block_on(async move { file.pwrite(write_offset, buffer).await });
 
             match result {
                 Ok(()) => {
                     let fs = self.fs.clone();
-                    let stats = self.block_on(async move {
-                        fs.lock().getattr(ino).await
-                    });
+                    let stats = self.block_on(async move { fs.lock().getattr(ino).await });
                     if let Ok(Some(stats)) = stats {
                         fill_file_info(&stats, file_info);
                     }
@@ -1266,16 +1282,14 @@ impl FileSystemContext for AgentFSWinFsp {
 
             // AgentFS has no separate allocation-size primitive, so we keep
             // Windows behavior simple and treat both size requests as truncate/extend.
-            let result = self.block_on(async move {
-                file.truncate(new_size).await
-            });
+            let result = self.block_on(async move { file.truncate(new_size).await });
 
             match result {
                 Ok(()) => {
                     let fs = self.fs.clone();
-                    if let Ok(Some(stats)) = self.block_on(async move {
-                        fs.lock().getattr(ino).await
-                    }) {
+                    if let Ok(Some(stats)) =
+                        self.block_on(async move { fs.lock().getattr(ino).await })
+                    {
                         fill_file_info(&stats, file_info);
                     }
                     Ok(())
@@ -1321,16 +1335,14 @@ impl FileSystemContext for AgentFSWinFsp {
             };
 
             // Truncate to zero
-            let result = self.block_on(async move {
-                file.truncate(0).await
-            });
+            let result = self.block_on(async move { file.truncate(0).await });
 
             match result {
                 Ok(()) => {
                     let fs = self.fs.clone();
-                    if let Ok(Some(stats)) = self.block_on(async move {
-                        fs.lock().getattr(ino).await
-                    }) {
+                    if let Ok(Some(stats)) =
+                        self.block_on(async move { fs.lock().getattr(ino).await })
+                    {
                         fill_file_info(&stats, file_info);
                     }
                     Ok(())
@@ -1356,16 +1368,12 @@ impl FileSystemContext for AgentFSWinFsp {
 
                 // file is Option<BoxedFile>, directories don't need flush
                 if let Some(file) = file {
-                    let result = self.block_on(async move {
-                        file.fsync().await
-                    });
+                    let result = self.block_on(async move { file.fsync().await });
 
                     match result {
                         Ok(()) => {
                             let fs = self.fs.clone();
-                            let stats = self.block_on(async move {
-                                fs.lock().getattr(ino).await
-                            });
+                            let stats = self.block_on(async move { fs.lock().getattr(ino).await });
                             if let Ok(Some(stats)) = stats {
                                 fill_file_info(&stats, file_info);
                             }
@@ -1386,9 +1394,7 @@ impl FileSystemContext for AgentFSWinFsp {
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         let fs = self.fs.clone();
-        let stats = self.block_on(async move {
-            fs.lock().statfs().await
-        });
+        let stats = self.block_on(async move { fs.lock().statfs().await });
 
         match stats {
             Ok(stats) => {
@@ -1408,7 +1414,8 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<u64> {
         let path = Self::win_path_to_unix(file_name);
         tracing::debug!("WinFsp::get_reparse_point_by_name path={}", path);
-        let stats = self.path_lookup(&path)
+        let stats = self
+            .path_lookup(&path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
         let Some(stats) = stats else {
             return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND));
@@ -1466,7 +1473,8 @@ impl FileSystemContext for AgentFSWinFsp {
             target,
             path
         );
-        let (parent_ino, name) = self.parse_path(&path)
+        let (parent_ino, name) = self
+            .parse_path(&path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
 
         let current_is_dir = {
@@ -1478,14 +1486,20 @@ impl FileSystemContext for AgentFSWinFsp {
         };
 
         if let Err(e) = self.delete_path(&path, current_is_dir) {
-            tracing::warn!("WinFsp::set_reparse_point delete placeholder failed path={} err={}", path, e);
+            tracing::warn!(
+                "WinFsp::set_reparse_point delete placeholder failed path={} err={}",
+                path,
+                e
+            );
             return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e)));
         }
 
         let fs = self.fs.clone();
         let target_owned = target.clone();
         let stats = self.block_on(async move {
-            fs.lock().symlink(parent_ino, &name, &target_owned, 0, 0).await
+            fs.lock()
+                .symlink(parent_ino, &name, &target_owned, 0, 0)
+                .await
         });
         let stats = match stats {
             Ok(stats) => stats,
@@ -1541,10 +1555,7 @@ pub struct MountOpts {
 }
 
 /// Mount an AgentFS filesystem using WinFsp.
-pub fn mount(
-    fs: Arc<Mutex<dyn FileSystem + Send>>,
-    opts: MountOpts,
-) -> Result<()> {
+pub fn mount(fs: Arc<Mutex<dyn FileSystem + Send>>, opts: MountOpts) -> Result<()> {
     let mountpoint = opts.mountpoint.clone();
     // Try to get the current runtime handle, or create a new runtime if not in async context
     let handle = match Handle::try_current() {

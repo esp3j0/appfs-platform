@@ -1,9 +1,10 @@
-# AppFS v0.1 (Revised Draft r7)
+# AppFS v0.1 (Revised Draft r8)
 
-- Version: `0.1-draft-r7`
+- Version: `0.1-draft-r8`
 - Date: `2026-03-16`
 - Status: `Draft`
 - Base Runtime: `AgentFS`
+- Conformance: `APPFS-conformance-v0.1.md`
 
 ## 1. Overview
 
@@ -157,6 +158,7 @@ Submission timing rules:
    - runtime SHOULD still emit a terminal event for audit (`action.completed` or `action.failed`).
    - if not completed within `inline_timeout_ms`, runtime MAY degrade to async handling, MUST emit `action.accepted`, and then terminal event later.
 4. For any accepted request, terminal event MUST be exactly one of `action.completed`, `action.failed`, or `action.canceled` (if cancellation is supported by app policy).
+5. Runtime MUST treat `close` as the only commit boundary. Interrupted/partial writes before `close` MUST NOT create requests or side effects.
 
 Input format:
 
@@ -226,7 +228,7 @@ Rules:
 Delivery semantics and dedup:
 
 1. AppFS stream delivery is `at-least-once`.
-2. Runtime SHOULD provide stable `event_id` per emitted event.
+2. Runtime MUST provide stable `event_id` per emitted event.
 3. Consumers MUST tolerate duplicate deliveries (especially when combining `tail` with `from-seq` replay).
 4. Recommended consumer dedup key is `(app, session_id, event_id)` when `event_id` exists, otherwise `(app, session_id, seq)`.
 
@@ -359,11 +361,23 @@ If client does not close explicitly, runtime/app MAY expire handles by TTL.
 ### 11.4 Handle Rules
 
 1. `handle_id` MUST be session-scoped.
-2. Accessing a handle from another session MUST fail with `EACCES`.
+2. Accessing a handle from another session MUST fail with permission-denied semantics (`EACCES` and/or `action.failed` with `PERMISSION_DENIED`).
 3. Expired handles MUST fail with `action.failed` (`error.code = "PAGER_HANDLE_EXPIRED"`).
 4. Invalid handle format MUST fail with `EINVAL`.
+5. Unknown handle MUST fail with `action.failed` (`error.code = "PAGER_HANDLE_NOT_FOUND"`).
+6. Already-closed handle MUST fail with `action.failed` (`error.code = "PAGER_HANDLE_CLOSED"`).
 
-### 11.5 Live Feed Behavior
+### 11.5 Paging Action Error Mapping
+
+For both `/_paging/fetch_next.act` and `/_paging/close.act`:
+
+1. Malformed `handle_id` format: close-time filesystem error `EINVAL`, and MUST NOT emit `action.accepted`.
+2. Unknown handle: terminal `action.failed` with `error.code = "PAGER_HANDLE_NOT_FOUND"`.
+3. Expired handle: terminal `action.failed` with `error.code = "PAGER_HANDLE_EXPIRED"`.
+4. Already-closed handle: terminal `action.failed` with `error.code = "PAGER_HANDLE_CLOSED"`.
+5. Cross-session handle access: terminal `action.failed` with `error.code = "PERMISSION_DENIED"` (app-specific detail MAY be appended).
+
+### 11.6 Live Feed Behavior
 
 For `mode = live`:
 
@@ -437,6 +451,17 @@ Example:
 {
   "app_id": "aiim",
   "contract_version": "0.1",
+  "conformance": {
+    "appfs_version": "0.1",
+    "profiles": ["core"],
+    "recommended": ["observer", "progress_policy"],
+    "extensions": [],
+    "implementation": {
+      "name": "aiim-adapter",
+      "version": "0.1.0",
+      "language": "rust"
+    }
+  },
   "nodes": {
     "chats/{chat_id}/messages.res.json": {
       "kind": "resource",
@@ -504,7 +529,36 @@ Example:
 }
 ```
 
-## 14. Security and Context
+## 14. How to Claim Compatibility
+
+To claim **AppFS v0.1 Core compatibility**, an implementation SHOULD:
+
+1. Publish `contract_version` and `conformance` in `manifest.res.json`.
+2. Run contract test gates:
+   - static: `CT-001`, `CT-003`, `CT-005`
+   - live: `CT-002`, `CT-004`
+3. Publish acceptance checklist status (pass/fail) against adapter requirements.
+4. Avoid claiming `core` if any Core MUST requirement is currently failing.
+
+Minimal conformance claim structure:
+
+```json
+{
+  "conformance": {
+    "appfs_version": "0.1",
+    "profiles": ["core"],
+    "recommended": ["observer"],
+    "extensions": [],
+    "implementation": {
+      "name": "example-adapter",
+      "version": "0.1.0",
+      "language": "rust"
+    }
+  }
+}
+```
+
+## 15. Security and Context
 
 `/app/<app_id>/_meta/context.res.json` MUST declare principal/session context.
 
@@ -515,7 +569,7 @@ If human approval is required:
 1. app/runtime emits `action.awaiting_approval`
 2. completion/failure event is emitted after decision
 
-## 15. Runtime Observability (Recommended)
+## 16. Runtime Observability (Recommended)
 
 Runtime SHOULD expose per-app observer status:
 
@@ -538,7 +592,7 @@ Purpose:
 1. Give agents and operators a low-token health surface.
 2. Speed up diagnosis of adapter/runtime regressions.
 
-## 16. Optional Advanced Mode (Non-Core)
+## 17. Optional Advanced Mode (Non-Core)
 
 For clients that need explicit request file lifecycles, apps MAY also expose:
 
@@ -548,7 +602,7 @@ For clients that need explicit request file lifecycles, apps MAY also expose:
 
 with explicit request documents. This is optional and must not be required for basic LLM+bash usage.
 
-## 17. AIIM Example
+## 18. AIIM Example
 
 Directory:
 
@@ -594,7 +648,7 @@ Expected events:
 {"seq":1205,"ts":"2026-03-16T09:20:00Z","app":"aiim","session_id":"sess-7f2c","request_id":"req-c115aa","path":"/_paging/fetch_next.act","type":"action.completed","content":{"items":[{"id":"m31","text":"..."}],"page":{"handle_id":"ph_7f2c","page_no":1,"has_more":true,"mode":"snapshot"}}}
 ```
 
-## 18. Open Items for v0.2
+## 19. Open Items for v0.2
 
 1. Unified cancellation endpoint semantics for all apps.
 2. Optional standard idempotency key behavior (if promoted from app-defined to spec-defined).

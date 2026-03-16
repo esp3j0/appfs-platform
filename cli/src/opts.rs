@@ -407,6 +407,25 @@ pub enum ServeCommand {
         #[arg(long, value_delimiter = ',')]
         tools: Option<Vec<String>>,
     },
+
+    /// Start an AppFS adapter runtime loop (filesystem contract to app events bridge)
+    Appfs {
+        /// AppFS root directory
+        #[arg(long, default_value = "/app", add = ArgValueCompleter::new(PathCompleter::dir()))]
+        root: PathBuf,
+
+        /// App ID under the root
+        #[arg(long, default_value = "aiim")]
+        app_id: String,
+
+        /// Session ID used in emitted events (auto-generated when omitted)
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Poll interval in milliseconds for action sink scanning
+        #[arg(long, default_value_t = 200)]
+        poll_ms: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

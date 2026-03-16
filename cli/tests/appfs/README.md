@@ -23,6 +23,13 @@ cd cli
 APPFS_CONTRACT_TESTS=1 ./tests/all.sh
 ```
 
+For a full Linux live run (mount + fixture + `serve appfs` + contract tests):
+
+```bash
+cd cli
+./tests/appfs/run-live-with-adapter.sh
+```
+
 ## Environment
 
 | Variable | Default |
@@ -34,9 +41,24 @@ APPFS_CONTRACT_TESTS=1 ./tests/all.sh
 | `APPFS_TIMEOUT_SEC` | `10` |
 | `APPFS_STATIC_FIXTURE` | `0` |
 
+## Live Harness Environment (`run-live-with-adapter.sh`)
+
+| Variable | Default |
+|---|---|
+| `APPFS_FIXTURE_DIR` | `../examples/appfs` (from repo root) |
+| `APPFS_LIVE_AGENT_ID` | `appfs-live-$$` |
+| `APPFS_LIVE_MOUNTPOINT` | `/tmp/agentfs-appfs-live-$$` |
+| `APPFS_APP_ID` | `aiim` |
+| `APPFS_ADAPTER_POLL_MS` | `100` |
+| `APPFS_TIMEOUT_SEC` | `20` |
+| `APPFS_MOUNT_WAIT_SEC` | `20` |
+| `APPFS_MOUNT_LOG` | `cli/appfs-mount-live.log` |
+| `APPFS_ADAPTER_LOG` | `cli/appfs-adapter-live.log` |
+
 ## Notes
 
 1. Tests are currently gated by `APPFS_CONTRACT_TESTS=1` so they do not affect existing CI by default.
 2. Some checks require `jq`; if missing, JSON field-level assertions are skipped.
 3. `APPFS_STATIC_FIXTURE=1` runs only static contract checks (layout/replay/manifest policy).
-4. This is a skeleton focused on protocol gates, not full adapter business behavior.
+4. `run-live-with-adapter.sh` is Linux/FUSE oriented and expects `fusermount` + `mountpoint`.
+5. This is a skeleton focused on protocol gates, not full adapter business behavior.
