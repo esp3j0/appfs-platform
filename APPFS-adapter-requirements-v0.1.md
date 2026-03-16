@@ -278,7 +278,7 @@ Evidence sources used:
 1. Build + static + live run log: `/home/yxy/rep/agentfs/cli/appfs-phase1-validation.log`
 2. Live harness script: `cli/tests/appfs/run-live-with-adapter.sh`
 3. Runtime implementation: `cli/src/cmd/appfs.rs`
-4. Live contract additions: `cli/tests/appfs/test-streaming-lifecycle.sh`, `cli/tests/appfs/test-submit-reject.sh`, `cli/tests/appfs/test-submit-order.sh`, `cli/tests/appfs/test-paging-errors.sh`, `cli/tests/appfs/test-submit-atomicity.sh`, `cli/tests/appfs/test-submit-interrupt.sh`, `cli/tests/appfs/test-path-safety.sh`
+4. Live contract additions: `cli/tests/appfs/test-streaming-lifecycle.sh`, `cli/tests/appfs/test-submit-reject.sh`, `cli/tests/appfs/test-submit-order.sh`, `cli/tests/appfs/test-paging-errors.sh`, `cli/tests/appfs/test-submit-atomicity.sh`, `cli/tests/appfs/test-submit-interrupt.sh`, `cli/tests/appfs/test-path-safety.sh`, `cli/tests/appfs/test-duplicate-consumption.sh`
 
 | Item | Status | Evidence | Note |
 |---|---|---|---|
@@ -291,7 +291,7 @@ Evidence sources used:
 | 7 | PASS | `CT-003` in validation log | Replay via `from-seq` works |
 | 8 | PASS | `CT-012` in validation log + `cli/src/cmd/appfs.rs` (`is_safe_action_rel_path`) | drive-letter/reserved/backslash unsafe paths are rejected without stream side effects |
 | 9 | FAIL | `cli/src/cmd/appfs.rs` | Deterministic overlong-segment shortening not implemented |
-| 10 | FAIL | No dedicated integration case yet | Duplicate-consumption behavior not validated by test suite |
+| 10 | PASS | `CT-013` in validation log | Same event is consumable from both live stream and replay surface; consumer dedupe is required |
 | 11 | PASS | `CT-009` in validation log + `cli/src/cmd/appfs.rs` | malformed/unknown/expired/closed/cross-session paging errors are mapped and asserted |
 | 12 | PASS | `CT-010/CT-011` in validation log + `cli/src/cmd/appfs.rs` stable-submit gate | In-progress and interrupted write scenarios are covered; no side effect before valid completed submit |
 | 13 | PARTIAL | `CT-008` in validation log | Same-path ordered multi-submit + single terminal validated; high-concurrency stress still missing |
