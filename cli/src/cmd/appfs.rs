@@ -593,22 +593,22 @@ impl AppfsAdapter {
             );
         }
 
-        if expires_at_ts.is_some_and(|expiry| Utc::now().timestamp() >= expiry) {
-            return self.emit_failed(
-                action_path,
-                request_id,
-                ERR_PAGER_HANDLE_EXPIRED,
-                "handle expired",
-                client_token,
-            );
-        }
-
         if closed {
             return self.emit_failed(
                 action_path,
                 request_id,
                 ERR_PAGER_HANDLE_CLOSED,
                 "handle already closed",
+                client_token,
+            );
+        }
+
+        if expires_at_ts.is_some_and(|expiry| Utc::now().timestamp() >= expiry) {
+            return self.emit_failed(
+                action_path,
+                request_id,
+                ERR_PAGER_HANDLE_EXPIRED,
+                "handle expired",
                 client_token,
             );
         }
@@ -690,22 +690,22 @@ impl AppfsAdapter {
             );
         }
 
-        if expires_at_ts.is_some_and(|expiry| Utc::now().timestamp() >= expiry) {
-            return self.emit_failed(
-                action_path,
-                request_id,
-                ERR_PAGER_HANDLE_EXPIRED,
-                "handle expired",
-                client_token,
-            );
-        }
-
         if closed {
             return self.emit_failed(
                 action_path,
                 request_id,
                 ERR_PAGER_HANDLE_CLOSED,
                 "handle already closed",
+                client_token,
+            );
+        }
+
+        if expires_at_ts.is_some_and(|expiry| Utc::now().timestamp() >= expiry) {
+            return self.emit_failed(
+                action_path,
+                request_id,
+                ERR_PAGER_HANDLE_EXPIRED,
+                "handle expired",
                 client_token,
             );
         }
