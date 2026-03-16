@@ -31,6 +31,7 @@ else
     $DIR/appfs/test-submit-atomicity.sh
     $DIR/appfs/test-submit-interrupt.sh
     $DIR/appfs/test-path-safety.sh
+    $DIR/appfs/test-duplicate-consumption.sh
     "
 fi
 
