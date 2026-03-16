@@ -1,25 +1,19 @@
 use agentfs_sdk::{error::Error as SdkError, AgentFSOptions, FileSystem};
 use anyhow::{Context, Result};
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 #[cfg(unix)]
 use agentfs_sdk::{HostFS, OverlayFS};
 #[cfg(unix)]
-use std::{
-    path::Path,
-    process::Command,
-};
+use std::{path::Path, process::Command};
 #[cfg(unix)]
 use tokio::sync::Mutex;
 #[cfg(unix)]
 use turso::value::Value;
 
-use crate::mount::MountOpts;
 #[cfg(unix)]
 use crate::mount::mount_fs;
+use crate::mount::MountOpts;
 #[cfg(unix)]
 use crate::nfs::AgentNFS;
 #[cfg(unix)]
@@ -161,8 +155,7 @@ async fn mount_winfsp_backend(args: MountArgs) -> Result<()> {
     };
 
     // Wrap filesystem in parking_lot::Mutex for WinFsp
-    let fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>> =
-        Arc::new(Mutex::new(agentfs.fs));
+    let fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>> = Arc::new(Mutex::new(agentfs.fs));
 
     let mount_opts = crate::mount::MountOpts {
         mountpoint: mountpoint.clone(),

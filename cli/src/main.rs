@@ -312,6 +312,20 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            ServeCommand::Appfs {
+                root,
+                app_id,
+                session_id,
+                poll_ms,
+            } => {
+                let rt = get_runtime();
+                if let Err(e) = rt.block_on(cmd::appfs::handle_appfs_adapter_command(
+                    root, app_id, session_id, poll_ms,
+                )) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         },
         Command::Ps => {
             if let Err(e) = cmd::ps::list_ps(&mut std::io::stdout()) {

@@ -80,7 +80,10 @@ pub async fn mount_winfsp(
             WINFSP_MOUNT_TIMEOUT.as_secs()
         );
     }
-    tracing::debug!("WinFsp filesystem mounted successfully at {}", mountpoint_str);
+    tracing::debug!(
+        "WinFsp filesystem mounted successfully at {}",
+        mountpoint_str
+    );
 
     // Box the host and leak it - we'll recover it during unmount
     // This is safe because we control the lifecycle and will properly clean up
@@ -91,7 +94,9 @@ pub async fn mount_winfsp(
         mountpoint,
         backend: MountBackend::Winfsp,
         lazy_unmount: opts.lazy_unmount,
-        inner: MountHandleInner::WinFsp { host_ptr: host_ptr as *mut () },
+        inner: MountHandleInner::WinFsp {
+            host_ptr: host_ptr as *mut (),
+        },
     })
 }
 

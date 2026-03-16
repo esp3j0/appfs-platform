@@ -1,9 +1,10 @@
 # AppFS Adapter Layer Requirements v0.1
 
-- Version: `0.1-draft`
+- Version: `0.1-draft-r2`
 - Date: `2026-03-16`
 - Status: `Draft`
-- Depends on: `APPFS-v0.1 (r7)`
+- Depends on: `APPFS-v0.1 (r8)`
+- Conformance profile: `APPFS-conformance-v0.1.md`
 
 ## 1. Decision
 
@@ -75,6 +76,8 @@ Adapter MUST provide data required to produce `_meta/manifest.res.json`:
 2. Adapter MUST validate payload according to `input_mode` and declared schema.
 3. Validation failure MUST return a deterministic error (`EINVAL`/`EMSGSIZE`) and MUST NOT emit `action.accepted`.
 4. Accepted requests MUST produce stream events with runtime-provided `request_id`.
+5. Runtime MUST treat `close` as the only submission boundary. Partial or interrupted writes before `close` MUST be discarded and MUST NOT trigger side effects.
+6. Runtime SHOULD stage request bytes and atomically promote them to submission input so adapter never receives truncated payload.
 
 ### AR-004 Execution Modes
 
@@ -96,14 +99,16 @@ Adapter MUST provide data required to produce `_meta/manifest.res.json`:
 Each emitted event line MUST include:
 
 1. `seq` (assigned by runtime stream layer)
-2. `ts`
-3. `app`
-4. `session_id`
-5. `request_id`
-6. `path`
-7. `type`
+2. `event_id`
+3. `ts`
+4. `app`
+5. `session_id`
+6. `request_id`
+7. `path`
+8. `type`
 
 For `action.failed`, `error.code` and `error.message` MUST be present.
+`event_id` MUST be stable across replay and unique within the app stream retention window.
 
 ### AR-006 Correlation
 
@@ -143,7 +148,8 @@ Adapter MUST map app errors to:
 
 1. Event delivery contract is `at-least-once`.
 2. Adapter MUST assume replay and duplicate-consumption scenarios are normal.
-3. Adapter-emitted payload SHOULD include stable correlation hints (`request_id`, optional `client_token`, optional `event_id`).
+3. Runtime MUST assign stable `event_id`; adapter and replay layers MUST preserve it unchanged.
+4. Adapter-emitted payload SHOULD include stable correlation hints (`request_id`, optional `client_token`).
 
 ### AR-013 Observer Publication
 
@@ -153,6 +159,39 @@ Adapter SHOULD expose or feed data for `/app/<app_id>/_meta/observer.res.json`:
 2. latency aggregates (`p95_accept_ms`, `p95_end_to_end_ms`)
 3. stream pressure (`stream_backlog`)
 4. last error timestamp (`last_error_ts`)
+
+### AR-014 Paging Handle Error Contract
+
+`/_paging/fetch_next.act` and `/_paging/close.act` MUST follow deterministic error mapping:
+
+1. Malformed `handle_id` format MUST fail at close-time with `EINVAL` and MUST NOT emit `action.accepted`.
+2. Unknown handle MUST emit `action.failed` with `error.code = "PAGER_HANDLE_NOT_FOUND"`.
+3. Expired handle MUST emit `action.failed` with `error.code = "PAGER_HANDLE_EXPIRED"`.
+4. Already-closed handle MUST emit `action.failed` with `error.code = "PAGER_HANDLE_CLOSED"`.
+5. Cross-session handle access MUST emit `action.failed` with `error.code = "PERMISSION_DENIED"` (optionally with app code detail).
+
+### AR-015 Concurrent Submit Ordering
+
+1. Runtime MUST preserve causal ordering within each `request_id`.
+2. For the same `(app_id, session_id, action_path)`, `action.accepted` sequence MUST follow `close` commit order.
+3. Exactly one terminal event MUST be emitted per accepted request even under concurrent submissions.
+
+### AR-016 Stream Surface Atomicity
+
+For each committed event `seq = N`, runtime MUST atomically keep these surfaces consistent:
+
+1. `_stream/events.evt.jsonl` contains the event line for `N`.
+2. `_stream/cursor.res.json` has `max_seq >= N`.
+3. `_stream/from-seq/N.evt.jsonl` is readable and includes `seq >= N`.
+
+Crash/restart MUST not expose partially published state where `cursor` points past durable event data.
+
+### AR-017 Adapter Lifecycle and Health
+
+1. Adapter runtime MUST expose readiness before accepting `.act` submissions.
+2. Adapter runtime MUST expose liveness/health status (direct endpoint or reflected observer metrics).
+3. On graceful shutdown, adapter runtime MUST stop new accepts first, then drain or mark in-flight requests deterministically.
+4. On restart recovery, runtime MUST reconcile accepted-but-not-terminal requests and emit deterministic terminal outcomes.
 
 ## 5. Non-Functional Requirements
 
@@ -225,6 +264,39 @@ Adapter implementation is accepted when all checks pass:
 8. Unsafe path guard: traversal/drive-injection/backslash payloads are rejected before side effects.
 9. Segment portability: overlong generated names are deterministically shortened with hash and remain <= 255 bytes.
 10. Delivery semantics: consumer-side duplicate handling is validated in integration tests.
+11. Paging handle errors: malformed/unknown/expired/closed/cross-session cases map to required error codes.
+12. Submit atomicity: interrupted writes do not create requests or events.
+13. Concurrent ordering: same action path preserves accept order and single terminal event per request.
+14. Stream atomicity: `events`, `cursor`, and `from-seq` stay consistent for every committed `seq`.
+15. `event_id` is present on all events and remains stable across replay.
+16. Lifecycle checks: readiness/liveness/shutdown/recovery behaviors are verified in integration tests.
+
+### 8.1 Phase 1 Validation Snapshot (`2026-03-16`)
+
+Evidence sources used:
+
+1. Build + static + live run log: `/home/yxy/rep/agentfs/cli/appfs-phase1-validation.log`
+2. Live harness script: `cli/tests/appfs/run-live-with-adapter.sh`
+3. Runtime implementation: `cli/src/cmd/appfs.rs`
+
+| Item | Status | Evidence | Note |
+|---|---|---|---|
+| 1 | PASS | `CT-001/CT-005` in validation log | Manifest nodes and schemas present |
+| 2 | FAIL | `cli/src/cmd/appfs.rs` | Generic malformed `.act` close-time validation is incomplete |
+| 3 | PASS | `CT-002` in validation log | Inline action emits terminal event |
+| 4 | FAIL | `cli/src/cmd/appfs.rs` | Streaming action lifecycle (`accepted/progress/terminal`) not fully implemented |
+| 5 | PASS | `CT-004` + `emit_failed` code path | `action.failed.error` structure emitted |
+| 6 | PASS | `CT-002` + token extraction logic | `request_id` always present; `client_token` echo supported |
+| 7 | PASS | `CT-003` in validation log | Replay via `from-seq` works |
+| 8 | FAIL | `cli/src/cmd/appfs.rs` | Unsafe path precheck guard not fully enforced at runtime boundary |
+| 9 | FAIL | `cli/src/cmd/appfs.rs` | Deterministic overlong-segment shortening not implemented |
+| 10 | FAIL | No dedicated integration case yet | Duplicate-consumption behavior not validated by test suite |
+| 11 | FAIL | `cli/src/cmd/appfs.rs` | Malformed-handle mapping differs from required close-time `EINVAL` behavior |
+| 12 | FAIL | No interrupted-write integration case yet | Submit atomicity under interrupted writes not verified |
+| 13 | FAIL | No concurrent submit integration case yet | Ordering/single-terminal guarantees unverified |
+| 14 | PASS | `CT-003` + publish sequence in code | `events/cursor/from-seq` consistency validated for normal publish path |
+| 15 | PASS | `CT-002/CT-003` + seq-based `event_id` | `event_id` present and replay-stable |
+| 16 | FAIL | No lifecycle integration case yet | Readiness/liveness/recovery checks pending |
 
 ## 9. Delivery Plan
 
