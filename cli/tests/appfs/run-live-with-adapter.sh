@@ -27,13 +27,46 @@ fail() {
     exit 1
 }
 
-cleanup() {
-    set +e
+start_adapter() {
+    say "Starting AppFS adapter runtime..."
+    "$AGENTFS_BIN" serve appfs --root "$APPFS_LIVE_MOUNTPOINT" --app-id "$APPFS_APP_ID" --poll-ms "$APPFS_ADAPTER_POLL_MS" >"$APPFS_ADAPTER_LOG" 2>&1 &
+    ADAPTER_PID=$!
+    sleep 1
+    if ! kill -0 "$ADAPTER_PID" 2>/dev/null; then
+        tail -n 80 "$APPFS_ADAPTER_LOG" 2>/dev/null || true
+        fail "adapter failed to start"
+    fi
+}
 
+stop_adapter() {
     if [ -n "${ADAPTER_PID:-}" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
         kill "$ADAPTER_PID" 2>/dev/null || true
         wait "$ADAPTER_PID" 2>/dev/null || true
     fi
+    ADAPTER_PID=""
+}
+
+wait_token_in_events() {
+    token="$1"
+    file="$2"
+    timeout="${3:-20}"
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        count="$(grep -c "$token" "$file" 2>/dev/null || true)"
+        [ -n "$count" ] || count=0
+        if [ "$count" -ge 1 ]; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+cleanup() {
+    set +e
+
+    stop_adapter
 
     if mountpoint -q "$APPFS_LIVE_MOUNTPOINT" 2>/dev/null; then
         fusermount -u "$APPFS_LIVE_MOUNTPOINT" 2>/dev/null || true
@@ -100,14 +133,7 @@ fi
 say "Copying AppFS fixture into mounted filesystem..."
 cp -a "$APPFS_FIXTURE_DIR"/. "$APPFS_LIVE_MOUNTPOINT"/
 
-say "Starting AppFS adapter runtime..."
-"$AGENTFS_BIN" serve appfs --root "$APPFS_LIVE_MOUNTPOINT" --app-id "$APPFS_APP_ID" --poll-ms "$APPFS_ADAPTER_POLL_MS" >"$APPFS_ADAPTER_LOG" 2>&1 &
-ADAPTER_PID=$!
-sleep 1
-if ! kill -0 "$ADAPTER_PID" 2>/dev/null; then
-    tail -n 80 "$APPFS_ADAPTER_LOG" 2>/dev/null || true
-    fail "adapter failed to start"
-fi
+start_adapter
 
 say "Running AppFS contract tests against live adapter..."
 if ! APPFS_CONTRACT_TESTS=1 APPFS_ROOT="$APPFS_LIVE_MOUNTPOINT" APPFS_APP_ID="$APPFS_APP_ID" APPFS_TIMEOUT_SEC="$APPFS_TIMEOUT_SEC" sh "$CLI_DIR/tests/test-appfs-contract.sh"; then
@@ -117,5 +143,23 @@ if ! APPFS_CONTRACT_TESTS=1 APPFS_ROOT="$APPFS_LIVE_MOUNTPOINT" APPFS_APP_ID="$A
     tail -n 80 "$APPFS_ADAPTER_LOG" 2>/dev/null || true
     fail "live AppFS contract tests failed"
 fi
+
+say "Lifecycle probe: graceful stop + restart + post-restart submit..."
+if ! kill -0 "$ADAPTER_PID" 2>/dev/null; then
+    fail "adapter not alive before lifecycle probe"
+fi
+stop_adapter
+if [ -n "${ADAPTER_PID:-}" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
+    fail "adapter still alive after stop signal"
+fi
+
+start_adapter
+events_file="$APPFS_LIVE_MOUNTPOINT/$APPFS_APP_ID/_stream/events.evt.jsonl"
+probe_action="$APPFS_LIVE_MOUNTPOINT/$APPFS_APP_ID/contacts/lifecycle/send_message.act"
+probe_token="ct-lifecycle-$$"
+mkdir -p "$(dirname "$probe_action")"
+printf 'token:%s\nrestart-ok\n' "$probe_token" > "$probe_action" || fail "lifecycle probe submit failed"
+wait_token_in_events "$probe_token" "$events_file" "$APPFS_TIMEOUT_SEC" || fail "lifecycle probe event not observed after adapter restart"
+say "Lifecycle probe passed."
 
 say "LIVE AppFS contract tests passed."
