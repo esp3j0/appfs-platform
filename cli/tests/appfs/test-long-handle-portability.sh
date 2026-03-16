@@ -33,7 +33,7 @@ wait_writable() {
 
 wait_for_token_event() {
     token="$1"
-    deadline=$(( $(date +%s) + APPFS_TIMEOUT_SEC ))
+    deadline=$(( $(date +%s) + ${APPFS_TIMEOUT_SEC} ))
     while :; do
         count="$(grep -c "$token" "$events" 2>/dev/null || true)"
         [ -n "$count" ] || count=0
@@ -64,24 +64,32 @@ submit_fetch() {
     tmp_file="$(mktemp)"
     grep "$token" "$events" > "$tmp_file" || true
     [ -s "$tmp_file" ] || fail "token lines missing: $token"
-    tail -n 1 "$tmp_file" | jq -e '.type=="action.completed"' >/dev/null 2>&1 || fail "token $token did not complete"
-    handle_out="$(tail -n 1 "$tmp_file" | jq -r '.content.page.handle_id')"
+    line="$(tail -n 1 "$tmp_file")"
+    event_type="$(printf '%s\n' "$line" | jq -r '.type')"
+    if [ "$event_type" != "action.completed" ]; then
+        error_code="$(printf '%s\n' "$line" | jq -r '.error.code // "UNKNOWN"')"
+        rm -f "$tmp_file"
+        fail "token $token expected action.completed, got $event_type (error.code=$error_code)"
+    fi
+    handle_out="$(printf '%s\n' "$line" | jq -r '.content.page.handle_id')"
     rm -f "$tmp_file"
 
     [ "$handle_out" != "null" ] || fail "token $token missing content.page.handle_id"
     [ -n "$handle_out" ] || fail "token $token empty normalized handle"
-    printf '%s\n' "$handle_out"
+    SUBMIT_FETCH_RESULT="$handle_out"
 }
 
 token_a="ct-long-handle-a-$$"
-norm_a="$(submit_fetch "$long_handle" "$token_a")"
+submit_fetch "$long_handle" "$token_a"
+norm_a="$SUBMIT_FETCH_RESULT"
 norm_a_len="$(printf '%s' "$norm_a" | wc -c | tr -d ' ')"
 [ "$norm_a_len" -le 255 ] || fail "normalized handle too long ($norm_a_len)"
 [ "$norm_a" != "$long_handle" ] || fail "overlong handle should be normalized"
 pass "overlong handle normalized to <=255 bytes"
 
 token_b="ct-long-handle-b-$$"
-norm_b="$(submit_fetch "$long_handle" "$token_b")"
+submit_fetch "$long_handle" "$token_b"
+norm_b="$SUBMIT_FETCH_RESULT"
 [ "$norm_b" = "$norm_a" ] || fail "normalization is not deterministic"
 pass "normalization is deterministic"
 
