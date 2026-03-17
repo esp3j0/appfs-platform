@@ -2,6 +2,8 @@
 
 Filesystem-native app protocol for shell-first AI agents.
 
+[中文 README](README.zh-CN.md)
+
 AppFS makes different apps look and feel like one filesystem contract, so an agent can use the same primitives across tools:
 
 1. `cat` for reading resources.
