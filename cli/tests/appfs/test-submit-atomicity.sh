@@ -47,10 +47,11 @@ before_lines="$(wc -l < "$events" 2>/dev/null || echo 0)"
 
 wait_writable "$action" || fail "action sink remained non-writable: $action"
 (
-    printf 'token:%s\n' "$token"
+    printf '{"client_token":"%s","text":"atomic' "$token"
     sleep 1
-    printf 'atomic-finish\n'
-) > "$action" &
+    printf '%s' '-finish"}'
+    printf '\n'
+) >> "$action" &
 writer_pid=$!
 
 sleep 1
