@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -602,6 +602,121 @@ impl AppfsAdapter {
         )
     }
 
+    fn validate_stale_snapshot_jsonl(
+        &self,
+        stale_abs: &Path,
+    ) -> std::result::Result<usize, String> {
+        let file = fs::File::open(stale_abs).map_err(|err| format!("open_failed: {err}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line_buf = Vec::new();
+        let mut valid_lines = 0usize;
+        let mut line_no = 0usize;
+
+        loop {
+            line_buf.clear();
+            let read = reader
+                .read_until(b'\n', &mut line_buf)
+                .map_err(|err| format!("read_failed line={} err={err}", line_no + 1))?;
+            if read == 0 {
+                break;
+            }
+            line_no += 1;
+
+            let Some(line) = decode_jsonl_line(&line_buf, line_no == 1)
+                .map_err(|err| format!("decode_failed line={line_no} err={err}"))?
+            else {
+                continue;
+            };
+
+            let value: JsonValue = serde_json::from_str(&line)
+                .map_err(|err| format!("parse_failed line={line_no} err={err}"))?;
+            if !value.is_object() {
+                return Err(format!("non_object_json line={line_no}"));
+            }
+            valid_lines += 1;
+        }
+
+        if valid_lines == 0 {
+            return Err("empty_or_blank_snapshot".to_string());
+        }
+
+        Ok(valid_lines)
+    }
+
+    fn resolve_snapshot_expand_cleanup_target(
+        &self,
+        temp_artifact: &str,
+    ) -> std::result::Result<PathBuf, String> {
+        let trimmed = temp_artifact.trim();
+        if trimmed.is_empty() {
+            return Err("empty_temp_artifact".to_string());
+        }
+
+        let rel_raw = trimmed.trim_start_matches(['/', '\\']);
+        let rel_path = Path::new(rel_raw);
+        if rel_path.is_absolute() {
+            return Err("absolute_temp_artifact_path".to_string());
+        }
+
+        let mut normalized = PathBuf::new();
+        for component in rel_path.components() {
+            match component {
+                Component::Normal(seg) => normalized.push(seg),
+                Component::CurDir => {}
+                Component::ParentDir => return Err("parent_dir_component_not_allowed".to_string()),
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("root_or_prefix_component_not_allowed".to_string())
+                }
+            }
+        }
+
+        if normalized.as_os_str().is_empty() {
+            return Err("empty_normalized_temp_artifact_path".to_string());
+        }
+
+        let allowed_prefix = Path::new("_stream").join("snapshot-expand-tmp");
+        if !normalized.starts_with(&allowed_prefix) {
+            return Err(format!(
+                "temp_artifact_outside_allowed_prefix path={}",
+                normalized.display()
+            ));
+        }
+
+        let app_root_canonical = fs::canonicalize(&self.app_dir)
+            .map_err(|err| format!("canonicalize_app_root_failed: {err}"))?;
+        let joined = self.app_dir.join(&normalized);
+
+        if joined.exists() {
+            let target_canonical = fs::canonicalize(&joined)
+                .map_err(|err| format!("canonicalize_temp_artifact_failed: {err}"))?;
+            if !target_canonical.starts_with(&app_root_canonical) {
+                return Err(format!(
+                    "temp_artifact_outside_app_root target={} app_root={}",
+                    target_canonical.display(),
+                    app_root_canonical.display()
+                ));
+            }
+            return Ok(joined);
+        }
+
+        let Some(parent) = joined.parent() else {
+            return Err("temp_artifact_has_no_parent".to_string());
+        };
+        if parent.exists() {
+            let parent_canonical = fs::canonicalize(parent)
+                .map_err(|err| format!("canonicalize_temp_artifact_parent_failed: {err}"))?;
+            if !parent_canonical.starts_with(&app_root_canonical) {
+                return Err(format!(
+                    "temp_artifact_parent_outside_app_root parent={} app_root={}",
+                    parent_canonical.display(),
+                    app_root_canonical.display()
+                ));
+            }
+        }
+
+        Ok(joined)
+    }
+
     fn update_snapshot_expand_journal(
         &mut self,
         resource_rel: &str,
@@ -656,25 +771,55 @@ impl AppfsAdapter {
 
         for (resource_rel, entry) in entries {
             let mut cleaned_temp = false;
+            let mut cleanup_status = "not_requested";
+            let mut cleanup_detail: Option<String> = None;
             if let Some(temp_artifact) = entry.temp_artifact.clone() {
-                let temp_abs = self.app_dir.join(temp_artifact.trim_start_matches('/'));
-                if temp_abs.exists() {
-                    fs::remove_file(&temp_abs).with_context(|| {
-                        format!(
-                            "Failed to remove unfinished snapshot temp artifact {}",
-                            temp_abs.display()
-                        )
-                    })?;
-                    cleaned_temp = true;
+                match self.resolve_snapshot_expand_cleanup_target(&temp_artifact) {
+                    Ok(temp_abs) => {
+                        if temp_abs.exists() {
+                            match fs::remove_file(&temp_abs) {
+                                Ok(_) => {
+                                    cleaned_temp = true;
+                                    cleanup_status = "deleted";
+                                }
+                                Err(err) => {
+                                    cleanup_status = "delete_failed";
+                                    cleanup_detail = Some(err.to_string());
+                                    eprintln!(
+                                        "[recovery] snapshot temp cleanup failed resource=/{} artifact={} err={}",
+                                        resource_rel,
+                                        temp_abs.display(),
+                                        err
+                                    );
+                                }
+                            }
+                        } else {
+                            cleanup_status = "missing";
+                        }
+                    }
+                    Err(reason) => {
+                        cleanup_status = "rejected";
+                        cleanup_detail = Some(reason.clone());
+                        eprintln!(
+                            "[recovery] snapshot temp cleanup skipped resource=/{} artifact={} reason={}",
+                            resource_rel, temp_artifact, reason
+                        );
+                    }
                 }
             }
 
             self.transition_snapshot_state(&resource_rel, SnapshotCacheState::Cold);
             self.clear_snapshot_recent_expand(&resource_rel);
             eprintln!(
-                "[recovery] snapshot expand incomplete resource=/{} status={} cleaned_temp={} -> cold",
-                resource_rel, entry.status, cleaned_temp
+                "[recovery] snapshot expand incomplete resource=/{} status={} cleaned_temp={} cleanup_status={} -> cold",
+                resource_rel, entry.status, cleaned_temp, cleanup_status
             );
+            if let Some(detail) = cleanup_detail.as_deref() {
+                eprintln!(
+                    "[recovery] snapshot expand cleanup detail resource=/{} detail={}",
+                    resource_rel, detail
+                );
+            }
 
             self.emit_event(
                 "/_snapshot/refresh.act",
@@ -684,6 +829,9 @@ impl AppfsAdapter {
                     "path": format!("/{}", resource_rel),
                     "status_before": entry.status,
                     "cleaned_temp": cleaned_temp,
+                    "cleanup_status": cleanup_status,
+                    "cleanup_detail": cleanup_detail,
+                    "temp_artifact": entry.temp_artifact,
                     "phase": "recovered",
                 })),
                 None,
@@ -1464,6 +1612,8 @@ impl AppfsAdapter {
         }
 
         if simulated_delay_ms > snapshot_spec.read_through_timeout_ms {
+            let mut stale_unavailable_reason: Option<&'static str> = None;
+            let mut stale_unavailable_detail: Option<String> = None;
             if matches!(
                 snapshot_spec.on_timeout,
                 SnapshotOnTimeoutPolicy::ReturnStale
@@ -1473,74 +1623,103 @@ impl AppfsAdapter {
                     Ok(meta) => {
                         let stale_bytes = meta.len() as usize;
                         if stale_bytes <= snapshot_spec.max_materialized_bytes {
-                            self.transition_snapshot_state(resource_rel, SnapshotCacheState::Hot);
-                            self.clear_snapshot_recent_expand(resource_rel);
-                            self.clear_snapshot_expand_journal_entry(resource_rel)?;
+                            match self.validate_stale_snapshot_jsonl(&stale_abs) {
+                                Ok(valid_lines) => {
+                                    self.transition_snapshot_state(
+                                        resource_rel,
+                                        SnapshotCacheState::Hot,
+                                    );
+                                    self.clear_snapshot_recent_expand(resource_rel);
+                                    self.clear_snapshot_expand_journal_entry(resource_rel)?;
+                                    eprintln!(
+                                        "[cache] timeout_return_stale resource={} bytes={} timeout_ms={} elapsed_ms={} health=valid valid_lines={}",
+                                        resource_path,
+                                        stale_bytes,
+                                        snapshot_spec.read_through_timeout_ms,
+                                        simulated_delay_ms,
+                                        valid_lines
+                                    );
+                                    self.emit_event(
+                                        &resource_path,
+                                        request_id,
+                                        "cache.expand",
+                                        Some(json!({
+                                            "path": resource_path.clone(),
+                                            "phase": "timeout",
+                                            "state": self.snapshot_state_for(resource_rel).as_str(),
+                                            "failure_reason": "timeout",
+                                            "timeout_ms": snapshot_spec.read_through_timeout_ms,
+                                            "elapsed_ms": simulated_delay_ms,
+                                            "on_timeout": snapshot_spec.on_timeout.as_str(),
+                                            "fallback": "return_stale",
+                                            "stale_health": "valid",
+                                            "stale_valid_lines": valid_lines,
+                                        })),
+                                        None,
+                                        client_token.clone(),
+                                    )?;
+                                    self.emit_event(
+                                        &resource_path,
+                                        request_id,
+                                        "cache.stale",
+                                        Some(json!({
+                                            "path": resource_path.clone(),
+                                            "reason": "timeout",
+                                            "bytes": stale_bytes,
+                                            "max_size": snapshot_spec.max_materialized_bytes,
+                                            "state": self.snapshot_state_for(resource_rel).as_str(),
+                                            "stale_health": "valid",
+                                            "stale_valid_lines": valid_lines,
+                                        })),
+                                        None,
+                                        client_token.clone(),
+                                    )?;
+                                    self.emit_event(
+                                        action_path,
+                                        request_id,
+                                        "action.completed",
+                                        Some(json!({
+                                            "refreshed": false,
+                                            "resource_path": resource_path,
+                                            "bytes": stale_bytes,
+                                            "max_materialized_bytes": snapshot_spec.max_materialized_bytes,
+                                            "cached": true,
+                                            "coalesced": false,
+                                            "stale": true,
+                                            "degrade_reason": "timeout_return_stale",
+                                            "stale_health": "valid",
+                                            "stale_valid_lines": valid_lines,
+                                            "state": self.snapshot_state_for(resource_rel).as_str(),
+                                            "generated_at": Utc::now().to_rfc3339(),
+                                        })),
+                                        None,
+                                        client_token,
+                                    )?;
+                                    return Ok(ProcessOutcome::Consumed);
+                                }
+                                Err(health_reason) => {
+                                    stale_unavailable_reason = Some("stale_cache_unhealthy");
+                                    stale_unavailable_detail = Some(health_reason.clone());
+                                    eprintln!(
+                                        "[cache] timeout_return_stale unavailable resource={} reason=stale_cache_unhealthy detail={}",
+                                        resource_path, health_reason
+                                    );
+                                }
+                            }
+                        } else {
+                            stale_unavailable_reason = Some("stale_cache_too_large");
+                            stale_unavailable_detail = Some(format!(
+                                "size={} max={}",
+                                stale_bytes, snapshot_spec.max_materialized_bytes
+                            ));
                             eprintln!(
-                                "[cache] timeout_return_stale resource={} bytes={} timeout_ms={} elapsed_ms={}",
-                                resource_path,
-                                stale_bytes,
-                                snapshot_spec.read_through_timeout_ms,
-                                simulated_delay_ms
+                                "[cache] timeout_return_stale unavailable resource={} reason=stale_cache_too_large size={} max={}",
+                                resource_path, stale_bytes, snapshot_spec.max_materialized_bytes
                             );
-                            self.emit_event(
-                                &resource_path,
-                                request_id,
-                                "cache.expand",
-                                Some(json!({
-                                    "path": resource_path.clone(),
-                                    "phase": "timeout",
-                                    "state": self.snapshot_state_for(resource_rel).as_str(),
-                                    "failure_reason": "timeout",
-                                    "timeout_ms": snapshot_spec.read_through_timeout_ms,
-                                    "elapsed_ms": simulated_delay_ms,
-                                    "on_timeout": snapshot_spec.on_timeout.as_str(),
-                                    "fallback": "return_stale",
-                                })),
-                                None,
-                                client_token.clone(),
-                            )?;
-                            self.emit_event(
-                                &resource_path,
-                                request_id,
-                                "cache.stale",
-                                Some(json!({
-                                    "path": resource_path.clone(),
-                                    "reason": "timeout",
-                                    "bytes": stale_bytes,
-                                    "max_size": snapshot_spec.max_materialized_bytes,
-                                    "state": self.snapshot_state_for(resource_rel).as_str(),
-                                })),
-                                None,
-                                client_token.clone(),
-                            )?;
-                            self.emit_event(
-                                action_path,
-                                request_id,
-                                "action.completed",
-                                Some(json!({
-                                    "refreshed": false,
-                                    "resource_path": resource_path,
-                                    "bytes": stale_bytes,
-                                    "max_materialized_bytes": snapshot_spec.max_materialized_bytes,
-                                    "cached": true,
-                                    "coalesced": false,
-                                    "stale": true,
-                                    "degrade_reason": "timeout_return_stale",
-                                    "state": self.snapshot_state_for(resource_rel).as_str(),
-                                    "generated_at": Utc::now().to_rfc3339(),
-                                })),
-                                None,
-                                client_token,
-                            )?;
-                            return Ok(ProcessOutcome::Consumed);
                         }
-                        eprintln!(
-                            "[cache] timeout_return_stale unavailable resource={} reason=stale_cache_too_large size={} max={}",
-                            resource_path, stale_bytes, snapshot_spec.max_materialized_bytes
-                        );
                     }
                     Err(_) => {
+                        stale_unavailable_reason = Some("no_stale_cache");
                         eprintln!(
                             "[cache] timeout_return_stale unavailable resource={} reason=no_stale_cache",
                             resource_path
@@ -1561,16 +1740,30 @@ impl AppfsAdapter {
                     "failure_reason": "timeout",
                     "timeout_ms": snapshot_spec.read_through_timeout_ms,
                     "on_timeout": snapshot_spec.on_timeout.as_str(),
+                    "stale_reason": stale_unavailable_reason,
+                    "stale_detail": stale_unavailable_detail,
                 })),
                 None,
                 client_token.clone(),
             )?;
-            let timeout_reason = format!(
-                "expand_timeout elapsed_ms={} timeout_ms={} on_timeout={}",
-                simulated_delay_ms,
-                snapshot_spec.read_through_timeout_ms,
-                snapshot_spec.on_timeout.as_str()
-            );
+            let timeout_reason = if let Some(reason) = stale_unavailable_reason {
+                let detail = stale_unavailable_detail.as_deref().unwrap_or("none");
+                format!(
+                    "expand_timeout elapsed_ms={} timeout_ms={} on_timeout={} stale_reason={} stale_detail={}",
+                    simulated_delay_ms,
+                    snapshot_spec.read_through_timeout_ms,
+                    snapshot_spec.on_timeout.as_str(),
+                    reason,
+                    detail
+                )
+            } else {
+                format!(
+                    "expand_timeout elapsed_ms={} timeout_ms={} on_timeout={}",
+                    simulated_delay_ms,
+                    snapshot_spec.read_through_timeout_ms,
+                    snapshot_spec.on_timeout.as_str()
+                )
+            };
             self.clear_snapshot_expand_journal_entry(resource_rel)?;
             return self.handle_snapshot_cache_expand_hook(
                 action_path,
