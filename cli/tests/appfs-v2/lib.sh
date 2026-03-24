@@ -5,6 +5,29 @@ say() {
     printf '%s\n' "$*"
 }
 
+record_v2_evidence() {
+    key="$1"
+    value="${2:-}"
+    evidence_file="${APPFS_V2_EVIDENCE_FILE:-}"
+    [ -n "$evidence_file" ] || return 0
+    if [ -n "$value" ]; then
+        printf '%s=%s\n' "$key" "$value" >>"$evidence_file"
+    else
+        printf '%s\n' "$key" >>"$evidence_file"
+    fi
+}
+
+persist_case_evidence() {
+    case_id="$1"
+    artifact_name="$2"
+    src_path="$3"
+    evidence_dir="${APPFS_V2_EVIDENCE_DIR:-}"
+    [ -n "$evidence_dir" ] || return 0
+    [ -f "$src_path" ] || return 0
+    mkdir -p "$evidence_dir"
+    cp "$src_path" "$evidence_dir/${case_id}.${artifact_name}"
+}
+
 pass() {
     say "  OK   $*"
 }

@@ -1,5 +1,6 @@
 pub mod appfs_adapter;
 pub mod appfs_adapter_testkit;
+pub mod appfs_connector_v2;
 pub mod appfs_demo_adapter;
 pub mod connection_pool;
 pub mod error;
@@ -29,7 +30,16 @@ pub use appfs_adapter_testkit::{
     default_request_context_v1, run_error_case_matrix_v1, run_required_case_matrix_v1,
     AdapterCaseErrorV1, ErrorCaseMatrixV1, RequiredCaseMatrixV1,
 };
-pub use appfs_demo_adapter::DemoAppAdapterV1;
+pub use appfs_connector_v2::connector_error_codes_v2;
+pub use appfs_connector_v2::{
+    ActionExecutionModeV2, ActionStreamingPlanV2, AppConnectorV2, AuthStatusV2, ConnectorContextV2,
+    ConnectorErrorV2, ConnectorInfoV2, ConnectorTransportV2, FetchLivePageRequestV2,
+    FetchLivePageResponseV2, FetchSnapshotChunkRequestV2, FetchSnapshotChunkResponseV2,
+    HealthStatusV2, LiveModeV2, LivePageInfoV2, SnapshotMetaV2, SnapshotRecordV2, SnapshotResumeV2,
+    SubmitActionOutcomeV2, SubmitActionRequestV2, SubmitActionResponseV2,
+    APPFS_CONNECTOR_SDK_V2_VERSION,
+};
+pub use appfs_demo_adapter::{DemoAppAdapterV1, DemoAppConnectorV2};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{

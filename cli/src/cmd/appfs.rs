@@ -1,4 +1,4 @@
-use agentfs_sdk::AppAdapterV1;
+use agentfs_sdk::AppConnectorV2;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -264,10 +264,12 @@ struct CursorState {
 
 #[derive(Debug, Clone)]
 struct PagingHandle {
-    page_no: u64,
+    page_no: u32,
     closed: bool,
     owner_session: String,
     expires_at_ts: Option<i64>,
+    upstream_cursor: Option<String>,
+    resource_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +292,8 @@ struct ActionCursorState {
     offset: u64,
     #[serde(default)]
     boundary_probe: Option<String>,
+    #[serde(default)]
+    pending_multiline_eof_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -320,5 +324,5 @@ struct AppfsAdapter {
     snapshot_expand_journal: HashMap<String, SnapshotExpandJournalEntry>,
     streaming_jobs: Vec<StreamingJob>,
     actionline_v2_strict: bool,
-    business_adapter: Box<dyn AppAdapterV1>,
+    business_connector: Box<dyn AppConnectorV2>,
 }

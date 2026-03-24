@@ -15,6 +15,9 @@ ADAPTER_PID=""
 ADAPTER_LOG=""
 
 cleanup() {
+    if [ -n "${EVENTS:-}" ]; then
+        persist_case_evidence "ct2-007" "events.evt.jsonl" "$EVENTS"
+    fi
     stop_adapter_process "${ADAPTER_PID:-}" "${AGENTFS_BIN:-}" "${TMP_ROOT:-}"
     if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ]; then
         rm -rf "$TMP_ROOT"
@@ -68,6 +71,7 @@ assert_token_completed() {
     line="$(grep "$token" "$EVENTS" 2>/dev/null | tail -n 1 || true)"
     [ -n "$line" ] || fail "missing event line for token=$token"
     assert_json_expr "$line" 'obj.get("type") == "action.completed"' "token $token did not emit action.completed"
+    assert_json_expr "$line" 'isinstance(obj.get("content"), dict) and isinstance(obj.get("content", {}).get("echo"), dict)' "token $token should carry v2 connector content.echo object"
     actual_token="$(printf '%s\n' "$line" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("client_token", ""))')"
     [ "$actual_token" = "$token" ] || fail "expected client_token=$token, got $actual_token"
 }
