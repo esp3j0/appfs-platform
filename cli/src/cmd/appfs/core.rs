@@ -1,7 +1,7 @@
 use agentfs_sdk::{
-    connector_error_codes_v2, ActionExecutionModeV2, AppAdapterV1, AppConnectorV2, AuthStatusV2,
-    ConnectorContextV2, ConnectorErrorV2, ConnectorInfoV2, ConnectorTransportV2,
-    DemoAppConnectorV2, FetchLivePageRequestV2, FetchLivePageResponseV2,
+    connector_error_codes_v2, ActionExecutionModeV2, AppAdapterV1, AppConnectorV2, AppConnectorV3,
+    AppStructureSyncReasonV3, AuthStatusV2, ConnectorContextV2, ConnectorErrorV2, ConnectorInfoV2,
+    ConnectorTransportV2, DemoAppConnectorV2, FetchLivePageRequestV2, FetchLivePageResponseV2,
     FetchSnapshotChunkRequestV2, FetchSnapshotChunkResponseV2, HealthStatusV2, SnapshotMetaV2,
     SubmitActionOutcomeV2, SubmitActionRequestV2, SubmitActionResponseV2,
 };
@@ -26,6 +26,7 @@ use super::shared::{
     is_transient_action_sink_busy, parse_snapshot_on_timeout_policy, template_specificity,
     MultilineRecoveryOutcome,
 };
+use super::tree_sync::{ensure_app_structure_initialized, refresh_app_structure};
 use super::{
     ActionCursorDoc, ActionCursorState, ActionSpec, AppfsAdapter, AppfsBridgeConfig, CursorState,
     ExecutionMode, InputMode, ManifestContract, ManifestDoc, ProcessOutcome, SnapshotSpec,
@@ -283,6 +284,7 @@ impl AppfsAdapter {
         session_id: String,
         bridge_config: AppfsBridgeConfig,
     ) -> Result<Self> {
+        ensure_app_structure_initialized(&root, &app_id, &session_id, &bridge_config)?;
         let app_dir = root.join(&app_id);
         let manifest_path = app_dir.join("_meta").join("manifest.res.json");
         let events_path = app_dir.join("_stream").join("events.evt.jsonl");
@@ -339,6 +341,7 @@ impl AppfsAdapter {
             }
         }
         let business_connector = build_business_connector(&app_id, &bridge_config)?;
+        let structure_connector = build_structure_connector(&app_id, &bridge_config)?;
         let connector_info = business_connector
             .connector_id()
             .map_err(|err| anyhow::anyhow!("connector_id failed: {}: {}", err.code, err.message))?;
@@ -375,6 +378,7 @@ impl AppfsAdapter {
             streaming_jobs: Self::load_streaming_jobs(&jobs_path)?,
             actionline_v2_strict: env_flag_enabled("APPFS_V2_ACTIONLINE_STRICT"),
             business_connector,
+            structure_connector,
         };
         adapter.initialize_snapshot_states();
         adapter.recover_snapshot_expand_journal()?;
@@ -692,6 +696,22 @@ impl AppfsAdapter {
                     client_token,
                 );
             }
+            Ok(action_dispatcher::DispatchRoute::EnterScope(request)) => {
+                return self.handle_enter_scope(
+                    &normalized_path,
+                    &request_id,
+                    &request.target_scope,
+                    client_token,
+                );
+            }
+            Ok(action_dispatcher::DispatchRoute::StructureRefresh(request)) => {
+                return self.handle_refresh_structure(
+                    &normalized_path,
+                    &request_id,
+                    request.target_scope.as_deref(),
+                    client_token,
+                );
+            }
             Ok(action_dispatcher::DispatchRoute::BusinessSubmit) => {}
             Err(action_dispatcher::DispatchRouteParseError::PagingFetchNext) => {
                 eprintln!(
@@ -710,6 +730,20 @@ impl AppfsAdapter {
             Err(action_dispatcher::DispatchRouteParseError::SnapshotRefresh) => {
                 eprintln!(
                     "AppFS adapter rejected malformed snapshot refresh payload at submit-time: {}",
+                    normalized_path
+                );
+                return Ok(ProcessOutcome::Consumed);
+            }
+            Err(action_dispatcher::DispatchRouteParseError::EnterScope) => {
+                eprintln!(
+                    "AppFS adapter rejected malformed enter_scope payload at submit-time: {}",
+                    normalized_path
+                );
+                return Ok(ProcessOutcome::Consumed);
+            }
+            Err(action_dispatcher::DispatchRouteParseError::StructureRefresh) => {
+                eprintln!(
+                    "AppFS adapter rejected malformed structure refresh payload at submit-time: {}",
                     normalized_path
                 );
                 return Ok(ProcessOutcome::Consumed);
@@ -876,6 +910,42 @@ pub(super) fn build_business_connector(
         );
     }
     Ok(connector)
+}
+
+pub(super) fn build_structure_connector(
+    app_id: &str,
+    bridge_config: &AppfsBridgeConfig,
+) -> Result<Option<Box<dyn AppConnectorV3>>> {
+    let normalized_http_endpoint = bridge_config
+        .adapter_http_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let normalized_grpc_endpoint = bridge_config
+        .adapter_grpc_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(endpoint) = normalized_http_endpoint {
+        return Ok(Some(Box::new(HttpBridgeConnectorV2::new(
+            app_id.to_string(),
+            endpoint.to_string(),
+            Duration::from_millis(bridge_config.adapter_http_timeout_ms.max(1)),
+            bridge_config.runtime_options,
+        ))));
+    }
+
+    if let Some(endpoint) = normalized_grpc_endpoint {
+        return Ok(Some(Box::new(GrpcBridgeConnectorV2::new(
+            app_id.to_string(),
+            endpoint.to_string(),
+            Duration::from_millis(bridge_config.adapter_grpc_timeout_ms.max(1)),
+            bridge_config.runtime_options,
+        )?)));
+    }
+
+    Ok(Some(Box::new(DemoAppConnectorV2::new(app_id.to_string()))))
 }
 
 pub(super) fn parse_manifest_contract_json(
@@ -1172,6 +1242,153 @@ impl AppfsAdapter {
         Ok(out)
     }
 
+    pub(super) fn reload_manifest_contract(&mut self) -> Result<()> {
+        let manifest_path = self.app_dir.join("_meta").join("manifest.res.json");
+        let manifest_contract = Self::load_manifest_contract(&manifest_path)?;
+        if manifest_contract.requires_paging_controls {
+            let fetch_path = self.app_dir.join("_paging").join("fetch_next.act");
+            let close_path = self.app_dir.join("_paging").join("close.act");
+            if !fetch_path.exists() || !close_path.exists() {
+                anyhow::bail!(
+                    "live pageable resources require paging control files to exist: {} and {}",
+                    fetch_path.display(),
+                    close_path.display()
+                );
+            }
+        }
+
+        self.action_specs = manifest_contract.action_specs;
+        self.snapshot_specs = manifest_contract.snapshot_specs;
+        self.snapshot_states.clear();
+        self.initialize_snapshot_states();
+        self.prepare_action_sinks()?;
+        Ok(())
+    }
+
+    pub(super) fn handle_enter_scope(
+        &mut self,
+        action_path: &str,
+        request_id: &str,
+        target_scope: &str,
+        client_token: Option<String>,
+    ) -> Result<ProcessOutcome> {
+        let Some(connector) = self.structure_connector.as_deref_mut() else {
+            self.emit_failed_with_retryable(
+                action_path,
+                request_id,
+                connector_error_codes_v2::NOT_SUPPORTED,
+                "structure sync is not supported for the configured connector transport",
+                false,
+                client_token,
+            )?;
+            return Ok(ProcessOutcome::Consumed);
+        };
+
+        let root = self
+            .app_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("app directory has no parent root"))?;
+        match refresh_app_structure(
+            root,
+            &self.app_id,
+            &self.session_id,
+            connector,
+            AppStructureSyncReasonV3::EnterScope,
+            Some(target_scope.to_string()),
+            Some(action_path.to_string()),
+        ) {
+            Ok(outcome) => {
+                self.reload_manifest_contract()?;
+                self.emit_event(
+                    action_path,
+                    request_id,
+                    "action.completed",
+                    Some(serde_json::json!({
+                        "refreshed": outcome.changed,
+                        "active_scope": outcome.active_scope,
+                        "revision": outcome.revision,
+                    })),
+                    None,
+                    client_token,
+                )?;
+                Ok(ProcessOutcome::Consumed)
+            }
+            Err(err) => {
+                self.emit_failed_with_retryable(
+                    action_path,
+                    request_id,
+                    "STRUCTURE_SYNC_FAILED",
+                    &format!("structure enter_scope failed: {err}"),
+                    true,
+                    client_token,
+                )?;
+                Ok(ProcessOutcome::Consumed)
+            }
+        }
+    }
+
+    pub(super) fn handle_refresh_structure(
+        &mut self,
+        action_path: &str,
+        request_id: &str,
+        target_scope: Option<&str>,
+        client_token: Option<String>,
+    ) -> Result<ProcessOutcome> {
+        let Some(connector) = self.structure_connector.as_deref_mut() else {
+            self.emit_failed_with_retryable(
+                action_path,
+                request_id,
+                connector_error_codes_v2::NOT_SUPPORTED,
+                "structure sync is not supported for the configured connector transport",
+                false,
+                client_token,
+            )?;
+            return Ok(ProcessOutcome::Consumed);
+        };
+
+        let root = self
+            .app_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("app directory has no parent root"))?;
+        match refresh_app_structure(
+            root,
+            &self.app_id,
+            &self.session_id,
+            connector,
+            AppStructureSyncReasonV3::Refresh,
+            target_scope.map(ToOwned::to_owned),
+            Some(action_path.to_string()),
+        ) {
+            Ok(outcome) => {
+                self.reload_manifest_contract()?;
+                self.emit_event(
+                    action_path,
+                    request_id,
+                    "action.completed",
+                    Some(serde_json::json!({
+                        "refreshed": outcome.changed,
+                        "active_scope": outcome.active_scope,
+                        "revision": outcome.revision,
+                    })),
+                    None,
+                    client_token,
+                )?;
+                Ok(ProcessOutcome::Consumed)
+            }
+            Err(err) => {
+                self.emit_failed_with_retryable(
+                    action_path,
+                    request_id,
+                    "STRUCTURE_SYNC_FAILED",
+                    &format!("structure refresh failed: {err}"),
+                    true,
+                    client_token,
+                )?;
+                Ok(ProcessOutcome::Consumed)
+            }
+        }
+    }
+
     fn new_request_id() -> String {
         let uuid = Uuid::new_v4().simple().to_string();
         format!("req-{}", &uuid[..8])
@@ -1182,6 +1399,7 @@ impl AppfsAdapter {
 mod tests {
     use super::{map_adapter_error_v1_to_connector_error_v2, LegacyAdapterConnectorV2};
     use super::{AppfsAdapter, AppfsBridgeConfig};
+    use crate::cmd::appfs::{ACTION_CURSORS_FILENAME, SNAPSHOT_EXPAND_JOURNAL_FILENAME};
     use agentfs_sdk::{
         AdapterControlActionV1, AdapterControlOutcomeV1, AdapterErrorV1, AdapterExecutionModeV1,
         AdapterInputModeV1, AdapterSubmitOutcomeV1, AppAdapterV1, AppConnectorV2,
@@ -1189,9 +1407,17 @@ mod tests {
     };
     use serde_json::{json, Value as JsonValue};
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
     use tempfile::TempDir;
+    use tonic::{Request, Response, Status};
 
     struct PagingCompatAdapter {
         seen_pages: Vec<u64>,
@@ -1327,6 +1553,26 @@ mod tests {
         }
     }
 
+    fn http_bridge_config(endpoint: String) -> AppfsBridgeConfig {
+        AppfsBridgeConfig {
+            adapter_http_endpoint: Some(endpoint),
+            adapter_http_timeout_ms: 5_000,
+            adapter_grpc_endpoint: None,
+            adapter_grpc_timeout_ms: 5_000,
+            runtime_options: super::super::BridgeRuntimeOptions::from_cli(2, 100, 1_000, 5, 3_000),
+        }
+    }
+
+    fn grpc_bridge_config(endpoint: String) -> AppfsBridgeConfig {
+        AppfsBridgeConfig {
+            adapter_http_endpoint: None,
+            adapter_http_timeout_ms: 5_000,
+            adapter_grpc_endpoint: Some(endpoint),
+            adapter_grpc_timeout_ms: 5_000,
+            runtime_options: super::super::BridgeRuntimeOptions::from_cli(2, 100, 1_000, 5, 3_000),
+        }
+    }
+
     fn fixture_adapter() -> (TempDir, AppfsAdapter) {
         let temp = TempDir::new().expect("tempdir");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/appfs/aiim");
@@ -1339,6 +1585,16 @@ mod tests {
             "{\n  \"min_seq\": 0,\n  \"max_seq\": 0,\n  \"retention_hint_sec\": 86400\n}\n",
         )
         .expect("reset cursor");
+        let _ = fs::remove_file(app_dir.join("_stream").join(ACTION_CURSORS_FILENAME));
+        let _ = fs::remove_file(app_dir.join("_stream").join("inflight.jobs.res.json"));
+        let _ = fs::remove_file(
+            app_dir
+                .join("_stream")
+                .join(SNAPSHOT_EXPAND_JOURNAL_FILENAME),
+        );
+        let replay_dir = app_dir.join("_stream").join("from-seq");
+        let _ = fs::remove_dir_all(&replay_dir);
+        fs::create_dir_all(&replay_dir).expect("reset replay dir");
         fs::write(
             app_dir
                 .join("contacts")
@@ -1359,6 +1615,687 @@ mod tests {
         (temp, adapter)
     }
 
+    fn structured_adapter() -> (TempDir, AppfsAdapter) {
+        let temp = TempDir::new().expect("tempdir");
+        let adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            bridge_config(),
+        )
+        .expect("structured adapter");
+
+        (temp, adapter)
+    }
+
+    struct TestHttpStructureBridge {
+        endpoint: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestHttpStructureBridge {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test bridge");
+            let addr = listener.local_addr().expect("listener addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+
+            let thread = thread::spawn(move || {
+                while let Ok((mut stream, _)) = listener.accept() {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    handle_test_http_connection(&mut stream);
+                }
+            });
+
+            Self {
+                endpoint: format!("http://{}", addr),
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestHttpStructureBridge {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(self.endpoint.trim_start_matches("http://"));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestGrpcConnectorV2Service;
+
+    #[tonic::async_trait]
+    impl super::super::grpc_bridge_adapter::proto_v2::appfs_connector_v2_server::AppfsConnectorV2
+        for TestGrpcConnectorV2Service
+    {
+        async fn get_connector_info(
+            &self,
+            _request: Request<super::super::grpc_bridge_adapter::proto_v2::GetConnectorInfoRequest>,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v2::GetConnectorInfoResponse>,
+            Status,
+        > {
+            Ok(Response::new(
+                super::super::grpc_bridge_adapter::proto_v2::GetConnectorInfoResponse {
+                    result: Some(
+                        super::super::grpc_bridge_adapter::proto_v2::get_connector_info_response::Result::Info(
+                            super::super::grpc_bridge_adapter::proto_v2::ConnectorInfoV2 {
+                                connector_id: "test-grpc-v2".to_string(),
+                                version: "0.4.0-test".to_string(),
+                                app_id: "aiim".to_string(),
+                                transport: super::super::grpc_bridge_adapter::proto_v2::ConnectorTransportV2::GrpcBridge as i32,
+                                supports_snapshot: true,
+                                supports_live: true,
+                                supports_action: true,
+                                optional_features: vec!["structure_sync_v3".to_string()],
+                            },
+                        ),
+                    ),
+                },
+            ))
+        }
+
+        async fn health(
+            &self,
+            _request: Request<super::super::grpc_bridge_adapter::proto_v2::HealthRequest>,
+        ) -> Result<Response<super::super::grpc_bridge_adapter::proto_v2::HealthResponse>, Status>
+        {
+            Ok(Response::new(
+                super::super::grpc_bridge_adapter::proto_v2::HealthResponse {
+                    result: Some(
+                        super::super::grpc_bridge_adapter::proto_v2::health_response::Result::Status(
+                            super::super::grpc_bridge_adapter::proto_v2::HealthStatusV2 {
+                                healthy: true,
+                                auth_status: super::super::grpc_bridge_adapter::proto_v2::AuthStatusV2::Valid as i32,
+                                message: Some("ok".to_string()),
+                                checked_at: "2026-03-24T00:00:00Z".to_string(),
+                            },
+                        ),
+                    ),
+                },
+            ))
+        }
+
+        async fn prewarm_snapshot_meta(
+            &self,
+            _request: Request<
+                super::super::grpc_bridge_adapter::proto_v2::PrewarmSnapshotMetaRequest,
+            >,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v2::PrewarmSnapshotMetaResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used in core structure tests"))
+        }
+
+        async fn fetch_snapshot_chunk(
+            &self,
+            _request: Request<
+                super::super::grpc_bridge_adapter::proto_v2::FetchSnapshotChunkRequest,
+            >,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v2::FetchSnapshotChunkResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used in core structure tests"))
+        }
+
+        async fn fetch_live_page(
+            &self,
+            _request: Request<super::super::grpc_bridge_adapter::proto_v2::FetchLivePageRequest>,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v2::FetchLivePageResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used in core structure tests"))
+        }
+
+        async fn submit_action(
+            &self,
+            _request: Request<super::super::grpc_bridge_adapter::proto_v2::SubmitActionRequest>,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v2::SubmitActionResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("not used in core structure tests"))
+        }
+    }
+
+    #[derive(Default)]
+    struct TestGrpcConnectorV3Service;
+
+    #[tonic::async_trait]
+    impl super::super::grpc_bridge_adapter::proto_v3::appfs_connector_v3_server::AppfsConnectorV3
+        for TestGrpcConnectorV3Service
+    {
+        async fn get_app_structure(
+            &self,
+            request: Request<super::super::grpc_bridge_adapter::proto_v3::GetAppStructureRequest>,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v3::GetAppStructureResponse>,
+            Status,
+        > {
+            let req = request
+                .into_inner()
+                .request
+                .ok_or_else(|| Status::invalid_argument("missing request"))?;
+            let result = if req.known_revision.as_deref() == Some("demo-structure-chat-001") {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncResultV3 {
+                    kind: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::app_structure_sync_result_v3::Kind::Unchanged(
+                            super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncUnchangedV3 {
+                                app_id: req.app_id,
+                                revision: "demo-structure-chat-001".to_string(),
+                                active_scope: Some("chat-001".to_string()),
+                            },
+                        ),
+                    ),
+                }
+            } else {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncResultV3 {
+                    kind: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::app_structure_sync_result_v3::Kind::Snapshot(
+                            super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncSnapshotV3 {
+                                snapshot: Some(grpc_structure_snapshot("chat-001")),
+                            },
+                        ),
+                    ),
+                }
+            };
+            Ok(Response::new(
+                super::super::grpc_bridge_adapter::proto_v3::GetAppStructureResponse {
+                    result: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::get_app_structure_response::Result::Response(
+                            result,
+                        ),
+                    ),
+                },
+            ))
+        }
+
+        async fn refresh_app_structure(
+            &self,
+            request: Request<
+                super::super::grpc_bridge_adapter::proto_v3::RefreshAppStructureRequest,
+            >,
+        ) -> Result<
+            Response<super::super::grpc_bridge_adapter::proto_v3::RefreshAppStructureResponse>,
+            Status,
+        > {
+            let req = request
+                .into_inner()
+                .request
+                .ok_or_else(|| Status::invalid_argument("missing request"))?;
+            if req.reason
+                == super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncReasonV3::EnterScope
+                    as i32
+                && req.target_scope.is_none()
+            {
+                return Ok(Response::new(
+                    super::super::grpc_bridge_adapter::proto_v3::RefreshAppStructureResponse {
+                        result: Some(
+                            super::super::grpc_bridge_adapter::proto_v3::refresh_app_structure_response::Result::Error(
+                                super::super::grpc_bridge_adapter::proto_v3::ConnectorErrorV3 {
+                                    code: "STRUCTURE_SCOPE_INVALID".to_string(),
+                                    message: "target_scope is required for enter_scope refresh"
+                                        .to_string(),
+                                    retryable: false,
+                                    details: None,
+                                },
+                            ),
+                        ),
+                    },
+                ));
+            }
+
+            let target_scope = req.target_scope.unwrap_or_else(|| "chat-001".to_string());
+            let snapshot = grpc_structure_snapshot(&target_scope);
+            let result = if req.known_revision.as_deref() == Some(snapshot.revision.as_str()) {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncResultV3 {
+                    kind: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::app_structure_sync_result_v3::Kind::Unchanged(
+                            super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncUnchangedV3 {
+                                app_id: req.app_id,
+                                revision: snapshot.revision,
+                                active_scope: snapshot.active_scope,
+                            },
+                        ),
+                    ),
+                }
+            } else {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncResultV3 {
+                    kind: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::app_structure_sync_result_v3::Kind::Snapshot(
+                            super::super::grpc_bridge_adapter::proto_v3::AppStructureSyncSnapshotV3 {
+                                snapshot: Some(snapshot),
+                            },
+                        ),
+                    ),
+                }
+            };
+            Ok(Response::new(
+                super::super::grpc_bridge_adapter::proto_v3::RefreshAppStructureResponse {
+                    result: Some(
+                        super::super::grpc_bridge_adapter::proto_v3::refresh_app_structure_response::Result::Response(
+                            result,
+                        ),
+                    ),
+                },
+            ))
+        }
+    }
+
+    struct TestGrpcStructureBridge {
+        endpoint: String,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestGrpcStructureBridge {
+        fn start() -> Self {
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind grpc test bridge");
+            std_listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+            let addr = std_listener.local_addr().expect("listener addr");
+            let (shutdown_tx, shutdown_rx) = mpsc::channel();
+
+            let thread = thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().expect("grpc test runtime");
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .expect("tokio listener");
+                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    shutdown_tx.send(tx).expect("send shutdown handle");
+                    tonic::transport::Server::builder()
+                        .add_service(
+                            super::super::grpc_bridge_adapter::proto_v2::appfs_connector_v2_server::AppfsConnectorV2Server::new(
+                                TestGrpcConnectorV2Service,
+                            ),
+                        )
+                        .add_service(
+                            super::super::grpc_bridge_adapter::proto_v3::appfs_connector_v3_server::AppfsConnectorV3Server::new(
+                                TestGrpcConnectorV3Service,
+                            ),
+                        )
+                        .serve_with_incoming_shutdown(
+                            tokio_stream::wrappers::TcpListenerStream::new(listener),
+                            async move {
+                                let _ = rx.await;
+                            },
+                        )
+                        .await
+                        .expect("run grpc test server");
+                });
+            });
+
+            Self {
+                endpoint: format!("http://{}", addr),
+                shutdown: Some(shutdown_rx.recv().expect("recv shutdown handle")),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for TestGrpcStructureBridge {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn grpc_node_kind(
+        kind: &str,
+    ) -> super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3 {
+        match kind {
+            "directory" => {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::Directory
+            }
+            "action_file" => {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::ActionFile
+            }
+            "snapshot_resource" => super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::SnapshotResource,
+            "live_resource" => {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::LiveResource
+            }
+            "static_json_resource" => {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::StaticJsonResource
+            }
+            _ => {
+                super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeKindV3::Unspecified
+            }
+        }
+    }
+
+    fn grpc_structure_snapshot(
+        scope: &str,
+    ) -> super::super::grpc_bridge_adapter::proto_v3::AppStructureSnapshotV3 {
+        let snapshot = structure_snapshot(scope);
+        let ownership_prefixes = snapshot
+            .get("ownership_prefixes")
+            .and_then(|value| value.as_array())
+            .expect("ownership prefixes")
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        let nodes = snapshot
+            .get("nodes")
+            .and_then(|value| value.as_array())
+            .expect("nodes")
+            .iter()
+            .map(
+                |node| super::super::grpc_bridge_adapter::proto_v3::AppStructureNodeV3 {
+                    path: node
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .expect("node path")
+                        .to_string(),
+                    kind: grpc_node_kind(
+                        node.get("kind")
+                            .and_then(|value| value.as_str())
+                            .expect("node kind"),
+                    ) as i32,
+                    manifest_entry_json: node
+                        .get("manifest_entry")
+                        .cloned()
+                        .map(|value| serde_json::to_string(&value).expect("manifest json")),
+                    seed_content_json: node
+                        .get("seed_content")
+                        .cloned()
+                        .map(|value| serde_json::to_string(&value).expect("seed json")),
+                    r#mutable: node
+                        .get("mutable")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    scope: node
+                        .get("scope")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                },
+            )
+            .collect::<Vec<_>>();
+
+        super::super::grpc_bridge_adapter::proto_v3::AppStructureSnapshotV3 {
+            app_id: snapshot
+                .get("app_id")
+                .and_then(|value| value.as_str())
+                .expect("snapshot app_id")
+                .to_string(),
+            revision: snapshot
+                .get("revision")
+                .and_then(|value| value.as_str())
+                .expect("snapshot revision")
+                .to_string(),
+            active_scope: snapshot
+                .get("active_scope")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
+            ownership_prefixes,
+            nodes,
+        }
+    }
+
+    fn connector_info_body() -> JsonValue {
+        json!({
+            "connector_id": "test-http-v3",
+            "version": "0.4.0-test",
+            "app_id": "aiim",
+            "transport": "http_bridge",
+            "supports_snapshot": true,
+            "supports_live": true,
+            "supports_action": true,
+            "optional_features": ["structure_sync_v3"],
+        })
+    }
+
+    fn action_manifest(template: &str) -> JsonValue {
+        json!({
+            "kind": "action",
+            "input_mode": "json",
+            "execution_mode": "inline",
+            "template": template,
+        })
+    }
+
+    fn snapshot_manifest(template: &str, max_bytes: u64) -> JsonValue {
+        json!({
+            "template": template,
+            "kind": "resource",
+            "output_mode": "jsonl",
+            "consistency": "read_through",
+            "snapshot": {
+                "max_materialized_bytes": max_bytes,
+                "prewarm": true,
+                "prewarm_timeout_ms": 5000,
+                "read_through_timeout_ms": 10000,
+                "on_timeout": "return_stale"
+            }
+        })
+    }
+
+    fn structure_snapshot(scope: &str) -> JsonValue {
+        let mut nodes = vec![
+            json!({"path":"contacts","kind":"directory","mutable":false}),
+            json!({"path":"contacts/zhangsan","kind":"directory","mutable":false}),
+            json!({
+                "path":"contacts/zhangsan/send_message.act",
+                "kind":"action_file",
+                "manifest_entry": action_manifest("contacts/{contact_id}/send_message.act"),
+                "mutable": true
+            }),
+            json!({"path":"_app","kind":"directory","mutable":false}),
+            json!({
+                "path":"_app/enter_scope.act",
+                "kind":"action_file",
+                "manifest_entry": action_manifest("_app/enter_scope.act"),
+                "mutable": true
+            }),
+            json!({
+                "path":"_app/refresh_structure.act",
+                "kind":"action_file",
+                "manifest_entry": action_manifest("_app/refresh_structure.act"),
+                "mutable": true
+            }),
+        ];
+
+        match scope {
+            "chat-long" => {
+                nodes.extend([
+                    json!({"path":"chats","kind":"directory","mutable":false,"scope":"chat-long"}),
+                    json!({"path":"chats/chat-long","kind":"directory","mutable":false,"scope":"chat-long"}),
+                    json!({
+                        "path":"chats/chat-long/messages.res.jsonl",
+                        "kind":"snapshot_resource",
+                        "manifest_entry": snapshot_manifest("chats/chat-long/messages.res.jsonl", 1024),
+                        "mutable": false,
+                        "scope":"chat-long"
+                    }),
+                ]);
+            }
+            _ => {
+                nodes.extend([
+                    json!({"path":"chats","kind":"directory","mutable":false,"scope":"chat-001"}),
+                    json!({"path":"chats/chat-001","kind":"directory","mutable":false,"scope":"chat-001"}),
+                    json!({
+                        "path":"chats/chat-001/messages.res.jsonl",
+                        "kind":"snapshot_resource",
+                        "manifest_entry": snapshot_manifest("chats/chat-001/messages.res.jsonl", 10 * 1024 * 1024),
+                        "mutable": false,
+                        "scope":"chat-001"
+                    }),
+                ]);
+            }
+        }
+
+        json!({
+            "app_id":"aiim",
+            "revision": format!("demo-structure-{scope}"),
+            "active_scope": scope,
+            "ownership_prefixes":["_meta","contacts","chats","_app"],
+            "nodes": nodes,
+        })
+    }
+
+    fn parse_http_request(stream: &mut TcpStream) -> Option<(String, JsonValue)> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let split = buffer.windows(4).position(|window| window == b"\r\n\r\n")?;
+        let (header, body) = buffer.split_at(split + 4);
+        let header_text = String::from_utf8_lossy(header);
+        let request_line = header_text.lines().next()?;
+        let mut parts = request_line.split_whitespace();
+        let _method = parts.next()?;
+        let route = parts.next()?.to_string();
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    if name.eq_ignore_ascii_case("Content-Length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+
+        let mut body_bytes = body.to_vec();
+        while body_bytes.len() < content_length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body_bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        let payload = if content_length == 0 {
+            json!({})
+        } else {
+            serde_json::from_slice(&body_bytes[..content_length]).ok()?
+        };
+        Some((route, payload))
+    }
+
+    fn write_http_json(stream: &mut TcpStream, status: u16, body: &JsonValue) {
+        let body_bytes = serde_json::to_vec(body).expect("encode body");
+        let response = format!(
+            "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            status,
+            body_bytes.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write headers");
+        stream.write_all(&body_bytes).expect("write body");
+        stream.flush().expect("flush response");
+    }
+
+    fn handle_test_http_connection(stream: &mut TcpStream) {
+        let Some((route, payload)) = parse_http_request(stream) else {
+            return;
+        };
+
+        let (status, body) = match route.as_str() {
+            "/v2/connector/info" => (200, connector_info_body()),
+            "/v3/connector/structure/get" => {
+                let known_revision = payload
+                    .get("request")
+                    .and_then(|value| value.get("known_revision"))
+                    .and_then(|value| value.as_str());
+                if known_revision == Some("demo-structure-chat-001") {
+                    (
+                        200,
+                        json!({
+                            "result": {
+                                "kind": "unchanged",
+                                "app_id": "aiim",
+                                "revision": "demo-structure-chat-001",
+                                "active_scope": "chat-001"
+                            }
+                        }),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({
+                            "result": {
+                                "kind": "snapshot",
+                                "snapshot": structure_snapshot("chat-001")
+                            }
+                        }),
+                    )
+                }
+            }
+            "/v3/connector/structure/refresh" => {
+                let request = payload.get("request").cloned().unwrap_or_else(|| json!({}));
+                let target_scope = request
+                    .get("target_scope")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("chat-001");
+                let snapshot = structure_snapshot(target_scope);
+                let revision = snapshot
+                    .get("revision")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let known_revision = request
+                    .get("known_revision")
+                    .and_then(|value| value.as_str());
+                if known_revision == Some(revision.as_str()) {
+                    (
+                        200,
+                        json!({
+                            "result": {
+                                "kind": "unchanged",
+                                "app_id": "aiim",
+                                "revision": revision,
+                                "active_scope": snapshot.get("active_scope").and_then(|value| value.as_str())
+                            }
+                        }),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({"result": {"kind": "snapshot", "snapshot": snapshot}}),
+                    )
+                }
+            }
+            _ => (
+                404,
+                json!({
+                    "code":"NOT_SUPPORTED",
+                    "message": format!("unknown path: {route}"),
+                    "retryable": false
+                }),
+            ),
+        };
+
+        write_http_json(stream, status, &body);
+    }
+
     fn append_text(path: &Path, text: &str) {
         let mut file = OpenOptions::new()
             .create(true)
@@ -1376,6 +2313,281 @@ mod tests {
             .filter(|line| line.contains(token))
             .map(|line| serde_json::from_str(line).expect("event json"))
             .collect()
+    }
+
+    #[test]
+    fn structured_bootstrap_exposes_app_control_actions() {
+        let (_temp, adapter) = structured_adapter();
+
+        assert!(adapter.app_dir.join("_app/enter_scope.act").exists());
+        assert!(adapter.app_dir.join("_app/refresh_structure.act").exists());
+        assert!(adapter
+            .action_specs
+            .iter()
+            .any(|spec| spec.template == "_app/enter_scope.act"));
+        assert!(adapter
+            .action_specs
+            .iter()
+            .any(|spec| spec.template == "_app/refresh_structure.act"));
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-001/messages.res.jsonl"));
+    }
+
+    #[test]
+    fn enter_scope_action_refreshes_structure_and_reloads_manifest() {
+        let (_temp, mut adapter) = structured_adapter();
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/enter_scope.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(
+            &action_path,
+            "{\"target_scope\":\"chat-long\",\"client_token\":\"scope-001\"}\n",
+        );
+        adapter.poll_once().expect("poll enter scope");
+
+        assert!(adapter.app_dir.join("chats/chat-long").exists());
+        assert!(!adapter.app_dir.join("chats/chat-001").exists());
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-long/messages.res.jsonl"));
+        assert!(!adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-001/messages.res.jsonl"));
+
+        let events = token_events(&events_path, "scope-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+        let content = events[0]
+            .get("content")
+            .expect("enter_scope completion content");
+        assert_eq!(
+            content.get("active_scope").and_then(|value| value.as_str()),
+            Some("chat-long")
+        );
+        assert_eq!(
+            content.get("refreshed").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn refresh_structure_action_reports_unchanged_revision_when_scope_is_same() {
+        let (_temp, mut adapter) = structured_adapter();
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/refresh_structure.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(&action_path, "{\"client_token\":\"refresh-001\"}\n");
+        adapter.poll_once().expect("poll refresh structure");
+
+        let events = token_events(&events_path, "refresh-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+        let content = events[0]
+            .get("content")
+            .expect("refresh completion content");
+        assert_eq!(
+            content.get("active_scope").and_then(|value| value.as_str()),
+            Some("chat-001")
+        );
+        assert_eq!(
+            content.get("refreshed").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(adapter.app_dir.join("chats/chat-001").exists());
+    }
+
+    #[test]
+    fn http_bridge_structure_bootstrap_exposes_app_control_actions() {
+        let bridge = TestHttpStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            http_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("http structured adapter");
+
+        assert!(adapter.app_dir.join("_app/enter_scope.act").exists());
+        assert!(adapter.app_dir.join("_app/refresh_structure.act").exists());
+        assert!(adapter.app_dir.join("chats/chat-001").exists());
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-001/messages.res.jsonl"));
+    }
+
+    #[test]
+    fn http_bridge_enter_scope_refreshes_structure_and_reloads_manifest() {
+        let bridge = TestHttpStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let mut adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            http_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("http structured adapter");
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/enter_scope.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(
+            &action_path,
+            "{\"target_scope\":\"chat-long\",\"client_token\":\"scope-http-001\"}\n",
+        );
+        adapter.poll_once().expect("poll enter scope");
+
+        assert!(adapter.app_dir.join("chats/chat-long").exists());
+        assert!(!adapter.app_dir.join("chats/chat-001").exists());
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-long/messages.res.jsonl"));
+
+        let events = token_events(&events_path, "scope-http-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+    }
+
+    #[test]
+    fn http_bridge_refresh_structure_reports_unchanged_revision() {
+        let bridge = TestHttpStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let mut adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            http_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("http structured adapter");
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/refresh_structure.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(&action_path, "{\"client_token\":\"refresh-http-001\"}\n");
+        adapter.poll_once().expect("poll refresh");
+
+        let events = token_events(&events_path, "refresh-http-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+        let content = events[0].get("content").expect("refresh content");
+        assert_eq!(
+            content.get("refreshed").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grpc_bridge_structure_bootstrap_exposes_app_control_actions() {
+        let bridge = TestGrpcStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            grpc_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("grpc structured adapter");
+
+        assert!(adapter.app_dir.join("_app/enter_scope.act").exists());
+        assert!(adapter.app_dir.join("_app/refresh_structure.act").exists());
+        assert!(adapter.app_dir.join("chats/chat-001").exists());
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-001/messages.res.jsonl"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grpc_bridge_enter_scope_refreshes_structure_and_reloads_manifest() {
+        let bridge = TestGrpcStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let mut adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            grpc_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("grpc structured adapter");
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/enter_scope.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(
+            &action_path,
+            "{\"target_scope\":\"chat-long\",\"client_token\":\"scope-grpc-001\"}\n",
+        );
+        adapter.poll_once().expect("poll enter scope");
+
+        assert!(adapter.app_dir.join("chats/chat-long").exists());
+        assert!(!adapter.app_dir.join("chats/chat-001").exists());
+        assert!(adapter
+            .snapshot_specs
+            .iter()
+            .any(|spec| spec.template == "chats/chat-long/messages.res.jsonl"));
+
+        let events = token_events(&events_path, "scope-grpc-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grpc_bridge_refresh_structure_reports_unchanged_revision() {
+        let bridge = TestGrpcStructureBridge::start();
+        let temp = TempDir::new().expect("tempdir");
+        let mut adapter = AppfsAdapter::new(
+            temp.path().to_path_buf(),
+            "aiim".to_string(),
+            "sess-test".to_string(),
+            grpc_bridge_config(bridge.endpoint.clone()),
+        )
+        .expect("grpc structured adapter");
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let action_path = adapter.app_dir.join("_app/refresh_structure.act");
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+
+        append_text(&action_path, "{\"client_token\":\"refresh-grpc-001\"}\n");
+        adapter.poll_once().expect("poll refresh");
+
+        let events = token_events(&events_path, "refresh-grpc-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.completed")
+        );
+        let content = events[0].get("content").expect("refresh content");
+        assert_eq!(
+            content.get("refreshed").and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]

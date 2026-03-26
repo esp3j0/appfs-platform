@@ -6,7 +6,9 @@ use anyhow::Context;
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 
-#[cfg(unix)]
+#[cfg(target_os = "windows")]
+use agentfs_sdk::AgentFS as SdkAgentFS;
+#[cfg(any(unix, target_os = "windows"))]
 use agentfs_sdk::{HostFS, OverlayFS};
 #[cfg(unix)]
 use std::{path::Path, process::Command};
@@ -67,6 +69,10 @@ pub struct MountArgs {
     pub backend: MountBackend,
     /// Enable AppFS snapshot read-through for the given app ID.
     pub appfs_app_id: Option<String>,
+    /// Additional AppFS app IDs for mount-side read-through.
+    pub appfs_app_ids: Vec<String>,
+    /// Load AppFS app routing from the persisted managed registry.
+    pub managed_appfs: bool,
     /// Session ID used for mount-side AppFS connector calls.
     pub appfs_session: Option<String>,
     /// Optional HTTP bridge endpoint for mount-side AppFS read-through.
@@ -90,51 +96,86 @@ pub struct MountArgs {
 }
 
 fn has_appfs_mount_config(args: &MountArgs) -> bool {
-    args.appfs_app_id.is_some()
+    args.managed_appfs
+        || args.appfs_app_id.is_some()
+        || !args.appfs_app_ids.is_empty()
         || args.appfs_session.is_some()
         || args.adapter_http_endpoint.is_some()
         || args.adapter_grpc_endpoint.is_some()
 }
 
 #[cfg(any(unix, target_os = "windows"))]
-fn appfs_mount_runtime_args(args: &MountArgs) -> Option<AppfsRuntimeCliArgs> {
-    args.appfs_app_id
-        .as_ref()
-        .map(|app_id| AppfsRuntimeCliArgs {
-            app_id: app_id.clone(),
-            session_id: args.appfs_session.clone(),
-            bridge: AppfsBridgeCliArgs {
-                adapter_http_endpoint: args.adapter_http_endpoint.clone(),
-                adapter_http_timeout_ms: args.adapter_http_timeout_ms,
-                adapter_grpc_endpoint: args.adapter_grpc_endpoint.clone(),
-                adapter_grpc_timeout_ms: args.adapter_grpc_timeout_ms,
-                adapter_bridge_max_retries: args.adapter_bridge_max_retries,
-                adapter_bridge_initial_backoff_ms: args.adapter_bridge_initial_backoff_ms,
-                adapter_bridge_max_backoff_ms: args.adapter_bridge_max_backoff_ms,
-                adapter_bridge_circuit_breaker_failures: args
-                    .adapter_bridge_circuit_breaker_failures,
-                adapter_bridge_circuit_breaker_cooldown_ms: args
-                    .adapter_bridge_circuit_breaker_cooldown_ms,
-            },
-        })
+fn appfs_mount_runtime_args(args: &MountArgs) -> Result<Vec<AppfsRuntimeCliArgs>> {
+    if args.managed_appfs {
+        return Ok(Vec::new());
+    }
+    appfs::build_runtime_cli_args(
+        args.appfs_app_id.clone(),
+        args.appfs_app_ids.clone(),
+        args.appfs_session.clone(),
+        AppfsBridgeCliArgs {
+            adapter_http_endpoint: args.adapter_http_endpoint.clone(),
+            adapter_http_timeout_ms: args.adapter_http_timeout_ms,
+            adapter_grpc_endpoint: args.adapter_grpc_endpoint.clone(),
+            adapter_grpc_timeout_ms: args.adapter_grpc_timeout_ms,
+            adapter_bridge_max_retries: args.adapter_bridge_max_retries,
+            adapter_bridge_initial_backoff_ms: args.adapter_bridge_initial_backoff_ms,
+            adapter_bridge_max_backoff_ms: args.adapter_bridge_max_backoff_ms,
+            adapter_bridge_circuit_breaker_failures: args.adapter_bridge_circuit_breaker_failures,
+            adapter_bridge_circuit_breaker_cooldown_ms: args
+                .adapter_bridge_circuit_breaker_cooldown_ms,
+        },
+        None,
+    )
 }
 
 #[cfg(any(unix, target_os = "windows"))]
 fn wrap_mount_fs_if_appfs_enabled(
     fs: Arc<Mutex<dyn FileSystem + Send>>,
     args: &MountArgs,
-) -> Arc<Mutex<dyn FileSystem + Send>> {
-    let Some(runtime_args) = appfs_mount_runtime_args(args) else {
-        return fs;
-    };
-    let bridge_config = appfs::build_appfs_bridge_config(runtime_args.bridge.clone());
-    appfs::mount_readthrough::wrap_mount_readthrough_filesystem(
+) -> Result<Arc<Mutex<dyn FileSystem + Send>>> {
+    if !has_appfs_mount_config(args) {
+        return Ok(fs);
+    }
+    let runtime_args = appfs_mount_runtime_args(args)?;
+    if runtime_args.is_empty() && !args.managed_appfs {
+        return Ok(fs);
+    }
+    Ok(appfs::mount_readthrough::wrap_mount_readthrough_filesystem(
         fs,
         appfs::mount_readthrough::MountSnapshotReadThroughConfig {
-            runtime: runtime_args,
-            bridge_config,
+            runtimes: runtime_args,
+            managed: args.managed_appfs,
         },
-    )
+    ))
+}
+
+fn validate_appfs_mount_mode(args: &MountArgs) -> Result<()> {
+    if args.managed_appfs
+        && (args.appfs_app_id.is_some()
+            || !args.appfs_app_ids.is_empty()
+            || args.appfs_session.is_some()
+            || args.adapter_http_endpoint.is_some()
+            || args.adapter_grpc_endpoint.is_some())
+    {
+        anyhow::bail!(
+            "--managed-appfs cannot be combined with explicit --appfs-app-id/--appfs-app/--appfs-session/adapter endpoint flags"
+        );
+    }
+
+    if !args.managed_appfs
+        && (args.appfs_session.is_some()
+            || args.adapter_http_endpoint.is_some()
+            || args.adapter_grpc_endpoint.is_some()
+            || !args.appfs_app_ids.is_empty())
+        && args.appfs_app_id.is_none()
+    {
+        anyhow::bail!(
+            "AppFS mount-side read-through requires --appfs-app-id when explicit AppFS bridge options are provided."
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -520,11 +561,7 @@ impl FileSystem for WinfspTokioFsAdapter {
 /// Mount the agent filesystem (Linux).
 #[cfg(target_os = "linux")]
 pub fn mount(args: MountArgs) -> Result<()> {
-    if has_appfs_mount_config(&args) && args.appfs_app_id.is_none() {
-        anyhow::bail!(
-            "AppFS mount-side read-through requires --appfs-app-id when any AppFS bridge option is provided."
-        );
-    }
+    validate_appfs_mount_mode(&args)?;
     if has_appfs_mount_config(&args) && !matches!(args.backend, MountBackend::Fuse) {
         anyhow::bail!(
             "AppFS snapshot read-through is currently supported only with --backend fuse on Linux."
@@ -546,11 +583,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 /// Mount the agent filesystem (macOS).
 #[cfg(target_os = "macos")]
 pub fn mount(args: MountArgs) -> Result<()> {
-    if has_appfs_mount_config(&args) && args.appfs_app_id.is_none() {
-        anyhow::bail!(
-            "AppFS mount-side read-through requires --appfs-app-id when any AppFS bridge option is provided."
-        );
-    }
+    validate_appfs_mount_mode(&args)?;
     match args.backend {
         MountBackend::Fuse => {
             anyhow::bail!(
@@ -574,11 +607,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 /// Mount the agent filesystem (Windows).
 #[cfg(target_os = "windows")]
 pub fn mount(args: MountArgs) -> Result<()> {
-    if has_appfs_mount_config(&args) && args.appfs_app_id.is_none() {
-        anyhow::bail!(
-            "AppFS mount-side read-through requires --appfs-app-id when any AppFS bridge option is provided."
-        );
-    }
+    validate_appfs_mount_mode(&args)?;
     match args.backend {
         MountBackend::Fuse => {
             anyhow::bail!(
@@ -614,6 +643,28 @@ async fn mount_winfsp_backend(args: MountArgs) -> Result<()> {
             args.mountpoint.display()
         );
     }
+    let mount_parent = args
+        .mountpoint
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "WinFsp mountpoint must include an existing parent directory: {}",
+                args.mountpoint.display()
+            )
+        })?;
+    if !mount_parent.exists() {
+        anyhow::bail!(
+            "WinFsp mountpoint parent does not exist: {}",
+            mount_parent.display()
+        );
+    }
+    if !mount_parent.is_dir() {
+        anyhow::bail!(
+            "WinFsp mountpoint parent is not a directory: {}",
+            mount_parent.display()
+        );
+    }
 
     // Don't use canonicalize - it adds the \\?\ prefix which WinFsp doesn't accept,
     // and it would fail anyway if the path doesn't exist.
@@ -632,8 +683,8 @@ async fn mount_winfsp_backend(args: MountArgs) -> Result<()> {
     };
 
     let fs: Arc<tokio::sync::Mutex<dyn agentfs_sdk::FileSystem + Send>> =
-        Arc::new(tokio::sync::Mutex::new(agentfs.fs));
-    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args);
+        overlay_mount_filesystem(&agentfs).await?;
+    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
     let fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>> =
         Arc::new(Mutex::new(WinfspTokioFsAdapter { inner: fs }));
 
@@ -661,6 +712,21 @@ async fn mount_winfsp_backend(args: MountArgs) -> Result<()> {
 
     // MountHandle will be dropped automatically and unmount
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn overlay_mount_filesystem(
+    agentfs: &SdkAgentFS,
+) -> Result<Arc<tokio::sync::Mutex<dyn agentfs_sdk::FileSystem + Send>>> {
+    if let Some(base_path) = agentfs.is_overlay_enabled().await? {
+        eprintln!("Using overlay filesystem with base: {}", base_path);
+        let hostfs = HostFS::new(&base_path)?;
+        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs.clone());
+        overlay.load().await?;
+        Ok(Arc::new(tokio::sync::Mutex::new(overlay)))
+    } else {
+        Ok(Arc::new(tokio::sync::Mutex::new(agentfs.fs.clone())))
+    }
 }
 
 /// Mount the agent filesystem using FUSE (Linux only).
@@ -758,7 +824,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
                 Ok(Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>)
             }
         })?;
-        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args);
+        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
 
         let mount_opts = MountOpts {
             mountpoint: mountpoint.clone(),
@@ -844,7 +910,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
                 Ok(Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>)
             }
         })?;
-        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args);
+        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
         let fs_adapter = DaemonMutexFsAdapter { inner: fs };
         let fs_arc: Arc<dyn FileSystem> = Arc::new(fs_adapter);
 
@@ -969,7 +1035,7 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         // Plain AgentFS
         Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
     };
-    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args);
+    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
 
     if args.foreground {
         // Use the unified mount API for foreground mode
@@ -1346,6 +1412,69 @@ pub fn prune_mounts(_force: bool) -> Result<()> {
     anyhow::bail!("Mount pruning is only available on Linux")
 }
 
+#[cfg(test)]
+mod appfs_mount_mode_tests {
+    use super::{validate_appfs_mount_mode, MountArgs, MountBackend};
+    use std::path::PathBuf;
+
+    fn base_args() -> MountArgs {
+        MountArgs {
+            id_or_path: "agent".to_string(),
+            mountpoint: PathBuf::from("/tmp/mount"),
+            auto_unmount: false,
+            allow_root: false,
+            allow_other: false,
+            foreground: false,
+            uid: None,
+            gid: None,
+            backend: MountBackend::default(),
+            appfs_app_id: None,
+            appfs_app_ids: Vec::new(),
+            managed_appfs: false,
+            appfs_session: None,
+            adapter_http_endpoint: None,
+            adapter_http_timeout_ms: 5000,
+            adapter_grpc_endpoint: None,
+            adapter_grpc_timeout_ms: 5000,
+            adapter_bridge_max_retries: 2,
+            adapter_bridge_initial_backoff_ms: 100,
+            adapter_bridge_max_backoff_ms: 1000,
+            adapter_bridge_circuit_breaker_failures: 5,
+            adapter_bridge_circuit_breaker_cooldown_ms: 3000,
+        }
+    }
+
+    #[test]
+    fn validate_mount_mode_rejects_managed_plus_explicit_appfs_flags() {
+        let mut args = base_args();
+        args.managed_appfs = true;
+        args.appfs_app_id = Some("aiim".to_string());
+
+        let err = validate_appfs_mount_mode(&args).expect_err("managed+explicit must fail");
+        assert!(err
+            .to_string()
+            .contains("--managed-appfs cannot be combined"));
+    }
+
+    #[test]
+    fn validate_mount_mode_rejects_explicit_bridge_without_primary_app() {
+        let mut args = base_args();
+        args.adapter_http_endpoint = Some("http://127.0.0.1:8080".to_string());
+
+        let err = validate_appfs_mount_mode(&args).expect_err("bridge without app id must fail");
+        assert!(err
+            .to_string()
+            .contains("requires --appfs-app-id when explicit AppFS bridge options are provided"));
+    }
+
+    #[test]
+    fn validate_mount_mode_accepts_managed_registry_only() {
+        let mut args = base_args();
+        args.managed_appfs = true;
+        validate_appfs_mount_mode(&args).expect("managed-only config should be accepted");
+    }
+}
+
 /// List all currently mounted agentfs filesystems (Windows stub).
 #[cfg(target_os = "windows")]
 pub fn list_mounts<W: std::io::Write>(out: &mut W) {
@@ -1356,6 +1485,137 @@ pub fn list_mounts<W: std::io::Write>(out: &mut W) {
 #[cfg(target_os = "windows")]
 pub fn prune_mounts(_force: bool) -> Result<()> {
     anyhow::bail!("Mount pruning is only available on Linux")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_overlay_tests {
+    use super::overlay_mount_filesystem;
+    use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, BoxedFile, FileSystem, Stats};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).expect("create destination dir");
+        for entry in fs::read_dir(src).expect("read source dir") {
+            let entry = entry.expect("dir entry");
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_dir_recursive(&src_path, &dst_path);
+            } else {
+                fs::copy(&src_path, &dst_path).expect("copy file");
+            }
+        }
+    }
+
+    fn cleanup_agent(id: &str) {
+        for suffix in [".db", ".db-shm", ".db-wal"] {
+            let _ = fs::remove_file(agentfs_dir().join(format!("{id}{suffix}")));
+        }
+    }
+
+    async fn lookup_path(fs: &dyn FileSystem, path: &str) -> Option<Stats> {
+        let mut current = fs.getattr(1).await.expect("root getattr")?;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            current = fs
+                .lookup(current.ino, segment)
+                .await
+                .expect("lookup path segment")?;
+        }
+        Some(current)
+    }
+
+    async fn read_file(fs: &dyn FileSystem, path: &str) -> Vec<u8> {
+        let stats = lookup_path(fs, path).await.expect("lookup file");
+        let file: BoxedFile = fs.open(stats.ino, 0).await.expect("open file");
+        file.pread(0, stats.size as u64)
+            .await
+            .expect("read file bytes")
+    }
+
+    #[tokio::test]
+    async fn winfsp_overlay_uses_hostfs_base_without_hydrating_delta() {
+        let fixture_root = TempDir::new().expect("fixture tempdir");
+        let app_dir = fixture_root.path().join("aiim");
+        let source_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/appfs/aiim");
+        copy_dir_recursive(&source_fixture, &app_dir);
+
+        let id = format!("winfsp-hydrate-{}", uuid::Uuid::new_v4().simple());
+        let agent = AgentFS::open(AgentFSOptions::with_id(&id).with_base(fixture_root.path()))
+            .await
+            .expect("open overlay agent");
+
+        agent.fs.mkdir("/aiim", 0, 0).await.expect("seed app dir");
+        agent
+            .fs
+            .mkdir("/aiim/_meta", 0, 0)
+            .await
+            .expect("seed meta dir");
+        let (_, file) = agent
+            .fs
+            .create_file("/aiim/custom.txt", 0o644, 0, 0)
+            .await
+            .expect("seed delta file");
+        file.pwrite(0, b"delta-only")
+            .await
+            .expect("write delta file");
+        file.fsync().await.expect("fsync delta file");
+
+        let (_, manifest_override) = agent
+            .fs
+            .create_file("/aiim/_meta/manifest.res.json", 0o644, 0, 0)
+            .await
+            .expect("create override manifest");
+        manifest_override
+            .pwrite(0, b"{\"override\":true}\n")
+            .await
+            .expect("write override manifest");
+        manifest_override
+            .fsync()
+            .await
+            .expect("fsync override manifest");
+
+        let fs = overlay_mount_filesystem(&agent)
+            .await
+            .expect("create overlay mount filesystem");
+        let fs = fs.lock().await;
+
+        assert!(
+            lookup_path(&*fs, "/aiim/chats/chat-001/messages.res.jsonl")
+                .await
+                .is_some(),
+            "base snapshot should be visible through overlay view"
+        );
+        assert!(
+            agent
+                .fs
+                .stat("/aiim/chats/chat-001/messages.res.jsonl")
+                .await
+                .expect("stat delta snapshot")
+                .is_none(),
+            "base snapshot should not be copied into delta"
+        );
+        let manifest = read_file(&*fs, "/aiim/_meta/manifest.res.json").await;
+        assert_eq!(
+            std::str::from_utf8(&manifest).expect("manifest utf8"),
+            "{\"override\":true}\n",
+            "delta override should win over base"
+        );
+        let delta_only = agent
+            .fs
+            .read_file("/aiim/custom.txt")
+            .await
+            .expect("read delta file")
+            .expect("delta file bytes");
+        assert_eq!(
+            std::str::from_utf8(&delta_only).expect("delta utf8"),
+            "delta-only"
+        );
+
+        drop(agent);
+        cleanup_agent(&id);
+    }
 }
 
 /// Print schema version mismatch error and exit.

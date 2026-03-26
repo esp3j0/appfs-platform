@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use super::errors::{ERR_INVALID_ARGUMENT, ERR_INVALID_PAYLOAD};
+use super::registry::AppfsRegistryTransportDoc;
 use super::{ActionSpec, InputMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,10 +28,34 @@ pub(super) struct SnapshotRefreshRequest {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct EnterScopeRequest {
+    pub(super) target_scope: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StructureRefreshRequest {
+    pub(super) target_scope: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RegisterAppRequest {
+    pub(super) app_id: String,
+    pub(super) session_id: Option<String>,
+    pub(super) transport: AppfsRegistryTransportDoc,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UnregisterAppRequest {
+    pub(super) app_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum DispatchRoute {
     PagingFetchNext(PagingRequest),
     PagingClose(PagingRequest),
     SnapshotRefresh(SnapshotRefreshRequest),
+    EnterScope(EnterScopeRequest),
+    StructureRefresh(StructureRefreshRequest),
     BusinessSubmit,
 }
 
@@ -39,6 +64,8 @@ pub(super) enum DispatchRouteParseError {
     PagingFetchNext,
     PagingClose,
     SnapshotRefresh,
+    EnterScope,
+    StructureRefresh,
 }
 
 pub(super) fn normalize_actionline_v2_payload(
@@ -69,6 +96,16 @@ pub(super) fn route_action(
         return parse_snapshot_refresh_request(payload)
             .map(DispatchRoute::SnapshotRefresh)
             .map_err(|_| DispatchRouteParseError::SnapshotRefresh);
+    }
+    if normalized_path == "/_app/enter_scope.act" {
+        return parse_enter_scope_request(payload)
+            .map(DispatchRoute::EnterScope)
+            .map_err(|_| DispatchRouteParseError::EnterScope);
+    }
+    if normalized_path == "/_app/refresh_structure.act" {
+        return parse_structure_refresh_request(payload)
+            .map(DispatchRoute::StructureRefresh)
+            .map_err(|_| DispatchRouteParseError::StructureRefresh);
     }
 
     Ok(DispatchRoute::BusinessSubmit)
@@ -193,4 +230,88 @@ pub(super) fn parse_snapshot_refresh_request(
     Ok(SnapshotRefreshRequest {
         resource_path: resource_path.trim().to_string(),
     })
+}
+
+pub(super) fn parse_enter_scope_request(
+    payload: &str,
+) -> std::result::Result<EnterScopeRequest, &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    let target_scope = json
+        .get("target_scope")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(ERR_INVALID_ARGUMENT)?;
+    Ok(EnterScopeRequest {
+        target_scope: target_scope.to_string(),
+    })
+}
+
+pub(super) fn parse_structure_refresh_request(
+    payload: &str,
+) -> std::result::Result<StructureRefreshRequest, &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    let target_scope = json
+        .get("target_scope")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Ok(StructureRefreshRequest { target_scope })
+}
+
+pub(super) fn parse_register_app_request(
+    payload: &str,
+) -> std::result::Result<RegisterAppRequest, &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    let object = json.as_object().ok_or(ERR_INVALID_ARGUMENT)?;
+    let app_id = object
+        .get("app_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ERR_INVALID_ARGUMENT)?
+        .to_string();
+    let session_id = object
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let transport = object
+        .get("transport")
+        .cloned()
+        .ok_or(ERR_INVALID_ARGUMENT)
+        .and_then(|value| {
+            serde_json::from_value::<AppfsRegistryTransportDoc>(value)
+                .map_err(|_| ERR_INVALID_ARGUMENT)
+        })?;
+    Ok(RegisterAppRequest {
+        app_id,
+        session_id,
+        transport,
+    })
+}
+
+pub(super) fn parse_unregister_app_request(
+    payload: &str,
+) -> std::result::Result<UnregisterAppRequest, &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    let app_id = json
+        .get("app_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ERR_INVALID_ARGUMENT)?
+        .to_string();
+    Ok(UnregisterAppRequest { app_id })
+}
+
+pub(super) fn parse_list_apps_request(payload: &str) -> std::result::Result<(), &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    if json.is_object() {
+        Ok(())
+    } else {
+        Err(ERR_INVALID_ARGUMENT)
+    }
 }
