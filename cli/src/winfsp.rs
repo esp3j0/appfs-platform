@@ -37,6 +37,16 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
 // Windows create options flags
 const FILE_DIRECTORY_FILE: u32 = 0x00000001;
 const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
+const FILE_READ_DATA: u32 = 0x00000001;
+const FILE_WRITE_DATA: u32 = 0x00000002;
+const FILE_APPEND_DATA: u32 = 0x00000004;
+const GENERIC_READ_ACCESS: u32 = 0x80000000;
+const GENERIC_WRITE_ACCESS: u32 = 0x40000000;
+const DELETE_ACCESS: u32 = 0x00010000;
+const OPEN_RDONLY: i32 = 0x0000;
+const OPEN_WRONLY: i32 = 0x0001;
+const OPEN_RDWR: i32 = 0x0002;
+const OPEN_NO_READ_HINT: i32 = 0x2000_0000;
 
 // Reparse tag/constants for symbolic links
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
@@ -167,6 +177,39 @@ fn fill_file_info(stats: &Stats, file_info: &mut FileInfo) {
     file_info.ea_size = 0;
 }
 
+fn volume_capacity(bytes_used: u64) -> (u64, u64) {
+    const MIN_TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
+    const HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+
+    let total_size = MIN_TOTAL_SIZE.max(bytes_used.saturating_add(HEADROOM_BYTES));
+    let free_size = total_size.saturating_sub(bytes_used);
+    (total_size, free_size)
+}
+
+fn granted_access_to_open_flags(granted_access: u32) -> i32 {
+    let wants_read =
+        granted_access == 0 || (granted_access & (FILE_READ_DATA | GENERIC_READ_ACCESS)) != 0;
+    let wants_write =
+        (granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE_ACCESS)) != 0;
+    let wants_delete = (granted_access & DELETE_ACCESS) != 0;
+
+    let mut flags = if wants_write {
+        if wants_read {
+            OPEN_RDWR
+        } else {
+            OPEN_WRONLY
+        }
+    } else {
+        OPEN_RDONLY
+    };
+
+    if !wants_read && (wants_write || wants_delete || granted_access != 0) {
+        flags |= OPEN_NO_READ_HINT;
+    }
+
+    flags
+}
+
 /// Tracks an open file or directory handle
 struct OpenFile {
     /// The file handle (None for directories)
@@ -179,6 +222,8 @@ struct OpenFile {
     is_symlink: bool,
     /// Pending delete flag - file should be deleted on close
     delete_on_close: std::sync::atomic::AtomicBool,
+    /// True once deletion has already been executed successfully.
+    deleted: std::sync::atomic::AtomicBool,
     /// Path to the file (for deletion on close)
     path: String,
 }
@@ -548,6 +593,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             is_dir: true,
                             is_symlink: false,
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
                         },
                     );
@@ -561,6 +607,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             is_dir: false,
                             is_symlink: true,
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
                         },
                     );
@@ -569,7 +616,8 @@ impl FileSystemContext for AgentFSWinFsp {
                     // For files, open the file handle
                     let fs = self.fs.clone();
                     let ino = stats.ino;
-                    let file = self.block_on(async move { fs.lock().open(ino, 0).await });
+                    let open_flags = granted_access_to_open_flags(granted_access);
+                    let file = self.block_on(async move { fs.lock().open(ino, open_flags).await });
 
                     match file {
                         Ok(file) => {
@@ -583,6 +631,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     delete_on_close: std::sync::atomic::AtomicBool::new(
                                         delete_on_close,
                                     ),
+                                    deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
                                 },
                             );
@@ -601,7 +650,7 @@ impl FileSystemContext for AgentFSWinFsp {
         &self,
         file_name: &U16CStr,
         create_options: u32,
-        _granted_access: u32,
+        granted_access: u32,
         _file_attributes: u32,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
@@ -655,6 +704,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             is_dir: true,
                             is_symlink: false,
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
                         },
                     );
@@ -668,6 +718,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             is_dir: false,
                             is_symlink: true,
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
+                            deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
                         },
                     );
@@ -675,7 +726,8 @@ impl FileSystemContext for AgentFSWinFsp {
                 } else {
                     let fs = self.fs.clone();
                     let ino = stats.ino;
-                    let file = self.block_on(async move { fs.lock().open(ino, 0).await });
+                    let open_flags = granted_access_to_open_flags(granted_access);
+                    let file = self.block_on(async move { fs.lock().open(ino, open_flags).await });
 
                     match file {
                         Ok(file) => {
@@ -689,6 +741,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     delete_on_close: std::sync::atomic::AtomicBool::new(
                                         delete_on_close,
                                     ),
+                                    deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
                                 },
                             );
@@ -756,6 +809,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     delete_on_close: std::sync::atomic::AtomicBool::new(
                                         delete_on_close,
                                     ),
+                                    deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
                                 },
                             );
@@ -771,6 +825,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     delete_on_close: std::sync::atomic::AtomicBool::new(
                                         delete_on_close,
                                     ),
+                                    deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
                                 },
                             );
@@ -779,7 +834,9 @@ impl FileSystemContext for AgentFSWinFsp {
                             // For files, open the newly created file
                             let fs = self.fs.clone();
                             let ino = stats.ino;
-                            let file = self.block_on(async move { fs.lock().open(ino, 0).await });
+                            let open_flags = granted_access_to_open_flags(granted_access);
+                            let file =
+                                self.block_on(async move { fs.lock().open(ino, open_flags).await });
 
                             match file {
                                 Ok(file) => {
@@ -793,6 +850,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                             delete_on_close: std::sync::atomic::AtomicBool::new(
                                                 delete_on_close,
                                             ),
+                                            deleted: std::sync::atomic::AtomicBool::new(false),
                                             path: path_owned,
                                         },
                                     );
@@ -823,8 +881,9 @@ impl FileSystemContext for AgentFSWinFsp {
 
             let delete_flag = FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
             let pending_delete = open_file.delete_on_close.load(Ordering::SeqCst);
+            let already_deleted = open_file.deleted.load(Ordering::SeqCst);
             (
-                delete_flag || pending_delete,
+                !already_deleted && (delete_flag || pending_delete),
                 open_file.is_dir,
                 open_file.path.clone(),
             )
@@ -1004,15 +1063,22 @@ impl FileSystemContext for AgentFSWinFsp {
             }
         }
 
-        let open_files = self.open_files.lock();
-        if let Some(open_file) = open_files.get(&context.fh) {
-            open_file
-                .delete_on_close
-                .store(delete_file, Ordering::SeqCst);
-            Ok(())
-        } else {
-            Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER))
+        if delete_file {
+            if let Err(e) = self.delete_path(&path, is_dir) {
+                return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e)));
+            }
         }
+
+        let open_files = self.open_files.lock();
+        let Some(open_file) = open_files.get(&context.fh) else {
+            return Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER));
+        };
+        open_file.delete_on_close.store(false, Ordering::SeqCst);
+        open_file.deleted.store(delete_file, Ordering::SeqCst);
+        if !delete_file {
+            open_file.deleted.store(false, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn rename(
@@ -1441,8 +1507,9 @@ impl FileSystemContext for AgentFSWinFsp {
 
         match stats {
             Ok(stats) => {
-                out_volume_info.total_size = 1024 * 1024 * 1024; // 1GB
-                out_volume_info.free_size = 1024 * 1024 * 1024 - stats.bytes_used;
+                let (total_size, free_size) = volume_capacity(stats.bytes_used);
+                out_volume_info.total_size = total_size;
+                out_volume_info.free_size = free_size;
                 Ok(())
             }
             Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -1647,7 +1714,7 @@ pub fn unmount(_mountpoint: &std::path::Path, _lazy: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_truncate_size;
+    use super::{resolve_truncate_size, volume_capacity};
 
     #[test]
     fn allocation_growth_does_not_change_logical_size() {
@@ -1663,5 +1730,20 @@ mod tests {
     fn eof_size_request_always_applies() {
         assert_eq!(resolve_truncate_size(2, 512, false), Some(512));
         assert_eq!(resolve_truncate_size(512, 2, false), Some(2));
+    }
+
+    #[test]
+    fn volume_capacity_keeps_minimum_headroom() {
+        let (total, free) = volume_capacity(1234);
+        assert_eq!(total, 1024 * 1024 * 1024);
+        assert_eq!(free, total - 1234);
+    }
+
+    #[test]
+    fn volume_capacity_saturates_when_usage_exceeds_minimum() {
+        let bytes_used = 2 * 1024 * 1024 * 1024;
+        let (total, free) = volume_capacity(bytes_used);
+        assert_eq!(total, bytes_used + 64 * 1024 * 1024);
+        assert_eq!(free, 64 * 1024 * 1024);
     }
 }

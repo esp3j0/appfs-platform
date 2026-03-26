@@ -1,6 +1,7 @@
 pub mod appfs_adapter;
 pub mod appfs_adapter_testkit;
 pub mod appfs_connector_v2;
+pub mod appfs_connector_v3;
 pub mod appfs_demo_adapter;
 pub mod connection_pool;
 pub mod error;
@@ -39,8 +40,16 @@ pub use appfs_connector_v2::{
     SubmitActionOutcomeV2, SubmitActionRequestV2, SubmitActionResponseV2,
     APPFS_CONNECTOR_SDK_V2_VERSION,
 };
+pub use appfs_connector_v3::{
+    AppConnectorV3, AppStructureNodeKindV3, AppStructureNodeV3, AppStructureSnapshotV3,
+    AppStructureSyncReasonV3, AppStructureSyncResultV3, ConnectorContextV3, ConnectorErrorV3,
+    ConnectorInfoV3, FetchLivePageRequestV3, FetchLivePageResponseV3, FetchSnapshotChunkRequestV3,
+    FetchSnapshotChunkResponseV3, GetAppStructureRequestV3, GetAppStructureResponseV3,
+    HealthStatusV3, RefreshAppStructureRequestV3, RefreshAppStructureResponseV3, SnapshotMetaV3,
+    SubmitActionRequestV3, SubmitActionResponseV3, APPFS_CONNECTOR_SDK_V3_VERSION,
+};
 pub use appfs_demo_adapter::{DemoAppAdapterV1, DemoAppConnectorV2};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, Stats, TimeChange,

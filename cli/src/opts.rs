@@ -263,6 +263,14 @@ pub enum Command {
         #[arg(long)]
         appfs_app_id: Option<String>,
 
+        /// Additional AppFS app IDs to expose through mount-side read-through (repeatable)
+        #[arg(long = "appfs-app")]
+        appfs_app_ids: Vec<String>,
+
+        /// Load AppFS app routing from /_appfs/apps.registry.json instead of CLI bootstrap flags
+        #[arg(long)]
+        managed_appfs: bool,
+
         /// Session ID used for mount-side AppFS connector calls
         #[arg(long)]
         appfs_session: Option<String>,
@@ -482,9 +490,17 @@ pub enum ServeCommand {
         #[arg(long, default_value = "/app", add = ArgValueCompleter::new(PathCompleter::dir()))]
         root: PathBuf,
 
+        /// Load runtime app/backend/session config from /_appfs/apps.registry.json
+        #[arg(long)]
+        managed: bool,
+
         /// App ID under the root
-        #[arg(long, default_value = "aiim")]
-        app_id: String,
+        #[arg(long)]
+        app_id: Option<String>,
+
+        /// Additional App IDs under the same root (repeatable)
+        #[arg(long = "app")]
+        app_ids: Vec<String>,
 
         /// Session ID used in emitted events (auto-generated when omitted)
         #[arg(long)]
