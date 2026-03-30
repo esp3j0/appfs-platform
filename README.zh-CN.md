@@ -99,7 +99,7 @@ Add-Content C:\mnt\appfs-managed-http\aiim\contacts\zhangsan\send_message.act '{
 启动参考 HTTP bridge：
 
 ```bash
-cd /path/to/agentfs/examples/appfs/http-bridge/python
+cd /path/to/agentfs/examples/appfs/bridges/http-python
 uv run python bridge_server.py
 ```
 
