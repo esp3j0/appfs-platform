@@ -1,0 +1,7 @@
+integration/.tmp/
+integration/.work/
+integration/mounts/
+integration/state/
+integration/**/*.db
+integration/**/*.sqlite
+integration/**/*.sqlite3
