@@ -1841,6 +1841,15 @@ mod tests {
         String::from_utf8(output.stdout).expect("stdout should be utf8")
     }
 
+    fn normalize_path_text(text: &str) -> String {
+        let normalized = text.replace('\\', "/");
+        if cfg!(windows) {
+            normalized.to_ascii_lowercase()
+        } else {
+            normalized
+        }
+    }
+
     fn init_git_repo(label: &str) -> PathBuf {
         let root = temp_dir(label);
         fs::create_dir_all(&root).expect("repo root");
@@ -2566,7 +2575,11 @@ mod tests {
         assert!(created.contains("feature/demo"));
         assert!(switched.contains("main"));
         assert!(added.contains("wt-demo"));
-        assert!(listed_worktrees.contains(worktree_path.to_str().expect("utf8 path")));
+        assert!(
+            normalize_path_text(&listed_worktrees).contains(&normalize_path_text(
+                worktree_path.to_str().expect("utf8 path")
+            ))
+        );
         assert!(removed.contains("Result           removed"));
 
         let _ = fs::remove_dir_all(repo);
