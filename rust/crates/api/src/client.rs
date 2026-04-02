@@ -156,12 +156,12 @@ where
         return Ok(ClawApiClient::from_auth(resolve_default_auth()?).with_base_url(read_base_url()));
     };
 
-    let auth = if provider_override.api_key_env.is_none() && provider_override.auth_token_env.is_none()
-    {
-        resolve_default_auth()?
-    } else {
-        resolve_claw_auth_from_override(provider_override)?
-    };
+    let auth =
+        if provider_override.api_key_env.is_none() && provider_override.auth_token_env.is_none() {
+            resolve_default_auth()?
+        } else {
+            resolve_claw_auth_from_override(provider_override)?
+        };
     let base_url = provider_override
         .base_url
         .clone()

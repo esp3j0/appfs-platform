@@ -648,10 +648,7 @@ fn parse_optional_provider_config(
     }))
 }
 
-fn parse_provider_kind(
-    value: &str,
-    context: &str,
-) -> Result<RuntimeProviderKind, ConfigError> {
+fn parse_provider_kind(value: &str, context: &str) -> Result<RuntimeProviderKind, ConfigError> {
     match value {
         "anthropic" | "claw" | "claw-api" => Ok(RuntimeProviderKind::Anthropic),
         "openai" | "openai-compatible" => Ok(RuntimeProviderKind::OpenAi),

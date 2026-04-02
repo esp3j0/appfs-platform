@@ -88,6 +88,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
+        name: "context",
+        aliases: &[],
+        summary: "Inspect estimated context window usage",
+        argument_hint: None,
+        resume_supported: true,
+        category: SlashCommandCategory::Workspace,
+    },
+    SlashCommandSpec {
         name: "compact",
         aliases: &[],
         summary: "Compact local session history",
@@ -303,6 +311,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
 pub enum SlashCommand {
     Help,
     Status,
+    Context,
     Compact,
     Branch {
         action: Option<String>,
@@ -386,6 +395,7 @@ impl SlashCommand {
         Some(match command {
             "help" => Self::Help,
             "status" => Self::Status,
+            "context" => Self::Context,
             "compact" => Self::Compact,
             "branch" => Self::Branch {
                 action: parts.next().map(ToOwned::to_owned),
@@ -1758,6 +1768,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Context
         | SlashCommand::Branch { .. }
         | SlashCommand::Bughunter { .. }
         | SlashCommand::Worktree { .. }
@@ -2125,6 +2136,7 @@ mod tests {
         assert!(help.contains("Automation & discovery"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
+        assert!(help.contains("/context"));
         assert!(help.contains("/compact"));
         assert!(help.contains("/bughunter [scope]"));
         assert!(help.contains("/branch [list|create <name>|switch <name>]"));
@@ -2154,8 +2166,8 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
-        assert_eq!(slash_command_specs().len(), 28);
-        assert_eq!(resume_supported_slash_commands().len(), 13);
+        assert_eq!(slash_command_specs().len(), 29);
+        assert_eq!(resume_supported_slash_commands().len(), 14);
     }
 
     #[test]
@@ -2209,6 +2221,7 @@ mod tests {
         let session = Session::new();
         assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/context", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/branch list", &session, CompactionConfig::default()).is_none()
         );
