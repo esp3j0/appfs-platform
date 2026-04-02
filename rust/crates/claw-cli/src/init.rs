@@ -336,14 +336,27 @@ mod tests {
     use super::{initialize_repo, render_init_claw_md};
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-init-{nanos}"))
+        let pid = std::process::id();
+        for _ in 0..1024 {
+            let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!("claw-init-{pid}-{nanos}-{counter}"));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create temp dir {}: {error}", candidate.display()),
+            }
+        }
+        panic!("failed to allocate unique temp dir after repeated attempts");
     }
 
     #[test]
