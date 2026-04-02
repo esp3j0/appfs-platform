@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  appfs-agent-rust:
+    name: appfs-agent rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    defaults:
+      run:
+        working-directory: appfs-agent/rust
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: appfs-agent/rust
+
+      - name: Run cargo check
+        run: cargo check --workspace
+
+      - name: Run cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Run release build
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --workspace --release
+
+  appfs-agent-python:
+    name: appfs-agent python
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: appfs-agent
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run repository tests
+        run: python -m unittest discover -s tests -v
+
+  appfs-contract-gate:
+    name: appfs contract gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: appfs/cli
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Install system dependencies
+        run: |
+          ../scripts/install-deps.sh
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Build CLI
+        run: cargo build --verbose
+
+      - name: Run AppFS static contract suite
+        env:
+          APPFS_CONTRACT_TESTS: "1"
+          APPFS_STATIC_FIXTURE: "1"
+          APPFS_ROOT: ${{ github.workspace }}/appfs/examples/appfs/fixtures
+        run: sh ./tests/test-appfs-contract.sh
+
+      - name: Run AppFS live contract suite
+        env:
+          APPFS_CONTRACT_TESTS: "1"
+          APPFS_TIMEOUT_SEC: "30"
+        run: sh ./tests/appfs/run-live-with-adapter.sh
+
+      - name: Run AppFS connector contract suite
+        env:
+          APPFS_CONNECTOR_CONTRACT_TESTS: "1"
+          APPFS_CONNECTOR_STRICT: "1"
+          APPFS_BUILD_BEFORE_RUN: "0"
+        run: sh ./tests/test-appfs-connector-contract.sh
+
+      - name: Run AppFS structure contract suite
+        env:
+          APPFS_STRUCTURE_TESTS: "1"
+          APPFS_BUILD_BEFORE_RUN: "0"
+        run: sh ./tests/test-appfs-structure-contract.sh
