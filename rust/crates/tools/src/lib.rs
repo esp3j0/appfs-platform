@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use api::{
     max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
+    ProviderOverride,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -13,8 +14,9 @@ use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
     ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ConfigLoader, ConversationRuntime, GrepSearchInput, MessageRole, OAuthConfig,
+    PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1635,6 +1637,7 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
+        .or_else(configured_default_model)
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
@@ -1646,6 +1649,12 @@ fn build_agent_runtime(
         agent_permission_policy(),
         job.system_prompt.clone(),
     ))
+}
+
+fn configured_default_model() -> Option<String> {
+    load_runtime_config_for_cwd()
+        .ok()
+        .and_then(|config| config.model().map(ToOwned::to_owned))
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -1816,13 +1825,45 @@ struct ProviderRuntimeClient {
 impl ProviderRuntimeClient {
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         let model = resolve_model_alias(&model).to_string();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+        let runtime_config = load_runtime_config_for_cwd().map_err(|error| error.to_string())?;
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
+        let client = ProviderClient::from_model_with_claw_auth_resolver(
+            &model,
+            provider_override.as_ref(),
+            || resolve_tool_auth_source(&oauth),
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
             model,
             allowed_tools,
         })
+    }
+}
+
+fn load_runtime_config_for_cwd() -> Result<RuntimeConfig, runtime::ConfigError> {
+    let cwd = std::env::current_dir()?;
+    ConfigLoader::default_for(cwd).load()
+}
+
+fn resolve_tool_auth_source(oauth: &Option<OAuthConfig>) -> Result<api::AuthSource, api::ApiError> {
+    api::resolve_startup_auth_source(|| Ok(oauth.clone()))
+}
+
+fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
+    ProviderOverride {
+        provider: match config.provider() {
+            RuntimeProviderKind::Anthropic => ProviderKind::ClawApi,
+            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
+            RuntimeProviderKind::Xai => ProviderKind::Xai,
+        },
+        base_url: config.base_url().map(ToOwned::to_owned),
+        api_key_env: config.api_key_env().map(ToOwned::to_owned),
+        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
     }
 }
 
