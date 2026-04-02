@@ -1,6 +1,10 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -161,7 +165,7 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && command_exists("unshare");
+    let namespace_supported = linux_namespace_support_available();
     let network_supported = namespace_supported;
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
@@ -277,9 +281,44 @@ fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn command_exists(command: &str) -> bool {
     env::var_os("PATH")
         .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_namespace_support_available() -> bool {
+    static SUPPORT: OnceLock<bool> = OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        if !command_exists("unshare") {
+            return false;
+        }
+
+        Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--ipc",
+                "--pid",
+                "--uts",
+                "--fork",
+                "sh",
+                "-lc",
+                "exit 0",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_namespace_support_available() -> bool {
+    false
 }
 
 #[cfg(test)]
