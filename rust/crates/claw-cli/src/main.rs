@@ -17,7 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AuthSource, ClawApiClient, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    ProviderKind, ProviderOverride,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -36,7 +37,8 @@ use runtime::{
     ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RuntimeConfig, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -172,7 +174,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
@@ -385,6 +387,12 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
 
 fn cli_parse_cwd() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+fn configured_default_model() -> Option<String> {
+    load_runtime_config_for_cwd(&cli_parse_cwd())
+        .ok()
+        .and_then(|config| config.model().map(ToOwned::to_owned))
 }
 
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
@@ -2185,12 +2193,13 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
             "model" => runtime_config.get("model"),
+            "provider" => runtime_config.get("provider"),
             "plugins" => runtime_config
                 .get("plugins")
                 .or_else(|| runtime_config.get("enabledPlugins")),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
+                    "  Unsupported config section '{other}'. Use env, hooks, model, provider, or plugins."
                 ));
                 return Ok(lines.join(
                     "
@@ -3052,7 +3061,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct DefaultRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ClawApiClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -3070,10 +3079,19 @@ impl DefaultRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
+            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: ClawApiClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url()),
+            client: ProviderClient::from_model_with_claw_auth_resolver(
+                &model,
+                provider_override.as_ref(),
+                || resolve_cli_auth_source(&oauth),
+            )?,
             model,
             enable_tools,
             emit_output,
@@ -3084,14 +3102,29 @@ impl DefaultRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
+    resolve_startup_auth_source(|| {
+        Ok(oauth.clone())
+    })
+}
+
+fn load_runtime_config_for_cwd(cwd: &Path) -> Result<RuntimeConfig, api::ApiError> {
+    ConfigLoader::default_for(cwd).load().map_err(|error| {
+        api::ApiError::Auth(format!("failed to load runtime config: {error}"))
+    })
+}
+
+fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
+    ProviderOverride {
+        provider: match config.provider() {
+            RuntimeProviderKind::Anthropic => ProviderKind::ClawApi,
+            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
+            RuntimeProviderKind::Xai => ProviderKind::Xai,
+        },
+        base_url: config.base_url().map(ToOwned::to_owned),
+        api_key_env: config.api_key_env().map(ToOwned::to_owned),
+        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
+    }
 }
 
 impl ApiClient for DefaultRuntimeClient {
@@ -4458,7 +4491,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
+        assert!(help.contains("/config [env|hooks|model|provider|plugins]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
