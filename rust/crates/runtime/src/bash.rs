@@ -300,6 +300,7 @@ mod tests {
 
     #[test]
     fn executes_simple_command() {
+        let _guard = crate::test_env_lock();
         let output = execute_bash(BashCommandInput {
             command: success_command(),
             timeout: Some(1_000),
@@ -320,6 +321,7 @@ mod tests {
 
     #[test]
     fn disables_sandbox_when_requested() {
+        let _guard = crate::test_env_lock();
         let output = execute_bash(BashCommandInput {
             command: success_command(),
             timeout: Some(1_000),

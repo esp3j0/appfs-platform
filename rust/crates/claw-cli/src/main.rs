@@ -18,8 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use api::{
     resolve_startup_auth_source, AuthSource, ClawApiClient, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    ProviderKind, ProviderOverride,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -36,8 +36,8 @@ use runtime::{
     parse_oauth_callback_request_target, save_oauth_credentials, set_shell_if_windows, ApiClient,
     ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    RuntimeConfig, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
     ToolExecutor, UsageTracker,
 };
 use serde_json::json;
@@ -45,11 +45,7 @@ use tools::GlobalToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
@@ -717,6 +713,63 @@ struct StatusUsage {
     estimated_tokens: usize,
 }
 
+fn format_context_report(
+    model: &str,
+    system_prompt: &[String],
+    session: &Session,
+    note: Option<&str>,
+) -> String {
+    let usage = runtime::analyze_context_usage(system_prompt, session);
+    let max_tokens = usize::try_from(max_tokens_for_model(model)).unwrap_or(64_000);
+    let percentage = if max_tokens == 0 {
+        0.0
+    } else {
+        (usage.total_tokens as f64 / max_tokens as f64) * 100.0
+    };
+    let mut lines = vec![format!(
+        "Context
+  Model            {model}
+  Tokens           est {} / {} ({percentage:.1}%)
+  Messages         {}
+  System prompt    {}
+  Session content  {}",
+        usage.total_tokens,
+        max_tokens,
+        usage.message_count,
+        usage.system_prompt_tokens,
+        usage.message_tokens,
+    )];
+
+    if let Some(note) = note {
+        lines.push("Notes".to_string());
+        lines.push(format!("  {note}"));
+    }
+
+    lines.push("Estimated usage by category".to_string());
+    for category in usage
+        .categories
+        .iter()
+        .filter(|category| category.tokens > 0)
+    {
+        let share = if max_tokens == 0 {
+            0.0
+        } else {
+            (category.tokens as f64 / max_tokens as f64) * 100.0
+        };
+        lines.push(format!(
+            "  {:<16} {:>6} ({share:.1}%)",
+            category.name, category.tokens
+        ));
+    }
+
+    lines.push("System prompt sections".to_string());
+    for section in &usage.system_prompt_sections {
+        lines.push(format!("  {:<16} {}", section.name, section.tokens));
+    }
+
+    lines.join("\n")
+}
+
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Model
@@ -948,6 +1001,21 @@ fn run_resume_command(
                     },
                     default_permission_mode().as_str(),
                     &status_context(Some(session_path))?,
+                )),
+            })
+        }
+        SlashCommand::Context => {
+            let model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            let system_prompt = build_system_prompt()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_context_report(
+                    &model,
+                    &system_prompt,
+                    session,
+                    Some(
+                        "Reconstructed from the current workspace. Restored sessions do not persist the original model or full system prompt.",
+                    ),
                 )),
             })
         }
@@ -1270,6 +1338,10 @@ impl LiveCli {
                 self.print_status();
                 false
             }
+            SlashCommand::Context => {
+                self.print_context();
+                false
+            }
             SlashCommand::Bughunter { scope } => {
                 self.run_bughunter(scope.as_deref())?;
                 false
@@ -1397,6 +1469,18 @@ impl LiveCli {
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
+            )
+        );
+    }
+
+    fn print_context(&self) {
+        println!(
+            "{}",
+            format_context_report(
+                &self.model,
+                &self.system_prompt,
+                self.runtime.session(),
+                None
             )
         );
     }
@@ -1995,7 +2079,8 @@ fn render_repl_help() -> String {
         "Interactive REPL".to_string(),
         "  Quick start          Ask a task in plain English or use one of the core commands below."
             .to_string(),
-        "  Core commands        /help · /status · /model · /permissions · /compact".to_string(),
+        "  Core commands        /help · /status · /context · /model · /permissions · /compact"
+            .to_string(),
         "  Exit                 /exit or /quit".to_string(),
         "  Vim mode             /vim toggles modal editing".to_string(),
         "  History              Up/Down recalls previous prompts".to_string(),
@@ -3103,15 +3188,13 @@ impl DefaultRuntimeClient {
 }
 
 fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
-    resolve_startup_auth_source(|| {
-        Ok(oauth.clone())
-    })
+    resolve_startup_auth_source(|| Ok(oauth.clone()))
 }
 
 fn load_runtime_config_for_cwd(cwd: &Path) -> Result<RuntimeConfig, api::ApiError> {
-    ConfigLoader::default_for(cwd).load().map_err(|error| {
-        api::ApiError::Auth(format!("failed to load runtime config: {error}"))
-    })
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| api::ApiError::Auth(format!("failed to load runtime config: {error}")))
 }
 
 fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
@@ -4153,10 +4236,10 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_tool_progress, filter_tool_specs, format_compact_report, format_cost_report,
-        format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_resume_report,
-        format_status_report, format_tool_call_start, format_tool_result,
+        describe_tool_progress, filter_tool_specs, format_compact_report, format_context_report,
+        format_cost_report, format_internal_prompt_progress_line, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         normalize_permission_mode, parse_args, parse_git_status_metadata, permission_policy,
         print_help_to, push_output_block, render_config_report, render_memory_report,
         render_repl_help, render_unknown_repl_command, resolve_model_alias, response_to_events,
@@ -4166,7 +4249,9 @@ mod tests {
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
-    use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use runtime::{
+        AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode, Session,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -4486,6 +4571,7 @@ mod tests {
         assert!(help.contains("Interactive REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
+        assert!(help.contains("/context"));
         assert!(help.contains("/model [model]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
@@ -4534,8 +4620,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "compact", "clear", "cost", "config", "memory", "init", "diff",
-                "version", "export", "agents", "skills",
+                "help", "status", "context", "compact", "clear", "cost", "config", "memory",
+                "init", "diff", "version", "export", "agents", "skills",
             ]
         );
     }
@@ -4575,6 +4661,44 @@ mod tests {
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
         assert!(report.contains("/compact"));
+    }
+
+    #[test]
+    fn context_report_uses_sectioned_layout() {
+        let report = format_context_report(
+            "claude-opus-4-6",
+            &[
+                "You are a coding assistant.".to_string(),
+                "# System\nUse tools carefully.".to_string(),
+            ],
+            &Session {
+                version: 1,
+                messages: vec![
+                    ConversationMessage::user_text("Inspect src/main.rs"),
+                    ConversationMessage::assistant(vec![
+                        ContentBlock::Text {
+                            text: "Looking now.".to_string(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "Read".to_string(),
+                            input: "{\"file_path\":\"src/main.rs\"}".to_string(),
+                        },
+                    ]),
+                    ConversationMessage::tool_result("tool-1", "Read", "fn main() {}", false),
+                ],
+            },
+            Some("Reconstructed from the current workspace."),
+        );
+        assert!(report.contains("Context"));
+        assert!(report.contains("Model            claude-opus-4-6"));
+        assert!(report.contains("Estimated usage by category"));
+        assert!(report.contains("System prompt"));
+        assert!(report.contains("Tool calls"));
+        assert!(report.contains("System prompt sections"));
+        assert!(report.contains("Intro"));
+        assert!(report.contains("System"));
+        assert!(report.contains("Reconstructed from the current workspace."));
     }
 
     #[test]
@@ -4766,6 +4890,7 @@ mod tests {
                 section: Some("env".to_string())
             })
         );
+        assert_eq!(SlashCommand::parse("/context"), Some(SlashCommand::Context));
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
     }
