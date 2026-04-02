@@ -2575,10 +2575,12 @@ mod tests {
         assert!(created.contains("feature/demo"));
         assert!(switched.contains("main"));
         assert!(added.contains("wt-demo"));
+        let worktree_name = worktree_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("worktree name");
         assert!(
-            normalize_path_text(&listed_worktrees).contains(&normalize_path_text(
-                worktree_path.to_str().expect("utf8 path")
-            ))
+            normalize_path_text(&listed_worktrees).contains(&normalize_path_text(worktree_name))
         );
         assert!(removed.contains("Result           removed"));
 
