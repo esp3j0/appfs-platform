@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 use api::{
     max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
-    ProviderOverride,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConfigLoader, ConversationRuntime, GrepSearchInput, MessageRole, OAuthConfig,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, OAuthConfig,
     PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
     RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
 };

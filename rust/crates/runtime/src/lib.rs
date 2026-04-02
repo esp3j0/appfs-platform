@@ -2,6 +2,7 @@ mod bash;
 mod bootstrap;
 mod compact;
 mod config;
+mod context;
 mod conversation;
 mod file_ops;
 mod hooks;
@@ -31,6 +32,9 @@ pub use config::{
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
     RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
+};
+pub use context::{
+    analyze_context_usage, ContextCategoryUsage, ContextSectionUsage, ContextUsageReport,
 };
 pub use conversation::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
