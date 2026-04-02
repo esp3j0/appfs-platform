@@ -1,122 +1,93 @@
-# Claw Code
+# appfs-agent Rust Workspace
 
-Claw Code is a local coding-agent CLI implemented in safe Rust. It is **Claude Code inspired** and developed as a **clean-room implementation**: it aims for a strong local agent experience, but it is **not** a direct port or copy of Claude Code.
+This Rust workspace is the active implementation core of `appfs-agent`, the agent runtime being built for AppFS.
 
-The Rust workspace is the current main product surface. The `claw` binary provides interactive sessions, one-shot prompts, workspace-aware tools, local agent workflows, and plugin-capable operation from a single workspace.
+The codebase still uses some earlier internal names such as `claw` for the current CLI binary. Those names are transitional. The product direction for this workspace is now:
+
+- a local agent runtime for AppFS-oriented workflows
+- strong tool execution, sessions, plugins, hooks, and workspace context
+- a future AppFS-native runtime entrypoint and lifecycle model
 
 ## Current status
 
 - **Version:** `0.1.0`
-- **Release stage:** initial public release, source-build distribution
-- **Primary implementation:** Rust workspace in this repository
-- **Platform focus:** macOS and Linux developer workstations
+- **Stage:** active runtime foundation, not final AppFS integration
+- **Primary implementation:** Rust workspace in this directory
+- **Current binary name:** `claw` (transitional)
 
-## Install, build, and run
+## What exists today
+
+The workspace already contains the main runtime building blocks:
+
+- `claw-cli` — current interactive CLI and one-shot prompt entrypoint
+- `runtime` — sessions, config, hooks, prompts, permissions, MCP, remote state
+- `tools` — built-in tool registry and tool execution
+- `commands` — slash commands, local skill discovery, agent discovery
+- `plugins` — plugin discovery, registry, lifecycle, hook, and tool support
+- `api` — provider clients and streaming
+- `lsp` — LSP support types and process helpers
+- `server` and `compat-harness` — supporting integration surfaces
+
+## Build and run
 
 ### Prerequisites
 
 - Rust stable toolchain
 - Cargo
-- Provider credentials for the model you want to use
+- credentials for the model/provider you intend to use
 
-### Authentication
-
-Anthropic-compatible models:
+### Build
 
 ```bash
-export ANTHROPIC_API_KEY="..."
-# Optional when using a compatible endpoint
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"
-```
-
-Grok models:
-
-```bash
-export XAI_API_KEY="..."
-# Optional when using a compatible endpoint
-export XAI_BASE_URL="https://api.x.ai"
-```
-
-OAuth login is also available:
-
-```bash
-cargo run --bin claw -- login
-```
-
-### Install locally
-
-```bash
-cargo install --path crates/claw-cli --locked
-```
-
-### Build from source
-
-```bash
+cargo build --workspace
 cargo build --release -p claw-cli
 ```
 
 ### Run
 
-From the workspace:
-
 ```bash
 cargo run --bin claw -- --help
 cargo run --bin claw --
 cargo run --bin claw -- prompt "summarize this workspace"
-cargo run --bin claw -- --model sonnet "review the latest changes"
 ```
 
-From the release build:
+## Current capabilities
 
-```bash
-./target/release/claw
-./target/release/claw prompt "explain crates/runtime"
-```
-
-## Supported capabilities
-
-- Interactive REPL and one-shot prompt execution
-- Saved-session inspection and resume flows
-- Built-in workspace tools for shell, file read/write/edit, search, web fetch/search, todos, and notebook updates
-- Slash commands for status, compaction, config inspection, diff, export, session management, and version reporting
-- Local agent and skill discovery with `claw agents` and `claw skills`
-- Plugin discovery and management through the CLI and slash-command surfaces
-- OAuth login/logout plus model/provider selection from the command line
-- Workspace-aware instruction/config loading (`CLAW.md`, config files, permissions, plugin settings)
+- interactive REPL and one-shot prompt execution
+- saved-session inspection and resume flows
+- built-in tools for shell, file operations, search, web fetch/search, todos, notebooks, config, and REPL-like execution
+- plugin and hook support
+- local skill and agent discovery
+- OAuth support
+- MCP bootstrap/client support
+- LSP support primitives
 
 ## Current limitations
 
-- Public distribution is **source-build only** today; this workspace is not set up for crates.io publishing
-- GitHub CI verifies `cargo check`, `cargo test`, and release builds, but automated release packaging is not yet present
-- Current CI targets Ubuntu and macOS; Windows release readiness is still to be established
-- Some live-provider integration coverage is opt-in because it requires external credentials and network access
-- The command surface may continue to evolve during the `0.x` series
+- the runtime is not yet presented through a final AppFS-native entrypoint
+- naming is still transitional in code and binaries
+- Windows is not yet part of the CI matrix
+- some higher-level parity features from the older TS snapshot are still missing
+- release packaging/distribution is still immature
 
-## Implementation
+## Near-term direction
 
-The Rust workspace is the active product implementation. It currently includes these crates:
+This workspace is expected to evolve in three layers:
 
-- `claw-cli` — user-facing binary
-- `api` — provider clients and streaming
-- `runtime` — sessions, config, permissions, prompts, and runtime loop
-- `tools` — built-in tool implementations
-- `commands` — slash-command registry and handlers
-- `plugins` — plugin discovery, registry, and lifecycle support
-- `lsp` — language-server protocol support types and process helpers
-- `server` and `compat-harness` — supporting services and compatibility tooling
+1. strengthen the current runtime core
+2. define how AppFS should launch, supervise, and communicate with the runtime
+3. complete naming and packaging changes once the runtime contract stabilizes
 
-## Roadmap
+## Verification notes
 
-- Publish packaged release artifacts for public installs
-- Add a repeatable release workflow and longer-lived changelog discipline
-- Expand platform verification beyond the current CI matrix
-- Add more task-focused examples and operator documentation
-- Continue tightening feature coverage and UX polish across the Rust implementation
+At the current checkpoint:
 
-## Release notes
+- `cargo build --workspace` passes
+- Windows build works
+- Windows test coverage is still incomplete because some tests remain Unix-oriented
 
-- Draft 0.1.0 release notes: [`docs/releases/0.1.0.md`](docs/releases/0.1.0.md)
+## Related docs
 
-## License
-
-See the repository root for licensing details.
+- Root repo overview: [../README.md](../README.md)
+- Migration checkpoint: [../PARITY.md](../PARITY.md)
+- Draft release notes: [docs/releases/0.1.0.md](docs/releases/0.1.0.md)
