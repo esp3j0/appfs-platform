@@ -98,6 +98,93 @@ cargo run --bin claw -- --help
 
 The current binary is still named `claw`. That is an implementation detail inherited from the earlier migration stage, not the final product name.
 
+## Model and provider configuration
+
+`appfs-agent` now supports two ways to choose a model backend:
+
+- set only `model` and let the runtime infer the provider from the model family
+- set both `model` and `provider` to force a specific provider family and gateway
+
+Runtime settings are loaded from these files, in precedence order:
+
+- `%HOME%\\.claw\\settings.json`
+- `.claw.json`
+- `.claw\\settings.json`
+- `.claw\\settings.local.json`
+
+The most useful pattern for AppFS deployments is to keep shared defaults in `.claw.json` and machine- or secret-specific overrides in `.claw/settings.local.json`.
+
+Example: OpenAI-compatible gateway with a custom model name
+
+```json
+{
+  "model": "qwen3-coder-plus",
+  "provider": {
+    "type": "openai",
+    "baseUrl": "https://gateway.example/v1",
+    "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
+  }
+}
+```
+
+Example: official OpenAI API
+
+```json
+{
+  "model": "gpt-4.1",
+  "provider": {
+    "type": "openai",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  }
+}
+```
+
+Example: Anthropic-compatible route
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "provider": {
+    "type": "anthropic",
+    "baseUrl": "https://anthropic-proxy.example",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "authTokenEnv": "ANTHROPIC_AUTH_TOKEN"
+  }
+}
+```
+
+Example: xAI
+
+```json
+{
+  "model": "grok-3",
+  "provider": {
+    "type": "xai",
+    "baseUrl": "https://api.x.ai/v1",
+    "apiKeyEnv": "XAI_API_KEY"
+  }
+}
+```
+
+Notes:
+
+- `model` can be any string; when `provider` is present, the runtime uses `provider.type` instead of guessing
+- `provider.type` currently supports `anthropic`, `openai`, and `xai`
+- `provider.baseUrl` lets you point at a proxy or any OpenAI-compatible gateway
+- `provider.authTokenEnv` is only valid for `anthropic`
+- if `provider` is omitted, the runtime falls back to model-based provider detection
+- the configured `model` is now used as the default model for the CLI and agent runtime
+
+You can inspect merged settings with:
+
+```bash
+cd rust
+cargo run --bin claw -- config provider
+```
+
+This prints the merged `provider` section after config-file precedence has been applied.
+
 ## Near-term roadmap
 
 The next phase for `appfs-agent` is to turn the current local runtime into an AppFS-native component:

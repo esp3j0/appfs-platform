@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 
@@ -11,6 +12,17 @@ fn provider_client_routes_grok_aliases_through_xai() {
     let client = ProviderClient::from_model("grok-mini").expect("grok alias should resolve");
 
     assert_eq!(client.provider_kind(), ProviderKind::Xai);
+}
+
+#[test]
+fn provider_client_routes_gpt_models_through_openai() {
+    let _lock = env_lock();
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("openai-test-key"));
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("claw-test-key"));
+
+    let client = ProviderClient::from_model("gpt-4.1").expect("gpt models should resolve");
+
+    assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
 }
 
 #[test]
@@ -43,6 +55,40 @@ fn provider_client_uses_explicit_auth_without_env_lookup() {
     .expect("explicit auth should avoid env lookup");
 
     assert_eq!(client.provider_kind(), ProviderKind::ClawApi);
+}
+
+#[test]
+fn provider_client_skips_claw_auth_resolver_for_grok_models() {
+    let _lock = env_lock();
+    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
+    let resolver_called = Cell::new(false);
+
+    let client = ProviderClient::from_model_with_claw_auth_resolver("grok-3", None, || {
+        resolver_called.set(true);
+        Err(ApiError::Auth("resolver should not be called".to_string()))
+    })
+    .expect("xAI models should not consult Claw auth");
+
+    assert_eq!(client.provider_kind(), ProviderKind::Xai);
+    assert!(!resolver_called.get());
+}
+
+#[test]
+fn provider_client_uses_claw_auth_resolver_for_claw_models() {
+    let _lock = env_lock();
+    let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let resolver_called = Cell::new(false);
+
+    let client =
+        ProviderClient::from_model_with_claw_auth_resolver("claude-sonnet-4-6", None, || {
+            resolver_called.set(true);
+            Ok(AuthSource::ApiKey("claw-test-key".to_string()))
+        })
+        .expect("Claw models should use resolver auth");
+
+    assert_eq!(client.provider_kind(), ProviderKind::ClawApi);
+    assert!(resolver_called.get());
 }
 
 #[test]

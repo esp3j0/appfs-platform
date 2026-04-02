@@ -51,6 +51,116 @@ cargo run --bin claw --
 cargo run --bin claw -- prompt "summarize this workspace"
 ```
 
+## Model and provider configuration
+
+The runtime loads settings from these files, in precedence order:
+
+1. `%HOME%\\.claw\\settings.json`
+2. `.claw.json`
+3. `.claw\\settings.json`
+4. `.claw\\settings.local.json`
+
+Shared repo defaults should usually live in `.claw.json`. Machine-local secrets and developer overrides should usually live in `.claw/settings.local.json`.
+
+The current provider config shape is:
+
+```json
+{
+  "model": "your-model-name",
+  "provider": {
+    "type": "openai",
+    "baseUrl": "https://gateway.example/v1",
+    "apiKeyEnv": "YOUR_API_KEY_ENV"
+  }
+}
+```
+
+Supported fields:
+
+- `model`: any model identifier string
+- `provider.type`: `anthropic`, `openai`, or `xai`
+- `provider.baseUrl`: optional override for a proxy or custom gateway
+- `provider.apiKeyEnv`: optional API key environment variable name
+- `provider.authTokenEnv`: optional extra auth token env var for `anthropic`
+
+Common examples:
+
+```json
+{
+  "model": "gpt-4.1",
+  "provider": {
+    "type": "openai",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  }
+}
+```
+
+```json
+{
+  "model": "qwen3-coder-plus",
+  "provider": {
+    "type": "openai",
+    "baseUrl": "https://gateway.example/v1",
+    "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
+  }
+}
+```
+
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "provider": {
+    "type": "anthropic",
+    "baseUrl": "https://anthropic-proxy.example",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "authTokenEnv": "ANTHROPIC_AUTH_TOKEN"
+  }
+}
+```
+
+```json
+{
+  "model": "grok-3",
+  "provider": {
+    "type": "xai",
+    "baseUrl": "https://api.x.ai/v1",
+    "apiKeyEnv": "XAI_API_KEY"
+  }
+}
+```
+
+Behavior notes:
+
+- if `provider` is present, the runtime uses it directly instead of inferring from the model name
+- if `provider` is absent, the runtime still supports model-based provider detection
+- the configured `model` becomes the default model used by the CLI and agent runtime
+- `authTokenEnv` is rejected for non-`anthropic` providers
+
+To inspect the merged provider view:
+
+```bash
+cargo run --bin claw -- config provider
+```
+
+To inspect the full merged config:
+
+```bash
+cargo run --bin claw -- config
+```
+
+## Migration notes
+
+Older setups could rely on model-name inference alone. That still works for known model families such as `claude-*`, `gpt-*`, `o1`/`o3`/`o4`, and `grok-*`.
+
+Use explicit `provider` config when:
+
+- you want to use a custom model name behind an OpenAI-compatible gateway
+- you need to force a provider family even when the model name is ambiguous
+- you want to override the default API base URL or credential env var names
+
+This makes it possible to point `appfs-agent` at arbitrary gateways without having to rename models to match built-in detection rules.
+
 ## Current capabilities
 
 - interactive REPL and one-shot prompt execution
