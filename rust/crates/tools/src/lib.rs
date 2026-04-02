@@ -3171,6 +3171,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -3189,12 +3190,16 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_path(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-tools-{unique}-{name}"))
+        let pid = std::process::id();
+        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("claw-tools-{pid}-{nanos}-{counter}-{name}"))
     }
 
     fn bash_echo_command() -> &'static str {
@@ -4414,6 +4419,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -4430,44 +4438,18 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(windows)]
-        {
-            let result = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "timeout": 1000}),
-            )
-            .expect("PowerShell should succeed");
-
-            let background = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "run_in_background": true}),
-            )
-            .expect("PowerShell background should succeed");
-
-            let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-            assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
-            assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-            let background_output: serde_json::Value =
-                serde_json::from_str(&background).expect("json");
-            assert!(background_output["backgroundTaskId"].as_str().is_some());
-            assert_eq!(background_output["backgroundedByUser"], true);
-            assert_eq!(background_output["assistantAutoBackgrounded"], false);
-            return;
-        }
-
-        #[cfg(not(windows))]
-        let dir = std::env::temp_dir().join(format!(
-            "claw-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        #[cfg(not(windows))]
+        let dir = temp_path("pwsh-bin");
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
         #[cfg(not(windows))]
         let script = dir.join("pwsh");
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"args=%*\"\r\necho !args! | findstr /C:\"Write-Output hello\" >nul && echo hello\r\n",
+        )
+        .expect("write script");
         #[cfg(not(windows))]
         std::fs::write(
             &script,
@@ -4484,9 +4466,7 @@ printf 'pwsh:%s' "$1"
             .arg(&script)
             .status()
             .expect("chmod");
-        #[cfg(not(windows))]
         let original_path = std::env::var_os("PATH").unwrap_or_default();
-        #[cfg(not(windows))]
         {
             let mut path_entries = vec![dir.clone()];
             path_entries.extend(std::env::split_paths(&original_path));
@@ -4494,7 +4474,6 @@ printf 'pwsh:%s' "$1"
             std::env::set_var("PATH", &updated_path);
         }
 
-        #[cfg(not(windows))]
         {
             let result = execute_tool(
                 "PowerShell",
@@ -4512,10 +4491,11 @@ printf 'pwsh:%s' "$1"
             let _ = std::fs::remove_dir_all(dir);
 
             let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-            assert_eq!(
-                output["stdout"].as_str().expect("stdout").trim(),
-                "pwsh:Write-Output hello"
-            );
+            #[cfg(windows)]
+            let expected_stdout = "hello";
+            #[cfg(not(windows))]
+            let expected_stdout = "pwsh:Write-Output hello";
+            assert_eq!(output["stdout"].as_str().expect("stdout").trim(), expected_stdout);
             assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
             let background_output: serde_json::Value =
