@@ -1,0 +1,1666 @@
+#[cfg(any(unix, target_os = "windows"))]
+use agentfs_sdk::FileSystem;
+use agentfs_sdk::{error::Error as SdkError, AgentFSOptions};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(any(unix, target_os = "windows"))]
+use std::sync::mpsc::SyncSender;
+use std::{path::PathBuf, sync::Arc};
+
+#[cfg(target_os = "windows")]
+use agentfs_sdk::AgentFS as SdkAgentFS;
+#[cfg(any(unix, target_os = "windows"))]
+use agentfs_sdk::{HostFS, OverlayFS};
+#[cfg(unix)]
+use std::{path::Path, process::Command};
+#[cfg(any(unix, target_os = "windows"))]
+use tokio::sync::Mutex;
+#[cfg(unix)]
+use turso::value::Value;
+
+#[cfg(unix)]
+use crate::mount::mount_fs;
+use crate::mount::MountOpts;
+#[cfg(unix)]
+use crate::nfs::AgentNFS;
+#[cfg(unix)]
+use crate::nfsserve::tcp::NFSTcp;
+
+#[cfg(target_os = "linux")]
+use agentfs_sdk::{get_mounts, Mount};
+#[cfg(target_os = "linux")]
+use std::{
+    io::{self, ErrorKind, Write},
+    os::unix::fs::MetadataExt,
+};
+
+#[cfg(any(unix, target_os = "windows"))]
+use crate::cmd::appfs::{self, AppfsBridgeCliArgs, AppfsRuntimeCliArgs};
+#[cfg(any(unix, target_os = "windows"))]
+use crate::cmd::init::open_agentfs;
+#[cfg(target_os = "linux")]
+use crate::fuse::FuseMountOptions;
+
+pub use crate::opts::MountBackend;
+
+/// Default NFS port to try (use a high port to avoid needing root)
+#[cfg(unix)]
+const DEFAULT_NFS_PORT: u32 = 11111;
+
+/// Arguments for the mount command.
+#[derive(Debug, Clone)]
+pub struct MountArgs {
+    /// The agent filesystem ID or path.
+    pub id_or_path: String,
+    /// The mountpoint path.
+    pub mountpoint: PathBuf,
+    /// Automatically unmount when the process exits.
+    pub auto_unmount: bool,
+    /// Allow root to access the mount.
+    pub allow_root: bool,
+    /// Allow other system users to access the mount.
+    pub allow_other: bool,
+    /// Run in foreground (don't daemonize).
+    pub foreground: bool,
+    /// User ID to report for all files (defaults to current user).
+    pub uid: Option<u32>,
+    /// Group ID to report for all files (defaults to current group).
+    pub gid: Option<u32>,
+    /// The mount backend to use (fuse or nfs).
+    pub backend: MountBackend,
+    /// Enable AppFS snapshot read-through for the given app ID.
+    pub appfs_app_id: Option<String>,
+    /// Additional AppFS app IDs for mount-side read-through.
+    pub appfs_app_ids: Vec<String>,
+    /// Load AppFS app routing from the persisted managed registry.
+    pub managed_appfs: bool,
+    /// Session ID used for mount-side AppFS connector calls.
+    pub appfs_session: Option<String>,
+    /// Optional HTTP bridge endpoint for mount-side AppFS read-through.
+    pub adapter_http_endpoint: Option<String>,
+    /// HTTP bridge request timeout in milliseconds.
+    pub adapter_http_timeout_ms: u64,
+    /// Optional gRPC bridge endpoint for mount-side AppFS read-through.
+    pub adapter_grpc_endpoint: Option<String>,
+    /// gRPC bridge request timeout in milliseconds.
+    pub adapter_grpc_timeout_ms: u64,
+    /// Max retry count for bridge transport failures.
+    pub adapter_bridge_max_retries: u32,
+    /// Initial backoff in milliseconds for bridge retries.
+    pub adapter_bridge_initial_backoff_ms: u64,
+    /// Max backoff in milliseconds for bridge retries.
+    pub adapter_bridge_max_backoff_ms: u64,
+    /// Consecutive bridge transport failures required to open circuit breaker.
+    pub adapter_bridge_circuit_breaker_failures: u32,
+    /// Circuit breaker cooldown in milliseconds before retrying bridge calls.
+    pub adapter_bridge_circuit_breaker_cooldown_ms: u64,
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+type MountReadyTx = SyncSender<Result<()>>;
+
+#[cfg(any(unix, target_os = "windows"))]
+fn notify_mount_ready(ready_tx: Option<&MountReadyTx>, result: Result<()>) {
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(result);
+    }
+}
+
+fn has_appfs_mount_config(args: &MountArgs) -> bool {
+    args.managed_appfs
+        || args.appfs_app_id.is_some()
+        || !args.appfs_app_ids.is_empty()
+        || args.appfs_session.is_some()
+        || args.adapter_http_endpoint.is_some()
+        || args.adapter_grpc_endpoint.is_some()
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+fn appfs_mount_runtime_args(args: &MountArgs) -> Result<Vec<AppfsRuntimeCliArgs>> {
+    if args.managed_appfs {
+        return Ok(Vec::new());
+    }
+    appfs::build_runtime_cli_args(
+        args.appfs_app_id.clone(),
+        args.appfs_app_ids.clone(),
+        args.appfs_session.clone(),
+        AppfsBridgeCliArgs {
+            adapter_http_endpoint: args.adapter_http_endpoint.clone(),
+            adapter_http_timeout_ms: args.adapter_http_timeout_ms,
+            adapter_grpc_endpoint: args.adapter_grpc_endpoint.clone(),
+            adapter_grpc_timeout_ms: args.adapter_grpc_timeout_ms,
+            adapter_bridge_max_retries: args.adapter_bridge_max_retries,
+            adapter_bridge_initial_backoff_ms: args.adapter_bridge_initial_backoff_ms,
+            adapter_bridge_max_backoff_ms: args.adapter_bridge_max_backoff_ms,
+            adapter_bridge_circuit_breaker_failures: args.adapter_bridge_circuit_breaker_failures,
+            adapter_bridge_circuit_breaker_cooldown_ms: args
+                .adapter_bridge_circuit_breaker_cooldown_ms,
+        },
+        None,
+    )
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+fn wrap_mount_fs_if_appfs_enabled(
+    fs: Arc<Mutex<dyn FileSystem + Send>>,
+    args: &MountArgs,
+) -> Result<Arc<Mutex<dyn FileSystem + Send>>> {
+    if !has_appfs_mount_config(args) {
+        return Ok(fs);
+    }
+    let runtime_args = appfs_mount_runtime_args(args)?;
+    if runtime_args.is_empty() && !args.managed_appfs {
+        return Ok(fs);
+    }
+    Ok(appfs::mount_runtime::wrap_mount_runtime_filesystem(
+        fs,
+        appfs::mount_runtime::MountSnapshotReadThroughConfig {
+            runtimes: runtime_args,
+            managed: args.managed_appfs,
+        },
+    ))
+}
+
+fn validate_appfs_mount_mode(args: &MountArgs) -> Result<()> {
+    if args.managed_appfs
+        && (args.appfs_app_id.is_some()
+            || !args.appfs_app_ids.is_empty()
+            || args.appfs_session.is_some()
+            || args.adapter_http_endpoint.is_some()
+            || args.adapter_grpc_endpoint.is_some())
+    {
+        anyhow::bail!(
+            "--managed-appfs cannot be combined with explicit --appfs-app-id/--appfs-app/--appfs-session/adapter endpoint flags"
+        );
+    }
+
+    if !args.managed_appfs
+        && (args.appfs_session.is_some()
+            || args.adapter_http_endpoint.is_some()
+            || args.adapter_grpc_endpoint.is_some()
+            || !args.appfs_app_ids.is_empty())
+        && args.appfs_app_id.is_none()
+    {
+        anyhow::bail!(
+            "AppFS mount-side read-through requires --appfs-app-id when explicit AppFS bridge options are provided."
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct DaemonMutexFsAdapter {
+    inner: Arc<Mutex<dyn FileSystem + Send>>,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl FileSystem for DaemonMutexFsAdapter {
+    async fn lookup(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.lookup(parent_ino, name).await
+    }
+
+    async fn getattr(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.getattr(ino).await
+    }
+
+    async fn readlink(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<String>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readlink(ino).await
+    }
+
+    async fn readdir(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<String>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir(ino).await
+    }
+
+    async fn readdir_plus(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<agentfs_sdk::DirEntry>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir_plus(ino).await
+    }
+
+    async fn chmod(
+        &self,
+        ino: i64,
+        mode: u32,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chmod(ino, mode).await
+    }
+
+    async fn chown(
+        &self,
+        ino: i64,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chown(ino, uid, gid).await
+    }
+
+    async fn utimens(
+        &self,
+        ino: i64,
+        atime: agentfs_sdk::TimeChange,
+        mtime: agentfs_sdk::TimeChange,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.utimens(ino, atime, mtime).await
+    }
+
+    async fn open(
+        &self,
+        ino: i64,
+        flags: i32,
+    ) -> std::result::Result<agentfs_sdk::BoxedFile, agentfs_sdk::error::Error> {
+        self.inner.lock().await.open(ino, flags).await
+    }
+
+    async fn mkdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .mkdir(parent_ino, name, mode, uid, gid)
+            .await
+    }
+
+    async fn create_file(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<(agentfs_sdk::Stats, agentfs_sdk::BoxedFile), agentfs_sdk::error::Error>
+    {
+        self.inner
+            .lock()
+            .await
+            .create_file(parent_ino, name, mode, uid, gid)
+            .await
+    }
+
+    async fn mknod(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .mknod(parent_ino, name, mode, rdev, uid, gid)
+            .await
+    }
+
+    async fn symlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .symlink(parent_ino, name, target, uid, gid)
+            .await
+    }
+
+    async fn unlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.unlink(parent_ino, name).await
+    }
+
+    async fn rmdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.rmdir(parent_ino, name).await
+    }
+
+    async fn link(
+        &self,
+        ino: i64,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .link(ino, newparent_ino, newname)
+            .await
+    }
+
+    async fn rename(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .rename(oldparent_ino, oldname, newparent_ino, newname)
+            .await
+    }
+
+    async fn statfs(
+        &self,
+    ) -> std::result::Result<agentfs_sdk::FilesystemStats, agentfs_sdk::error::Error> {
+        self.inner.lock().await.statfs().await
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WinfspTokioFsAdapter {
+    inner: Arc<Mutex<dyn FileSystem + Send>>,
+}
+
+#[cfg(target_os = "windows")]
+#[async_trait::async_trait]
+impl FileSystem for WinfspTokioFsAdapter {
+    async fn lookup(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.lookup(parent_ino, name).await
+    }
+
+    async fn getattr(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<agentfs_sdk::Stats>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.getattr(ino).await
+    }
+
+    async fn readlink(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<String>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readlink(ino).await
+    }
+
+    async fn readdir(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<String>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir(ino).await
+    }
+
+    async fn readdir_plus(
+        &self,
+        ino: i64,
+    ) -> std::result::Result<Option<Vec<agentfs_sdk::DirEntry>>, agentfs_sdk::error::Error> {
+        self.inner.lock().await.readdir_plus(ino).await
+    }
+
+    async fn chmod(
+        &self,
+        ino: i64,
+        mode: u32,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chmod(ino, mode).await
+    }
+
+    async fn chown(
+        &self,
+        ino: i64,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.chown(ino, uid, gid).await
+    }
+
+    async fn utimens(
+        &self,
+        ino: i64,
+        atime: agentfs_sdk::TimeChange,
+        mtime: agentfs_sdk::TimeChange,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.utimens(ino, atime, mtime).await
+    }
+
+    async fn open(
+        &self,
+        ino: i64,
+        flags: i32,
+    ) -> std::result::Result<agentfs_sdk::BoxedFile, agentfs_sdk::error::Error> {
+        self.inner.lock().await.open(ino, flags).await
+    }
+
+    async fn mkdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .mkdir(parent_ino, name, mode, uid, gid)
+            .await
+    }
+
+    async fn create_file(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<(agentfs_sdk::Stats, agentfs_sdk::BoxedFile), agentfs_sdk::error::Error>
+    {
+        self.inner
+            .lock()
+            .await
+            .create_file(parent_ino, name, mode, uid, gid)
+            .await
+    }
+
+    async fn mknod(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .mknod(parent_ino, name, mode, rdev, uid, gid)
+            .await
+    }
+
+    async fn symlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .symlink(parent_ino, name, target, uid, gid)
+            .await
+    }
+
+    async fn unlink(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.unlink(parent_ino, name).await
+    }
+
+    async fn rmdir(
+        &self,
+        parent_ino: i64,
+        name: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner.lock().await.rmdir(parent_ino, name).await
+    }
+
+    async fn link(
+        &self,
+        ino: i64,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> std::result::Result<agentfs_sdk::Stats, agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .link(ino, newparent_ino, newname)
+            .await
+    }
+
+    async fn rename(
+        &self,
+        oldparent_ino: i64,
+        oldname: &str,
+        newparent_ino: i64,
+        newname: &str,
+    ) -> std::result::Result<(), agentfs_sdk::error::Error> {
+        self.inner
+            .lock()
+            .await
+            .rename(oldparent_ino, oldname, newparent_ino, newname)
+            .await
+    }
+
+    async fn statfs(
+        &self,
+    ) -> std::result::Result<agentfs_sdk::FilesystemStats, agentfs_sdk::error::Error> {
+        self.inner.lock().await.statfs().await
+    }
+}
+
+/// Mount the agent filesystem (Linux).
+#[cfg(target_os = "linux")]
+pub fn mount(args: MountArgs) -> Result<()> {
+    mount_with_ready(args, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn mount_with_ready(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    validate_appfs_mount_mode(&args)?;
+    if has_appfs_mount_config(&args) && !matches!(args.backend, MountBackend::Fuse) {
+        anyhow::bail!(
+            "AppFS snapshot read-through is currently supported only with --backend fuse on Linux."
+        );
+    }
+    match args.backend {
+        MountBackend::Fuse => mount_fuse(args, ready_tx),
+        MountBackend::Nfs => {
+            let rt = crate::get_runtime();
+            rt.block_on(mount_nfs_backend(args, ready_tx))
+        }
+        MountBackend::Winfsp => anyhow::bail!(
+            "WinFsp mounting is only supported on Windows.\n\
+             Use --backend fuse or --backend nfs on Linux."
+        ),
+    }
+}
+
+/// Mount the agent filesystem (macOS).
+#[cfg(target_os = "macos")]
+pub fn mount(args: MountArgs) -> Result<()> {
+    mount_with_ready(args, None)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn mount_with_ready(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    validate_appfs_mount_mode(&args)?;
+    match args.backend {
+        MountBackend::Fuse => {
+            anyhow::bail!(
+                "FUSE mounting is not supported on macOS.\n\
+                 Use --backend nfs (default) or `agentfs nfs` instead."
+            );
+        }
+        MountBackend::Nfs => {
+            let rt = crate::get_runtime();
+            rt.block_on(mount_nfs_backend(args, ready_tx))
+        }
+        MountBackend::Winfsp => {
+            anyhow::bail!(
+                "WinFsp mounting is only supported on Windows.\n\
+                 Use --backend nfs on macOS."
+            );
+        }
+    }
+}
+
+/// Mount the agent filesystem (Windows).
+#[cfg(target_os = "windows")]
+pub fn mount(args: MountArgs) -> Result<()> {
+    mount_with_ready(args, None)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn mount_with_ready(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    validate_appfs_mount_mode(&args)?;
+    match args.backend {
+        MountBackend::Fuse => {
+            anyhow::bail!(
+                "FUSE mounting is not supported on Windows.\n\
+                 Use --backend winfsp instead."
+            );
+        }
+        MountBackend::Nfs => {
+            anyhow::bail!(
+                "NFS mounting is not supported on Windows.\n\
+                 Use --backend winfsp instead."
+            );
+        }
+        MountBackend::Winfsp => {
+            let rt = crate::get_runtime();
+            rt.block_on(mount_winfsp_backend(args, ready_tx))
+        }
+    }
+}
+
+/// Mount the agent filesystem using WinFsp (Windows only).
+#[cfg(target_os = "windows")]
+async fn mount_winfsp_backend(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    use parking_lot::Mutex;
+
+    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+
+    // WinFsp requires the mountpoint to NOT exist - it will create the directory itself.
+    // This is opposite to FUSE/NFS which require the directory to exist.
+    if args.mountpoint.exists() {
+        anyhow::bail!(
+            "Mountpoint already exists: {}. WinFsp requires a non-existent path - it will create the directory.",
+            args.mountpoint.display()
+        );
+    }
+    let mount_parent = args
+        .mountpoint
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "WinFsp mountpoint must include an existing parent directory: {}",
+                args.mountpoint.display()
+            )
+        })?;
+    if !mount_parent.exists() {
+        anyhow::bail!(
+            "WinFsp mountpoint parent does not exist: {}",
+            mount_parent.display()
+        );
+    }
+    if !mount_parent.is_dir() {
+        anyhow::bail!(
+            "WinFsp mountpoint parent is not a directory: {}",
+            mount_parent.display()
+        );
+    }
+
+    // Don't use canonicalize - it adds the \\?\ prefix which WinFsp doesn't accept,
+    // and it would fail anyway if the path doesn't exist.
+    let mountpoint = args.mountpoint.clone();
+
+    // WinFsp FileSystemName field is limited to 16 WCHARs, so use just "agentfs"
+    let fsname = "agentfs".to_string();
+
+    // Open AgentFS
+    let agentfs = match open_agentfs(opts).await {
+        Ok(fs) => fs,
+        Err(SdkError::SchemaVersionMismatch { found, expected }) => {
+            exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let fs: Arc<tokio::sync::Mutex<dyn agentfs_sdk::FileSystem + Send>> =
+        overlay_mount_filesystem(&agentfs).await?;
+    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
+    let fs: Arc<Mutex<dyn agentfs_sdk::FileSystem + Send>> =
+        Arc::new(Mutex::new(WinfspTokioFsAdapter { inner: fs }));
+
+    let mount_opts = MountOpts {
+        mountpoint: mountpoint.clone(),
+        backend: MountBackend::Winfsp,
+        fsname,
+        uid: args.uid,
+        gid: args.gid,
+        allow_other: args.allow_other,
+        allow_root: args.allow_root,
+        auto_unmount: args.auto_unmount,
+        lazy_unmount: false,
+        timeout: std::time::Duration::from_secs(10),
+    };
+
+    // Call winfsp mount directly
+    let _mount_handle = crate::mount::winfsp::mount_winfsp(fs, mount_opts).await?;
+    notify_mount_ready(ready_tx.as_ref(), Ok(()));
+
+    eprintln!("Mounted at {}", mountpoint.display());
+    eprintln!("Press Ctrl+C to unmount and exit.");
+
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+
+    // MountHandle will be dropped automatically and unmount
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn overlay_mount_filesystem(
+    agentfs: &SdkAgentFS,
+) -> Result<Arc<tokio::sync::Mutex<dyn agentfs_sdk::FileSystem + Send>>> {
+    if let Some(base_path) = agentfs.is_overlay_enabled().await? {
+        eprintln!("Using overlay filesystem with base: {}", base_path);
+        let hostfs = HostFS::new(&base_path)?;
+        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs.clone());
+        overlay.load().await?;
+        Ok(Arc::new(tokio::sync::Mutex::new(overlay)))
+    } else {
+        Ok(Arc::new(tokio::sync::Mutex::new(agentfs.fs.clone())))
+    }
+}
+
+/// Mount the agent filesystem using FUSE (Linux only).
+#[cfg(target_os = "linux")]
+fn mount_fuse(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+
+    // Check schema version before daemonizing. This allows us to show the error
+    // message to the user directly, rather than having it appear in daemon logs.
+    {
+        let rt = crate::get_runtime();
+        let db_path = opts.db_path()?;
+        let result: Result<(), SdkError> = rt.block_on(async {
+            let db = turso::Builder::new_local(&db_path).build().await?;
+            let conn = db.connect()?;
+            agentfs_sdk::schema::check_schema_version(&conn).await?;
+            Ok(())
+        });
+        if let Err(SdkError::SchemaVersionMismatch { found, expected }) = result {
+            exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
+        }
+    }
+
+    let fsname = format!(
+        "agentfs:{}",
+        std::fs::canonicalize(&args.id_or_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| args.id_or_path.clone())
+    );
+
+    let mountpoint = canonicalize_mountpoint_with_recovery(&args.mountpoint)?;
+    let mountpoint_ino = {
+        use anyhow::Context as _;
+        std::fs::metadata(mountpoint.clone())
+            .context("Failed to get mountpoint inode")?
+            .ino()
+    };
+
+    let fuse_opts = FuseMountOptions {
+        mountpoint: args.mountpoint.clone(),
+        auto_unmount: args.auto_unmount,
+        allow_root: args.allow_root,
+        allow_other: args.allow_other,
+        fsname: fsname.clone(),
+        uid: args.uid,
+        gid: args.gid,
+    };
+
+    if args.foreground {
+        let rt = crate::get_runtime();
+        let agentfs = match rt.block_on(open_agentfs(opts)) {
+            Ok(fs) => fs,
+            Err(SdkError::SchemaVersionMismatch { found, expected }) => {
+                exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Check for overlay configuration
+        let fs: Arc<Mutex<dyn FileSystem + Send>> = rt.block_on(async {
+            // Query base_path in a separate scope so connection is released before overlay load.
+            let base_path: Option<String> = {
+                let conn = agentfs.get_connection().await?;
+                let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
+                match conn.query(query, ()).await {
+                    Ok(mut rows) => {
+                        if let Ok(Some(row)) = rows.next().await {
+                            row.get_value(0).ok().and_then(|v| {
+                                if let Value::Text(s) = v {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None, // Table doesn't exist or query failed
+                }
+            }; // conn is dropped here
+
+            if let Some(base_path) = base_path {
+                // Create OverlayFS with HostFS base, loading existing whiteouts
+                eprintln!("Using overlay filesystem with base: {}", base_path);
+                let hostfs = HostFS::new(&base_path)?;
+                let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
+                let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+                overlay.load().await?; // Load persisted whiteouts and origin mappings
+                Ok::<Arc<Mutex<dyn FileSystem + Send>>, anyhow::Error>(Arc::new(Mutex::new(
+                    overlay,
+                )))
+            } else {
+                // Plain AgentFS
+                Ok(Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>)
+            }
+        })?;
+        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
+
+        let mount_opts = MountOpts {
+            mountpoint: mountpoint.clone(),
+            backend: MountBackend::Fuse,
+            fsname: fsname.clone(),
+            uid: args.uid,
+            gid: args.gid,
+            allow_other: args.allow_other,
+            allow_root: args.allow_root,
+            auto_unmount: args.auto_unmount,
+            // Prefer lazy detach on Ctrl+C path to reduce stale mountpoint risk.
+            lazy_unmount: true,
+            timeout: std::time::Duration::from_secs(10),
+        };
+
+        rt.block_on(async {
+            let _mount_handle = mount_fs(fs, mount_opts).await?;
+            notify_mount_ready(ready_tx.as_ref(), Ok(()));
+            eprintln!("Mounted at {}", mountpoint.display());
+            eprintln!("Press Ctrl+C to unmount and exit.");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = wait_for_external_unmount(mountpoint.clone()) => {
+                    eprintln!(
+                        "Mountpoint {} was unmounted externally; exiting foreground mode.",
+                        mountpoint.display()
+                    );
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        return Ok(());
+    }
+
+    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+    let id_or_path = args.id_or_path.clone();
+    let mount = move || {
+        let rt = crate::get_runtime();
+        let agentfs = match rt.block_on(open_agentfs(opts)) {
+            Ok(fs) => fs,
+            Err(SdkError::SchemaVersionMismatch { found, expected }) => {
+                exit_schema_version_mismatch(&found, &expected, &id_or_path);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Check for overlay configuration
+        let fs: Arc<Mutex<dyn FileSystem + Send>> = rt.block_on(async {
+            // Query base_path in a separate scope so connection is released
+            let base_path: Option<String> = {
+                let conn = agentfs.get_connection().await?;
+                let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
+                match conn.query(query, ()).await {
+                    Ok(mut rows) => {
+                        if let Ok(Some(row)) = rows.next().await {
+                            row.get_value(0).ok().and_then(|v| {
+                                if let Value::Text(s) = v {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None, // Table doesn't exist or query failed
+                }
+            }; // conn is dropped here
+
+            if let Some(base_path) = base_path {
+                // Create OverlayFS with HostFS base, loading existing whiteouts
+                eprintln!("Using overlay filesystem with base: {}", base_path);
+                let hostfs = HostFS::new(&base_path)?;
+                let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
+                let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+                overlay.load().await?; // Load persisted whiteouts and origin mappings
+                Ok::<Arc<Mutex<dyn FileSystem + Send>>, anyhow::Error>(Arc::new(Mutex::new(
+                    overlay,
+                )))
+            } else {
+                // Plain AgentFS
+                Ok(Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>)
+            }
+        })?;
+        let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
+        let fs_adapter = DaemonMutexFsAdapter { inner: fs };
+        let fs_arc: Arc<dyn FileSystem> = Arc::new(fs_adapter);
+
+        crate::fuse::mount(fs_arc, fuse_opts, rt)
+    };
+
+    crate::daemon::daemonize(
+        mount,
+        move || is_mounted(&mountpoint),
+        std::time::Duration::from_secs(10),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn canonicalize_mountpoint_with_recovery(mountpoint: &Path) -> Result<PathBuf> {
+    match std::fs::canonicalize(mountpoint) {
+        Ok(path) => Ok(path),
+        Err(err) if err.raw_os_error() == Some(libc::ENOTCONN) => {
+            eprintln!(
+                "Detected stale FUSE mountpoint state at {} (ENOTCONN); attempting lazy unmount recovery.",
+                mountpoint.display()
+            );
+            lazy_unmount_fuse(mountpoint)?;
+            std::fs::canonicalize(mountpoint).with_context(|| {
+                format!(
+                    "Mountpoint {} is still unavailable after stale mountpoint recovery",
+                    mountpoint.display()
+                )
+            })
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            anyhow::bail!("Mountpoint does not exist: {}", mountpoint.display());
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to access mountpoint {}", mountpoint.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lazy_unmount_fuse(mountpoint: &Path) -> Result<()> {
+    const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
+    for cmd in FUSERMOUNT_COMMANDS {
+        let result = std::process::Command::new(cmd)
+            .args(["-uz"])
+            .arg(mountpoint.as_os_str())
+            .status();
+
+        match result {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => continue,  // Command ran but failed, try next.
+            Err(_) => continue, // Command not found, try next.
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to auto-recover stale mountpoint {}. Try: fusermount -uz {}",
+        mountpoint.display(),
+        mountpoint.display()
+    )
+}
+
+/// Mount the agent filesystem using NFS over localhost.
+#[cfg(unix)]
+async fn mount_nfs_backend(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
+    use crate::cmd::init::open_agentfs;
+
+    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+
+    if !args.mountpoint.exists() {
+        anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
+    }
+
+    let mountpoint = std::fs::canonicalize(args.mountpoint.clone())?;
+
+    let fsname = format!(
+        "agentfs:{}",
+        std::fs::canonicalize(&args.id_or_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| args.id_or_path.clone())
+    );
+
+    // Open AgentFS
+    let agentfs = match open_agentfs(opts).await {
+        Ok(fs) => fs,
+        Err(SdkError::SchemaVersionMismatch { found, expected }) => {
+            exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Check for overlay configuration
+    // Query base_path in a separate scope so connection is released before load_whiteouts
+    let base_path: Option<String> = {
+        let conn = agentfs.get_connection().await?;
+        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
+        match conn.query(query, ()).await {
+            Ok(mut rows) => {
+                if let Ok(Some(row)) = rows.next().await {
+                    row.get_value(0).ok().and_then(|v| {
+                        if let Value::Text(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None, // Table doesn't exist or query failed
+        }
+    }; // conn is dropped here
+
+    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(base_path) = base_path {
+        // Create OverlayFS with HostFS base, loading existing whiteouts
+        eprintln!("Using overlay filesystem with base: {}", base_path);
+        let hostfs = HostFS::new(&base_path)?;
+        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
+        overlay.load().await?; // Load persisted whiteouts and origin mappings
+        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
+    } else {
+        // Plain AgentFS
+        Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
+    };
+    let fs = wrap_mount_fs_if_appfs_enabled(fs, &args)?;
+
+    if args.foreground {
+        // Use the unified mount API for foreground mode
+        let mount_opts = MountOpts {
+            mountpoint: mountpoint.clone(),
+            backend: MountBackend::Nfs,
+            fsname,
+            uid: args.uid,
+            gid: args.gid,
+            allow_other: args.allow_other,
+            allow_root: args.allow_root,
+            auto_unmount: args.auto_unmount,
+            lazy_unmount: true,
+            timeout: std::time::Duration::from_secs(10),
+        };
+
+        let _mount_handle = mount_fs(fs, mount_opts).await?;
+        notify_mount_ready(ready_tx.as_ref(), Ok(()));
+
+        eprintln!("Mounted at {}", mountpoint.display());
+        eprintln!("Press Ctrl+C to unmount and exit.");
+        tokio::signal::ctrl_c().await?;
+
+        // Handle drops automatically when we exit this scope
+    } else {
+        // Daemon mode: use manual NFS server setup for persistent background operation
+        let nfs = AgentNFS::new(fs);
+        let port = find_available_port(DEFAULT_NFS_PORT)?;
+
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let listener = crate::nfsserve::tcp::NFSTcpListener::bind(&bind_addr, nfs)
+            .await
+            .context("Failed to bind NFS server")?;
+
+        eprintln!("Starting NFS server on 127.0.0.1:{}", port);
+
+        tokio::spawn(async move {
+            if let Err(e) = listener.handle_forever().await {
+                eprintln!("NFS server error: {}", e);
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        nfs_mount(port, &mountpoint)?;
+
+        eprintln!("Mounted at {}", mountpoint.display());
+        eprintln!(
+            "Running in background. Use 'umount {}' to unmount.",
+            mountpoint.display()
+        );
+
+        // Block forever (server runs in background task)
+        std::future::pending::<()>().await;
+    }
+
+    Ok(())
+}
+
+/// Find an available TCP port starting from the given port.
+#[cfg(unix)]
+fn find_available_port(start_port: u32) -> Result<u32> {
+    for port in start_port..start_port + 100 {
+        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!(
+        "Could not find an available port in range {}-{}",
+        start_port,
+        start_port + 100
+    );
+}
+
+/// Mount the NFS filesystem (Linux version).
+#[cfg(target_os = "linux")]
+fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
+    let output = Command::new("mount")
+        .args([
+            "-t",
+            "nfs",
+            "-o",
+            &format!(
+                "vers=3,tcp,port={},mountport={},nolock,soft,timeo=10,retrans=2",
+                port, port
+            ),
+            "127.0.0.1:/",
+            mountpoint.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute mount command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to mount NFS: {}. Make sure NFS client tools are installed (nfs-common on Debian/Ubuntu, nfs-utils on Fedora/RHEL) and you have permission to mount (try running with sudo).",
+            stderr.trim()
+        );
+    }
+
+    Ok(())
+}
+
+/// Mount the NFS filesystem (macOS version).
+#[cfg(target_os = "macos")]
+fn nfs_mount(port: u32, mountpoint: &Path) -> Result<()> {
+    let output = Command::new("/sbin/mount_nfs")
+        .args([
+            "-o",
+            &format!(
+                "locallocks,vers=3,tcp,port={},mountport={},soft,timeo=10,retrans=2",
+                port, port
+            ),
+            "127.0.0.1:/",
+            mountpoint.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute mount_nfs")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to mount NFS: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Check if a path is a mountpoint by comparing device IDs
+#[cfg(target_os = "linux")]
+fn is_mounted(path: &std::path::Path) -> bool {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("/"),
+    };
+
+    let parent_meta = match std::fs::metadata(parent) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    // Different device IDs means it's a mountpoint
+    path_meta.dev() != parent_meta.dev()
+}
+
+/// Wait until a mounted path is externally unmounted.
+///
+/// This keeps foreground mount mode compatible with test harnesses that
+/// unmount using `fusermount -u` and then wait for the foreground process.
+#[cfg(target_os = "linux")]
+async fn wait_for_external_unmount(mountpoint: PathBuf) {
+    let mut consecutive_not_mounted = 0u8;
+    loop {
+        if is_mounted(&mountpoint) {
+            consecutive_not_mounted = 0;
+        } else {
+            consecutive_not_mounted = consecutive_not_mounted.saturating_add(1);
+            // Require multiple consecutive misses to avoid transient mount-state races.
+            if consecutive_not_mounted >= 3 {
+                return;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// List all currently mounted agentfs filesystems (Linux)
+#[cfg(target_os = "linux")]
+pub fn list_mounts<W: Write>(out: &mut W) {
+    let mounts = get_mounts();
+
+    if mounts.is_empty() {
+        let _ = writeln!(out, "No agentfs filesystems mounted.");
+        return;
+    }
+
+    // Calculate column widths
+    let id_width = mounts.iter().map(|m| m.id.len()).max().unwrap_or(2).max(2);
+    let mount_width = mounts
+        .iter()
+        .map(|m| m.mountpoint.to_string_lossy().len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+
+    // Print header
+    let _ = writeln!(
+        out,
+        "{:<id_width$}  {:<mount_width$}",
+        "ID",
+        "MOUNTPOINT",
+        id_width = id_width,
+        mount_width = mount_width
+    );
+
+    // Print mounts
+    for mount in &mounts {
+        let _ = writeln!(
+            out,
+            "{:<id_width$}  {:<mount_width$}",
+            mount.id,
+            mount.mountpoint.display(),
+            id_width = id_width,
+            mount_width = mount_width
+        );
+    }
+}
+
+/// List all currently mounted agentfs filesystems (macOS stub)
+#[cfg(target_os = "macos")]
+pub fn list_mounts<W: std::io::Write>(out: &mut W) {
+    let _ = writeln!(out, "Mount listing is only available on Linux.");
+}
+
+/// Check if a mount point is in use by any process.
+///
+/// Scans /proc to find processes with open files or current working directory
+/// on the given mountpoint.
+#[cfg(target_os = "linux")]
+fn is_mount_in_use(mountpoint: &Path) -> bool {
+    let mountpoint = match mountpoint.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false, // Can't check, assume not in use
+    };
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only check numeric directories (PIDs)
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let pid_path = entry.path();
+
+        // Check cwd
+        if let Ok(cwd) = std::fs::read_link(pid_path.join("cwd")) {
+            if cwd.starts_with(&mountpoint) {
+                return true;
+            }
+        }
+
+        // Check open file descriptors
+        let fd_dir = pid_path.join("fd");
+        if let Ok(fds) = std::fs::read_dir(&fd_dir) {
+            for fd_entry in fds.flatten() {
+                if let Ok(target) = std::fs::read_link(fd_entry.path()) {
+                    if target.starts_with(&mountpoint) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Unmount a FUSE filesystem.
+///
+/// Tries fusermount3 first, then falls back to fusermount.
+#[cfg(target_os = "linux")]
+fn unmount_fuse(mountpoint: &Path) -> Result<()> {
+    const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
+
+    for cmd in FUSERMOUNT_COMMANDS {
+        let result = std::process::Command::new(cmd)
+            .args(["-u"])
+            .arg(mountpoint.as_os_str())
+            .status();
+
+        match result {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => continue,  // Command ran but failed, try next
+            Err(_) => continue, // Command not found, try next
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to unmount {}. You may need to unmount manually with: fusermount -u {}",
+        mountpoint.display(),
+        mountpoint.display()
+    )
+}
+
+/// Ask for user confirmation.
+#[cfg(target_os = "linux")]
+fn confirm(prompt: &str) -> bool {
+    eprint!("{} ", prompt);
+    let _ = io::stderr().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Prune unused agentfs mount points.
+///
+/// Finds all mounted agentfs filesystems that are not in use by any process
+/// and unmounts them.
+#[cfg(target_os = "linux")]
+pub fn prune_mounts(force: bool) -> Result<()> {
+    let mounts = get_mounts();
+
+    // Get active session IDs to exclude from pruning
+    let active_sessions = super::ps::active_session_ids();
+
+    // Find unused mounts (not in use by any process and no active session)
+    let unused_mounts: Vec<&Mount> = mounts
+        .iter()
+        .filter(|m| !is_mount_in_use(&m.mountpoint) && !active_sessions.contains(&m.id))
+        .collect();
+
+    if unused_mounts.is_empty() {
+        println!("Nothing to prune.");
+        return Ok(());
+    }
+
+    // Display what will be unmounted
+    println!("The following unused mount points will be unmounted:");
+    println!();
+    for mount in &unused_mounts {
+        println!("  {} -> {}", mount.id, mount.mountpoint.display());
+    }
+    println!();
+
+    // Ask for confirmation unless --force
+    if !force && !confirm("Are you sure? (y/N)") {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // Unmount each unused mount
+    let mut errors = Vec::new();
+    for mount in &unused_mounts {
+        print!("Unmounting {}... ", mount.mountpoint.display());
+        let _ = io::stdout().flush();
+
+        match unmount_fuse(&mount.mountpoint) {
+            Ok(()) => println!("done"),
+            Err(e) => {
+                println!("failed");
+                errors.push(format!("{}: {}", mount.mountpoint.display(), e));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        eprintln!();
+        eprintln!("Some mounts could not be unmounted:");
+        for error in &errors {
+            eprintln!("  {}", error);
+        }
+        anyhow::bail!("Failed to unmount {} mount(s)", errors.len());
+    }
+
+    Ok(())
+}
+
+/// Prune unused agentfs mount points (macOS stub).
+#[cfg(target_os = "macos")]
+pub fn prune_mounts(_force: bool) -> Result<()> {
+    anyhow::bail!("Mount pruning is only available on Linux")
+}
+
+#[cfg(test)]
+mod appfs_mount_mode_tests {
+    use super::{validate_appfs_mount_mode, MountArgs, MountBackend};
+    use std::path::PathBuf;
+
+    fn base_args() -> MountArgs {
+        MountArgs {
+            id_or_path: "agent".to_string(),
+            mountpoint: PathBuf::from("/tmp/mount"),
+            auto_unmount: false,
+            allow_root: false,
+            allow_other: false,
+            foreground: false,
+            uid: None,
+            gid: None,
+            backend: MountBackend::default(),
+            appfs_app_id: None,
+            appfs_app_ids: Vec::new(),
+            managed_appfs: false,
+            appfs_session: None,
+            adapter_http_endpoint: None,
+            adapter_http_timeout_ms: 5000,
+            adapter_grpc_endpoint: None,
+            adapter_grpc_timeout_ms: 5000,
+            adapter_bridge_max_retries: 2,
+            adapter_bridge_initial_backoff_ms: 100,
+            adapter_bridge_max_backoff_ms: 1000,
+            adapter_bridge_circuit_breaker_failures: 5,
+            adapter_bridge_circuit_breaker_cooldown_ms: 3000,
+        }
+    }
+
+    #[test]
+    fn validate_mount_mode_rejects_managed_plus_explicit_appfs_flags() {
+        let mut args = base_args();
+        args.managed_appfs = true;
+        args.appfs_app_id = Some("aiim".to_string());
+
+        let err = validate_appfs_mount_mode(&args).expect_err("managed+explicit must fail");
+        assert!(err
+            .to_string()
+            .contains("--managed-appfs cannot be combined"));
+    }
+
+    #[test]
+    fn validate_mount_mode_rejects_explicit_bridge_without_primary_app() {
+        let mut args = base_args();
+        args.adapter_http_endpoint = Some("http://127.0.0.1:8080".to_string());
+
+        let err = validate_appfs_mount_mode(&args).expect_err("bridge without app id must fail");
+        assert!(err
+            .to_string()
+            .contains("requires --appfs-app-id when explicit AppFS bridge options are provided"));
+    }
+
+    #[test]
+    fn validate_mount_mode_accepts_managed_registry_only() {
+        let mut args = base_args();
+        args.managed_appfs = true;
+        validate_appfs_mount_mode(&args).expect("managed-only config should be accepted");
+    }
+}
+
+/// List all currently mounted agentfs filesystems (Windows stub).
+#[cfg(target_os = "windows")]
+pub fn list_mounts<W: std::io::Write>(out: &mut W) {
+    let _ = writeln!(out, "Mount listing is only available on Linux.");
+}
+
+/// Prune unused agentfs mount points (Windows stub).
+#[cfg(target_os = "windows")]
+pub fn prune_mounts(_force: bool) -> Result<()> {
+    anyhow::bail!("Mount pruning is only available on Linux")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_overlay_tests {
+    use super::overlay_mount_filesystem;
+    use agentfs_sdk::{agentfs_dir, AgentFS, AgentFSOptions, BoxedFile, FileSystem, Stats};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).expect("create destination dir");
+        for entry in fs::read_dir(src).expect("read source dir") {
+            let entry = entry.expect("dir entry");
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_dir_recursive(&src_path, &dst_path);
+            } else {
+                fs::copy(&src_path, &dst_path).expect("copy file");
+            }
+        }
+    }
+
+    fn cleanup_agent(id: &str) {
+        for suffix in [".db", ".db-shm", ".db-wal"] {
+            let _ = fs::remove_file(agentfs_dir().join(format!("{id}{suffix}")));
+        }
+    }
+
+    async fn lookup_path(fs: &dyn FileSystem, path: &str) -> Option<Stats> {
+        let mut current = fs.getattr(1).await.expect("root getattr")?;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            current = fs
+                .lookup(current.ino, segment)
+                .await
+                .expect("lookup path segment")?;
+        }
+        Some(current)
+    }
+
+    async fn read_file(fs: &dyn FileSystem, path: &str) -> Vec<u8> {
+        let stats = lookup_path(fs, path).await.expect("lookup file");
+        let file: BoxedFile = fs.open(stats.ino, 0).await.expect("open file");
+        file.pread(0, stats.size as u64)
+            .await
+            .expect("read file bytes")
+    }
+
+    #[tokio::test]
+    async fn winfsp_overlay_uses_hostfs_base_without_hydrating_delta() {
+        let fixture_root = TempDir::new().expect("fixture tempdir");
+        let app_dir = fixture_root.path().join("aiim");
+        let source_fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/appfs/fixtures/aiim");
+        copy_dir_recursive(&source_fixture, &app_dir);
+
+        let id = format!("winfsp-hydrate-{}", uuid::Uuid::new_v4().simple());
+        let agent = AgentFS::open(AgentFSOptions::with_id(&id).with_base(fixture_root.path()))
+            .await
+            .expect("open overlay agent");
+
+        agent.fs.mkdir("/aiim", 0, 0).await.expect("seed app dir");
+        agent
+            .fs
+            .mkdir("/aiim/_meta", 0, 0)
+            .await
+            .expect("seed meta dir");
+        let (_, file) = agent
+            .fs
+            .create_file("/aiim/custom.txt", 0o644, 0, 0)
+            .await
+            .expect("seed delta file");
+        file.pwrite(0, b"delta-only")
+            .await
+            .expect("write delta file");
+        file.fsync().await.expect("fsync delta file");
+
+        let (_, manifest_override) = agent
+            .fs
+            .create_file("/aiim/_meta/manifest.res.json", 0o644, 0, 0)
+            .await
+            .expect("create override manifest");
+        manifest_override
+            .pwrite(0, b"{\"override\":true}\n")
+            .await
+            .expect("write override manifest");
+        manifest_override
+            .fsync()
+            .await
+            .expect("fsync override manifest");
+
+        let fs = overlay_mount_filesystem(&agent)
+            .await
+            .expect("create overlay mount filesystem");
+        let fs = fs.lock().await;
+
+        assert!(
+            lookup_path(&*fs, "/aiim/chats/chat-001/messages.res.jsonl")
+                .await
+                .is_some(),
+            "base snapshot should be visible through overlay view"
+        );
+        assert!(
+            agent
+                .fs
+                .stat("/aiim/chats/chat-001/messages.res.jsonl")
+                .await
+                .expect("stat delta snapshot")
+                .is_none(),
+            "base snapshot should not be copied into delta"
+        );
+        let manifest = read_file(&*fs, "/aiim/_meta/manifest.res.json").await;
+        assert_eq!(
+            std::str::from_utf8(&manifest).expect("manifest utf8"),
+            "{\"override\":true}\n",
+            "delta override should win over base"
+        );
+        let delta_only = agent
+            .fs
+            .read_file("/aiim/custom.txt")
+            .await
+            .expect("read delta file")
+            .expect("delta file bytes");
+        assert_eq!(
+            std::str::from_utf8(&delta_only).expect("delta utf8"),
+            "delta-only"
+        );
+
+        drop(agent);
+        cleanup_agent(&id);
+    }
+}
+
+/// Print schema version mismatch error and exit.
+fn exit_schema_version_mismatch(found: &str, expected: &str, id_or_path: &str) -> ! {
+    eprintln!("Error: Filesystem `{}` requires migration", id_or_path);
+    eprintln!();
+    eprintln!(
+        "Found schema version {}, but this version of agentfs requires {}.",
+        found, expected
+    );
+    eprintln!();
+    eprintln!("To upgrade, run:");
+    eprintln!();
+    eprintln!("    agentfs migrate {}", id_or_path);
+    eprintln!();
+    std::process::exit(1);
+}

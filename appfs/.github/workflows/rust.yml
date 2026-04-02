@@ -1,0 +1,676 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Required AppFS gate: in-process runtime path + connector required set (linux).
+  appfs-contract-gate:
+    name: AppFS Contract Gate (linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Build CLI
+      run: cargo build --verbose
+
+    - name: Run AppFS v0.1 static contract suite (baseline)
+      env:
+        APPFS_CONTRACT_TESTS: "1"
+        APPFS_STATIC_FIXTURE: "1"
+        APPFS_ROOT: ${{ github.workspace }}/examples/appfs/fixtures
+      run: sh ./tests/test-appfs-contract.sh
+
+    - name: Run AppFS v0.1 live contract suite (baseline smoke)
+      env:
+        APPFS_CONTRACT_TESTS: "1"
+        APPFS_TIMEOUT_SEC: "30"
+      run: sh ./tests/appfs/run-live-with-adapter.sh
+
+    - name: Run AppFS connector contract suite (required set)
+      env:
+        APPFS_CONNECTOR_CONTRACT_TESTS: "1"
+        APPFS_CONNECTOR_STRICT: "1"
+        APPFS_BUILD_BEFORE_RUN: "0"
+      run: sh ./tests/test-appfs-connector-contract.sh
+
+    - name: Run AppFS structure contract suite
+      env:
+        APPFS_STRUCTURE_TESTS: "1"
+        APPFS_BUILD_BEFORE_RUN: "0"
+      run: sh ./tests/test-appfs-structure-contract.sh
+
+  # Legacy baseline bridge gate (required): v0.1 live HTTP bridge smoke
+  appfs-contract-gate-http-bridge:
+    # Keep check-run name stable for branch protection; semantic: http legacy baseline gate.
+    name: AppFS Contract Gate (linux, http bridge)
+    runs-on: ubuntu-latest
+    needs: appfs-contract-gate
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "latest"
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Run HTTP bridge unit tests
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        uv run python -m unittest discover -s tests -t . -p "test_*.py"
+
+    - name: Start HTTP bridge
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        APPFS_BRIDGE_FAIL_NEXT_SUBMIT_ACTION=4 \
+        APPFS_BRIDGE_FAIL_PATH_PREFIX=/contacts/resilience- \
+        APPFS_BRIDGE_FAIL_HTTP_STATUS=503 \
+        nohup uv run python bridge_server.py >"$RUNNER_TEMP/appfs-http-bridge.log" 2>&1 &
+        echo $! >"$RUNNER_TEMP/appfs-http-bridge.pid"
+        uv run python - <<'PY'
+        import socket
+        import sys
+        import time
+
+        for _ in range(30):
+            sock = socket.socket()
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", 8080))
+                sock.close()
+                sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("HTTP bridge did not become ready on 127.0.0.1:8080", file=sys.stderr)
+        sys.exit(1)
+        PY
+
+    - name: Run AppFS v0.1 live contract suite (legacy baseline, HTTP bridge)
+      env:
+        APPFS_CONTRACT_TESTS: "1"
+        APPFS_TIMEOUT_SEC: "30"
+        APPFS_ADAPTER_HTTP_ENDPOINT: "http://127.0.0.1:8080"
+        APPFS_ADAPTER_BRIDGE_MAX_RETRIES: "1"
+        APPFS_ADAPTER_BRIDGE_INITIAL_BACKOFF_MS: "50"
+        APPFS_ADAPTER_BRIDGE_MAX_BACKOFF_MS: "200"
+        APPFS_ADAPTER_BRIDGE_CIRCUIT_BREAKER_FAILURES: "2"
+        APPFS_ADAPTER_BRIDGE_CIRCUIT_BREAKER_COOLDOWN_MS: "4000"
+        APPFS_BRIDGE_RESILIENCE_CONTRACT: "1"
+        APPFS_BRIDGE_RESILIENCE_COOLDOWN_WAIT_SEC: "4"
+      run: sh ./tests/appfs/run-live-with-adapter.sh
+
+    - name: Dump HTTP bridge log on failure
+      if: failure()
+      run: tail -n 200 "$RUNNER_TEMP/appfs-http-bridge.log" || true
+
+    - name: Stop HTTP bridge
+      if: always()
+      run: |
+        if [ -f "$RUNNER_TEMP/appfs-http-bridge.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/appfs-http-bridge.pid")" 2>/dev/null || true
+        fi
+
+  # Informational AppFS bridge signal: CT2 subset over HTTP bridge path.
+  # Required gate is the in-process job above; bridge jobs are non-blocking diagnostics.
+  appfs-contract-signal-http-bridge:
+    name: AppFS Contract Signal (informational, linux, http bridge)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: appfs-contract-gate
+    if: always()
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "latest"
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Build CLI
+      run: cargo build --verbose
+
+    - name: Run HTTP bridge unit tests
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        uv run python -m unittest discover -s tests -t . -p "test_*.py"
+
+    - name: Start HTTP bridge
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        nohup uv run python bridge_server.py >"$RUNNER_TEMP/appfs-http-bridge.log" 2>&1 &
+        echo $! >"$RUNNER_TEMP/appfs-http-bridge.pid"
+        uv run python - <<'PY'
+        import socket
+        import sys
+        import time
+
+        for _ in range(30):
+            sock = socket.socket()
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", 8080))
+                sock.close()
+                sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("HTTP bridge did not become ready on 127.0.0.1:8080", file=sys.stderr)
+        sys.exit(1)
+        PY
+
+    - name: Run AppFS connector contract subset (HTTP bridge mode, informational)
+      id: http_connector_subset
+      continue-on-error: true
+      env:
+        APPFS_CONNECTOR_CONTRACT_TESTS: "1"
+        APPFS_CONNECTOR_STRICT: "1"
+        APPFS_BUILD_BEFORE_RUN: "0"
+        APPFS_CONNECTOR_REQUIRED_CASES: "ct2-002,ct2-003,ct2-004,ct2-005,ct2-007,ct2-008,ct2-009"
+        APPFS_CONNECTOR_EXTENDED_CASES: "none"
+        APPFS_ADAPTER_HTTP_ENDPOINT: "http://127.0.0.1:8080"
+      run: sh ./tests/test-appfs-connector-contract.sh
+
+    - name: Summarize HTTP bridge subset informational result
+      if: always()
+      run: |
+        if [ "${{ steps.http_connector_subset.outcome }}" = "failure" ]; then
+          echo "AppFS connector HTTP bridge subset: FAILED (non-blocking informational signal)." >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::AppFS connector HTTP bridge subset failed; non-blocking informational signal."
+        else
+          echo "AppFS connector HTTP bridge subset: PASSED." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Dump HTTP bridge log on failure
+      if: steps.http_connector_subset.outcome == 'failure'
+      run: tail -n 200 "$RUNNER_TEMP/appfs-http-bridge.log" || true
+
+    - name: Stop HTTP bridge
+      if: always()
+      run: |
+        if [ -f "$RUNNER_TEMP/appfs-http-bridge.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/appfs-http-bridge.pid")" 2>/dev/null || true
+        fi
+
+  # Informational AppFS bridge signal: higher-risk CT2 coverage over HTTP bridge path.
+  appfs-contract-signal-http-bridge-high-risk:
+    name: AppFS Contract Signal (informational, linux, http bridge high-risk)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: appfs-contract-gate
+    if: always()
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        version: "latest"
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Build CLI
+      run: cargo build --verbose
+
+    - name: Run HTTP bridge unit tests
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        uv run python -m unittest discover -s tests -t . -p "test_*.py"
+
+    - name: Start HTTP bridge (high-risk)
+      run: |
+        cd ../examples/appfs/bridges/http-python
+        nohup uv run python bridge_server.py >"$RUNNER_TEMP/appfs-http-bridge-high-risk.log" 2>&1 &
+        echo $! >"$RUNNER_TEMP/appfs-http-bridge-high-risk.pid"
+        uv run python - <<'PY'
+        import socket
+        import sys
+        import time
+
+        for _ in range(30):
+            sock = socket.socket()
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", 8080))
+                sock.close()
+                sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("HTTP bridge did not become ready on 127.0.0.1:8080", file=sys.stderr)
+        sys.exit(1)
+        PY
+
+    - name: Run AppFS connector high-risk bridge coverage (HTTP mode, informational)
+      id: http_connector_high_risk
+      continue-on-error: true
+      env:
+        APPFS_CONNECTOR_CONTRACT_TESTS: "1"
+        APPFS_CONNECTOR_STRICT: "1"
+        APPFS_BUILD_BEFORE_RUN: "0"
+        APPFS_CONNECTOR_REQUIRED_CASES: "ct2-006"
+        APPFS_CONNECTOR_EXTENDED_CASES: "ct2-028"
+        APPFS_ADAPTER_HTTP_ENDPOINT: "http://127.0.0.1:8080"
+      run: sh ./tests/test-appfs-connector-contract.sh
+
+    - name: Summarize HTTP bridge high-risk informational result
+      if: always()
+      run: |
+        if [ "${{ steps.http_connector_high_risk.outcome }}" = "failure" ]; then
+          echo "AppFS connector HTTP bridge high-risk coverage: FAILED (non-blocking informational signal)." >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::AppFS connector HTTP bridge high-risk coverage failed; non-blocking informational signal."
+        else
+          echo "AppFS connector HTTP bridge high-risk coverage: PASSED." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Dump HTTP bridge log on failure (high-risk)
+      if: steps.http_connector_high_risk.outcome == 'failure'
+      run: tail -n 200 "$RUNNER_TEMP/appfs-http-bridge-high-risk.log" || true
+
+    - name: Stop HTTP bridge (high-risk)
+      if: always()
+      run: |
+        if [ -f "$RUNNER_TEMP/appfs-http-bridge-high-risk.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/appfs-http-bridge-high-risk.pid")" 2>/dev/null || true
+        fi
+
+  # Legacy baseline bridge gate (informational): v0.1 live gRPC bridge smoke
+  appfs-contract-gate-grpc-bridge:
+    # Keep check-run name stable for branch protection; semantic: grpc legacy baseline gate.
+    name: AppFS Contract Gate (linux, grpc bridge)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: appfs-contract-gate
+    if: always()
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Install gRPC bridge dependencies
+      run: |
+        cd ../examples/appfs/bridges/grpc-python
+        python3 -m pip install --upgrade pip
+        python3 -m pip install -r requirements.txt
+        chmod +x ./generate_stubs.sh
+        ./generate_stubs.sh
+
+    - name: Start gRPC bridge
+      run: |
+        cd ../examples/appfs/bridges/grpc-python
+        APPFS_BRIDGE_FAIL_NEXT_SUBMIT_ACTION=4 \
+        APPFS_BRIDGE_FAIL_PATH_PREFIX=/contacts/resilience- \
+        APPFS_BRIDGE_FAIL_GRPC_CODE=UNAVAILABLE \
+        nohup python3 grpc_server.py >"$RUNNER_TEMP/appfs-grpc-bridge.log" 2>&1 &
+        echo $! >"$RUNNER_TEMP/appfs-grpc-bridge.pid"
+        python3 - <<'PY'
+        import socket
+        import sys
+        import time
+
+        for _ in range(30):
+            sock = socket.socket()
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", 50051))
+                sock.close()
+                sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("gRPC bridge did not become ready on 127.0.0.1:50051", file=sys.stderr)
+        sys.exit(1)
+        PY
+
+    - name: Run AppFS v0.1 live contract suite (legacy baseline, gRPC bridge)
+      env:
+        APPFS_CONTRACT_TESTS: "1"
+        APPFS_TIMEOUT_SEC: "30"
+        APPFS_ADAPTER_GRPC_ENDPOINT: "http://127.0.0.1:50051"
+        APPFS_ADAPTER_BRIDGE_MAX_RETRIES: "1"
+        APPFS_ADAPTER_BRIDGE_INITIAL_BACKOFF_MS: "50"
+        APPFS_ADAPTER_BRIDGE_MAX_BACKOFF_MS: "200"
+        APPFS_ADAPTER_BRIDGE_CIRCUIT_BREAKER_FAILURES: "2"
+        APPFS_ADAPTER_BRIDGE_CIRCUIT_BREAKER_COOLDOWN_MS: "4000"
+        APPFS_BRIDGE_RESILIENCE_CONTRACT: "1"
+        APPFS_BRIDGE_RESILIENCE_COOLDOWN_WAIT_SEC: "4"
+      run: sh ./tests/appfs/run-live-with-adapter.sh
+
+    - name: Dump gRPC bridge log on failure
+      if: failure()
+      run: tail -n 200 "$RUNNER_TEMP/appfs-grpc-bridge.log" || true
+
+    - name: Stop gRPC bridge
+      if: always()
+      run: |
+        if [ -f "$RUNNER_TEMP/appfs-grpc-bridge.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/appfs-grpc-bridge.pid")" 2>/dev/null || true
+        fi
+
+  # Informational AppFS bridge signal: CT2 subset over gRPC bridge path.
+  appfs-contract-signal-grpc-bridge:
+    name: AppFS Contract Signal (informational, linux, grpc bridge)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: appfs-contract-gate
+    if: always()
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install system dependencies
+      run: |
+        ../scripts/install-deps.sh
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Build CLI
+      run: cargo build --verbose
+
+    - name: Install gRPC bridge dependencies
+      run: |
+        cd ../examples/appfs/bridges/grpc-python
+        python3 -m pip install --upgrade pip
+        python3 -m pip install -r requirements.txt
+        chmod +x ./generate_stubs.sh
+        ./generate_stubs.sh
+
+    - name: Start gRPC bridge
+      run: |
+        cd ../examples/appfs/bridges/grpc-python
+        nohup python3 grpc_server.py >"$RUNNER_TEMP/appfs-grpc-bridge.log" 2>&1 &
+        echo $! >"$RUNNER_TEMP/appfs-grpc-bridge.pid"
+        python3 - <<'PY'
+        import socket
+        import sys
+        import time
+
+        for _ in range(30):
+            sock = socket.socket()
+            sock.settimeout(1.0)
+            try:
+                sock.connect(("127.0.0.1", 50051))
+                sock.close()
+                sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("gRPC bridge did not become ready on 127.0.0.1:50051", file=sys.stderr)
+        sys.exit(1)
+        PY
+
+    - name: Run AppFS connector contract subset (gRPC bridge mode, informational)
+      id: grpc_connector_subset
+      continue-on-error: true
+      env:
+        APPFS_CONNECTOR_CONTRACT_TESTS: "1"
+        APPFS_CONNECTOR_STRICT: "1"
+        APPFS_BUILD_BEFORE_RUN: "0"
+        APPFS_CONNECTOR_REQUIRED_CASES: "ct2-002,ct2-007,ct2-008,ct2-009"
+        APPFS_CONNECTOR_EXTENDED_CASES: "none"
+        APPFS_ADAPTER_GRPC_ENDPOINT: "http://127.0.0.1:50051"
+      run: sh ./tests/test-appfs-connector-contract.sh
+
+    - name: Summarize gRPC bridge informational result
+      if: always()
+      run: |
+        if [ "${{ steps.grpc_connector_subset.outcome }}" = "failure" ]; then
+          echo "AppFS connector gRPC bridge subset: FAILED (non-blocking informational signal)." >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::AppFS connector gRPC bridge subset failed; non-blocking informational signal."
+        else
+          echo "AppFS connector gRPC bridge subset: PASSED." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Dump gRPC bridge log on failure
+      if: steps.grpc_connector_subset.outcome == 'failure'
+      run: tail -n 200 "$RUNNER_TEMP/appfs-grpc-bridge.log" || true
+
+    - name: Stop gRPC bridge
+      if: always()
+      run: |
+        if [ -f "$RUNNER_TEMP/appfs-grpc-bridge.pid" ]; then
+          kill "$(cat "$RUNNER_TEMP/appfs-grpc-bridge.pid")" 2>/dev/null || true
+        fi
+
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.project }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        project: [cli, sdk/rust]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        components: rustfmt, clippy
+
+    - name: Install system dependencies
+      if: matrix.project == 'cli' && (matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest')
+      run: ../scripts/install-deps.sh
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: ${{ matrix.project }}/target
+        key: ${{ runner.os }}-cargo-build-target-${{ matrix.project }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check formatting
+      if: matrix.os == 'ubuntu-latest'
+      run: cargo fmt -- --check
+
+    - name: Run clippy
+      if: matrix.os == 'ubuntu-latest'
+      run: cargo clippy -- -D warnings
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Run integration tests
+      if: matrix.project == 'cli' && matrix.os == 'ubuntu-latest'
+      run: tests/all.sh
+
+  check:
+    name: Check (${{ matrix.os }}, ${{ matrix.project }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        project: [cli, sdk/rust]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Install system dependencies
+      if: matrix.project == 'cli' && (matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest')
+      run: ../scripts/install-deps.sh
+
+    - name: Check
+      run: cargo check --all-features
+
+  check-no-default-features:
+    name: Check no-default-features (cli)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Check with no default features
+      run: cargo check --no-default-features
+
+  build-linux-arm64:
+    name: Build (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v4
+
+    # necessary for sandbox
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: linux-arm64-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: linux-arm64-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: cli/target
+        key: linux-arm64-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build CLI
+      working-directory: cli
+      run: cargo build --verbose
+
+    - name: Run tests
+      working-directory: cli
+      run: cargo test --verbose
