@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
-use lsp::LspContextEnrichment;
 
 #[derive(Debug)]
 pub enum PromptBuildError {
@@ -36,7 +35,7 @@ impl From<ConfigError> for PromptBuildError {
 }
 
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-pub const FRONTIER_MODEL_NAME: &str = "Opus 4.6";
+pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
@@ -132,15 +131,6 @@ impl SystemPromptBuilder {
     }
 
     #[must_use]
-    pub fn with_lsp_context(mut self, enrichment: &LspContextEnrichment) -> Self {
-        if !enrichment.is_empty() {
-            self.append_sections
-                .push(enrichment.render_prompt_section());
-        }
-        self
-    }
-
-    #[must_use]
     pub fn build(&self) -> Vec<String> {
         let mut sections = Vec::new();
         sections.push(get_simple_intro_section(self.output_style_name.is_some()));
@@ -211,9 +201,9 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
-            dir.join("CLAW.md"),
-            dir.join("CLAW.local.md"),
-            dir.join(".claw").join("CLAW.md"),
+            dir.join("CLAUDE.md"),
+            dir.join("CLAUDE.local.md"),
+            dir.join(".claw").join("CLAUDE.md"),
             dir.join(".claw").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
@@ -292,7 +282,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-            "Claw instruction files discovered: {}.",
+            "Claude instruction files discovered: {}.",
             project_context.instruction_files.len()
         ));
     }
@@ -311,7 +301,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claw instructions".to_string()];
+    let mut sections = vec!["# Claude instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -523,24 +513,31 @@ mod tests {
         crate::test_env_lock()
     }
 
+    fn ensure_valid_cwd() {
+        if std::env::current_dir().is_err() {
+            std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))
+                .expect("test cwd should be recoverable");
+        }
+    }
+
     #[test]
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
-        fs::write(root.join("CLAW.md"), "root instructions").expect("write root instructions");
-        fs::write(root.join("CLAW.local.md"), "local instructions")
+        fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
+        fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
         fs::create_dir_all(root.join("apps").join(".claw")).expect("apps claw dir");
-        fs::write(root.join("apps").join("CLAW.md"), "apps instructions")
+        fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(
             root.join("apps").join(".claw").join("instructions.md"),
-            "apps dot claw instructions",
+            "apps dot claude instructions",
         )
-        .expect("write apps dot claw instructions");
-        fs::write(nested.join(".claw").join("CLAW.md"), "nested rules")
+        .expect("write apps dot claude instructions");
+        fs::write(nested.join(".claw").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
         fs::write(
             nested.join(".claw").join("instructions.md"),
@@ -561,7 +558,7 @@ mod tests {
                 "root instructions",
                 "local instructions",
                 "apps instructions",
-                "apps dot claw instructions",
+                "apps dot claude instructions",
                 "nested rules",
                 "nested instructions"
             ]
@@ -574,8 +571,8 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(&nested).expect("nested dir");
-        fs::write(root.join("CLAW.md"), "same rules\n\n").expect("write root");
-        fs::write(nested.join("CLAW.md"), "same rules\n").expect("write nested");
+        fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
@@ -603,14 +600,15 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.claw/CLAW.md")),
-            "CLAW.md"
+            display_context_path(Path::new("/tmp/project/.claw/CLAUDE.md")),
+            "CLAUDE.md"
         );
     }
 
     #[test]
     fn discover_with_git_includes_status_snapshot() {
         let _guard = env_lock();
+        ensure_valid_cwd();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         std::process::Command::new("git")
@@ -618,7 +616,7 @@ mod tests {
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        fs::write(root.join("CLAW.md"), "rules").expect("write instructions");
+        fs::write(root.join("CLAUDE.md"), "rules").expect("write instructions");
         fs::write(root.join("tracked.txt"), "hello").expect("write tracked file");
 
         let context =
@@ -626,7 +624,7 @@ mod tests {
 
         let status = context.git_status.expect("git status should be present");
         assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? CLAW.md"));
+        assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
         assert!(context.git_diff.is_none());
 
@@ -636,6 +634,7 @@ mod tests {
     #[test]
     fn discover_with_git_includes_diff_snapshot_for_tracked_changes() {
         let _guard = env_lock();
+        ensure_valid_cwd();
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
         std::process::Command::new("git")
@@ -677,10 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn load_system_prompt_reads_claw_files_and_config() {
+    fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".claw")).expect("claw dir");
-        fs::write(root.join("CLAW.md"), "Project rules").expect("write instructions");
+        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".claw").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -688,6 +687,7 @@ mod tests {
         .expect("write settings");
 
         let _guard = env_lock();
+        ensure_valid_cwd();
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
         let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
@@ -719,10 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_claw_code_style_sections_with_project_context() {
+    fn renders_claude_code_style_sections_with_project_context() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".claw")).expect("claw dir");
-        fs::write(root.join("CLAW.md"), "Project rules").expect("write CLAW.md");
+        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
         fs::write(
             root.join(".claw").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -743,7 +743,7 @@ mod tests {
 
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# Claw instructions"));
+        assert!(prompt.contains("# Claude instructions"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
@@ -760,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_dot_claw_instructions_markdown() {
+    fn discovers_dot_claude_instructions_markdown() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
@@ -785,10 +785,10 @@ mod tests {
     #[test]
     fn renders_instruction_file_metadata() {
         let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/CLAW.md"),
+            path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
-        assert!(rendered.contains("# Claw instructions"));
+        assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }

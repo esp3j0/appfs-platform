@@ -1,203 +1,181 @@
-# appfs-agent Rust Workspace
+# 🦞 Claw Code — Rust Implementation
 
-This Rust workspace is the active implementation core of `appfs-agent`, the agent runtime being built for AppFS.
+A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
 
-The codebase still uses some earlier internal names such as `claw` for the current CLI binary. Those names are transitional. The product direction for this workspace is now:
-
-- a local agent runtime for AppFS-oriented workflows
-- strong tool execution, sessions, plugins, hooks, and workspace context
-- a future AppFS-native runtime entrypoint and lifecycle model
-
-## Current status
-
-- **Version:** `0.1.0`
-- **Stage:** active runtime foundation, not final AppFS integration
-- **Primary implementation:** Rust workspace in this directory
-- **Current binary name:** `claw` (transitional)
-
-## What exists today
-
-The workspace already contains the main runtime building blocks:
-
-- `claw-cli` — current interactive CLI and one-shot prompt entrypoint
-- `runtime` — sessions, config, hooks, prompts, permissions, MCP, remote state
-- `tools` — built-in tool registry and tool execution
-- `commands` — slash commands, local skill discovery, agent discovery
-- `plugins` — plugin discovery, registry, lifecycle, hook, and tool support
-- `api` — provider clients and streaming
-- `lsp` — LSP support types and process helpers
-- `server` and `compat-harness` — supporting integration surfaces
-
-## Build and run
-
-### Prerequisites
-
-- Rust stable toolchain
-- Cargo
-- credentials for the model/provider you intend to use
-
-### Build
+## Quick Start
 
 ```bash
-cargo build --workspace
-cargo build --release -p claw-cli
+# Build
+cd rust/
+cargo build --release
+
+# Run interactive REPL
+./target/release/claw
+
+# One-shot prompt
+./target/release/claw prompt "explain this codebase"
+
+# With specific model
+./target/release/claw --model sonnet prompt "fix the bug in main.rs"
 ```
 
-### Run
+## Configuration
+
+Set your API credentials:
 
 ```bash
-cargo run --bin claw -- --help
-cargo run --bin claw --
-cargo run --bin claw -- prompt "summarize this workspace"
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Or use a proxy
+export ANTHROPIC_BASE_URL="https://your-proxy.com"
 ```
 
-## Model and provider configuration
-
-The runtime loads settings from these files, in precedence order:
-
-1. `%HOME%\\.claw\\settings.json`
-2. `.claw.json`
-3. `.claw\\settings.json`
-4. `.claw\\settings.local.json`
-
-Shared repo defaults should usually live in `.claw.json`. Machine-local secrets and developer overrides should usually live in `.claw/settings.local.json`.
-
-The current provider config shape is:
-
-```json
-{
-  "model": "your-model-name",
-  "provider": {
-    "type": "openai",
-    "baseUrl": "https://gateway.example/v1",
-    "apiKeyEnv": "YOUR_API_KEY_ENV"
-  }
-}
-```
-
-Supported fields:
-
-- `model`: any model identifier string
-- `provider.type`: `anthropic`, `openai`, or `xai`
-- `provider.baseUrl`: optional override for a proxy or custom gateway
-- `provider.apiKeyEnv`: optional API key environment variable name
-- `provider.authTokenEnv`: optional extra auth token env var for `anthropic`
-
-Common examples:
-
-```json
-{
-  "model": "gpt-4.1",
-  "provider": {
-    "type": "openai",
-    "baseUrl": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
-  }
-}
-```
-
-```json
-{
-  "model": "qwen3-coder-plus",
-  "provider": {
-    "type": "openai",
-    "baseUrl": "https://gateway.example/v1",
-    "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
-  }
-}
-```
-
-```json
-{
-  "model": "claude-sonnet-4-6",
-  "provider": {
-    "type": "anthropic",
-    "baseUrl": "https://anthropic-proxy.example",
-    "apiKeyEnv": "ANTHROPIC_API_KEY",
-    "authTokenEnv": "ANTHROPIC_AUTH_TOKEN"
-  }
-}
-```
-
-```json
-{
-  "model": "grok-3",
-  "provider": {
-    "type": "xai",
-    "baseUrl": "https://api.x.ai/v1",
-    "apiKeyEnv": "XAI_API_KEY"
-  }
-}
-```
-
-Behavior notes:
-
-- if `provider` is present, the runtime uses it directly instead of inferring from the model name
-- if `provider` is absent, the runtime still supports model-based provider detection
-- the configured `model` becomes the default model used by the CLI and agent runtime
-- `authTokenEnv` is rejected for non-`anthropic` providers
-
-To inspect the merged provider view:
+Or authenticate via OAuth:
 
 ```bash
-cargo run --bin claw -- config provider
+claw login
 ```
 
-To inspect the full merged config:
+## Mock parity harness
+
+The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
 
 ```bash
-cargo run --bin claw -- config
+cd rust/
+
+# Run the scripted clean-environment harness
+./scripts/run_mock_parity_harness.sh
+
+# Or start the mock service manually for ad hoc CLI runs
+cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ```
 
-## Migration notes
+Harness coverage:
 
-Older setups could rely on model-name inference alone. That still works for known model families such as `claude-*`, `gpt-*`, `o1`/`o3`/`o4`, and `grok-*`.
+- `streaming_text`
+- `read_file_roundtrip`
+- `grep_chunk_assembly`
+- `write_file_allowed`
+- `write_file_denied`
 
-Use explicit `provider` config when:
+Primary artifacts:
 
-- you want to use a custom model name behind an OpenAI-compatible gateway
-- you need to force a provider family even when the model name is ambiguous
-- you want to override the default API base URL or credential env var names
+- `crates/mock-anthropic-service/` — reusable mock Anthropic-compatible service
+- `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — clean-env CLI harness
+- `scripts/run_mock_parity_harness.sh` — reproducible wrapper
 
-This makes it possible to point `appfs-agent` at arbitrary gateways without having to rename models to match built-in detection rules.
+## Features
 
-## Current capabilities
+| Feature | Status |
+|---------|--------|
+| Anthropic API + streaming | ✅ |
+| OAuth login/logout | ✅ |
+| Interactive REPL (rustyline) | ✅ |
+| Tool system (bash, read, write, edit, grep, glob) | ✅ |
+| Web tools (search, fetch) | ✅ |
+| Sub-agent orchestration | ✅ |
+| Todo tracking | ✅ |
+| Notebook editing | ✅ |
+| CLAUDE.md / project memory | ✅ |
+| Config file hierarchy (.claude.json) | ✅ |
+| Permission system | ✅ |
+| MCP server lifecycle | ✅ |
+| Session persistence + resume | ✅ |
+| Extended thinking (thinking blocks) | ✅ |
+| Cost tracking + usage display | ✅ |
+| Git integration | ✅ |
+| Markdown terminal rendering (ANSI) | ✅ |
+| Model aliases (opus/sonnet/haiku) | ✅ |
+| Slash commands (/status, /compact, /clear, etc.) | ✅ |
+| Hooks (PreToolUse/PostToolUse) | 🔧 Config only |
+| Plugin system | 📋 Planned |
+| Skills registry | 📋 Planned |
 
-- interactive REPL and one-shot prompt execution
-- saved-session inspection and resume flows
-- built-in tools for shell, file operations, search, web fetch/search, todos, notebooks, config, and REPL-like execution
-- plugin and hook support
-- local skill and agent discovery
-- OAuth support
-- MCP bootstrap/client support
-- LSP support primitives
+## Model Aliases
 
-## Current limitations
+Short names resolve to the latest model versions:
 
-- the runtime is not yet presented through a final AppFS-native entrypoint
-- naming is still transitional in code and binaries
-- Windows is not yet part of the CI matrix
-- some higher-level parity features from the older TS snapshot are still missing
-- release packaging/distribution is still immature
+| Alias | Resolves To |
+|-------|------------|
+| `opus` | `claude-opus-4-6` |
+| `sonnet` | `claude-sonnet-4-6` |
+| `haiku` | `claude-haiku-4-5-20251213` |
 
-## Near-term direction
+## CLI Flags
 
-This workspace is expected to evolve in three layers:
+```
+claw [OPTIONS] [COMMAND]
 
-1. strengthen the current runtime core
-2. define how AppFS should launch, supervise, and communicate with the runtime
-3. complete naming and packaging changes once the runtime contract stabilizes
+Options:
+  --model MODEL                    Set the model (alias or full name)
+  --dangerously-skip-permissions   Skip all permission checks
+  --permission-mode MODE           Set read-only, workspace-write, or danger-full-access
+  --allowedTools TOOLS             Restrict enabled tools
+  --output-format FORMAT           Output format (text or json)
+  --version, -V                    Print version info
 
-## Verification notes
+Commands:
+  prompt <text>      One-shot prompt (non-interactive)
+  login              Authenticate via OAuth
+  logout             Clear stored credentials
+  init               Initialize project config
+  doctor             Check environment health
+  self-update        Update to latest version
+```
 
-At the current checkpoint:
+## Slash Commands (REPL)
 
-- `cargo build --workspace` passes
-- Windows build works
-- Windows test coverage is still incomplete because some tests remain Unix-oriented
+Tab completion now expands not just slash command names, but also common workflow arguments like model aliases, permission modes, and recent session IDs.
 
-## Related docs
+| Command | Description |
+|---------|-------------|
+| `/help` | Show help |
+| `/status` | Show session status (model, tokens, cost) |
+| `/cost` | Show cost breakdown |
+| `/compact` | Compact conversation history |
+| `/clear` | Clear conversation |
+| `/model [name]` | Show or switch model |
+| `/permissions` | Show or switch permission mode |
+| `/config [section]` | Show config (env, hooks, model) |
+| `/memory` | Show CLAUDE.md contents |
+| `/diff` | Show git diff |
+| `/export [path]` | Export conversation |
+| `/session [id]` | Resume a previous session |
+| `/version` | Show version |
 
-- Root repo overview: [../README.md](../README.md)
-- Migration checkpoint: [../PARITY.md](../PARITY.md)
-- Draft release notes: [docs/releases/0.1.0.md](docs/releases/0.1.0.md)
+## Workspace Layout
+
+```
+rust/
+├── Cargo.toml              # Workspace root
+├── Cargo.lock
+└── crates/
+    ├── api/                # Anthropic API client + SSE streaming
+    ├── commands/           # Shared slash-command registry
+    ├── compat-harness/     # TS manifest extraction harness
+    ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
+    ├── runtime/            # Session, config, permissions, MCP, prompts
+    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
+    └── tools/              # Built-in tool implementations
+```
+
+### Crate Responsibilities
+
+- **api** — HTTP client, SSE stream parser, request/response types, auth (API key + OAuth bearer)
+- **commands** — Slash command definitions and help text generation
+- **compat-harness** — Extracts tool/prompt manifests from upstream TS source
+- **mock-anthropic-service** — Deterministic `/v1/messages` mock for CLI parity tests and local harness runs
+- **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
+- **rusty-claude-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
+- **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
+
+## Stats
+
+- **~20K lines** of Rust
+- **7 crates** in workspace
+- **Binary name:** `claw`
+- **Default model:** `claude-opus-4-6`
+- **Default permissions:** `danger-full-access`
+
+## License
+
+See repository root.
