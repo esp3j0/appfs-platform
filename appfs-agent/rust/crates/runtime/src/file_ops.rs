@@ -498,6 +498,7 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
