@@ -13,12 +13,15 @@ jobs:
       - self-hosted
       - windows
       - winfsp
+    env:
+      CHECKOUT_PATH: repo-${{ github.run_id }}-http-demo
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           clean: false
+          path: ${{ env.CHECKOUT_PATH }}
 
       - name: Clean stale self-hosted state
         shell: powershell
@@ -52,8 +55,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            appfs/cli
-            appfs-agent/rust
+            ${{ env.CHECKOUT_PATH }}/appfs/cli
+            ${{ env.CHECKOUT_PATH }}/appfs-agent/rust
 
       - name: Run HTTP demo integration smoke test
         shell: powershell
@@ -61,4 +64,5 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE $env:CHECKOUT_PATH)
           ./integration/scripts/test-windows-appfs-agent-http-demo.ps1
