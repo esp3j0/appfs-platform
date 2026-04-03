@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::bash_shell_path;
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
@@ -632,21 +633,10 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 }
 
 fn shell_command(command: &str) -> CommandWithStdin {
-    #[cfg(windows)]
-    let mut command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    #[cfg(not(windows))]
-    let command_builder = {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    command_builder
+    let mut command_builder =
+        Command::new(bash_shell_path().expect("bash shell should be available"));
+    command_builder.arg("-lc").arg(command);
+    CommandWithStdin::new(command_builder)
 }
 
 struct CommandWithStdin {
@@ -975,12 +965,6 @@ mod tests {
         )));
     }
 
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
-    }
-
-    #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
     }

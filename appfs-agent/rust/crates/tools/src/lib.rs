@@ -3449,11 +3449,9 @@ struct ReplRuntime {
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
-            args: &["-c"],
-        }),
+        "python" | "py" => {
+            resolve_python_repl_runtime().ok_or_else(|| String::from("python runtime not found"))
+        }
         "javascript" | "js" | "node" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])
                 .ok_or_else(|| String::from("node runtime not found"))?,
@@ -3468,11 +3466,43 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
+fn resolve_python_repl_runtime() -> Option<ReplRuntime> {
+    #[cfg(windows)]
+    if command_runs_successfully("py", &["-3", "--version"]) {
+        return Some(ReplRuntime {
+            program: "py",
+            args: &["-3", "-c"],
+        });
+    }
+
+    for candidate in ["python3", "python"] {
+        if command_runs_successfully(candidate, &["--version"]) {
+            return Some(ReplRuntime {
+                program: candidate,
+                args: &["-c"],
+            });
+        }
+    }
+
+    None
+}
+
 fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
     commands
         .iter()
         .copied()
         .find(|command| command_exists(command))
+}
+
+fn command_runs_successfully(command: &str, args: &[&str]) -> bool {
+    Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -3807,12 +3837,37 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 || command_path.is_absolute() {
+        return command_path.exists();
+    }
+
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| executable_exists_in_dir(&dir, command))
+    })
+}
+
+#[cfg(windows)]
+fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
+    let candidate = dir.join(command);
+    if candidate.exists() {
+        return true;
+    }
+
+    if Path::new(command).extension().is_some() {
+        return false;
+    }
+
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
+    pathext
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .any(|ext| dir.join(format!("{command}{ext}")).exists())
+}
+
+#[cfg(not(windows))]
+fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
+    dir.join(command).exists()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4409,17 +4464,19 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
-        let home = temp_path("skills-home");
-        let skill_dir = home.join(".agents").join("skills").join("help");
-        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let codex_home = temp_path("codex-home");
+        let skill_dir = codex_home.join("skills").join("help");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "# help\n\nGuide on using oh-my-codex plugin\n",
+            "description: Guide on using oh-my-codex plugin\n\n# Help\n\nUse this skill for overviews.\n",
         )
-        .expect("skill file should exist");
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        .expect("write skill prompt");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &codex_home);
 
         let result = execute_tool(
             "Skill",
@@ -4432,10 +4489,8 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(PathBuf::from(output["path"].as_str().expect("path"))
+            .ends_with(PathBuf::from("help").join("SKILL.md")));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -4451,17 +4506,15 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(PathBuf::from(dollar_output["path"].as_str().expect("path"))
+            .ends_with(PathBuf::from("help").join("SKILL.md")));
 
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
+        if let Some(codex_home) = original_codex_home {
+            std::env::set_var("CODEX_HOME", codex_home);
         } else {
-            std::env::remove_var("HOME");
+            std::env::remove_var("CODEX_HOME");
         }
-        fs::remove_dir_all(home).expect("temp home should clean up");
+        fs::remove_dir_all(codex_home).expect("temp home should clean up");
     }
 
     #[test]
@@ -5079,10 +5132,10 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert!(
+            PathBuf::from(globbed_output["filenames"][0].as_str().expect("filename"))
+                .ends_with(PathBuf::from("nested").join("lib.rs"))
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -5407,6 +5460,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -5454,15 +5510,19 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "clawd-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let dir = temp_path("pwsh-bin");
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
+        #[cfg(not(windows))]
         let script = dir.join("pwsh");
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"args=%*\"\r\necho !args! | findstr /C:\"Write-Output hello\" >nul && echo hello\r\n",
+        )
+        .expect("write script");
+        #[cfg(not(windows))]
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -5472,37 +5532,53 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
+        #[cfg(not(windows))]
         std::process::Command::new("/bin/chmod")
             .arg("+x")
             .arg(&script)
             .status()
             .expect("chmod");
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        {
+            let mut path_entries = vec![dir.clone()];
+            path_entries.extend(std::env::split_paths(&original_path));
+            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
+            std::env::set_var("PATH", &updated_path);
+        }
 
-        let result = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
-        )
-        .expect("PowerShell should succeed");
+        {
+            let result = execute_tool(
+                "PowerShell",
+                &json!({"command": "Write-Output hello", "timeout": 1000}),
+            )
+            .expect("PowerShell should succeed");
 
-        let background = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "run_in_background": true}),
-        )
-        .expect("PowerShell background should succeed");
+            let background = execute_tool(
+                "PowerShell",
+                &json!({"command": "Write-Output hello", "run_in_background": true}),
+            )
+            .expect("PowerShell background should succeed");
 
-        std::env::set_var("PATH", original_path);
-        let _ = std::fs::remove_dir_all(dir);
+            std::env::set_var("PATH", original_path);
+            let _ = std::fs::remove_dir_all(dir);
 
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
-        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+            let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+            #[cfg(windows)]
+            let expected_stdout = "hello";
+            #[cfg(not(windows))]
+            let expected_stdout = "pwsh:Write-Output hello";
+            assert_eq!(
+                output["stdout"].as_str().expect("stdout").trim(),
+                expected_stdout
+            );
+            assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+            let background_output: serde_json::Value =
+                serde_json::from_str(&background).expect("json");
+            assert!(background_output["backgroundTaskId"].as_str().is_some());
+            assert_eq!(background_output["backgroundedByUser"], true);
+            assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        }
     }
 
     #[test]
