@@ -24,9 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    PromptCache, ProviderClient,
+    ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -44,8 +46,8 @@ use runtime::{
     ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
     ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::GlobalToolRegistry;
@@ -211,7 +213,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     #[cfg(test)]
     let _guard = test_env_lock();
 
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_help = false;
@@ -651,6 +653,12 @@ fn cli_parse_cwd() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
+fn configured_default_model() -> Option<String> {
+    load_runtime_config_for_cwd(&cli_parse_cwd())
+        .ok()
+        .and_then(|config| config.model().map(ToOwned::to_owned))
+}
+
 #[cfg(test)]
 fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -1077,6 +1085,59 @@ fn format_unknown_slash_command_message(name: &str) -> String {
     }
 }
 
+fn format_context_report(
+    model: &str,
+    system_prompt: &[String],
+    session: &Session,
+    note: Option<&str>,
+) -> String {
+    let usage = runtime::analyze_context_usage(system_prompt, session);
+    let max_tokens = usize::try_from(max_tokens_for_model(model)).unwrap_or(64_000);
+    let percentage = if max_tokens == 0 {
+        0.0
+    } else {
+        (usage.total_tokens as f64 / max_tokens as f64) * 100.0
+    };
+    let mut lines = vec![format!(
+        "Context
+  Model            {model}
+  Tokens           est {} / {} ({percentage:.1}%)
+  Messages         {}
+  System prompt    {}
+  Session content  {}",
+        usage.total_tokens,
+        max_tokens,
+        usage.message_count,
+        usage.system_prompt_tokens,
+        usage.message_tokens,
+    )];
+
+    if let Some(note) = note {
+        lines.push("Notes".to_string());
+        lines.push(format!("  {note}"));
+    }
+
+    lines.push("Estimated usage by category".to_string());
+    for category in usage.categories.iter().filter(|category| category.tokens > 0) {
+        let share = if max_tokens == 0 {
+            0.0
+        } else {
+            (category.tokens as f64 / max_tokens as f64) * 100.0
+        };
+        lines.push(format!(
+            "  {:<16} {:>6} ({share:.1}%)",
+            category.name, category.tokens
+        ));
+    }
+
+    lines.push("System prompt sections".to_string());
+    for section in &usage.system_prompt_sections {
+        lines.push(format!("  {:<16} {}", section.name, section.tokens));
+    }
+
+    lines.join("\n")
+}
+
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Model
@@ -1406,6 +1467,21 @@ fn run_resume_command(
                 ))),
             })
         }
+        SlashCommand::Context { .. } => {
+            let model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            let system_prompt = build_system_prompt()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_context_report(
+                    &model,
+                    &system_prompt,
+                    session,
+                    Some(
+                        "Reconstructed from the current workspace. Restored sessions do not persist the original model or full system prompt.",
+                    ),
+                )),
+            })
+        }
         SlashCommand::Cost => {
             let usage = UsageTracker::from_session(session).cumulative_usage();
             Ok(ResumeCommandOutcome {
@@ -1518,7 +1594,6 @@ fn run_resume_command(
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
-        | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -1611,14 +1686,14 @@ struct RuntimePluginState {
 }
 
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
 }
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
     ) -> Self {
         Self {
@@ -1647,7 +1722,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -1972,6 +2047,10 @@ impl LiveCli {
                 Self::print_sandbox_status();
                 false
             }
+            SlashCommand::Context { .. } => {
+                self.print_context();
+                false
+            }
             SlashCommand::Compact => {
                 self.compact()?;
                 false
@@ -2063,7 +2142,6 @@ impl LiveCli {
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
@@ -2116,6 +2194,13 @@ impl LiveCli {
         println!(
             "{}",
             format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
+        );
+    }
+
+    fn print_context(&self) {
+        println!(
+            "{}",
+            format_context_report(&self.model, &self.system_prompt, self.runtime.session(), None)
         );
     }
 
@@ -3062,12 +3147,13 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
             "model" => runtime_config.get("model"),
+            "provider" => runtime_config.get("provider"),
             "plugins" => runtime_config
                 .get("plugins")
                 .or_else(|| runtime_config.get("enabledPlugins")),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
+                    "  Unsupported config section '{other}'. Use env, hooks, model, provider, or plugins."
                 ));
                 return Ok(lines.join(
                     "
@@ -4007,7 +4093,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        DefaultRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -4110,9 +4196,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct DefaultRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -4121,7 +4207,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl AnthropicRuntimeClient {
+impl DefaultRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -4131,11 +4217,18 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let runtime_config = load_runtime_config_for_cwd(&cwd)?;
+        let provider_override = runtime_config.provider().map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: ProviderClient::from_model_with_anthropic_auth_resolver(
+                &model,
+                provider_override.as_ref(),
+                || resolve_cli_auth_source(&oauth),
+            )?
+            .with_prompt_cache(PromptCache::new(session_id)),
             model,
             enable_tools,
             emit_output,
@@ -4146,17 +4239,30 @@ impl AnthropicRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
+    resolve_startup_auth_source(|| Ok(oauth.clone()))
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+fn load_runtime_config_for_cwd(cwd: &Path) -> Result<RuntimeConfig, api::ApiError> {
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| api::ApiError::Auth(format!("failed to load runtime config: {error}")))
+}
+
+fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
+    ProviderOverride {
+        provider: match config.provider() {
+            RuntimeProviderKind::Anthropic => ProviderKind::Anthropic,
+            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
+            RuntimeProviderKind::Xai => ProviderKind::Xai,
+        },
+        base_url: config.base_url().map(ToOwned::to_owned),
+        api_key_env: config.api_key_env().map(ToOwned::to_owned),
+        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
+    }
+}
+
+impl ApiClient for DefaultRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
@@ -4938,7 +5044,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));

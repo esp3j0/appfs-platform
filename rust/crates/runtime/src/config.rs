@@ -51,9 +51,25 @@ pub struct RuntimeFeatureConfig {
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    provider: Option<RuntimeProviderConfig>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeProviderKind {
+    Anthropic,
+    OpenAi,
+    Xai,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProviderConfig {
+    provider: RuntimeProviderKind,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    auth_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -257,6 +273,7 @@ impl ConfigLoader {
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
+            provider: parse_optional_provider_config(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
@@ -331,6 +348,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn provider(&self) -> Option<&RuntimeProviderConfig> {
+        self.feature_config.provider.as_ref()
+    }
+
+    #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.feature_config.permission_mode
     }
@@ -385,6 +407,11 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn provider(&self) -> Option<&RuntimeProviderConfig> {
+        self.provider.as_ref()
+    }
+
+    #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.permission_mode
     }
@@ -397,6 +424,28 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
+    }
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn provider(&self) -> RuntimeProviderKind {
+        self.provider
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env.as_deref()
+    }
+
+    #[must_use]
+    pub fn auth_token_env(&self) -> Option<&str> {
+        self.auth_token_env.as_deref()
     }
 }
 
@@ -611,6 +660,60 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_optional_provider_config(
+    root: &JsonValue,
+) -> Result<Option<RuntimeProviderConfig>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(None);
+    };
+    let Some(provider_value) = object.get("provider") else {
+        return Ok(None);
+    };
+
+    if let Some(provider) = provider_value.as_str() {
+        return Ok(Some(RuntimeProviderConfig {
+            provider: parse_provider_kind(provider, "merged settings.provider")?,
+            base_url: None,
+            api_key_env: None,
+            auth_token_env: None,
+        }));
+    }
+
+    let provider = expect_object(provider_value, "merged settings.provider")?;
+    let provider_kind = parse_provider_kind(
+        expect_string(provider, "type", "merged settings.provider")?,
+        "merged settings.provider.type",
+    )?;
+    let auth_token_env =
+        optional_string(provider, "authTokenEnv", "merged settings.provider")?.map(str::to_string);
+    if auth_token_env.is_some() && provider_kind != RuntimeProviderKind::Anthropic {
+        return Err(ConfigError::Parse(
+            "merged settings.provider.authTokenEnv is only supported for anthropic providers"
+                .to_string(),
+        ));
+    }
+
+    Ok(Some(RuntimeProviderConfig {
+        provider: provider_kind,
+        base_url: optional_string(provider, "baseUrl", "merged settings.provider")?
+            .map(str::to_string),
+        api_key_env: optional_string(provider, "apiKeyEnv", "merged settings.provider")?
+            .map(str::to_string),
+        auth_token_env,
+    }))
+}
+
+fn parse_provider_kind(value: &str, context: &str) -> Result<RuntimeProviderKind, ConfigError> {
+    match value {
+        "anthropic" | "claw" | "claw-api" => Ok(RuntimeProviderKind::Anthropic),
+        "openai" | "openai-compatible" => Ok(RuntimeProviderKind::OpenAi),
+        "xai" => Ok(RuntimeProviderKind::Xai),
+        other => Err(ConfigError::Parse(format!(
+            "{context}: unsupported provider type {other}"
+        ))),
+    }
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {

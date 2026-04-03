@@ -4067,6 +4067,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -4086,12 +4087,16 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_path(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+        let pid = std::process::id();
+        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("claw-tools-{pid}-{nanos}-{counter}-{name}"))
     }
 
     #[test]

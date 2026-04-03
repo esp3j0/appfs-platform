@@ -1072,14 +1072,25 @@ mod tests {
         McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
     };
 
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_dir() -> PathBuf {
-        static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        let unique_id = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("runtime-mcp-stdio-{nanos}-{unique_id}"))
+        let pid = std::process::id();
+        for _ in 0..1024 {
+            let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate =
+                std::env::temp_dir().join(format!("runtime-mcp-stdio-{pid}-{nanos}-{counter}"));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create temp dir {}: {error}", candidate.display()),
+            }
+        }
+        panic!("failed to allocate unique temp dir after repeated attempts");
     }
 
     fn write_echo_script() -> PathBuf {

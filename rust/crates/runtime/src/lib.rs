@@ -2,6 +2,7 @@ mod bash;
 mod bootstrap;
 mod compact;
 mod config;
+mod context;
 mod conversation;
 mod file_ops;
 mod hooks;
@@ -30,8 +31,12 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
+    RuntimeProviderKind, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
+};
+pub use context::{
+    analyze_context_usage, ContextCategoryUsage, ContextSectionUsage, ContextUsageReport,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
