@@ -1,5 +1,4 @@
 use crate::session::Session;
-use serde::{Deserialize, Serialize};
 
 const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
 const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
@@ -26,7 +25,7 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -250,9 +249,9 @@ mod tests {
         let cost = usage.estimate_cost_usd();
         assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
         assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
-        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-6"));
+        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-20250514"));
         assert!(lines[0].contains("estimated_cost=$54.6750"));
-        assert!(lines[0].contains("model=claude-sonnet-4-6"));
+        assert!(lines[0].contains("model=claude-sonnet-4-20250514"));
         assert!(lines[1].contains("cache_read=$0.3000"));
     }
 
@@ -265,7 +264,7 @@ mod tests {
             cache_read_input_tokens: 0,
         };
 
-        let haiku = pricing_for_model("claude-haiku-4-5-20251213").expect("haiku pricing");
+        let haiku = pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing");
         let opus = pricing_for_model("claude-opus-4-6").expect("opus pricing");
         let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
@@ -287,21 +286,19 @@ mod tests {
 
     #[test]
     fn reconstructs_usage_from_session_messages() {
-        let session = Session {
-            version: 1,
-            messages: vec![ConversationMessage {
-                role: MessageRole::Assistant,
-                blocks: vec![ContentBlock::Text {
-                    text: "done".to_string(),
-                }],
-                usage: Some(TokenUsage {
-                    input_tokens: 5,
-                    output_tokens: 2,
-                    cache_creation_input_tokens: 1,
-                    cache_read_input_tokens: 0,
-                }),
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: "done".to_string(),
             }],
-        };
+            usage: Some(TokenUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cache_creation_input_tokens: 1,
+                cache_read_input_tokens: 0,
+            }),
+        }];
 
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
