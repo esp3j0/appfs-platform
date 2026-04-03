@@ -191,6 +191,7 @@ fn normalize_windows_path_for_compare(path: &Path) -> String {
 
 #[cfg(windows)]
 fn is_supported_shell_path(path: &Path) -> bool {
+    let normalized = normalize_windows_path_for_compare(path);
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -199,7 +200,7 @@ fn is_supported_shell_path(path: &Path) -> bool {
     matches!(
         file_name.as_deref(),
         Some(name) if (name.contains("bash") || name.contains("zsh")) && path.is_file()
-    )
+    ) && !normalized.contains(r"\appdata\local\microsoft\windowsapps\")
 }
 
 #[cfg(windows)]
