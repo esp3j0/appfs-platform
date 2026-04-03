@@ -80,7 +80,11 @@ impl IncrementalSseParser {
     }
 
     fn take_event(&mut self) -> Option<SseEvent> {
-        if self.data_lines.is_empty() && self.event_name.is_none() && self.id.is_none() && self.retry.is_none() {
+        if self.data_lines.is_empty()
+            && self.event_name.is_none()
+            && self.id.is_none()
+            && self.retry.is_none()
+        {
             return None;
         }
 
@@ -102,8 +106,13 @@ mod tests {
 
     #[test]
     fn parses_streaming_events() {
+        // given
         let mut parser = IncrementalSseParser::new();
+
+        // when
         let first = parser.push_chunk("event: message\ndata: hel");
+
+        // then
         assert!(first.is_empty());
 
         let second = parser.push_chunk("lo\n\nid: 1\ndata: world\n\n");
@@ -123,6 +132,27 @@ mod tests {
                     retry: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn finish_flushes_a_trailing_event_without_separator() {
+        // given
+        let mut parser = IncrementalSseParser::new();
+        parser.push_chunk("event: message\ndata: trailing");
+
+        // when
+        let events = parser.finish();
+
+        // then
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: Some("message".to_string()),
+                data: "trailing".to_string(),
+                id: None,
+                retry: None,
+            }]
         );
     }
 }
