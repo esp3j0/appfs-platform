@@ -31,9 +31,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
-    RuntimeProviderKind, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind,
+    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use context::{
     analyze_context_usage, ContextCategoryUsage, ContextSectionUsage, ContextUsageReport,

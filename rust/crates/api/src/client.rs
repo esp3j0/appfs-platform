@@ -154,7 +154,9 @@ where
     F: FnOnce() -> Result<AuthSource, ApiError>,
 {
     let Some(provider_override) = provider_override else {
-        return Ok(AnthropicClient::from_auth(resolve_default_auth()?).with_base_url(read_base_url()));
+        return Ok(
+            AnthropicClient::from_auth(resolve_default_auth()?).with_base_url(read_base_url())
+        );
     };
 
     let auth =

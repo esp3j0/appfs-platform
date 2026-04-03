@@ -24,9 +24,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
     ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
@@ -1118,7 +1117,11 @@ fn format_context_report(
     }
 
     lines.push("Estimated usage by category".to_string());
-    for category in usage.categories.iter().filter(|category| category.tokens > 0) {
+    for category in usage
+        .categories
+        .iter()
+        .filter(|category| category.tokens > 0)
+    {
         let share = if max_tokens == 0 {
             0.0
         } else {
@@ -2200,7 +2203,12 @@ impl LiveCli {
     fn print_context(&self) {
         println!(
             "{}",
-            format_context_report(&self.model, &self.system_prompt, self.runtime.session(), None)
+            format_context_report(
+                &self.model,
+                &self.system_prompt,
+                self.runtime.session(),
+                None
+            )
         );
     }
 
@@ -4219,7 +4227,9 @@ impl DefaultRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let runtime_config = load_runtime_config_for_cwd(&cwd)?;
-        let provider_override = runtime_config.provider().map(provider_override_from_runtime_config);
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
         let oauth = runtime_config.oauth().cloned();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
