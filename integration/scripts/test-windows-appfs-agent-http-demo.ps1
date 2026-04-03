@@ -6,6 +6,7 @@ param(
     [string]$MountPoint = "C:\mnt\appfs-agent-http-demo",
     [string]$AppId = "aiim",
     [string]$HttpEndpoint = "http://127.0.0.1:8080",
+    [int]$MountBootstrapTimeoutSec = 180,
     [switch]$SkipCleanup,
     [switch]$KeepLogs
 )
@@ -23,6 +24,8 @@ $script:BridgeHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-http-demo-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
 $script:HadFailure = $false
+$script:AppfsExe = Join-Path $script:AppfsCliDir "target\debug\agentfs.exe"
+$script:ClawExe = Join-Path $script:AppfsAgentRustDir "target\debug\claw.exe"
 
 function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
@@ -228,6 +231,23 @@ function Require-Command {
     }
 }
 
+function Build-TestBinaries {
+    Write-Section "Build Test Binaries"
+
+    Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+        "build",
+        "--bin", "agentfs"
+    ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+    Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
+
+    Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+        "build",
+        "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
+        "-p", "rusty-claude-cli"
+    ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+    Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
+}
+
 function Append-Utf8JsonLine {
     param(
         [string]$Path,
@@ -250,6 +270,7 @@ function Main {
     }
 
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
+    Build-TestBinaries
 
     $mountParent = Split-Path -Parent $MountPoint
     if ($mountParent -and !(Test-Path $mountParent)) {
@@ -281,23 +302,19 @@ function Main {
     Write-Success "HTTP bridge is serving at $HttpEndpoint"
 
     Write-Section "Init AppFS"
-    Push-Location $script:AppfsCliDir
-    try {
-        Invoke-LoggedCommand -Name "appfs-init" -FilePath "cargo" -ArgumentList @("run", "--", "init", $AgentId, "--force") -WorkingDirectory $script:AppfsCliDir | Out-Null
-    } finally {
-        Pop-Location
-    }
+    Invoke-LoggedCommand -Name "appfs-init" -FilePath $script:AppfsExe -ArgumentList @(
+        "init", $AgentId, "--force"
+    ) -WorkingDirectory $script:AppfsCliDir | Out-Null
     Assert-True (Test-Path $script:DbPath) "Created database $script:DbPath"
 
     Write-Section "Start AppFS"
-    $script:AppfsHandle = New-LogHandle -Name "appfs-up" -FilePath "cargo" -ArgumentList @(
-        "run", "--",
+    $script:AppfsHandle = New-LogHandle -Name "appfs-up" -FilePath $script:AppfsExe -ArgumentList @(
         "appfs", "up", $script:DbPath, $MountPoint,
         "--backend", "winfsp"
     ) -WorkingDirectory $script:AppfsCliDir
 
     $controlDir = Join-Path $MountPoint "_appfs"
-    Wait-Until -Description "AppFS mount bootstrap" -TimeoutSec 25 -Condition {
+    Wait-Until -Description "AppFS mount bootstrap" -TimeoutSec $MountBootstrapTimeoutSec -Condition {
         Ensure-ProcessRunning $script:AppfsHandle
         return (Test-Path (Join-Path $controlDir "register_app.act")) -and
             (Test-Path (Join-Path $controlDir "list_apps.act"))
@@ -344,11 +361,7 @@ function Main {
     $prompt = "Use bash only. Run these commands in order and show their outputs: pwd ; head -n 3 chats/chat-001/messages.res.jsonl ; printf '{""version"":2,""client_token"":""$clientToken"",""payload"":{""text"":""hello-from-agent-http-demo""}}`n' >> contacts/zhangsan/send_message.act ; tail -n 20 _stream/events.evt.jsonl | grep $clientToken"
     Push-Location $appRoot
     try {
-        $promptOutput = Invoke-LoggedCommand -Name "claw-demo" -FilePath "cargo" -ArgumentList @(
-            "run",
-            "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
-            "-p", "rusty-claude-cli",
-            "--",
+        $promptOutput = Invoke-LoggedCommand -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
             "--dangerously-skip-permissions",
             "--allowedTools", "bash",
             "prompt",
