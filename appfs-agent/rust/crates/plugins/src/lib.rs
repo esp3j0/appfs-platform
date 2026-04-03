@@ -1,4 +1,5 @@
 mod hooks;
+mod shell;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
@@ -9,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use shell::{env_path_for_bash, prepare_hook_command, prepare_tool_command};
 
 pub use hooks::{HookEvent, HookRunResult, HookRunner};
 
@@ -303,7 +305,7 @@ impl PluginTool {
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
-        let mut process = Command::new(&self.command);
+        let (mut process, uses_bash) = prepare_tool_command(&self.command)?;
         process
             .args(&self.args)
             .stdin(Stdio::piped())
@@ -314,9 +316,14 @@ impl PluginTool {
             .env("CLAWD_TOOL_NAME", &self.definition.name)
             .env("CLAWD_TOOL_INPUT", &input_json);
         if let Some(root) = &self.root {
-            process
-                .current_dir(root)
-                .env("CLAWD_PLUGIN_ROOT", root.display().to_string());
+            process.current_dir(root).env(
+                "CLAWD_PLUGIN_ROOT",
+                if uses_bash {
+                    env_path_for_bash(root)
+                } else {
+                    root.display().to_string()
+                },
+            );
         }
 
         let mut child = process.spawn()?;
@@ -2013,25 +2020,7 @@ fn run_lifecycle_commands(
     }
 
     for command in commands {
-        let mut process = if Path::new(command).exists() {
-            if cfg!(windows) {
-                let mut process = Command::new("cmd");
-                process.arg("/C").arg(command);
-                process
-            } else {
-                let mut process = Command::new("sh");
-                process.arg(command);
-                process
-            }
-        } else if cfg!(windows) {
-            let mut process = Command::new("cmd");
-            process.arg("/C").arg(command);
-            process
-        } else {
-            let mut process = Command::new("sh");
-            process.arg("-lc").arg(command);
-            process
-        };
+        let mut process = prepare_hook_command(command)?;
         if let Some(root) = &metadata.root {
             process.current_dir(root);
         }

@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
-use std::path::Path;
 use std::process::Command;
 
 use serde_json::json;
 
+use crate::shell::prepare_hook_command;
 use crate::{PluginError, PluginHooks, PluginRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,17 @@ impl HookRunner {
         is_error: bool,
         payload: &str,
     ) -> HookCommandOutcome {
-        let mut child = shell_command(command);
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return HookCommandOutcome::Failed {
+                    message: format!(
+                        "{} hook `{command}` failed to start for `{tool_name}`: {error}",
+                        event.as_str()
+                    ),
+                };
+            }
+        };
         child.stdin(std::process::Stdio::piped());
         child.stdout(std::process::Stdio::piped());
         child.stderr(std::process::Stdio::piped());
@@ -280,26 +290,8 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
     message
 }
 
-fn shell_command(command: &str) -> CommandWithStdin {
-    #[cfg(windows)]
-    let command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    #[cfg(not(windows))]
-    let command_builder = if Path::new(command).exists() {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg(command);
-        CommandWithStdin::new(command_builder)
-    } else {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    command_builder
+fn shell_command(command: &str) -> std::io::Result<CommandWithStdin> {
+    prepare_hook_command(command).map(CommandWithStdin::new)
 }
 
 struct CommandWithStdin {

@@ -208,6 +208,9 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    #[cfg(test)]
+    let _guard = test_env_lock();
+
     let mut model = DEFAULT_MODEL.to_string();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
@@ -586,11 +589,18 @@ fn resolve_model_alias(model: &str) -> &str {
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    current_tool_registry()?.normalize_allowed_tools(values)
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    match current_tool_registry() {
+        Ok(registry) => registry.normalize_allowed_tools(values),
+        Err(_) => GlobalToolRegistry::builtin().normalize_allowed_tools(values),
+    }
 }
 
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let cwd = cli_parse_cwd();
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
     let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
@@ -637,8 +647,20 @@ fn default_permission_mode() -> PermissionMode {
         .unwrap_or(PermissionMode::DangerFullAccess)
 }
 
+fn cli_parse_cwd() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+#[cfg(test)]
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
-    let cwd = env::current_dir().ok()?;
+    let cwd = cli_parse_cwd();
     let loader = ConfigLoader::default_for(&cwd);
     loader
         .load()
@@ -655,7 +677,7 @@ fn filter_tool_specs(
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
-    let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let mut cwd = cli_parse_cwd();
     let mut date = DEFAULT_DATE.to_string();
     let mut index = 0;
 
@@ -5257,10 +5279,7 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::test_env_lock()
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -6433,7 +6452,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = env_lock();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6471,7 +6490,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = env_lock();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6518,11 +6537,6 @@ UU conflicted.rs",
         assert!(usage.contains("/session list"));
     }
 
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn temp_workspace(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6533,7 +6547,9 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = crate::init::render_init_claude_md(std::path::Path::new("."));
+        let _guard = env_lock();
+        let rust_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let rendered = crate::init::render_init_claude_md(&rust_workspace);
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }

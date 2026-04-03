@@ -1,7 +1,10 @@
 use std::fs;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -16,6 +19,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .block_on(MockAnthropicService::spawn())
         .expect("mock service should start");
     let base_url = server.base_url();
+    wait_for_mock_service(&base_url);
 
     let cases = [
         ScenarioCase {
@@ -127,6 +131,8 @@ fn run_case(case: ScenarioCase, workspace: &Path, base_url: &str) -> Value {
             "--output-format=json",
         ]);
 
+    preserve_process_runtime_env(&mut command);
+
     if let Some(allowed_tools) = case.allowed_tools {
         command.args(["--allowedTools", allowed_tools]);
     }
@@ -178,7 +184,16 @@ fn assert_read_file_roundtrip(workspace: &Path, response: &Value) {
     let output = response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.join("fixture.txt").display().to_string()));
+    let output_json: Value = serde_json::from_str(output).expect("tool output should be json");
+    let reported_path = output_json["file"]["filePath"]
+        .as_str()
+        .expect("read_file output should include file path");
+    assert!(
+        paths_match(reported_path, &workspace.join("fixture.txt")),
+        "tool output did not include expected path.\nexpected: {}\nactual: {}",
+        workspace.join("fixture.txt").display(),
+        reported_path
+    );
     assert!(output.contains("alpha parity line"));
 }
 
@@ -207,10 +222,11 @@ fn assert_write_file_allowed(workspace: &Path, response: &Value) {
         response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("generated/output.txt"));
+    let message = response["message"].as_str().expect("message text");
+    assert!(
+        message.contains("generated") && message.contains("output.txt"),
+        "expected message to mention generated output path, got: {message}"
+    );
     let generated = workspace.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");
@@ -254,4 +270,63 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "claw-mock-parity-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+fn wait_for_mock_service(base_url: &str) {
+    let address = base_url
+        .strip_prefix("http://")
+        .expect("mock service base url should use http")
+        .parse::<SocketAddr>()
+        .expect("mock service base url should contain a socket address");
+
+    let timeout = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start.elapsed() < timeout {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+            Ok(_) => return,
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    panic!(
+        "mock service did not become ready at {base_url}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "timed out".to_string())
+    );
+}
+
+fn preserve_process_runtime_env(command: &mut Command) {
+    if cfg!(windows) {
+        for key in [
+            "SystemRoot",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
+fn paths_match(reported_path: &str, expected_path: &Path) -> bool {
+    normalize_reported_path(reported_path) == expected_path
+}
+
+fn normalize_reported_path(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+
+    PathBuf::from(path)
 }
