@@ -274,6 +274,20 @@ function Write-Utf8TextFile {
     [System.IO.File]::WriteAllText($Path, $Content, $script:Utf8NoBom)
 }
 
+function ConvertFrom-JsonSafe {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    try {
+        return $Text | ConvertFrom-Json -Depth 100 -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
 function Main {
     Require-Command cargo
     Require-Command python
@@ -412,11 +426,33 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
         Pop-Location
     }
 
-    Assert-True ($promptResponse.Contains("__PWD__")) "Prompt ran the scripted bash command"
-    Assert-True ($promptResponse.Contains("/c/mnt/appfs-agent-http-demo/aiim")) "Prompt ran inside the mounted AppFS tree"
-    Assert-True ($promptResponse.Contains("__SNAPSHOT__")) "Prompt surfaced snapshot command output"
-    Assert-True ($promptResponse.Contains('"text":"hello"')) "Prompt returned mounted snapshot content"
-    Assert-True ($promptResponse.Contains("__ACTION_WRITTEN__")) "Prompt executed the action append step"
+    $promptPayload = ConvertFrom-JsonSafe $promptResponse
+    $promptMessage = if ($promptPayload -and $promptPayload.PSObject.Properties.Name -contains "message") {
+        [string]$promptPayload.message
+    } else {
+        $promptResponse
+    }
+    $toolOutputText = $promptResponse
+    if (
+        $promptPayload -and
+        $promptPayload.PSObject.Properties.Name -contains "tool_results" -and
+        $promptPayload.tool_results -and
+        $promptPayload.tool_results.Count -gt 0
+    ) {
+        $toolOutputRaw = [string]$promptPayload.tool_results[0].output
+        $toolOutputPayload = ConvertFrom-JsonSafe $toolOutputRaw
+        if ($toolOutputPayload -and $toolOutputPayload.PSObject.Properties.Name -contains "stdout") {
+            $toolOutputText = [string]$toolOutputPayload.stdout
+        } else {
+            $toolOutputText = $toolOutputRaw
+        }
+    }
+
+    Assert-True ($promptMessage.Contains("__PWD__") -or $toolOutputText.Contains("__PWD__")) "Prompt ran the scripted bash command"
+    Assert-True ($toolOutputText.Contains("/c/mnt/appfs-agent-http-demo/aiim")) "Prompt ran inside the mounted AppFS tree"
+    Assert-True ($toolOutputText.Contains("__SNAPSHOT__")) "Prompt surfaced snapshot command output"
+    Assert-True ($toolOutputText.Contains('"text":"hello"')) "Prompt returned mounted snapshot content"
+    Assert-True ($toolOutputText.Contains("__ACTION_WRITTEN__")) "Prompt executed the action append step"
 
     Wait-Until -Description "agent-submitted client token in mounted event stream" -TimeoutSec 30 -Condition {
         Ensure-ProcessRunning $script:AppfsHandle
