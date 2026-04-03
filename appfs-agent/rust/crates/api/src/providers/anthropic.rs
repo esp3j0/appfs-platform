@@ -1,20 +1,24 @@
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use runtime::format_usd;
 use runtime::{
     load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
     OAuthTokenExchangeRequest,
 };
 use serde::Deserialize;
+use serde_json::{Map, Value};
+use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
+use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{Provider, ProviderFuture};
 use crate::sse::SseParser;
-use crate::types::{MessageRequest, MessageResponse, StreamEvent};
+use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -44,7 +48,7 @@ impl AuthSource {
             (Some(api_key), None) => Ok(Self::ApiKey(api_key)),
             (None, Some(bearer_token)) => Ok(Self::BearerToken(bearer_token)),
             (None, None) => Err(ApiError::missing_credentials(
-                "Claw",
+                "Anthropic",
                 &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
             )),
         }
@@ -106,16 +110,20 @@ impl From<OAuthTokenSet> for AuthSource {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClawApiClient {
+pub struct AnthropicClient {
     http: reqwest::Client,
     auth: AuthSource,
     base_url: String,
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    request_profile: AnthropicRequestProfile,
+    session_tracer: Option<SessionTracer>,
+    prompt_cache: Option<PromptCache>,
+    last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
-impl ClawApiClient {
+impl AnthropicClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
@@ -125,6 +133,10 @@ impl ClawApiClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            request_profile: AnthropicRequestProfile::default(),
+            session_tracer: None,
+            prompt_cache: None,
+            last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -137,6 +149,10 @@ impl ClawApiClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            request_profile: AnthropicRequestProfile::default(),
+            session_tracer: None,
+            prompt_cache: None,
+            last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -195,6 +211,70 @@ impl ClawApiClient {
     }
 
     #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
+        self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_identity(mut self, client_identity: ClientIdentity) -> Self {
+        self.request_profile.client_identity = client_identity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
+        self.request_profile = self.request_profile.with_beta(beta);
+        self
+    }
+
+    #[must_use]
+    pub fn with_extra_body_param(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.request_profile = self.request_profile.with_extra_body(key, value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
+        self.prompt_cache = Some(prompt_cache);
+        self
+    }
+
+    #[must_use]
+    pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
+        self.prompt_cache.as_ref().map(PromptCache::stats)
+    }
+
+    #[must_use]
+    pub fn request_profile(&self) -> &AnthropicRequestProfile {
+        &self.request_profile
+    }
+
+    #[must_use]
+    pub fn session_tracer(&self) -> Option<&SessionTracer> {
+        self.session_tracer.as_ref()
+    }
+
+    #[must_use]
+    pub fn prompt_cache(&self) -> Option<&PromptCache> {
+        self.prompt_cache.as_ref()
+    }
+
+    #[must_use]
+    pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
+        self.last_prompt_cache_record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    #[must_use]
+    pub fn with_request_profile(mut self, request_profile: AnthropicRequestProfile) -> Self {
+        self.request_profile = request_profile;
+        self
+    }
+
+    #[must_use]
     pub fn auth_source(&self) -> &AuthSource {
         &self.auth
     }
@@ -207,6 +287,13 @@ impl ClawApiClient {
             stream: false,
             ..request.clone()
         };
+
+        if let Some(prompt_cache) = &self.prompt_cache {
+            if let Some(response) = prompt_cache.lookup_completion(&request) {
+                return Ok(response);
+            }
+        }
+
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let mut response = response
@@ -215,6 +302,33 @@ impl ClawApiClient {
             .map_err(ApiError::from)?;
         if response.request_id.is_none() {
             response.request_id = request_id;
+        }
+
+        if let Some(prompt_cache) = &self.prompt_cache {
+            let record = prompt_cache.record_response(&request, &response);
+            self.store_last_prompt_cache_record(record);
+        }
+        if let Some(session_tracer) = &self.session_tracer {
+            session_tracer.record_analytics(
+                AnalyticsEvent::new("api", "message_usage")
+                    .with_property(
+                        "request_id",
+                        response
+                            .request_id
+                            .clone()
+                            .map_or(Value::Null, Value::String),
+                    )
+                    .with_property("total_tokens", Value::from(response.total_tokens()))
+                    .with_property(
+                        "estimated_cost_usd",
+                        Value::String(format_usd(
+                            response
+                                .usage
+                                .estimated_cost_usd(&response.model)
+                                .total_cost_usd(),
+                        )),
+                    ),
+            );
         }
         Ok(response)
     }
@@ -232,6 +346,11 @@ impl ClawApiClient {
             parser: SseParser::new(),
             pending: VecDeque::new(),
             done: false,
+            request: request.clone(),
+            prompt_cache: self.prompt_cache.clone(),
+            latest_usage: None,
+            usage_recorded: false,
+            last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
         })
     }
 
@@ -284,18 +403,46 @@ impl ClawApiClient {
 
         loop {
             attempts += 1;
+            if let Some(session_tracer) = &self.session_tracer {
+                session_tracer.record_http_request_started(
+                    attempts,
+                    "POST",
+                    "/v1/messages",
+                    Map::new(),
+                );
+            }
             match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        if let Some(session_tracer) = &self.session_tracer {
+                            session_tracer.record_http_request_succeeded(
+                                attempts,
+                                "POST",
+                                "/v1/messages",
+                                response.status().as_u16(),
+                                request_id_from_headers(response.headers()),
+                                Map::new(),
+                            );
+                        }
+                        return Ok(response);
+                    }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                        self.record_request_failure(attempts, &error);
                         last_error = Some(error);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        self.record_request_failure(attempts, &error);
+                        return Err(error);
+                    }
                 },
                 Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                    self.record_request_failure(attempts, &error);
                     last_error = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.record_request_failure(attempts, &error);
+                    return Err(error);
+                }
             }
 
             if attempts > self.max_retries {
@@ -319,12 +466,35 @@ impl ClawApiClient {
         let request_builder = self
             .http
             .post(&request_url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
         let mut request_builder = self.auth.apply(request_builder);
+        for (header_name, header_value) in self.request_profile.header_pairs() {
+            request_builder = request_builder.header(header_name, header_value);
+        }
 
-        request_builder = request_builder.json(request);
+        let request_body = self.request_profile.render_json_body(request)?;
+        request_builder = request_builder.json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
+    }
+
+    fn record_request_failure(&self, attempt: u32, error: &ApiError) {
+        if let Some(session_tracer) = &self.session_tracer {
+            session_tracer.record_http_request_failed(
+                attempt,
+                "POST",
+                "/v1/messages",
+                error.to_string(),
+                error.is_retryable(),
+                Map::new(),
+            );
+        }
+    }
+
+    fn store_last_prompt_cache_record(&self, record: PromptCacheRecord) {
+        *self
+            .last_prompt_cache_record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -368,7 +538,7 @@ impl AuthSource {
             }
             Ok(Some(token_set)) => Ok(Self::BearerToken(token_set.access_token)),
             Ok(None) => Err(ApiError::missing_credentials(
-                "Claw",
+                "Anthropic",
                 &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
             )),
             Err(error) => Err(error),
@@ -415,7 +585,7 @@ where
 
     let Some(token_set) = load_saved_oauth_token()? else {
         return Err(ApiError::missing_credentials(
-            "Claw",
+            "Anthropic",
             &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
         ));
     };
@@ -446,7 +616,7 @@ fn resolve_saved_oauth_token_set(
     let Some(refresh_token) = token_set.refresh_token.clone() else {
         return Err(ApiError::ExpiredOAuthToken);
     };
-    let client = ClawApiClient::from_auth(AuthSource::None).with_base_url(read_base_url());
+    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(read_base_url());
     let refreshed = client_runtime_block_on(async {
         client
             .refresh_oauth_token(
@@ -515,7 +685,7 @@ fn read_api_key() -> Result<String, ApiError> {
         .or_else(|| auth.bearer_token())
         .map(ToOwned::to_owned)
         .ok_or(ApiError::missing_credentials(
-            "Claw",
+            "Anthropic",
             &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
         ))
 }
@@ -540,7 +710,7 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
-impl Provider for ClawApiClient {
+impl Provider for AnthropicClient {
     type Stream = MessageStream;
 
     fn send_message<'a>(
@@ -565,6 +735,11 @@ pub struct MessageStream {
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
     done: bool,
+    request: MessageRequest,
+    prompt_cache: Option<PromptCache>,
+    latest_usage: Option<Usage>,
+    usage_recorded: bool,
+    last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
 impl MessageStream {
@@ -576,6 +751,7 @@ impl MessageStream {
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {
+                self.observe_event(&event);
                 return Ok(Some(event));
             }
 
@@ -598,6 +774,29 @@ impl MessageStream {
             }
         }
     }
+
+    fn observe_event(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
+                self.latest_usage = Some(usage.clone());
+            }
+            StreamEvent::MessageStop(_) => {
+                if !self.usage_recorded {
+                    if let (Some(prompt_cache), Some(usage)) =
+                        (&self.prompt_cache, self.latest_usage.as_ref())
+                    {
+                        let record = prompt_cache.record_usage(&self.request, usage);
+                        *self
+                            .last_prompt_cache_record
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+                    }
+                    self.usage_recorded = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
@@ -607,7 +806,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 
     let body = response.text().await.unwrap_or_else(|_| String::new());
-    let parsed_error = serde_json::from_str::<ApiErrorEnvelope>(&body).ok();
+    let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
 
     Err(ApiError::Api {
@@ -628,12 +827,12 @@ const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiErrorEnvelope {
-    error: ApiErrorBody,
+struct AnthropicErrorEnvelope {
+    error: AnthropicErrorBody,
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiErrorBody {
+struct AnthropicErrorBody {
     #[serde(rename = "type")]
     error_type: String,
     message: String,
@@ -652,7 +851,7 @@ mod tests {
 
     use super::{
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, AuthSource, ClawApiClient, OAuthTokenSet,
+        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
@@ -976,7 +1175,7 @@ mod tests {
 
     #[test]
     fn backoff_doubles_until_maximum() {
-        let client = ClawApiClient::new("test-key").with_retry_policy(
+        let client = AnthropicClient::new("test-key").with_retry_policy(
             3,
             Duration::from_millis(10),
             Duration::from_millis(25),

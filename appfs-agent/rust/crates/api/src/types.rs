@@ -1,3 +1,4 @@
+use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -159,7 +160,29 @@ pub struct Usage {
 impl Usage {
     #[must_use]
     pub const fn total_tokens(&self) -> u32 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+
+    #[must_use]
+    pub const fn token_usage(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+        }
+    }
+
+    #[must_use]
+    pub fn estimated_cost_usd(&self, model: &str) -> UsageCostEstimate {
+        let usage = self.token_usage();
+        pricing_for_model(model).map_or_else(
+            || usage.estimate_cost_usd(),
+            |pricing| usage.estimate_cost_usd_with_pricing(pricing),
+        )
     }
 }
 
@@ -220,4 +243,48 @@ pub enum StreamEvent {
     ContentBlockDelta(ContentBlockDeltaEvent),
     ContentBlockStop(ContentBlockStopEvent),
     MessageStop(MessageStopEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use runtime::format_usd;
+
+    use super::{MessageResponse, Usage};
+
+    #[test]
+    fn usage_total_tokens_includes_cache_tokens() {
+        let usage = Usage {
+            input_tokens: 10,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 3,
+            output_tokens: 4,
+        };
+
+        assert_eq!(usage.total_tokens(), 19);
+        assert_eq!(usage.token_usage().total_tokens(), 19);
+    }
+
+    #[test]
+    fn message_response_estimates_cost_from_model_usage() {
+        let response = MessageResponse {
+            id: "msg_cost".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1_000_000,
+                cache_creation_input_tokens: 100_000,
+                cache_read_input_tokens: 200_000,
+                output_tokens: 500_000,
+            },
+            request_id: None,
+        };
+
+        let cost = response.usage.estimated_cost_usd(&response.model);
+        assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
+        assert_eq!(response.total_tokens(), 1_800_000);
+    }
 }

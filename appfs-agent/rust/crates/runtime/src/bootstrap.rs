@@ -21,7 +21,7 @@ pub struct BootstrapPlan {
 
 impl BootstrapPlan {
     #[must_use]
-    pub fn claw_default() -> Self {
+    pub fn claude_code_default() -> Self {
         Self::from_phases(vec![
             BootstrapPhase::CliEntry,
             BootstrapPhase::FastPathVersion,
@@ -52,5 +52,60 @@ impl BootstrapPlan {
     #[must_use]
     pub fn phases(&self) -> &[BootstrapPhase] {
         &self.phases
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BootstrapPhase, BootstrapPlan};
+
+    #[test]
+    fn from_phases_deduplicates_while_preserving_order() {
+        // given
+        let phases = vec![
+            BootstrapPhase::CliEntry,
+            BootstrapPhase::FastPathVersion,
+            BootstrapPhase::CliEntry,
+            BootstrapPhase::MainRuntime,
+            BootstrapPhase::FastPathVersion,
+        ];
+
+        // when
+        let plan = BootstrapPlan::from_phases(phases);
+
+        // then
+        assert_eq!(
+            plan.phases(),
+            &[
+                BootstrapPhase::CliEntry,
+                BootstrapPhase::FastPathVersion,
+                BootstrapPhase::MainRuntime,
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_code_default_covers_each_phase_once() {
+        // given
+        let expected = [
+            BootstrapPhase::CliEntry,
+            BootstrapPhase::FastPathVersion,
+            BootstrapPhase::StartupProfiler,
+            BootstrapPhase::SystemPromptFastPath,
+            BootstrapPhase::ChromeMcpFastPath,
+            BootstrapPhase::DaemonWorkerFastPath,
+            BootstrapPhase::BridgeFastPath,
+            BootstrapPhase::DaemonFastPath,
+            BootstrapPhase::BackgroundSessionFastPath,
+            BootstrapPhase::TemplateFastPath,
+            BootstrapPhase::EnvironmentRunnerFastPath,
+            BootstrapPhase::MainRuntime,
+        ];
+
+        // when
+        let plan = BootstrapPlan::claude_code_default();
+
+        // then
+        assert_eq!(plan.phases(), &expected);
     }
 }
