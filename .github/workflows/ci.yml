@@ -94,20 +94,20 @@ jobs:
       - name: Build CLI
         run: cargo build --verbose
 
-      - name: Run AppFS static contract suite
+      - name: Run AppFS v0.1 static contract suite (baseline)
         env:
           APPFS_CONTRACT_TESTS: "1"
           APPFS_STATIC_FIXTURE: "1"
-          APPFS_ROOT: ${{ github.workspace }}/appfs/examples/appfs/fixtures
+          APPFS_ROOT: ${{ github.workspace }}/appfs/examples/appfs
         run: sh ./tests/test-appfs-contract.sh
 
-      - name: Run AppFS live contract suite
+      - name: Run AppFS v0.1 live contract suite (baseline smoke)
         env:
           APPFS_CONTRACT_TESTS: "1"
           APPFS_TIMEOUT_SEC: "30"
         run: sh ./tests/appfs/run-live-with-adapter.sh
 
-      - name: Run AppFS connector contract suite
+      - name: Run AppFS connector contract suite (required set)
         env:
           APPFS_CONNECTOR_CONTRACT_TESTS: "1"
           APPFS_CONNECTOR_STRICT: "1"
