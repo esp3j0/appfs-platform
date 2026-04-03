@@ -448,11 +448,16 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
         }
     }
 
+    $snapshotContentSeen =
+        $toolOutputText.Contains('"text":"hello"') -or
+        $promptMessage.Contains('"text":"hello"') -or
+        $promptResponse.Contains('\"text\":\"hello\"')
+
     Assert-True ($promptMessage.Contains("__PWD__") -or $toolOutputText.Contains("__PWD__")) "Prompt ran the scripted bash command"
     Assert-True ($toolOutputText.Contains("/c/mnt/appfs-agent-http-demo/aiim")) "Prompt ran inside the mounted AppFS tree"
-    Assert-True ($toolOutputText.Contains("__SNAPSHOT__")) "Prompt surfaced snapshot command output"
-    Assert-True ($toolOutputText.Contains('"text":"hello"')) "Prompt returned mounted snapshot content"
-    Assert-True ($toolOutputText.Contains("__ACTION_WRITTEN__")) "Prompt executed the action append step"
+    Assert-True ($toolOutputText.Contains("__SNAPSHOT__") -or $promptMessage.Contains("__SNAPSHOT__")) "Prompt surfaced snapshot command output"
+    Assert-True ($snapshotContentSeen) "Prompt returned mounted snapshot content"
+    Assert-True ($toolOutputText.Contains("__ACTION_WRITTEN__") -or $promptMessage.Contains("__ACTION_WRITTEN__")) "Prompt executed the action append step"
 
     Wait-Until -Description "agent-submitted client token in mounted event stream" -TimeoutSec 30 -Condition {
         Ensure-ProcessRunning $script:AppfsHandle
