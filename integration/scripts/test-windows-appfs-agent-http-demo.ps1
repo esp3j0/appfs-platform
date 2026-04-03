@@ -27,9 +27,9 @@ $script:HadFailure = $false
 $script:AppfsExe = Join-Path $script:AppfsCliDir "target\debug\agentfs.exe"
 $script:ClawExe = Join-Path $script:AppfsAgentRustDir "target\debug\claw.exe"
 
-function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
-function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
-function Write-WarningLine { Write-Host "⚠ $args" -ForegroundColor Yellow }
+function Write-Success { Write-Host "[ok] $args" -ForegroundColor Green }
+function Write-Fail { Write-Host "[fail] $args" -ForegroundColor Red }
+function Write-WarningLine { Write-Host "[warn] $args" -ForegroundColor Yellow }
 function Write-Section { Write-Host "`n==== $args ====" -ForegroundColor Magenta }
 
 function Remove-TestPath {
@@ -261,6 +261,19 @@ function Append-Utf8JsonLine {
     [System.IO.File]::AppendAllText($Path, $JsonLine + "`n", $script:Utf8NoBom)
 }
 
+function Write-Utf8TextFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $parent = Split-Path -Parent $Path
+    if ($parent) {
+        [void][System.IO.Directory]::CreateDirectory($parent)
+    }
+    [System.IO.File]::WriteAllText($Path, $Content, $script:Utf8NoBom)
+}
+
 function Main {
     Require-Command cargo
     Require-Command python
@@ -370,11 +383,27 @@ function Main {
 
     Write-Section "Run appfs-agent Demo Prompt"
     $clientToken = "agent-http-demo-001" # @I-am-sure-its-safe
-    $prompt = "Use bash only. Run these commands in order and show their outputs: pwd ; head -n 3 chats/chat-001/messages.res.jsonl ; printf '{""version"":2,""client_token"":""$clientToken"",""payload"":{""text"":""hello-from-agent-http-demo""}}`n' >> contacts/zhangsan/send_message.act ; tail -n 20 _stream/events.evt.jsonl | grep $clientToken"
+    $demoScriptPath = Join-Path $appRoot ".ci-http-demo.sh"
+    $demoScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+echo "__PWD__"
+pwd
+echo "__SNAPSHOT__"
+head -n 3 chats/chat-001/messages.res.jsonl
+echo "__ACTION_WRITTEN__"
+printf '%s\n' '{"version":2,"client_token":"$clientToken","payload":{"text":"hello-from-agent-http-demo"}}' >> contacts/zhangsan/send_message.act
+echo "__EVENT_TAIL__"
+tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
+"@
+    Write-Utf8TextFile -Path $demoScriptPath -Content $demoScript
+
+    $prompt = "Use bash only. Run `bash ./.ci-http-demo.sh` exactly once. Do not rewrite the script. Return the exact command output."
     Push-Location $appRoot
     try {
-        $promptOutput = Invoke-LoggedCommand -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
+        $promptResponse = Invoke-LoggedCommand -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
             "--dangerously-skip-permissions",
+            "--output-format", "json",
             "--allowedTools", "bash",
             "prompt",
             $prompt
@@ -383,13 +412,37 @@ function Main {
         Pop-Location
     }
 
-    Assert-True ($promptOutput.Contains("/c/mnt/")) "Prompt ran inside the mounted AppFS tree"
-    Assert-True ($promptOutput.Contains("messages.res.jsonl")) "Prompt surfaced snapshot command output"
-    Assert-True ($promptOutput.Contains($clientToken)) "Prompt surfaced the action event token"
+    Assert-True ($promptResponse.Contains("__PWD__")) "Prompt ran the scripted bash command"
+    Assert-True ($promptResponse.Contains("/c/mnt/appfs-agent-http-demo/aiim")) "Prompt ran inside the mounted AppFS tree"
+    Assert-True ($promptResponse.Contains("__SNAPSHOT__")) "Prompt surfaced snapshot command output"
+    Assert-True ($promptResponse.Contains('"text":"hello"')) "Prompt returned mounted snapshot content"
+    Assert-True ($promptResponse.Contains("__ACTION_WRITTEN__")) "Prompt executed the action append step"
 
-    $eventMatch = Select-String -Path $eventsPath -Pattern $clientToken -SimpleMatch | Select-Object -Last 1
-    Assert-True ($null -ne $eventMatch) "Mounted app event stream contains the agent-submitted client token"
-    Assert-True (($eventMatch.Line -like '*"action.completed"*') -or ((Get-Content $eventsPath -Raw).Contains('"type":"action.completed"'))) "Mounted app event stream contains an action.completed event"
+    Wait-Until -Description "agent-submitted client token in mounted event stream" -TimeoutSec 30 -Condition {
+        Ensure-ProcessRunning $script:AppfsHandle
+        if (!(Test-Path $eventsPath)) {
+            return $false
+        }
+        try {
+            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains($clientToken)
+        } catch {
+            return $false
+        }
+    }
+    Write-Success "Mounted app event stream contains the agent-submitted client token"
+
+    Wait-Until -Description "action.completed event in mounted event stream" -TimeoutSec 30 -Condition {
+        Ensure-ProcessRunning $script:AppfsHandle
+        if (!(Test-Path $eventsPath)) {
+            return $false
+        }
+        try {
+            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains('"type":"action.completed"')
+        } catch {
+            return $false
+        }
+    }
+    Write-Success "Mounted app event stream contains an action.completed event"
 
     Write-Host "`nAppFS + appfs-agent HTTP demo integration smoke test passed." -ForegroundColor Green
 }
