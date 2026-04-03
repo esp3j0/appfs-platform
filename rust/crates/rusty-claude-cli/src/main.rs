@@ -5406,6 +5406,21 @@ mod tests {
         result
     }
 
+    fn cleanup_temp_dir(path: &Path) {
+        for _ in 0..10 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let _ = error;
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = fs::remove_dir_all(path);
+    }
+
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         if include_hooks {
@@ -5489,7 +5504,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_temp_dir(&root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -5523,7 +5538,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_temp_dir(&root);
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
@@ -6035,7 +6050,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -6341,7 +6356,7 @@ mod tests {
         );
         assert_eq!(branch.as_deref(), Some("rcc/cli"));
         assert!(project_root.is_none());
-        fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+        cleanup_temp_dir(&temp_root);
     }
 
     #[test]
@@ -6399,7 +6414,7 @@ UU conflicted.rs",
         });
         assert!(report.contains("clean working tree"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -6426,7 +6441,7 @@ UU conflicted.rs",
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -6453,7 +6468,7 @@ UU conflicted.rs",
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -6482,7 +6497,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -6601,7 +6616,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_temp_dir(&workspace);
     }
 
     #[test]
@@ -6634,7 +6649,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_temp_dir(&workspace);
     }
 
     #[test]
