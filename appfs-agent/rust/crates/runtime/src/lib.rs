@@ -2,7 +2,6 @@ mod bash;
 mod bootstrap;
 mod compact;
 mod config;
-mod context;
 mod conversation;
 mod file_ops;
 mod hooks;
@@ -16,8 +15,8 @@ mod prompt;
 mod remote;
 pub mod sandbox;
 mod session;
+mod sse;
 mod usage;
-mod windows_shell;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
@@ -30,25 +29,21 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     CLAW_SETTINGS_SCHEMA_NAME,
 };
-pub use context::{
-    analyze_context_usage, ContextCategoryUsage, ContextSectionUsage, ContextUsageReport,
-};
 pub use conversation::{
-    ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
+    ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
 };
-pub use hooks::{HookEvent, HookRunResult, HookRunner};
-pub use lsp::{
-    FileDiagnostics, LspContextEnrichment, LspError, LspManager, LspServerConfig, SymbolLocation,
-    WorkspaceDiagnostics,
+pub use hooks::{
+    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -74,8 +69,8 @@ pub use oauth::{
     PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
-    PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
-    PermissionPrompter, PermissionRequest,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
@@ -86,14 +81,20 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
-pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
+pub use sandbox::{
+    build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
+    resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
+    FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
+    SandboxRequest, SandboxStatus,
+};
+pub use session::{
+    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
+    SessionFork,
+};
+pub use sse::{IncrementalSseParser, SseEvent};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
-pub use windows_shell::{bash_shell_path, set_shell_if_windows};
-
-#[cfg(windows)]
-pub use windows_shell::windows_path_to_posix_path;
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

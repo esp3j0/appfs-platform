@@ -5,18 +5,16 @@ use std::time::{Duration, Instant};
 
 use api::{
     max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
-    ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, OAuthConfig,
-    PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
+    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -171,11 +169,10 @@ impl GlobalToolRegistry {
         builtin.chain(plugin).collect()
     }
 
-    #[must_use]
     pub fn permission_specs(
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
-    ) -> Vec<(String, PermissionMode)> {
+    ) -> Result<Vec<(String, PermissionMode)>, String> {
         let builtin = mvp_tool_specs()
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
@@ -188,12 +185,11 @@ impl GlobalToolRegistry {
                     .is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
             })
             .map(|tool| {
-                (
-                    tool.definition().name.clone(),
-                    permission_mode_from_plugin(tool.required_permission()),
-                )
-            });
-        builtin.chain(plugin).collect()
+                permission_mode_from_plugin(tool.required_permission())
+                    .map(|permission| (tool.definition().name.clone(), permission))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(builtin.chain(plugin).collect())
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
@@ -213,12 +209,12 @@ fn normalize_tool_name(value: &str) -> String {
     value.trim().replace('-', "_").to_ascii_lowercase()
 }
 
-fn permission_mode_from_plugin(value: &str) -> PermissionMode {
+fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     match value {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported plugin permission: {other}"),
+        "read-only" => Ok(PermissionMode::ReadOnly),
+        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+        other => Err(format!("unsupported plugin permission: {other}")),
     }
 }
 
@@ -236,7 +232,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" }
+                    "dangerouslyDisableSandbox": { "type": "boolean" },
+                    "namespaceRestrictions": { "type": "boolean" },
+                    "isolateNetwork": { "type": "boolean" },
+                    "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
+                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -490,7 +490,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Config",
-            description: "Get or set Claw Code settings.",
+            description: "Get or set Claude Code settings.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -500,6 +500,26 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["setting"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "EnterPlanMode",
+            description: "Enable a worktree-local planning mode override and remember the previous local setting for ExitPlanMode.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "ExitPlanMode",
+            description: "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -544,6 +564,275 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "AskUserQuestion",
+            description: "Ask the user a question and wait for their response.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string" },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskCreate",
+            description: "Create a background task that runs in a separate subprocess.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskGet",
+            description: "Get the status and details of a background task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskList",
+            description: "List all background tasks and their current status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskStop",
+            description: "Stop a running background task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskUpdate",
+            description: "Send a message or update to a running background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "message": { "type": "string" }
+                },
+                "required": ["task_id", "message"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskOutput",
+            description: "Retrieve the output produced by a background task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" }
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamCreate",
+            description: "Create a team of sub-agents for parallel task execution.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["prompt"]
+                        }
+                    }
+                },
+                "required": ["name", "tasks"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TeamDelete",
+            description: "Delete a team and stop all its running tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string" }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronCreate",
+            description: "Create a scheduled recurring task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schedule": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["schedule", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronDelete",
+            description: "Delete a scheduled recurring task by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cron_id": { "type": "string" }
+                },
+                "required": ["cron_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "CronList",
+            description: "List all scheduled recurring tasks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "LSP",
+            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "minimum": 0 },
+                    "character": { "type": "integer", "minimum": 0 },
+                    "query": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ListMcpResources",
+            description: "List available resources from connected MCP servers.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ReadMcpResource",
+            description: "Read a specific resource from an MCP server by URI.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "McpAuth",
+            description: "Authenticate with an MCP server that requires OAuth or credentials.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "RemoteTrigger",
+            description: "Trigger a remote action or webhook endpoint.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
+                    "headers": { "type": "object" },
+                    "body": { "type": "string" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "MCP",
+            description: "Execute a tool provided by a connected MCP server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["server", "tool"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TestingPermission",
+            description: "Test-only tool for verifying permission enforcement behavior.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
     ]
 }
 
@@ -565,15 +854,243 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
         "Config" => from_value::<ConfigInput>(input).and_then(run_config),
+        "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
+        "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
+        "AskUserQuestion" => {
+            from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
+        }
+        "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
+        "TaskList" => run_task_list(input.clone()),
+        "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
+        "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
+        "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
+        "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
+        "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
+        "CronList" => run_cron_list(input.clone()),
+        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
+        "ListMcpResources" => {
+            from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
+        }
+        "ReadMcpResource" => from_value::<McpResourceInput>(input).and_then(run_read_mcp_resource),
+        "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
+        "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
+        "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        "TestingPermission" => {
+            from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
+        }
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
+fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    let mut result = json!({
+        "question": input.question,
+        "status": "pending",
+        "message": "Waiting for user response"
+    });
+    if let Some(options) = &input.options {
+        result["options"] = json!(options);
+    }
+    to_pretty_json(result)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let task_id = format!("task_{secs:08x}");
+    to_pretty_json(json!({
+        "task_id": task_id,
+        "status": "created",
+        "prompt": input.prompt,
+        "description": input.description
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_get(input: TaskIdInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "task_id": input.task_id,
+        "status": "unknown",
+        "message": "Task runtime not yet implemented"
+    }))
+}
+
+fn run_task_list(_input: Value) -> Result<String, String> {
+    to_pretty_json(json!({
+        "tasks": [],
+        "message": "No tasks found"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "task_id": input.task_id,
+        "status": "stopped",
+        "message": "Task stop requested"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "task_id": input.task_id,
+        "status": "updated",
+        "message": input.message
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "task_id": input.task_id,
+        "output": "",
+        "message": "No output available"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
+    let team_id = format!(
+        "team_{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    to_pretty_json(json!({
+        "team_id": team_id,
+        "name": input.name,
+        "task_count": input.tasks.len(),
+        "status": "created"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "team_id": input.team_id,
+        "status": "deleted"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
+    let cron_id = format!(
+        "cron_{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    to_pretty_json(json!({
+        "cron_id": cron_id,
+        "schedule": input.schedule,
+        "prompt": input.prompt,
+        "description": input.description,
+        "status": "created"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "cron_id": input.cron_id,
+        "status": "deleted"
+    }))
+}
+
+fn run_cron_list(_input: Value) -> Result<String, String> {
+    to_pretty_json(json!({
+        "crons": [],
+        "message": "No scheduled tasks found"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_lsp(input: LspInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "action": input.action,
+        "path": input.path,
+        "line": input.line,
+        "character": input.character,
+        "query": input.query,
+        "results": [],
+        "message": "LSP server not connected"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": input.server,
+        "resources": [],
+        "message": "No MCP resources available"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": input.server,
+        "uri": input.uri,
+        "content": "",
+        "message": "Resource not available"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": input.server,
+        "status": "auth_required",
+        "message": "MCP authentication not yet implemented"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "url": input.url,
+        "method": input.method.unwrap_or_else(|| "GET".to_string()),
+        "headers": input.headers,
+        "body": input.body,
+        "status": "triggered",
+        "message": "Remote trigger stub response"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "server": input.server,
+        "tool": input.tool,
+        "arguments": input.arguments,
+        "result": null,
+        "message": "MCP tool proxy not yet connected"
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_testing_permission(input: TestingPermissionInput) -> Result<String, String> {
+    to_pretty_json(json!({
+        "action": input.action,
+        "permitted": true,
+        "message": "Testing permission tool stub"
+    }))
+}
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
@@ -647,7 +1164,7 @@ fn run_notebook_edit(input: NotebookEditInput) -> Result<String, String> {
 }
 
 fn run_sleep(input: SleepInput) -> Result<String, String> {
-    to_pretty_json(execute_sleep(input))
+    to_pretty_json(execute_sleep(input)?)
 }
 
 fn run_brief(input: BriefInput) -> Result<String, String> {
@@ -658,8 +1175,16 @@ fn run_config(input: ConfigInput) -> Result<String, String> {
     to_pretty_json(execute_config(input)?)
 }
 
+fn run_enter_plan_mode(input: EnterPlanModeInput) -> Result<String, String> {
+    to_pretty_json(execute_enter_plan_mode(input)?)
+}
+
+fn run_exit_plan_mode(input: ExitPlanModeInput) -> Result<String, String> {
+    to_pretty_json(execute_exit_plan_mode(input)?)
+}
+
 fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
-    to_pretty_json(execute_structured_output(input))
+    to_pretty_json(execute_structured_output(input)?)
 }
 
 fn run_repl(input: ReplInput) -> Result<String, String> {
@@ -810,6 +1335,14 @@ struct ConfigInput {
     value: Option<ConfigValue>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct EnterPlanModeInput {}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ExitPlanModeInput {}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ConfigValue {
@@ -835,6 +1368,105 @@ struct PowerShellInput {
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionInput {
+    question: String,
+    #[serde(default)]
+    options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCreateInput {
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskIdInput {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskUpdateInput {
+    task_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    name: String,
+    tasks: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeleteInput {
+    team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronCreateInput {
+    schedule: String,
+    prompt: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CronDeleteInput {
+    cron_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspInput {
+    action: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    character: Option<u32>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpResourceInput {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthInput {
+    server: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteTriggerInput {
+    url: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    headers: Option<Value>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolInput {
+    server: String,
+    tool: String,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestingPermissionInput {
+    action: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -967,6 +1599,33 @@ struct ConfigOutput {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanModeState {
+    #[serde(rename = "hadLocalOverride")]
+    had_local_override: bool,
+    #[serde(rename = "previousLocalMode")]
+    previous_local_mode: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct PlanModeOutput {
+    success: bool,
+    operation: String,
+    changed: bool,
+    active: bool,
+    managed: bool,
+    message: String,
+    #[serde(rename = "settingsPath")]
+    settings_path: String,
+    #[serde(rename = "statePath")]
+    state_path: String,
+    #[serde(rename = "previousLocalMode")]
+    previous_local_mode: Option<Value>,
+    #[serde(rename = "currentLocalMode")]
+    current_local_mode: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct StructuredOutputResult {
     data: String,
@@ -1092,7 +1751,7 @@ fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("claw-rust-tools/0.1")
+        .user_agent("clawd-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
 }
@@ -1113,7 +1772,7 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
 }
 
 fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAW_WEB_SEARCH_BASE_URL") {
+    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
         let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
         url.query_pairs_mut().append_pair("q", query);
         return Ok(url);
@@ -1458,11 +2117,11 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
 }
 
 fn todo_store_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_TODO_STORE") {
+    if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".claw-todos.json"))
+    Ok(cwd.join(".clawd-todos.json"))
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -1595,7 +2254,7 @@ where
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("claw-agent-{}", job.manifest.agent_id);
+    let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -1637,7 +2296,6 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .or_else(configured_default_model)
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
@@ -1649,12 +2307,6 @@ fn build_agent_runtime(
         agent_permission_policy(),
         job.system_prompt.clone(),
     ))
-}
-
-fn configured_default_model() -> Option<String> {
-    load_runtime_config_for_cwd()
-        .ok()
-        .and_then(|config| config.model().map(ToOwned::to_owned))
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -1823,19 +2475,10 @@ struct ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
+    #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).to_string();
-        let runtime_config = load_runtime_config_for_cwd().map_err(|error| error.to_string())?;
-        let provider_override = runtime_config
-            .provider()
-            .map(provider_override_from_runtime_config);
-        let oauth = runtime_config.oauth().cloned();
-        let client = ProviderClient::from_model_with_claw_auth_resolver(
-            &model,
-            provider_override.as_ref(),
-            || resolve_tool_auth_source(&oauth),
-        )
-        .map_err(|error| error.to_string())?;
+        let model = resolve_model_alias(&model).clone();
+        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
@@ -1845,29 +2488,8 @@ impl ProviderRuntimeClient {
     }
 }
 
-fn load_runtime_config_for_cwd() -> Result<RuntimeConfig, runtime::ConfigError> {
-    let cwd = std::env::current_dir()?;
-    ConfigLoader::default_for(cwd).load()
-}
-
-fn resolve_tool_auth_source(oauth: &Option<OAuthConfig>) -> Result<api::AuthSource, api::ApiError> {
-    api::resolve_startup_auth_source(|| Ok(oauth.clone()))
-}
-
-fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
-    ProviderOverride {
-        provider: match config.provider() {
-            RuntimeProviderKind::Anthropic => ProviderKind::ClawApi,
-            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
-            RuntimeProviderKind::Xai => ProviderKind::Xai,
-        },
-        base_url: config.base_url().map(ToOwned::to_owned),
-        api_key_env: config.api_key_env().map(ToOwned::to_owned),
-        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
-    }
-}
-
 impl ApiClient for ProviderRuntimeClient {
+    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
@@ -1937,12 +2559,7 @@ impl ApiClient for ProviderRuntimeClient {
                         }
                     }
                     ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(TokenUsage {
-                            input_tokens: delta.usage.input_tokens,
-                            output_tokens: delta.usage.output_tokens,
-                            cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: 0,
-                        }));
+                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
@@ -1950,6 +2567,8 @@ impl ApiClient for ProviderRuntimeClient {
                     }
                 }
             }
+
+            push_prompt_cache_record(&self.client, &mut events);
 
             if !saw_stop
                 && events.iter().any(|event| {
@@ -1975,7 +2594,9 @@ impl ApiClient for ProviderRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            Ok(response_to_events(response))
+            let mut events = response_to_events(response);
+            push_prompt_cache_record(&self.client, &mut events);
+            Ok(events)
         })
     }
 }
@@ -2091,14 +2712,30 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         }
     }
 
-    events.push(AssistantEvent::Usage(TokenUsage {
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
-        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-        cache_read_input_tokens: response.usage.cache_read_input_tokens,
-    }));
+    events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     events
+}
+
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+    if let Some(record) = client.take_last_prompt_cache_record() {
+        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
+            events.push(AssistantEvent::PromptCache(event));
+        }
+    }
+}
+
+fn prompt_cache_record_to_runtime_event(
+    record: api::PromptCacheRecord,
+) -> Option<PromptCacheEvent> {
+    let cache_break = record.cache_break?;
+    Some(PromptCacheEvent {
+        unexpected: cache_break.unexpected,
+        reason: cache_break.reason,
+        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
+        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
+        token_drop: cache_break.token_drop,
+    })
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -2256,14 +2893,14 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_AGENT_STORE") {
+    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".claw-agents"));
+        return Ok(workspace_root.join(".clawd-agents"));
     }
-    Ok(cwd.join(".claw-agents"))
+    Ok(cwd.join(".clawd-agents"))
 }
 
 fn make_agent_id() -> String {
@@ -2368,7 +3005,8 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
 
     let cell_id = match edit_mode {
         NotebookEditMode::Insert => {
-            let resolved_cell_type = resolved_cell_type.expect("insert cell type");
+            let resolved_cell_type = resolved_cell_type
+                .ok_or_else(|| String::from("insert mode requires a cell type"))?;
             let new_id = make_cell_id(cells.len());
             let new_cell = build_notebook_cell(&new_id, resolved_cell_type, &new_source);
             let insert_at = target_index.map_or(cells.len(), |index| index + 1);
@@ -2380,16 +3018,21 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
                 .map(ToString::to_string)
         }
         NotebookEditMode::Delete => {
-            let removed = cells.remove(target_index.expect("delete target index"));
+            let idx = target_index
+                .ok_or_else(|| String::from("delete mode requires a target cell index"))?;
+            let removed = cells.remove(idx);
             removed
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string)
         }
         NotebookEditMode::Replace => {
-            let resolved_cell_type = resolved_cell_type.expect("replace cell type");
+            let resolved_cell_type = resolved_cell_type
+                .ok_or_else(|| String::from("replace mode requires a cell type"))?;
+            let idx = target_index
+                .ok_or_else(|| String::from("replace mode requires a target cell index"))?;
             let cell = cells
-                .get_mut(target_index.expect("replace target index"))
+                .get_mut(idx)
                 .ok_or_else(|| String::from("Cell index out of range"))?;
             cell["source"] = serde_json::Value::Array(source_lines(&new_source));
             cell["cell_type"] = serde_json::Value::String(match resolved_cell_type {
@@ -2480,13 +3123,21 @@ fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
         })
 }
 
+const MAX_SLEEP_DURATION_MS: u64 = 300_000;
+
 #[allow(clippy::needless_pass_by_value)]
-fn execute_sleep(input: SleepInput) -> SleepOutput {
+fn execute_sleep(input: SleepInput) -> Result<SleepOutput, String> {
+    if input.duration_ms > MAX_SLEEP_DURATION_MS {
+        return Err(format!(
+            "duration_ms {} exceeds maximum allowed sleep of {MAX_SLEEP_DURATION_MS}ms",
+            input.duration_ms,
+        ));
+    }
     std::thread::sleep(Duration::from_millis(input.duration_ms));
-    SleepOutput {
+    Ok(SleepOutput {
         duration_ms: input.duration_ms,
         message: format!("Slept for {}ms", input.duration_ms),
-    }
+    })
 }
 
 fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
@@ -2583,25 +3234,204 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
     }
 }
 
-fn execute_structured_output(input: StructuredOutputInput) -> StructuredOutputResult {
-    StructuredOutputResult {
+const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
+
+fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
+    let state_path = plan_mode_state_file()?;
+    let mut document = read_json_object(&settings_path)?;
+    let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
+    let current_is_plan =
+        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
+
+    if let Some(state) = read_plan_mode_state(&state_path)? {
+        if current_is_plan {
+            return Ok(PlanModeOutput {
+                success: true,
+                operation: String::from("enter"),
+                changed: false,
+                active: true,
+                managed: true,
+                message: String::from("Plan mode override is already active for this worktree."),
+                settings_path: settings_path.display().to_string(),
+                state_path: state_path.display().to_string(),
+                previous_local_mode: state.previous_local_mode,
+                current_local_mode,
+            });
+        }
+        clear_plan_mode_state(&state_path)?;
+    }
+
+    if current_is_plan {
+        return Ok(PlanModeOutput {
+            success: true,
+            operation: String::from("enter"),
+            changed: false,
+            active: true,
+            managed: false,
+            message: String::from(
+                "Worktree-local plan mode is already enabled outside EnterPlanMode; leaving it unchanged.",
+            ),
+            settings_path: settings_path.display().to_string(),
+            state_path: state_path.display().to_string(),
+            previous_local_mode: None,
+            current_local_mode,
+        });
+    }
+
+    let state = PlanModeState {
+        had_local_override: current_local_mode.is_some(),
+        previous_local_mode: current_local_mode.clone(),
+    };
+    write_plan_mode_state(&state_path, &state)?;
+    set_nested_value(
+        &mut document,
+        PERMISSION_DEFAULT_MODE_PATH,
+        Value::String(String::from("plan")),
+    );
+    write_json_object(&settings_path, &document)?;
+
+    Ok(PlanModeOutput {
+        success: true,
+        operation: String::from("enter"),
+        changed: true,
+        active: true,
+        managed: true,
+        message: String::from("Enabled worktree-local plan mode override."),
+        settings_path: settings_path.display().to_string(),
+        state_path: state_path.display().to_string(),
+        previous_local_mode: state.previous_local_mode,
+        current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
+    })
+}
+
+fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
+    let settings_path = config_file_for_scope(ConfigScope::Settings)?;
+    let state_path = plan_mode_state_file()?;
+    let mut document = read_json_object(&settings_path)?;
+    let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
+    let current_is_plan =
+        matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
+
+    let Some(state) = read_plan_mode_state(&state_path)? else {
+        return Ok(PlanModeOutput {
+            success: true,
+            operation: String::from("exit"),
+            changed: false,
+            active: current_is_plan,
+            managed: false,
+            message: String::from("No EnterPlanMode override is active for this worktree."),
+            settings_path: settings_path.display().to_string(),
+            state_path: state_path.display().to_string(),
+            previous_local_mode: None,
+            current_local_mode,
+        });
+    };
+
+    if !current_is_plan {
+        clear_plan_mode_state(&state_path)?;
+        return Ok(PlanModeOutput {
+            success: true,
+            operation: String::from("exit"),
+            changed: false,
+            active: false,
+            managed: false,
+            message: String::from(
+                "Cleared stale EnterPlanMode state because plan mode was already changed outside the tool.",
+            ),
+            settings_path: settings_path.display().to_string(),
+            state_path: state_path.display().to_string(),
+            previous_local_mode: state.previous_local_mode,
+            current_local_mode,
+        });
+    }
+
+    if state.had_local_override {
+        if let Some(previous_local_mode) = state.previous_local_mode.clone() {
+            set_nested_value(
+                &mut document,
+                PERMISSION_DEFAULT_MODE_PATH,
+                previous_local_mode,
+            );
+        } else {
+            remove_nested_value(&mut document, PERMISSION_DEFAULT_MODE_PATH);
+        }
+    } else {
+        remove_nested_value(&mut document, PERMISSION_DEFAULT_MODE_PATH);
+    }
+    write_json_object(&settings_path, &document)?;
+    clear_plan_mode_state(&state_path)?;
+
+    Ok(PlanModeOutput {
+        success: true,
+        operation: String::from("exit"),
+        changed: true,
+        active: false,
+        managed: false,
+        message: String::from("Restored the prior worktree-local plan mode setting."),
+        settings_path: settings_path.display().to_string(),
+        state_path: state_path.display().to_string(),
+        previous_local_mode: state.previous_local_mode,
+        current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
+    })
+}
+
+fn execute_structured_output(
+    input: StructuredOutputInput,
+) -> Result<StructuredOutputResult, String> {
+    if input.0.is_empty() {
+        return Err(String::from("structured output payload must not be empty"));
+    }
+    Ok(StructuredOutputResult {
         data: String::from("Structured output provided successfully"),
         structured_output: input.0,
-    }
+    })
 }
 
 fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
-    let _ = input.timeout_ms;
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let output = Command::new(runtime.program)
+    let mut process = Command::new(runtime.program);
+    process
         .args(runtime.args)
         .arg(&input.code)
-        .output()
-        .map_err(|error| error.to_string())?;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = if let Some(timeout_ms) = input.timeout_ms {
+        let mut child = process.spawn().map_err(|error| error.to_string())?;
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                break child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
+            }
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                child.kill().map_err(|error| error.to_string())?;
+                child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
+                return Err(format!(
+                    "REPL execution exceeded timeout of {timeout_ms} ms"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        process
+            .spawn()
+            .map_err(|error| error.to_string())?
+            .wait_with_output()
+            .map_err(|error| error.to_string())?
+    };
 
     Ok(ReplOutput {
         language: input.language,
@@ -2619,9 +3449,11 @@ struct ReplRuntime {
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => {
-            resolve_python_repl_runtime().ok_or_else(|| String::from("python runtime not found"))
-        }
+        "python" | "py" => Ok(ReplRuntime {
+            program: detect_first_command(&["python3", "python"])
+                .ok_or_else(|| String::from("python runtime not found"))?,
+            args: &["-c"],
+        }),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])
                 .ok_or_else(|| String::from("node runtime not found"))?,
@@ -2636,43 +3468,11 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
-fn resolve_python_repl_runtime() -> Option<ReplRuntime> {
-    #[cfg(windows)]
-    if command_runs_successfully("py", &["-3", "--version"]) {
-        return Some(ReplRuntime {
-            program: "py",
-            args: &["-3", "-c"],
-        });
-    }
-
-    for candidate in ["python3", "python"] {
-        if command_runs_successfully(candidate, &["--version"]) {
-            return Some(ReplRuntime {
-                program: candidate,
-                args: &["-c"],
-            });
-        }
-    }
-
-    None
-}
-
 fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
     commands
         .iter()
         .copied()
         .find(|command| command_exists(command))
-}
-
-fn command_runs_successfully(command: &str, args: &[&str]) -> bool {
-    Command::new(command)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -2903,6 +3703,72 @@ fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], ne
     set_nested_value(map, rest, new_value);
 }
 
+fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str]) -> bool {
+    let Some((first, rest)) = path.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return root.remove(*first).is_some();
+    }
+
+    let mut should_remove_parent = false;
+    let removed = root.get_mut(*first).is_some_and(|entry| {
+        entry.as_object_mut().is_some_and(|map| {
+            let removed = remove_nested_value(map, rest);
+            should_remove_parent = removed && map.is_empty();
+            removed
+        })
+    });
+
+    if should_remove_parent {
+        root.remove(*first);
+    }
+
+    removed
+}
+
+fn plan_mode_state_file() -> Result<PathBuf, String> {
+    Ok(config_file_for_scope(ConfigScope::Settings)?
+        .parent()
+        .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
+        .join("tool-state")
+        .join("plan-mode.json"))
+}
+
+fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_str(&contents)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_plan_mode_state(path: &Path, state: &PlanModeState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(state).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn clear_plan_mode_state(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn iso8601_timestamp() -> String {
     if let Ok(output) = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
@@ -2941,37 +3807,12 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    let command_path = Path::new(command);
-    if command_path.components().count() > 1 || command_path.is_absolute() {
-        return command_path.exists();
-    }
-
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| executable_exists_in_dir(&dir, command))
-    })
-}
-
-#[cfg(windows)]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
-    let candidate = dir.join(command);
-    if candidate.exists() {
-        return true;
-    }
-
-    if Path::new(command).extension().is_some() {
-        return false;
-    }
-
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-    pathext
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .any(|ext| dir.join(format!("{command}{ext}")).exists())
-}
-
-#[cfg(not(windows))]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
-    dir.join(command).exists()
+    std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3171,15 +4012,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
-        execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        push_output_block, AgentInput, AgentJob, SubagentToolExecutor,
+        execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, AgentInput, AgentJob,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
@@ -3190,28 +4031,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     fn temp_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
+        let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let pid = std::process::id();
-        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("claw-tools-{pid}-{nanos}-{counter}-{name}"))
-    }
-
-    fn bash_echo_command() -> &'static str {
-        "printf 'hello'"
-    }
-
-    fn bash_error_command() -> &'static str {
-        "printf 'oops' >&2; exit 7"
-    }
-
-    fn bash_sleep_command() -> &'static str {
-        "sleep 1"
+        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
     }
 
     #[test]
@@ -3232,6 +4057,8 @@ mod tests {
         assert!(names.contains(&"Sleep"));
         assert!(names.contains(&"SendUserMessage"));
         assert!(names.contains(&"Config"));
+        assert!(names.contains(&"EnterPlanMode"));
+        assert!(names.contains(&"ExitPlanMode"));
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
@@ -3241,6 +4068,17 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn permission_mode_from_plugin_rejects_invalid_inputs() {
+        let unknown_permission = permission_mode_from_plugin("admin")
+            .expect_err("unknown plugin permission should fail");
+        assert!(unknown_permission.contains("unsupported plugin permission: admin"));
+
+        let empty_permission =
+            permission_mode_from_plugin("").expect_err("empty plugin permission should fail");
+        assert!(empty_permission.contains("unsupported plugin permission: "));
     }
 
     #[test]
@@ -3319,9 +4157,6 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -3337,7 +4172,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAW_WEB_SEARCH_BASE_URL",
+            "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
@@ -3349,7 +4184,7 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");
@@ -3385,7 +4220,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAW_WEB_SEARCH_BASE_URL",
+            "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/fallback", server.addr()),
         );
         let result = execute_tool(
@@ -3395,7 +4230,7 @@ mod tests {
             }),
         )
         .expect("WebSearch fallback parsing should succeed");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         let results = output["results"].as_array().expect("results array");
@@ -3408,10 +4243,10 @@ mod tests {
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
 
-        std::env::set_var("CLAW_WEB_SEARCH_BASE_URL", "://bad-base-url");
+        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
     }
 
@@ -3478,7 +4313,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos.json");
-        std::env::set_var("CLAW_TODO_STORE", &path);
+        std::env::set_var("CLAWD_TODO_STORE", &path);
 
         let first = execute_tool(
             "TodoWrite",
@@ -3504,7 +4339,7 @@ mod tests {
             }),
         )
         .expect("TodoWrite should succeed");
-        std::env::remove_var("CLAW_TODO_STORE");
+        std::env::remove_var("CLAWD_TODO_STORE");
         let _ = std::fs::remove_file(path);
 
         let second_output: serde_json::Value = serde_json::from_str(&second).expect("valid json");
@@ -3525,7 +4360,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos-errors.json");
-        std::env::set_var("CLAW_TODO_STORE", &path);
+        std::env::set_var("CLAWD_TODO_STORE", &path);
 
         let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
             .expect_err("empty todos should fail");
@@ -3565,7 +4400,7 @@ mod tests {
             }),
         )
         .expect("completed todos should succeed");
-        std::env::remove_var("CLAW_TODO_STORE");
+        std::env::remove_var("CLAWD_TODO_STORE");
         let _ = fs::remove_file(path);
 
         let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
@@ -3574,19 +4409,17 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let codex_home = temp_path("codex-home");
-        let skill_dir = codex_home.join("skills").join("help");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let home = temp_path("skills-home");
+        let skill_dir = home.join(".agents").join("skills").join("help");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "description: Guide on using oh-my-codex plugin\n\n# Help\n\nUse this skill for overviews.\n",
+            "# help\n\nGuide on using oh-my-codex plugin\n",
         )
-        .expect("write skill prompt");
-        let original_codex_home = std::env::var_os("CODEX_HOME");
-        std::env::set_var("CODEX_HOME", &codex_home);
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
 
         let result = execute_tool(
             "Skill",
@@ -3599,8 +4432,10 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(PathBuf::from(output["path"].as_str().expect("path"))
-            .ends_with(PathBuf::from("help").join("SKILL.md")));
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -3616,14 +4451,17 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(PathBuf::from(dollar_output["path"].as_str().expect("path"))
-            .ends_with(PathBuf::from("help").join("SKILL.md")));
+        assert!(dollar_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("/help/SKILL.md"));
 
-        match original_codex_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
         }
-        let _ = fs::remove_dir_all(codex_home);
+        fs::remove_dir_all(home).expect("temp home should clean up");
     }
 
     #[test]
@@ -3665,7 +4503,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
-        std::env::set_var("CLAW_AGENT_STORE", &dir);
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
@@ -3685,7 +4523,7 @@ mod tests {
             },
         )
         .expect("Agent should succeed");
-        std::env::remove_var("CLAW_AGENT_STORE");
+        std::env::remove_var("CLAWD_AGENT_STORE");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
@@ -3742,7 +4580,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-runner");
-        std::env::set_var("CLAW_AGENT_STORE", &dir);
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
 
         let completed = execute_agent_with_spawn(
             AgentInput {
@@ -3824,7 +4662,7 @@ mod tests {
         assert!(spawn_error_manifest.contains("\"status\": \"failed\""));
         assert!(spawn_error_manifest.contains("thread creation failed"));
 
-        std::env::remove_var("CLAW_AGENT_STORE");
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4074,16 +4912,13 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": bash_echo_command() }))
+        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
-        assert_eq!(
-            success_output["stdout"].as_str().expect("stdout").trim(),
-            "hello"
-        );
+        assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": bash_error_command() }))
+        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
             .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
@@ -4092,11 +4927,8 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool(
-            "bash",
-            &json!({ "command": bash_sleep_command(), "timeout": 10 }),
-        )
-        .expect("bash timeout should return output");
+        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
+            .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -4107,7 +4939,7 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": bash_sleep_command(), "run_in_background": true }),
+            &json!({ "command": "sleep 1", "run_in_background": true }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -4247,10 +5079,10 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(
-            PathBuf::from(globbed_output["filenames"][0].as_str().expect("filename"))
-                .ends_with(PathBuf::from("nested").join("lib.rs"))
-        );
+        assert!(globbed_output["filenames"][0]
+            .as_str()
+            .expect("filename")
+            .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -4314,9 +5146,24 @@ mod tests {
     }
 
     #[test]
+    fn given_excessive_duration_when_sleep_then_rejects_with_error() {
+        let result = execute_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
+        let error = result.expect_err("excessive sleep should fail");
+        assert!(error.contains("exceeds maximum allowed sleep"));
+    }
+
+    #[test]
+    fn given_zero_duration_when_sleep_then_succeeds() {
+        let result =
+            execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["duration_ms"], 0);
+    }
+
+    #[test]
     fn brief_returns_sent_message_and_attachment_metadata() {
         let attachment = std::env::temp_dir().join(format!(
-            "claw-brief-{}.png",
+            "clawd-brief-{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4347,7 +5194,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "claw-config-{}",
+            "clawd-config-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4408,6 +5255,140 @@ mod tests {
     }
 
     #[test]
+    fn enter_and_exit_plan_mode_round_trip_existing_local_override() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "clawd-plan-mode-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        std::fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
+        )
+        .expect("write local settings");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
+        assert_eq!(enter_output["changed"], true);
+        assert_eq!(enter_output["managed"], true);
+        assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
+        assert_eq!(enter_output["currentLocalMode"], "plan");
+
+        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+            .expect("local settings after enter");
+        assert!(local_settings.contains(r#""defaultMode": "plan""#));
+        let state =
+            std::fs::read_to_string(cwd.join(".claw").join("tool-state").join("plan-mode.json"))
+                .expect("plan mode state");
+        assert!(state.contains(r#""hadLocalOverride": true"#));
+        assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
+
+        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
+        assert_eq!(exit_output["changed"], true);
+        assert_eq!(exit_output["managed"], false);
+        assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
+        assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
+
+        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+            .expect("local settings after exit");
+        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
+        assert!(!cwd
+            .join(".claw")
+            .join("tool-state")
+            .join("plan-mode.json")
+            .exists());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "clawd-plan-mode-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
+        assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
+        assert_eq!(enter_output["currentLocalMode"], "plan");
+
+        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
+        assert_eq!(exit_output["changed"], true);
+        assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
+
+        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+            .expect("local settings after exit");
+        let local_settings_json: serde_json::Value =
+            serde_json::from_str(&local_settings).expect("valid settings json");
+        assert_eq!(
+            local_settings_json.get("permissions"),
+            None,
+            "permissions override should be removed on exit"
+        );
+        assert!(!cwd
+            .join(".claw")
+            .join("tool-state")
+            .join("plan-mode.json")
+            .exists());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn structured_output_echoes_input_payload() {
         let result = execute_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
             .expect("StructuredOutput should succeed");
@@ -4418,10 +5399,14 @@ mod tests {
     }
 
     #[test]
+    fn given_empty_payload_when_structured_output_then_rejects_with_error() {
+        let result = execute_tool("StructuredOutput", &json!({}));
+        let error = result.expect_err("empty payload should fail");
+        assert!(error.contains("must not be empty"));
+    }
+
+    #[test]
     fn repl_executes_python_code() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -4434,23 +5419,50 @@ mod tests {
     }
 
     #[test]
+    fn given_empty_code_when_repl_then_rejects_with_error() {
+        let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
+
+        let error = result.expect_err("empty REPL code should fail");
+        assert!(error.contains("code must not be empty"));
+    }
+
+    #[test]
+    fn given_unsupported_language_when_repl_then_rejects_with_error() {
+        let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
+
+        let error = result.expect_err("unsupported REPL language should fail");
+        assert!(error.contains("unsupported REPL language: ruby"));
+    }
+
+    #[test]
+    fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let result = execute_tool(
+            "REPL",
+            &json!({
+                "language": "python",
+                "code": "import time\ntime.sleep(1)",
+                "timeout_ms": 10
+            }),
+        );
+
+        let error = result.expect_err("timed out REPL execution should fail");
+        assert!(error.contains("REPL execution exceeded timeout of 10 ms"));
+    }
+
+    #[test]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = temp_path("pwsh-bin");
+        let dir = std::env::temp_dir().join(format!(
+            "clawd-pwsh-bin-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).expect("create dir");
-        #[cfg(windows)]
-        let script = dir.join("pwsh.cmd");
-        #[cfg(not(windows))]
         let script = dir.join("pwsh");
-        #[cfg(windows)]
-        std::fs::write(
-            &script,
-            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"args=%*\"\r\necho !args! | findstr /C:\"Write-Output hello\" >nul && echo hello\r\n",
-        )
-        .expect("write script");
-        #[cfg(not(windows))]
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -4460,50 +5472,37 @@ printf 'pwsh:%s' "$1"
 "#,
         )
         .expect("write script");
-        #[cfg(not(windows))]
         std::process::Command::new("/bin/chmod")
             .arg("+x")
             .arg(&script)
             .status()
             .expect("chmod");
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
-        {
-            let mut path_entries = vec![dir.clone()];
-            path_entries.extend(std::env::split_paths(&original_path));
-            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
-            std::env::set_var("PATH", &updated_path);
-        }
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
 
-        {
-            let result = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "timeout": 1000}),
-            )
-            .expect("PowerShell should succeed");
+        let result = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "timeout": 1000}),
+        )
+        .expect("PowerShell should succeed");
 
-            let background = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "run_in_background": true}),
-            )
-            .expect("PowerShell background should succeed");
+        let background = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "run_in_background": true}),
+        )
+        .expect("PowerShell background should succeed");
 
-            std::env::set_var("PATH", original_path);
-            let _ = std::fs::remove_dir_all(dir);
+        std::env::set_var("PATH", original_path);
+        let _ = std::fs::remove_dir_all(dir);
 
-            let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-            #[cfg(windows)]
-            let expected_stdout = "hello";
-            #[cfg(not(windows))]
-            let expected_stdout = "pwsh:Write-Output hello";
-            assert_eq!(output["stdout"].as_str().expect("stdout").trim(), expected_stdout);
-            assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        assert!(output["stderr"].as_str().expect("stderr").is_empty());
 
-            let background_output: serde_json::Value =
-                serde_json::from_str(&background).expect("json");
-            assert!(background_output["backgroundTaskId"].as_str().is_some());
-            assert_eq!(background_output["backgroundedByUser"], true);
-            assert_eq!(background_output["assistantAutoBackgrounded"], false);
-        }
+        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
+        assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert_eq!(background_output["backgroundedByUser"], true);
+        assert_eq!(background_output["assistantAutoBackgrounded"], false);
     }
 
     #[test]
@@ -4513,7 +5512,7 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
         let empty_dir = std::env::temp_dir().join(format!(
-            "claw-empty-bin-{}",
+            "clawd-empty-bin-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
