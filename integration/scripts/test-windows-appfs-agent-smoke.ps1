@@ -1,0 +1,323 @@
+# AppFS + appfs-agent Windows smoke test
+# Covers: appfs init + appfs up + mounted workspace + claw status (+ optional prompt)
+
+param(
+    [string]$AgentId = "appfs-agent-smoke",
+    [string]$MountPoint = "C:\mnt\appfs-agent-smoke",
+    [string]$WorkspaceName = "workspace",
+    [switch]$SkipCleanup,
+    [switch]$KeepLogs,
+    [switch]$RunPrompt
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$script:RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+$script:AppfsCliDir = Join-Path $script:RepoRoot "appfs\cli"
+$script:AppfsAgentRustDir = Join-Path $script:RepoRoot "appfs-agent\rust"
+$script:DbPath = Join-Path $script:AppfsCliDir ".agentfs\$AgentId.db"
+$script:AppfsHandle = $null
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-smoke-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
+$script:HadFailure = $false
+
+function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
+function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
+function Write-WarningLine { Write-Host "⚠ $args" -ForegroundColor Yellow }
+function Write-Section { Write-Host "`n==== $args ====" -ForegroundColor Magenta }
+
+function Remove-TestPath {
+    param(
+        [string]$Path,
+        [switch]$Recurse
+    )
+
+    if (!(Test-Path $Path)) {
+        return
+    }
+
+    try {
+        Remove-Item -Path $Path -Force -Recurse:$Recurse -ErrorAction Stop
+    } catch {
+        if (Test-Path $Path -PathType Container) {
+            if ($Recurse) {
+                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
+            } else {
+                cmd /c "rmdir `"$Path`"" | Out-Null
+            }
+        } elseif (Test-Path $Path -PathType Leaf) {
+            cmd /c "del /f /q `"$Path`"" | Out-Null
+        }
+    }
+}
+
+function Stop-LoggedProcess {
+    param($Handle)
+
+    if ($null -eq $Handle) {
+        return
+    }
+
+    if ($Handle.Process -and !$Handle.Process.HasExited) {
+        try {
+            Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
+            $null = $Handle.Process.WaitForExit(5000)
+        } catch {
+            Write-WarningLine "Failed to stop $($Handle.Name): $_"
+        }
+    }
+}
+
+function Cleanup-TestArtifacts {
+    Stop-LoggedProcess $script:AppfsHandle
+
+    if (!$SkipCleanup) {
+        Remove-TestPath -Path $MountPoint -Recurse
+        Remove-TestPath -Path $script:DbPath
+        Remove-TestPath -Path "$($script:DbPath)-shm"
+        Remove-TestPath -Path "$($script:DbPath)-wal"
+    }
+
+    if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
+        Remove-TestPath -Path $script:LogDir -Recurse
+    }
+}
+
+function Fail-WithContext {
+    param([string]$Message)
+
+    $script:HadFailure = $true
+    Write-Fail $Message
+    if (Test-Path $script:LogDir) {
+        Write-Host "`nLogs preserved at $script:LogDir" -ForegroundColor Gray
+        foreach ($path in @(
+            (Join-Path $script:LogDir "appfs-up.stdout.log"),
+            (Join-Path $script:LogDir "appfs-up.stderr.log"),
+            (Join-Path $script:LogDir "claw-status.log"),
+            (Join-Path $script:LogDir "claw-prompt.log")
+        )) {
+            if (Test-Path $path) {
+                Write-Host "`n--- tail: $path ---" -ForegroundColor Gray
+                Get-Content $path -Tail 40 -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    throw $Message
+}
+
+function New-LogHandle {
+    param(
+        [string]$Name,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory
+    )
+
+    $stdout = Join-Path $script:LogDir "$Name.stdout.log"
+    $stderr = Join-Path $script:LogDir "$Name.stderr.log"
+    $proc = Start-Process -FilePath $FilePath `
+        -ArgumentList $ArgumentList `
+        -WorkingDirectory $WorkingDirectory `
+        -PassThru `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr
+
+    return [pscustomobject]@{
+        Name = $Name
+        Process = $proc
+        Stdout = $stdout
+        Stderr = $stderr
+    }
+}
+
+function Assert-True {
+    param(
+        [bool]$Condition,
+        [string]$Message
+    )
+
+    if (!$Condition) {
+        Fail-WithContext $Message
+    }
+    Write-Success $Message
+}
+
+function Ensure-ProcessRunning {
+    param($Handle)
+
+    if ($Handle.Process.HasExited) {
+        throw "$($Handle.Name) exited unexpectedly with code $($Handle.Process.ExitCode)"
+    }
+}
+
+function Wait-Until {
+    param(
+        [scriptblock]$Condition,
+        [string]$Description,
+        [int]$TimeoutSec = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+    while ((Get-Date) -lt $deadline) {
+        try {
+            if (& $Condition) {
+                return
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    if ($lastError) {
+        Fail-WithContext "Timed out waiting for $Description. Last error: $lastError"
+    } else {
+        Fail-WithContext "Timed out waiting for $Description"
+    }
+}
+
+function Invoke-LoggedCommand {
+    param(
+        [string]$Name,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory
+    )
+
+    $logPath = Join-Path $script:LogDir "$Name.log"
+    $stdoutPath = Join-Path $script:LogDir "$Name.stdout.tmp.log"
+    $stderrPath = Join-Path $script:LogDir "$Name.stderr.tmp.log"
+    $process = Start-Process -FilePath $FilePath `
+        -ArgumentList $ArgumentList `
+        -WorkingDirectory $WorkingDirectory `
+        -PassThru `
+        -WindowStyle Hidden `
+        -Wait `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath
+
+    $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
+    $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
+    $text = ($stdout + $stderr).TrimEnd()
+    [System.IO.File]::WriteAllText($logPath, $text + [Environment]::NewLine, $script:Utf8NoBom)
+
+    Remove-TestPath -Path $stdoutPath
+    Remove-TestPath -Path $stderrPath
+
+    if ($process.ExitCode -ne 0) {
+        Fail-WithContext "$Name failed with exit code $($process.ExitCode)"
+    }
+    if ($text) {
+        Write-Host $text
+    }
+    return $text
+}
+
+function Require-Command {
+    param([string]$Name)
+
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command not found: $Name"
+    }
+}
+
+function Main {
+    Require-Command cargo
+
+    [void][System.IO.Directory]::CreateDirectory($script:LogDir)
+
+    $mountParent = Split-Path -Parent $MountPoint
+    if ($mountParent -and !(Test-Path $mountParent)) {
+        New-Item -ItemType Directory -Path $mountParent -Force | Out-Null
+    }
+
+    if (Test-Path $MountPoint) {
+        Remove-TestPath -Path $MountPoint -Recurse
+    }
+    Remove-TestPath -Path $script:DbPath
+    Remove-TestPath -Path "$($script:DbPath)-shm"
+    Remove-TestPath -Path "$($script:DbPath)-wal"
+
+    Write-Section "Init AppFS"
+    Push-Location $script:AppfsCliDir
+    try {
+        Invoke-LoggedCommand -Name "appfs-init" -FilePath "cargo" -ArgumentList @("run", "--", "init", $AgentId, "--force") -WorkingDirectory $script:AppfsCliDir | Out-Null
+    } finally {
+        Pop-Location
+    }
+    Assert-True (Test-Path $script:DbPath) "Created database $script:DbPath"
+
+    Write-Section "Start AppFS"
+    $script:AppfsHandle = New-LogHandle -Name "appfs-up" -FilePath "cargo" -ArgumentList @(
+        "run", "--",
+        "appfs", "up", $script:DbPath, $MountPoint,
+        "--backend", "winfsp"
+    ) -WorkingDirectory $script:AppfsCliDir
+
+    $controlDir = Join-Path $MountPoint "_appfs"
+    $workspaceDir = Join-Path $MountPoint $WorkspaceName
+    $helloPath = Join-Path $workspaceDir "hello.txt"
+
+    Wait-Until -Description "AppFS mount bootstrap" -TimeoutSec 25 -Condition {
+        Ensure-ProcessRunning $script:AppfsHandle
+        return (Test-Path (Join-Path $controlDir "register_app.act")) -and
+            (Test-Path (Join-Path $controlDir "list_apps.act"))
+    }
+    Write-Success "AppFS mount is ready"
+
+    Write-Section "Prepare Workspace"
+    New-Item -ItemType Directory -Path $workspaceDir -Force | Out-Null
+    [System.IO.File]::WriteAllText($helloPath, "hello from appfs mount`n", $script:Utf8NoBom)
+    Assert-True (Test-Path $helloPath) "Created mounted workspace file $helloPath"
+    Assert-True ((Get-Content $helloPath -Raw).Contains("hello from appfs mount")) "Mounted hello.txt is readable from PowerShell"
+
+    Write-Section "Run appfs-agent Status"
+    Push-Location $workspaceDir
+    try {
+        $statusOutput = Invoke-LoggedCommand -Name "claw-status" -FilePath "cargo" -ArgumentList @(
+            "run",
+            "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
+            "-p", "rusty-claude-cli",
+            "--",
+            "status"
+        ) -WorkingDirectory $workspaceDir
+    } finally {
+        Pop-Location
+    }
+    Assert-True ($statusOutput.Contains("Workspace")) "claw status rendered a workspace snapshot inside the mount"
+    Assert-True ($statusOutput.Contains($workspaceDir)) "claw status reported the mounted workspace path"
+
+    if ($RunPrompt) {
+        Write-Section "Run appfs-agent Prompt"
+        if ([string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) {
+            Fail-WithContext "RunPrompt requires ANTHROPIC_API_KEY in the environment"
+        }
+
+        Push-Location $workspaceDir
+        try {
+            $promptOutput = Invoke-LoggedCommand -Name "claw-prompt" -FilePath "cargo" -ArgumentList @(
+                "run",
+                "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
+                "-p", "rusty-claude-cli",
+                "--",
+                "--dangerously-skip-permissions",
+                "prompt",
+                "Confirm the current working directory, list files in the current directory, and print the exact contents of hello.txt. Do not modify any files."
+            ) -WorkingDirectory $workspaceDir
+        } finally {
+            Pop-Location
+        }
+        Assert-True ($promptOutput.Contains("hello from appfs mount")) "claw prompt surfaced hello.txt content from the mounted workspace"
+    }
+
+    Write-Host "`nAppFS + appfs-agent Windows smoke test passed." -ForegroundColor Green
+}
+
+try {
+    Main
+} finally {
+    Cleanup-TestArtifacts
+}

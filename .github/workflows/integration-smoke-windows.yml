@@ -1,0 +1,44 @@
+name: Integration Smoke (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_prompt:
+        description: "Also run a real appfs-agent prompt against the mounted workspace"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  appfs-agent-windows-smoke:
+    name: appfs + appfs-agent smoke
+    runs-on:
+      - self-hosted
+      - windows
+      - winfsp
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            appfs/cli
+            appfs-agent/rust
+
+      - name: Run Windows smoke test
+        shell: powershell
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          $args = @()
+          if ("${{ inputs.run_prompt }}" -eq "true") {
+            $args += "-RunPrompt"
+          }
+          ./integration/scripts/test-windows-appfs-agent-smoke.ps1 @args
