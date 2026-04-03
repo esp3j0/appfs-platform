@@ -1,5 +1,6 @@
 mod client;
 mod error;
+mod prompt_cache;
 mod providers;
 mod sse;
 mod types;
@@ -9,7 +10,11 @@ pub use client::{
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient, ProviderOverride,
 };
 pub use error::ApiError;
-pub use providers::claw_provider::{AuthSource, ClawApiClient, ClawApiClient as ApiClient};
+pub use prompt_cache::{
+    CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
+    PromptCacheStats,
+};
+pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind,
@@ -20,4 +25,10 @@ pub use types::{
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
     MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+};
+
+pub use telemetry::{
+    AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, JsonlTelemetrySink,
+    MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
+    DEFAULT_ANTHROPIC_VERSION,
 };

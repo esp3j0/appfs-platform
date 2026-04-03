@@ -163,6 +163,28 @@ mod tests {
 
     #[test]
     fn analyzes_system_prompt_sections_and_message_categories() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage {
+                role: MessageRole::System,
+                blocks: vec![ContentBlock::Text {
+                    text: "Summary:\nEarlier context".to_string(),
+                }],
+                usage: None,
+            },
+            ConversationMessage::user_text("Please inspect src/main.rs"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "I will inspect it.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "Read".to_string(),
+                    input: "{\"file_path\":\"src/main.rs\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("tool-1", "Read", "fn main() {}", false),
+        ];
         let report = analyze_context_usage(
             &[
                 "You are a coding assistant.".to_string(),
@@ -170,30 +192,7 @@ mod tests {
                 "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__".to_string(),
                 "# Project context\nWorking directory: repo".to_string(),
             ],
-            &Session {
-                version: 1,
-                messages: vec![
-                    ConversationMessage {
-                        role: MessageRole::System,
-                        blocks: vec![ContentBlock::Text {
-                            text: "Summary:\nEarlier context".to_string(),
-                        }],
-                        usage: None,
-                    },
-                    ConversationMessage::user_text("Please inspect src/main.rs"),
-                    ConversationMessage::assistant(vec![
-                        ContentBlock::Text {
-                            text: "I will inspect it.".to_string(),
-                        },
-                        ContentBlock::ToolUse {
-                            id: "tool-1".to_string(),
-                            name: "Read".to_string(),
-                            input: "{\"file_path\":\"src/main.rs\"}".to_string(),
-                        },
-                    ]),
-                    ConversationMessage::tool_result("tool-1", "Read", "fn main() {}", false),
-                ],
-            },
+            &session,
         );
 
         assert_eq!(report.message_count, 4);

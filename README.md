@@ -1,206 +1,191 @@
-# appfs-agent
+# Rewriting Project Claw Code
 
-`appfs-agent` is the agent runtime companion for [AppFS](C:/Users/esp3j/rep/agentfs/README.md): a local, tool-using coding/runtime harness that is being adapted to run inside the AppFS ecosystem.
+<p align="center">
+  <strong>⭐ The fastest repo in history to surpass 50K stars, reaching the milestone in just 2 hours after publication ⭐</strong>
+</p>
 
-The repository started from clean-room harness experimentation and parity work. Its current direction is narrower and more practical:
+<p align="center">
+  <a href="https://star-history.com/#instructkr/claw-code&Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=instructkr/claw-code&type=Date" width="600" />
+    </picture>
+  </a>
+</p>
 
-- provide a local agent runtime that fits naturally into AppFS workflows
-- keep strong shell/file/tool ergonomics for agents
-- support plugins, hooks, skills, and session state
-- evolve toward an AppFS-native control plane and runtime contract
+<p align="center">
+  <img src="assets/clawd-hero.jpeg" alt="Claw" width="300" />
+</p>
 
-## Current status
+<p align="center">
+  <strong>Better Harness Tools, not merely storing the archive of leaked Claude Code</strong>
+</p>
 
-This repository is now positioned as **AppFS's agent runtime workspace**.
+<p align="center">
+  <a href="https://github.com/sponsors/instructkr"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github&style=for-the-badge" alt="Sponsor on GitHub" /></a>
+</p>
 
-Today:
+> [!IMPORTANT]
+> **Rust port is now in progress** on the [`dev/rust`](https://github.com/instructkr/claw-code/tree/dev/rust) branch and is expected to be merged into main today. The Rust implementation aims to deliver a faster, memory-safe harness runtime. Stay tuned — this will be the definitive version of the project.
 
-- the primary implementation lives in `rust/`
-- there is still historical parity and analysis material in `src/` and `PARITY.md`
-- some internal crate and binary names still reflect the earlier migration stage
-- the public repo name and product direction are now `appfs-agent`
+> If you find this work useful, consider [sponsoring @instructkr on GitHub](https://github.com/sponsors/instructkr) to support continued open-source harness engineering research.
 
-In other words: the runtime direction has changed first; internal naming cleanup will follow incrementally.
+---
 
-## How this fits with AppFS
+## Backstory
 
-AppFS gives shell-first agents a filesystem-native way to work with apps.
+At 4 AM on March 31, 2026, I woke up to my phone blowing up with notifications. The Claude Code source had been exposed, and the entire dev community was in a frenzy. My girlfriend in Korea was genuinely worried I might face legal action from Anthropic just for having the code on my machine — so I did what any engineer would do under pressure: I sat down, ported the core features to Python from scratch, and pushed it before the sun came up.
 
-`appfs-agent` is intended to be the agent-side runtime that can:
+The whole thing was orchestrated end-to-end using [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex) by [@bellman_ych](https://x.com/bellman_ych) — a workflow layer built on top of OpenAI's Codex ([@OpenAIDevs](https://x.com/OpenAIDevs)). I used `$team` mode for parallel code review and `$ralph` mode for persistent execution loops with architect-level verification. The entire porting session — from reading the original harness structure to producing a working Python tree with tests — was driven through OmX orchestration.
 
-- execute local coding and automation tasks
-- maintain conversations, sessions, and tool state
-- load project instructions and local skills
-- expose or consume AppFS-managed resources
-- eventually participate as a first-class managed runtime inside `agentfs appfs`
+The result is a clean-room Python rewrite that captures the architectural patterns of Claude Code's agent harness without copying any proprietary source. I'm now actively collaborating with [@bellman_ych](https://x.com/bellman_ych) — the creator of OmX himself — to push this further. The basic Python foundation is already in place and functional, but we're just getting started. **Stay tuned — a much more capable version is on the way.**
 
-Short version:
+https://github.com/instructkr/claw-code
 
-- `agentfs` / `appfs`: filesystem protocol, mounts, runtime control plane
-- `appfs-agent`: the agent execution runtime that lives on top of that substrate
+![Tweet screenshot](assets/tweet-screenshot.png)
 
-## Repository layout
+## The Creators Featured in Wall Street Journal For Avid Claude Code Fans
+
+I've been deeply interested in **harness engineering** — studying how agent systems wire tools, orchestrate tasks, and manage runtime context. This isn't a sudden thing. The Wall Street Journal featured my work earlier this month, documenting how I've been one of the most active power users exploring these systems:
+
+> AI startup worker Sigrid Jin, who attended the Seoul dinner, single-handedly used 25 billion of Claude Code tokens last year. At the time, usage limits were looser, allowing early enthusiasts to reach tens of billions of tokens at a very low cost.
+>
+> Despite his countless hours with Claude Code, Jin isn't faithful to any one AI lab. The tools available have different strengths and weaknesses, he said. Codex is better at reasoning, while Claude Code generates cleaner, more shareable code.
+>
+> Jin flew to San Francisco in February for Claude Code's first birthday party, where attendees waited in line to compare notes with Cherny. The crowd included a practicing cardiologist from Belgium who had built an app to help patients navigate care, and a California lawyer who made a tool for automating building permit approvals using Claude Code.
+>
+> "It was basically like a sharing party," Jin said. "There were lawyers, there were doctors, there were dentists. They did not have software engineering backgrounds."
+>
+> — *The Wall Street Journal*, March 21, 2026, [*"The Trillion Dollar Race to Automate Our Entire Lives"*](https://lnkd.in/gs9td3qd)
+
+![WSJ Feature](assets/wsj-feature.png)
+
+---
+
+## Porting Status
+
+The main source tree is now Python-first.
+
+- `src/` contains the active Python porting workspace
+- `tests/` verifies the current Python workspace
+- the exposed snapshot is no longer part of the tracked repository state
+
+The current Python workspace is not yet a complete one-to-one replacement for the original system, but the primary implementation surface is now Python.
+
+## Why this rewrite exists
+
+I originally studied the exposed codebase to understand its harness, tool wiring, and agent workflow. After spending more time with the legal and ethical questions—and after reading the essay linked below—I did not want the exposed snapshot itself to remain the main tracked source tree.
+
+This repository now focuses on Python porting work instead.
+
+## Repository Layout
 
 ```text
 .
-├── rust/                    # Active Rust runtime workspace
-│   ├── crates/claw-cli/     # Current interactive CLI binary
-│   ├── crates/runtime/      # Conversation loop, config, hooks, sessions
-│   ├── crates/tools/        # Built-in tool registry and execution
-│   ├── crates/commands/     # Slash commands and local discovery
-│   ├── crates/plugins/      # Plugin loading, lifecycle, hook support
-│   ├── crates/api/          # Model/provider clients and streaming
-│   ├── crates/lsp/          # LSP support types/process helpers
-│   └── crates/server/       # Supporting services
-├── src/                     # Historical parity-analysis and porting workspace
-├── tests/                   # Validation for the non-Rust workspace surfaces
-├── PARITY.md                # TS snapshot vs Rust migration checkpoint
+├── src/                                # Python porting workspace
+│   ├── __init__.py
+│   ├── commands.py
+│   ├── main.py
+│   ├── models.py
+│   ├── port_manifest.py
+│   ├── query_engine.py
+│   ├── task.py
+│   └── tools.py
+├── tests/                              # Python verification
+├── assets/omx/                         # OmX workflow screenshots
+├── 2026-03-09-is-legal-the-same-as-legitimate-ai-reimplementation-and-the-erosion-of-copyleft.md
 └── README.md
 ```
 
-## Current capabilities
+## Python Workspace Overview
 
-The Rust workspace already provides a usable local agent runtime core:
+The new Python `src/` tree currently provides:
 
-- interactive REPL and one-shot prompt execution
-- session persistence and resume flows
-- shell, file, search, web, todo, notebook, config, REPL, and PowerShell tools
-- plugin discovery and plugin-provided tools
-- hook execution around tool calls
-- local skills and agent discovery
-- OAuth support, MCP bootstrap/client support, and LSP support primitives
+- **`port_manifest.py`** — summarizes the current Python workspace structure
+- **`models.py`** — dataclasses for subsystems, modules, and backlog state
+- **`commands.py`** — Python-side command port metadata
+- **`tools.py`** — Python-side tool port metadata
+- **`query_engine.py`** — renders a Python porting summary from the active workspace
+- **`main.py`** — a CLI entrypoint for manifest and summary output
 
-This is enough to treat the Rust workspace as the foundation of `appfs-agent`, even though the full AppFS integration story is not finished yet.
+## Quickstart
 
-## Current gaps
-
-The runtime is not fully AppFS-native yet.
-
-Important gaps still include:
-
-- internal naming still uses `claw` in several places
-- no dedicated AppFS runtime entrypoint yet
-- no explicit AppFS-managed lifecycle integration yet
-- no final command/API contract for how AppFS should start, supervise, and communicate with the agent runtime
-- historical TS parity is still incomplete in several advanced areas
-
-See [PARITY.md](C:/Users/esp3j/rep/claw-code/PARITY.md) for the migration checkpoint.
-
-## Build and run
-
-The active implementation is the Rust workspace:
+Render the Python porting summary:
 
 ```bash
-cd rust
-cargo build --workspace
-cargo run --bin claw -- --help
+python3 -m src.main summary
 ```
 
-The current binary is still named `claw`. That is an implementation detail inherited from the earlier migration stage, not the final product name.
-
-## Model and provider configuration
-
-`appfs-agent` now supports two ways to choose a model backend:
-
-- set only `model` and let the runtime infer the provider from the model family
-- set both `model` and `provider` to force a specific provider family and gateway
-
-Runtime settings are loaded from these files, in precedence order:
-
-- `%HOME%\\.claw\\settings.json`
-- `.claw.json`
-- `.claw\\settings.json`
-- `.claw\\settings.local.json`
-
-The most useful pattern for AppFS deployments is to keep shared defaults in `.claw.json` and machine- or secret-specific overrides in `.claw/settings.local.json`.
-
-Example: OpenAI-compatible gateway with a custom model name
-
-```json
-{
-  "model": "qwen3-coder-plus",
-  "provider": {
-    "type": "openai",
-    "baseUrl": "https://gateway.example/v1",
-    "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
-  }
-}
-```
-
-Example: official OpenAI API
-
-```json
-{
-  "model": "gpt-4.1",
-  "provider": {
-    "type": "openai",
-    "baseUrl": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
-  }
-}
-```
-
-Example: Anthropic-compatible route
-
-```json
-{
-  "model": "claude-sonnet-4-6",
-  "provider": {
-    "type": "anthropic",
-    "baseUrl": "https://anthropic-proxy.example",
-    "apiKeyEnv": "ANTHROPIC_API_KEY",
-    "authTokenEnv": "ANTHROPIC_AUTH_TOKEN"
-  }
-}
-```
-
-Example: xAI
-
-```json
-{
-  "model": "grok-3",
-  "provider": {
-    "type": "xai",
-    "baseUrl": "https://api.x.ai/v1",
-    "apiKeyEnv": "XAI_API_KEY"
-  }
-}
-```
-
-Notes:
-
-- `model` can be any string; when `provider` is present, the runtime uses `provider.type` instead of guessing
-- `provider.type` currently supports `anthropic`, `openai`, and `xai`
-- `provider.baseUrl` lets you point at a proxy or any OpenAI-compatible gateway
-- `provider.authTokenEnv` is only valid for `anthropic`
-- if `provider` is omitted, the runtime falls back to model-based provider detection
-- the configured `model` is now used as the default model for the CLI and agent runtime
-
-You can inspect merged settings with:
+Print the current Python workspace manifest:
 
 ```bash
-cd rust
-cargo run --bin claw -- config provider
+python3 -m src.main manifest
 ```
 
-This prints the merged `provider` section after config-file precedence has been applied.
+List the current Python modules:
 
-## Near-term roadmap
+```bash
+python3 -m src.main subsystems --limit 16
+```
 
-The next phase for `appfs-agent` is to turn the current local runtime into an AppFS-native component:
+Run verification:
 
-1. keep tightening the Rust runtime core
-2. define the AppFS-facing runtime contract
-3. introduce an AppFS-oriented entrypoint and naming pass
-4. decide which historical parity features are worth preserving
-5. make Windows support and CI first-class if AppFS deployment needs it
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-## Relationship to the archived work
+Run the parity audit against the local ignored archive (when present):
 
-This repository still contains:
+```bash
+python3 -m src.main parity-audit
+```
 
-- historical migration artifacts
-- parity analysis against the archived TypeScript snapshot
-- an earlier Python-first porting surface
+Inspect mirrored command/tool inventories:
 
-Those are now supporting materials. The main product direction is the Rust-based `appfs-agent` runtime.
+```bash
+python3 -m src.main commands --limit 10
+python3 -m src.main tools --limit 10
+```
+
+## Current Parity Checkpoint
+
+The port now mirrors the archived root-entry file surface, top-level subsystem names, and command/tool inventories much more closely than before. However, it is **not yet** a full runtime-equivalent replacement for the original TypeScript system; the Python tree still contains fewer executable runtime slices than the archived source.
+
+
+## Built with `oh-my-codex`
+
+The restructuring and documentation work on this repository was AI-assisted and orchestrated with Yeachan Heo's [oh-my-codex (OmX)](https://github.com/Yeachan-Heo/oh-my-codex), layered on top of Codex.
+
+- **`$team` mode:** used for coordinated parallel review and architectural feedback
+- **`$ralph` mode:** used for persistent execution, verification, and completion discipline
+- **Codex-driven workflow:** used to turn the main `src/` tree into a Python-first porting workspace
+
+### OmX workflow screenshots
+
+![OmX workflow screenshot 1](assets/omx/omx-readme-review-1.png)
+
+*Ralph/team orchestration view while the README and essay context were being reviewed in terminal panes.*
+
+![OmX workflow screenshot 2](assets/omx/omx-readme-review-2.png)
+
+*Split-pane review and verification flow during the final README wording pass.*
+
+## Community
+
+<p align="center">
+  <a href="https://instruct.kr/"><img src="assets/instructkr.png" alt="instructkr" width="400" /></a>
+</p>
+
+Join the [**instructkr Discord**](https://instruct.kr/) — the best Korean language model community. Come chat about LLMs, harness engineering, agent workflows, and everything in between.
+
+[![Discord](https://img.shields.io/badge/Join%20Discord-instruct.kr-5865F2?logo=discord&style=for-the-badge)](https://instruct.kr/)
+
+## Star History
+
+See the chart at the top of this README.
+
+## Ownership / Affiliation Disclaimer
+
+- This repository does **not** claim ownership of the original Claude Code source material.
+- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.

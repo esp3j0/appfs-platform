@@ -2,7 +2,8 @@ __pycache__/
 archive/
 .omx/
 .clawd-agents/
-rust/.claw/
+.port_sessions/
 # Claude Code local artifacts
+.claude/
 .claude/settings.local.json
 .claude/sessions/

@@ -53,6 +53,7 @@ pub struct RuntimeFeatureConfig {
     model: Option<String>,
     provider: Option<RuntimeProviderConfig>,
     permission_mode: Option<ResolvedPermissionMode>,
+    permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
 }
 
@@ -75,6 +76,14 @@ pub struct RuntimeProviderConfig {
 pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
+    post_tool_use_failure: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimePermissionRuleConfig {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    ask: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -113,6 +122,7 @@ pub struct McpStdioServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub tool_call_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +275,7 @@ impl ConfigLoader {
             model: parse_optional_model(&merged_value),
             provider: parse_optional_provider_config(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
+            permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
         };
 
@@ -347,6 +358,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.feature_config.permission_rules
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
@@ -401,8 +417,35 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.permission_rules
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
+    }
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn provider(&self) -> RuntimeProviderKind {
+        self.provider
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env.as_deref()
+    }
+
+    #[must_use]
+    pub fn auth_token_env(&self) -> Option<&str> {
+        self.auth_token_env.as_deref()
     }
 }
 
@@ -445,28 +488,6 @@ impl RuntimePluginConfig {
     }
 }
 
-impl RuntimeProviderConfig {
-    #[must_use]
-    pub fn provider(&self) -> RuntimeProviderKind {
-        self.provider
-    }
-
-    #[must_use]
-    pub fn base_url(&self) -> Option<&str> {
-        self.base_url.as_deref()
-    }
-
-    #[must_use]
-    pub fn api_key_env(&self) -> Option<&str> {
-        self.api_key_env.as_deref()
-    }
-
-    #[must_use]
-    pub fn auth_token_env(&self) -> Option<&str> {
-        self.auth_token_env.as_deref()
-    }
-}
-
 #[must_use]
 pub fn default_config_home() -> PathBuf {
     std::env::var_os("CLAW_CONFIG_HOME")
@@ -477,10 +498,15 @@ pub fn default_config_home() -> PathBuf {
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
+            post_tool_use_failure,
         }
     }
 
@@ -504,6 +530,37 @@ impl RuntimeHookConfig {
     pub fn extend(&mut self, other: &Self) {
         extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
         extend_unique(&mut self.post_tool_use, other.post_tool_use());
+        extend_unique(
+            &mut self.post_tool_use_failure,
+            other.post_tool_use_failure(),
+        );
+    }
+
+    #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
+}
+
+impl RuntimePermissionRuleConfig {
+    #[must_use]
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
+    }
+
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    #[must_use]
+    pub fn ask(&self) -> &[String] {
+        &self.ask
     }
 }
 
@@ -556,7 +613,7 @@ fn read_optional_json_object(
 
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
-        Err(error) if is_legacy_config => return Ok(None),
+        Err(_error) if is_legacy_config => return Ok(None),
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
@@ -671,6 +728,32 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
         pre_tool_use: optional_string_array(hooks, "PreToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
         post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_string_array(
+            hooks,
+            "PostToolUseFailure",
+            "merged settings.hooks",
+        )?
+        .unwrap_or_default(),
+    })
+}
+
+fn parse_optional_permission_rules(
+    root: &JsonValue,
+) -> Result<RuntimePermissionRuleConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+    let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+
+    Ok(RuntimePermissionRuleConfig {
+        allow: optional_string_array(permissions, "allow", "merged settings.permissions")?
+            .unwrap_or_default(),
+        deny: optional_string_array(permissions, "deny", "merged settings.permissions")?
+            .unwrap_or_default(),
+        ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
     })
 }
@@ -812,6 +895,7 @@ fn parse_mcp_server_config(
             command: expect_string(object, "command", context)?.to_string(),
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
+            tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -935,6 +1019,27 @@ fn optional_u16(
     }
 }
 
+fn optional_u64(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match object.get(key) {
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key} must be a non-negative integer"
+                )));
+            };
+            let number = u64::try_from(number).map_err(|_| {
+                ConfigError::Parse(format!("{context}: field {key} is out of range"))
+            })?;
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
 fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, bool>, ConfigError> {
     let Some(map) = value.as_object() else {
         return Err(ConfigError::Parse(format!(
@@ -1042,8 +1147,9 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
-        RuntimeProviderKind, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
+        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
+        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1074,11 +1180,13 @@ mod tests {
             .to_string()
             .contains("top-level settings value must be a JSON object"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
     }
 
     #[test]
-    fn loads_and_merges_claw_code_config_files_by_precedence() {
+    fn loads_and_merges_claude_code_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
@@ -1092,7 +1200,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan"}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -1102,7 +1210,7 @@ mod tests {
         .expect("write project compat config");
         fs::write(
             cwd.join(".claw").join("settings.json"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -1123,7 +1231,6 @@ mod tests {
             Some(&JsonValue::String("opus".to_string()))
         );
         assert_eq!(loaded.model(), Some("opus"));
-        assert!(loaded.provider().is_none());
         assert_eq!(
             loaded.permission_mode(),
             Some(ResolvedPermissionMode::WorkspaceWrite)
@@ -1148,6 +1255,16 @@ mod tests {
             .contains_key("PostToolUse"));
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
+        assert_eq!(
+            loaded.hooks().post_tool_use_failure(),
+            &["project-failure".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
+        assert_eq!(
+            loaded.permission_rules().deny(),
+            &["Bash(rm -rf)".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
 
@@ -1374,71 +1491,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_provider_config() {
-        let root = temp_dir();
-        let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
-        fs::create_dir_all(&home).expect("home config dir");
-
-        fs::write(
-            cwd.join(".claw").join("settings.local.json"),
-            r#"{
-              "model": "qwen3-coder-plus",
-              "provider": {
-                "type": "openai",
-                "baseUrl": "https://gateway.example/v1",
-                "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
-              }
-            }"#,
-        )
-        .expect("write local settings");
-
-        let loaded = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-
-        assert_eq!(loaded.model(), Some("qwen3-coder-plus"));
-        let provider = loaded.provider().expect("provider config should exist");
-        assert_eq!(provider.provider(), RuntimeProviderKind::OpenAi);
-        assert_eq!(provider.base_url(), Some("https://gateway.example/v1"));
-        assert_eq!(provider.api_key_env(), Some("APPFS_GATEWAY_API_KEY"));
-        assert_eq!(provider.auth_token_env(), None);
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn rejects_auth_token_env_for_non_anthropic_provider() {
-        let root = temp_dir();
-        let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
-        fs::create_dir_all(&home).expect("home config dir");
-
-        fs::write(
-            cwd.join(".claw").join("settings.local.json"),
-            r#"{
-              "provider": {
-                "type": "openai",
-                "authTokenEnv": "SHOULD_FAIL"
-              }
-            }"#,
-        )
-        .expect("write local settings");
-
-        let error = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect_err("config should reject auth token env");
-        assert!(error
-            .to_string()
-            .contains("authTokenEnv is only supported for anthropic providers"));
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
     fn rejects_invalid_mcp_server_shapes() {
+        // given
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
@@ -1450,13 +1504,132 @@ mod tests {
         )
         .expect("write broken settings");
 
+        // when
         let error = ConfigLoader::new(&cwd, &home)
             .load()
             .expect_err("config should fail");
+
+        // then
         assert!(error
             .to_string()
             .contains("mcpServers.broken: missing string field url"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn empty_settings_file_loads_defaults() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("empty settings should still load");
+
+        // then
+        assert_eq!(loaded.loaded_entries().len(), 1);
+        assert_eq!(loaded.permission_mode(), None);
+        assert_eq!(loaded.plugins().enabled_plugins().len(), 0);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn deep_merge_objects_merges_nested_maps() {
+        // given
+        let mut target = JsonValue::parse(r#"{"env":{"A":"1","B":"2"},"model":"haiku"}"#)
+            .expect("target JSON should parse")
+            .as_object()
+            .expect("target should be an object")
+            .clone();
+        let source =
+            JsonValue::parse(r#"{"env":{"B":"override","C":"3"},"sandbox":{"enabled":true}}"#)
+                .expect("source JSON should parse")
+                .as_object()
+                .expect("source should be an object")
+                .clone();
+
+        // when
+        deep_merge_objects(&mut target, &source);
+
+        // then
+        let env = target
+            .get("env")
+            .and_then(JsonValue::as_object)
+            .expect("env should remain an object");
+        assert_eq!(env.get("A"), Some(&JsonValue::String("1".to_string())));
+        assert_eq!(
+            env.get("B"),
+            Some(&JsonValue::String("override".to_string()))
+        );
+        assert_eq!(env.get("C"), Some(&JsonValue::String("3".to_string())));
+        assert!(target.contains_key("sandbox"));
+    }
+
+    #[test]
+    fn permission_mode_aliases_resolve_to_expected_modes() {
+        // given / when / then
+        assert_eq!(
+            parse_permission_mode_label("plan", "test").expect("plan should resolve"),
+            ResolvedPermissionMode::ReadOnly
+        );
+        assert_eq!(
+            parse_permission_mode_label("acceptEdits", "test").expect("acceptEdits should resolve"),
+            ResolvedPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
+            ResolvedPermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn hook_config_merge_preserves_uniques() {
+        // given
+        let base = RuntimeHookConfig::new(
+            vec!["pre-a".to_string()],
+            vec!["post-a".to_string()],
+            vec!["failure-a".to_string()],
+        );
+        let overlay = RuntimeHookConfig::new(
+            vec!["pre-a".to_string(), "pre-b".to_string()],
+            vec!["post-a".to_string(), "post-b".to_string()],
+            vec!["failure-b".to_string()],
+        );
+
+        // when
+        let merged = base.merged(&overlay);
+
+        // then
+        assert_eq!(
+            merged.pre_tool_use(),
+            &["pre-a".to_string(), "pre-b".to_string()]
+        );
+        assert_eq!(
+            merged.post_tool_use(),
+            &["post-a".to_string(), "post-b".to_string()]
+        );
+        assert_eq!(
+            merged.post_tool_use_failure(),
+            &["failure-a".to_string(), "failure-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugin_state_falls_back_to_default_for_unknown_plugin() {
+        // given
+        let mut config = RuntimePluginConfig::default();
+        config.set_plugin_state("known".to_string(), true);
+
+        // when / then
+        assert!(config.state_for("known", false));
+        assert!(config.state_for("missing", true));
+        assert!(!config.state_for("missing", false));
     }
 }
