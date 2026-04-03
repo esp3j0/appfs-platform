@@ -321,7 +321,8 @@ fn preserve_process_runtime_env(command: &mut Command) {
 }
 
 fn paths_match(reported_path: &str, expected_path: &Path) -> bool {
-    normalize_reported_path(reported_path) == expected_path
+    canonicalize_for_compare(&normalize_reported_path(reported_path))
+        == canonicalize_for_compare(expected_path)
 }
 
 fn normalize_reported_path(path: &str) -> PathBuf {
@@ -329,4 +330,8 @@ fn normalize_reported_path(path: &str) -> PathBuf {
     let path = path.strip_prefix(r"\\?\").unwrap_or(path);
 
     PathBuf::from(path)
+}
+
+fn canonicalize_for_compare(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
