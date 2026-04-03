@@ -353,8 +353,20 @@ function Main {
     }
     Write-Success "Registered app tree is visible"
 
-    $snapshotPreview = Get-Content $snapshotPath -TotalCount 3 | Out-String
-    Assert-True ($snapshotPreview.Contains("hello")) "Initial snapshot is readable from the mount"
+    Wait-Until -Description "initial snapshot content" -TimeoutSec 20 -Condition {
+        Ensure-ProcessRunning $script:AppfsHandle
+        if (!(Test-Path $snapshotPath)) {
+            return $false
+        }
+        try {
+            $snapshotContent = Get-Content $snapshotPath -Raw -ErrorAction Stop
+            return $snapshotContent.Contains('"text":"hello"') -or $snapshotContent.Contains("hello")
+        } catch {
+            return $false
+        }
+    }
+    $snapshotPreview = Get-Content $snapshotPath -TotalCount 3 -ErrorAction Stop | Out-String
+    Write-Success "Initial snapshot is readable from the mount"
 
     Write-Section "Run appfs-agent Demo Prompt"
     $clientToken = "agent-http-demo-001"
