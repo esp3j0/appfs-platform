@@ -201,7 +201,6 @@ fn prepare_command(
 
     let mut prepared = Command::new(bash_shell_path()?);
     prepared.arg("-lc").arg(command);
-
     prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
         configure_bash_sandbox_env(&mut prepared, cwd);
@@ -229,7 +228,6 @@ fn prepare_tokio_command(
 
     let mut prepared = TokioCommand::new(bash_shell_path()?);
     prepared.arg("-lc").arg(command);
-
     prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
         configure_bash_sandbox_env(&mut prepared, cwd);
@@ -300,6 +298,7 @@ mod tests {
 
     #[test]
     fn executes_simple_command() {
+        let _guard = crate::test_env_lock();
         let output = execute_bash(BashCommandInput {
             command: success_command(),
             timeout: Some(1_000),
@@ -320,6 +319,7 @@ mod tests {
 
     #[test]
     fn disables_sandbox_when_requested() {
+        let _guard = crate::test_env_lock();
         let output = execute_bash(BashCommandInput {
             command: success_command(),
             timeout: Some(1_000),
