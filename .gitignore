@@ -4,6 +4,5 @@ archive/
 .clawd-agents/
 .port_sessions/
 # Claude Code local artifacts
-.claude/
 .claude/settings.local.json
 .claude/sessions/

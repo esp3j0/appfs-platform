@@ -56,12 +56,19 @@ Harness coverage:
 - `grep_chunk_assembly`
 - `write_file_allowed`
 - `write_file_denied`
+- `multi_tool_turn_roundtrip`
+- `bash_stdout_roundtrip`
+- `bash_permission_prompt_approved`
+- `bash_permission_prompt_denied`
+- `plugin_tool_roundtrip`
 
 Primary artifacts:
 
 - `crates/mock-anthropic-service/` — reusable mock Anthropic-compatible service
 - `crates/rusty-claude-cli/tests/mock_parity_harness.rs` — clean-env CLI harness
 - `scripts/run_mock_parity_harness.sh` — reproducible wrapper
+- `scripts/run_mock_parity_diff.py` — scenario checklist + PARITY mapping runner
+- `mock_parity_scenarios.json` — scenario-to-PARITY manifest
 
 ## Features
 
