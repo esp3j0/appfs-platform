@@ -427,28 +427,6 @@ impl RuntimeFeatureConfig {
     }
 }
 
-impl RuntimeProviderConfig {
-    #[must_use]
-    pub fn provider(&self) -> RuntimeProviderKind {
-        self.provider
-    }
-
-    #[must_use]
-    pub fn base_url(&self) -> Option<&str> {
-        self.base_url.as_deref()
-    }
-
-    #[must_use]
-    pub fn api_key_env(&self) -> Option<&str> {
-        self.api_key_env.as_deref()
-    }
-
-    #[must_use]
-    pub fn auth_token_env(&self) -> Option<&str> {
-        self.auth_token_env.as_deref()
-    }
-}
-
 impl RuntimePluginConfig {
     #[must_use]
     pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> {
@@ -485,6 +463,28 @@ impl RuntimePluginConfig {
             .get(plugin_id)
             .copied()
             .unwrap_or(default_enabled)
+    }
+}
+
+impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn provider(&self) -> RuntimeProviderKind {
+        self.provider
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env.as_deref()
+    }
+
+    #[must_use]
+    pub fn auth_token_env(&self) -> Option<&str> {
+        self.auth_token_env.as_deref()
     }
 }
 
@@ -1149,7 +1149,7 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimePluginConfig, RuntimeProviderKind, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1231,6 +1231,7 @@ mod tests {
             Some(&JsonValue::String("opus".to_string()))
         );
         assert_eq!(loaded.model(), Some("opus"));
+        assert!(loaded.provider().is_none());
         assert_eq!(
             loaded.permission_mode(),
             Some(ResolvedPermissionMode::WorkspaceWrite)
@@ -1486,6 +1487,70 @@ mod tests {
             Some("plugin-cache/installed.json")
         );
         assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_provider_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{
+              "model": "qwen3-coder-plus",
+              "provider": {
+                "type": "openai",
+                "baseUrl": "https://gateway.example/v1",
+                "apiKeyEnv": "APPFS_GATEWAY_API_KEY"
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.model(), Some("qwen3-coder-plus"));
+        let provider = loaded.provider().expect("provider config should exist");
+        assert_eq!(provider.provider(), RuntimeProviderKind::OpenAi);
+        assert_eq!(provider.base_url(), Some("https://gateway.example/v1"));
+        assert_eq!(provider.api_key_env(), Some("APPFS_GATEWAY_API_KEY"));
+        assert_eq!(provider.auth_token_env(), None);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_auth_token_env_for_non_anthropic_provider() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{
+              "provider": {
+                "type": "openai",
+                "authTokenEnv": "SHOULD_FAIL"
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should reject auth token env");
+        assert!(error
+            .to_string()
+            .contains("authTokenEnv is only supported for anthropic providers"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -336,14 +336,50 @@ mod tests {
     use super::{initialize_repo, render_init_claude_md};
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_dir() -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("rusty-claude-init-{nanos}"))
+        let temp_root = std::env::temp_dir();
+        let pid = std::process::id();
+
+        loop {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be after epoch")
+                .as_nanos();
+            let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = temp_root.join(format!("rusty-claude-init-{pid}-{nanos}-{counter}"));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create temp dir: {error}"),
+            }
+        }
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        for attempt in 0..10 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error)
+                    if attempt < 9
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::DirectoryNotEmpty
+                                | std::io::ErrorKind::PermissionDenied
+                        ) =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) if !path.exists() => return,
+                Err(error) => panic!("cleanup temp dir: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -378,7 +414,7 @@ mod tests {
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -407,7 +443,7 @@ mod tests {
         assert_eq!(gitignore.matches(".claude/settings.local.json").count(), 1);
         assert_eq!(gitignore.matches(".claude/sessions/").count(), 1);
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 
     #[test]
@@ -428,6 +464,6 @@ mod tests {
         assert!(rendered.contains("pyproject.toml"));
         assert!(rendered.contains("Next.js detected"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_temp_dir(&root);
     }
 }

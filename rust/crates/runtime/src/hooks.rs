@@ -422,7 +422,21 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
     ) -> HookCommandOutcome {
-        let mut child = shell_command(command);
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return HookCommandOutcome::Failed {
+                    parsed: ParsedHookOutput {
+                        messages: vec![format!(
+                            "{} hook `{command}` failed to start for `{}`: {error}",
+                            event.as_str(),
+                            tool_name
+                        )],
+                        ..ParsedHookOutput::default()
+                    },
+                };
+            }
+        };
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
@@ -632,11 +646,10 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
     message
 }
 
-fn shell_command(command: &str) -> CommandWithStdin {
-    let mut command_builder =
-        Command::new(bash_shell_path().expect("bash shell should be available"));
+fn shell_command(command: &str) -> std::io::Result<CommandWithStdin> {
+    let mut command_builder = Command::new(bash_shell_path()?);
     command_builder.arg("-lc").arg(command);
-    CommandWithStdin::new(command_builder)
+    Ok(CommandWithStdin::new(command_builder))
 }
 
 struct CommandWithStdin {
@@ -727,7 +740,7 @@ mod tests {
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'pre ok'")],
+            vec![shell_echo("pre ok")],
             Vec::new(),
             Vec::new(),
         ));
@@ -740,7 +753,7 @@ mod tests {
     #[test]
     fn denies_exit_code_two() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+            vec![shell_echo_and_exit("blocked by hook", 2)],
             Vec::new(),
             Vec::new(),
         ));
@@ -965,7 +978,15 @@ mod tests {
         )));
     }
 
-    fn shell_snippet(script: &str) -> String {
-        script.to_string()
+    fn shell_echo(message: &str) -> String {
+        format!("printf '{message}'")
+    }
+
+    fn shell_snippet(command: &str) -> String {
+        command.to_string()
+    }
+
+    fn shell_echo_and_exit(message: &str, code: i32) -> String {
+        format!("printf '{message}'; exit {code}")
     }
 }
