@@ -5860,7 +5860,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        remove_dir_all_with_retry(root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -5894,7 +5894,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        remove_dir_all_with_retry(root);
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
@@ -6418,7 +6418,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -6690,7 +6690,7 @@ mod tests {
         );
         assert_eq!(branch.as_deref(), Some("rcc/cli"));
         assert!(project_root.is_none());
-        fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&temp_root);
     }
 
     #[test]
@@ -6746,7 +6746,7 @@ UU conflicted.rs",
         let report = render_diff_report_for(&root).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -6771,7 +6771,7 @@ UU conflicted.rs",
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -6796,7 +6796,7 @@ UU conflicted.rs",
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -6825,7 +6825,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
