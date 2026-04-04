@@ -1,6 +1,7 @@
 target/
 .omx/
 .clawd-agents/
+.claw/
 .claude/
 .clawd-todos.json
 .sandbox-home/

@@ -142,6 +142,7 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
+    let lower = canonical.to_ascii_lowercase();
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
@@ -158,7 +159,26 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if is_openai_model_name(&lower) {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     None
+}
+
+fn is_openai_model_name(model: &str) -> bool {
+    model.starts_with("gpt-")
+        || model.starts_with("chatgpt-")
+        || model == "o1"
+        || model.starts_with("o1-")
+        || model == "o3"
+        || model.starts_with("o3-")
+        || model == "o4"
+        || model.starts_with("o4-")
 }
 
 #[must_use]
@@ -206,6 +226,8 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+        assert_eq!(detect_provider_kind("gpt-4.1"), ProviderKind::OpenAi);
+        assert_eq!(detect_provider_kind("o3"), ProviderKind::OpenAi);
     }
 
     #[test]

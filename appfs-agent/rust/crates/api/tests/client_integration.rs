@@ -429,6 +429,49 @@ async fn provider_client_dispatches_anthropic_requests() {
 }
 
 #[tokio::test]
+async fn provider_client_honors_anthropic_base_url_with_explicit_auth() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            "{\"id\":\"msg_provider_env_base\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Env base URL\"}],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+        )],
+    )
+    .await;
+
+    let original_base_url = std::env::var_os("ANTHROPIC_BASE_URL");
+    std::env::set_var("ANTHROPIC_BASE_URL", server.base_url());
+
+    let client = ProviderClient::from_model_with_anthropic_auth(
+        "claude-sonnet-4-6",
+        Some(AuthSource::ApiKey("test-key".to_string())),
+    )
+    .expect("provider client should honor env base URL");
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("provider-dispatched request should succeed");
+
+    match original_base_url {
+        Some(value) => std::env::set_var("ANTHROPIC_BASE_URL", value),
+        None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+    }
+
+    assert_eq!(response.total_tokens(), 5);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/v1/messages");
+    assert_eq!(
+        request.headers.get("x-api-key").map(String::as_str),
+        Some("test-key")
+    );
+}
+
+#[tokio::test]
 async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(

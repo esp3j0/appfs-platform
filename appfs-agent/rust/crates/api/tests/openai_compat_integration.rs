@@ -310,6 +310,46 @@ async fn provider_client_dispatches_xai_requests_from_env() {
     );
 }
 
+#[tokio::test]
+async fn provider_client_dispatches_openai_requests_from_env() {
+    let _lock = env_lock();
+    let _api_key = ScopedEnvVar::set("OPENAI_API_KEY", "openai-test-key");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            "{\"id\":\"chatcmpl_openai_provider\",\"model\":\"gpt-4.1\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Through OpenAI provider\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}",
+        )],
+    )
+    .await;
+    let _base_url = ScopedEnvVar::set("OPENAI_BASE_URL", server.base_url());
+
+    let client =
+        ProviderClient::from_model("gpt-4.1").expect("OpenAI provider client should construct");
+    assert!(matches!(client, ProviderClient::OpenAi(_)));
+
+    let response = client
+        .send_message(&MessageRequest {
+            model: "gpt-4.1".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("provider-dispatched request should succeed");
+
+    assert_eq!(response.total_tokens(), 11);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer openai-test-key")
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,

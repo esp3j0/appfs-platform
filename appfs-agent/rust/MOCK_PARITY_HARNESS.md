@@ -17,6 +17,11 @@ The harness runs these scripted scenarios against a fresh workspace and isolated
 3. `grep_chunk_assembly`
 4. `write_file_allowed`
 5. `write_file_denied`
+6. `multi_tool_turn_roundtrip`
+7. `bash_stdout_roundtrip`
+8. `bash_permission_prompt_approved`
+9. `bash_permission_prompt_denied`
+10. `plugin_tool_roundtrip`
 
 ## Run
 
@@ -24,6 +29,15 @@ The harness runs these scripted scenarios against a fresh workspace and isolated
 cd rust/
 ./scripts/run_mock_parity_harness.sh
 ```
+
+Behavioral checklist / parity diff:
+
+```bash
+cd rust/
+python3 scripts/run_mock_parity_diff.py
+```
+
+Scenario-to-PARITY mappings live in `mock_parity_scenarios.json`.
 
 ## Manual mock server
 
