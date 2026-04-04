@@ -20,7 +20,7 @@ jobs:
       - windows
       - winfsp
     env:
-      CHECKOUT_PATH: repo-${{ github.run_id }}-smoke
+      CHECKOUT_PATH: repo-selfhosted-smoke
 
     steps:
       - name: Check out repository
@@ -56,13 +56,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            ${{ env.CHECKOUT_PATH }}/appfs/cli
-            ${{ env.CHECKOUT_PATH }}/appfs-agent/rust
 
       - name: Run Windows smoke test
         shell: powershell
