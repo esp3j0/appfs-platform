@@ -125,6 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             permission_mode,
         } => print_status_snapshot(&model, permission_mode)?,
+        CliAction::ConfigShow => print_config_json()?,
         CliAction::Sandbox => print_sandbox_status_snapshot()?,
         CliAction::Prompt {
             prompt,
@@ -174,6 +175,7 @@ enum CliAction {
         model: String,
         permission_mode: PermissionMode,
     },
+    ConfigShow,
     Sandbox,
     Prompt {
         prompt: String,
@@ -362,6 +364,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
         }),
+        "config" => parse_config_args(&rest[1..]),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
         }),
@@ -402,7 +405,7 @@ fn parse_single_word_command_alias(
     model: &str,
     permission_mode_override: Option<PermissionMode>,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 1 || rest[0] == "branch" {
+    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config") {
         return None;
     }
 
@@ -424,6 +427,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         "dump-manifests"
             | "bootstrap-plan"
             | "agents"
+            | "config"
             | "mcp"
             | "skills"
             | "system-prompt"
@@ -727,6 +731,16 @@ fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     Ok(CliAction::PrintSystemPrompt { cwd, date })
+}
+
+fn parse_config_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw config show".to_string()),
+        [action] if action == "show" => Ok(CliAction::ConfigShow),
+        [action, ..] => Err(format!(
+            "unknown config action: {action}. Usage: claw config show"
+        )),
+    }
 }
 
 fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
@@ -3648,6 +3662,19 @@ fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn print_config_json() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", render_merged_runtime_config_json()?);
+    Ok(())
+}
+
+fn render_merged_runtime_config_json() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let parsed: serde_json::Value = serde_json::from_str(&runtime_config.as_json().render())?;
+    Ok(serde_json::to_string_pretty(&parsed)?)
+}
+
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -5965,6 +5992,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Show workspace status, origin/main freshness, active worktrees, and recent commits"
     )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "      Print the merged runtime config as JSON")?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
     writeln!(out, "  claw dump-manifests")?;
@@ -6046,6 +6075,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
+    writeln!(out, "  claw config show")?;
     writeln!(out, "  claw branch delete")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
@@ -6074,9 +6104,9 @@ mod tests {
         parse_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_git_worktrees, parse_recent_commits, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
+        render_diff_report_for, render_memory_report, render_merged_runtime_config_json,
+        render_repl_help, render_resume_usage, resolve_model_alias, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
         GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
@@ -6547,6 +6577,18 @@ mod tests {
             .expect_err("unknown branch action should fail");
         assert!(unknown_error.contains("unknown branch action: prune"));
         assert!(unknown_error.contains("Usage: claw branch delete"));
+    }
+
+    #[test]
+    fn parses_config_show_subcommand() {
+        assert_eq!(
+            parse_args(&["config".to_string(), "show".to_string()])
+                .expect("config show should parse"),
+            CliAction::ConfigShow
+        );
+
+        let error = parse_args(&["config".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw config show"));
     }
 
     #[test]
@@ -7220,6 +7262,16 @@ mod tests {
     }
 
     #[test]
+    fn merged_runtime_config_json_renders_pretty_valid_json() {
+        let rendered =
+            render_merged_runtime_config_json().expect("runtime config json should render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("runtime config json should parse");
+        assert!(parsed.is_object());
+        assert!(rendered.starts_with("{\n") || rendered == "{}");
+    }
+
+    #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
         assert!(report.contains("Memory"));
@@ -7549,6 +7601,7 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("claw config show"));
         assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
