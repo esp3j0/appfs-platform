@@ -279,6 +279,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 6. Add branding/source-of-truth residue checks for docs — after repo migration, old org names can survive in badges, star-history URLs, and copied snippets; docs need a consistency pass or CI lint to catch stale branding automatically
 7. Reconcile README product narrative with current repo reality — top-level docs now say the active workspace is Rust, but later sections still describe the repo as Python-first; users should not have to infer which implementation is canonical
 8. Eliminate warning spam from first-run help/build path — `cargo run -p rusty-claude-cli -- --help` currently prints a wall of compile warnings before the actual help text, which pollutes the first-touch UX and hides the product surface behind unrelated noise
+9. Promote `doctor` from slash-only to top-level CLI entrypoint — users naturally try `claw doctor`, but today it errors and tells them to enter a REPL or resume path first; healthcheck flows should be callable directly from the shell
 
 **P1 — Next (integration wiring, unblocks verification)**
 2. Add cross-module integration tests — **done**: 12 integration tests covering worker→recovery→policy, stale_branch→policy, green_contract→policy, reconciliation flows
