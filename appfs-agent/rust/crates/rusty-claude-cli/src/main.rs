@@ -5860,7 +5860,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        remove_dir_all_with_retry(root);
+        remove_dir_all_with_retry(&root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -5894,7 +5894,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        remove_dir_all_with_retry(root);
+        remove_dir_all_with_retry(&root);
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
