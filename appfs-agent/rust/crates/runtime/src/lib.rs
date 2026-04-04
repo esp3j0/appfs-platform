@@ -1,23 +1,40 @@
 mod bash;
+pub mod bash_validation;
 mod bootstrap;
 mod compact;
 mod config;
 mod conversation;
 mod file_ops;
+pub mod green_contract;
 mod hooks;
 mod json;
+pub mod lsp_client;
 mod mcp;
 mod mcp_client;
+pub mod mcp_lifecycle_hardened;
 mod mcp_stdio;
+pub mod mcp_tool_bridge;
 mod oauth;
+pub mod permission_enforcer;
 mod permissions;
+pub mod plugin_lifecycle;
+mod policy_engine;
 mod prompt;
+pub mod recovery_recipes;
 mod remote;
 pub mod sandbox;
 mod session;
+pub mod session_control;
 mod sse;
+pub mod stale_branch;
+pub mod summary_compression;
+pub mod task_packet;
+pub mod task_registry;
+pub mod team_cron_registry;
+pub mod trust_resolver;
 mod usage;
 mod windows_shell;
+pub mod worker_boot;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
@@ -30,8 +47,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind,
+    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
@@ -54,13 +71,18 @@ pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
+pub use mcp_lifecycle_hardened::{
+    McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
+    McpLifecycleValidator, McpPhaseResult,
+};
 pub use mcp_stdio::{
     spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    ManagedMcpTool, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
-    McpInitializeServerInfo, McpListResourcesParams, McpListResourcesResult, McpListToolsParams,
-    McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpResource,
-    McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess, McpTool,
-    McpToolCallContent, McpToolCallParams, McpToolCallResult, UnsupportedMcpServer,
+    ManagedMcpTool, McpDiscoveryFailure, McpInitializeClientInfo, McpInitializeParams,
+    McpInitializeResult, McpInitializeServerInfo, McpListResourcesParams, McpListResourcesResult,
+    McpListToolsParams, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
+    McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
+    McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
+    UnsupportedMcpServer,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
@@ -73,9 +95,21 @@ pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
+pub use plugin_lifecycle::{
+    DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
+    PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
+};
+pub use policy_engine::{
+    evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+    PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+};
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
     SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+};
+pub use recovery_recipes::{
+    attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryContext,
+    RecoveryEvent, RecoveryRecipe, RecoveryResult, RecoveryStep,
 };
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,
@@ -93,10 +127,23 @@ pub use session::{
     SessionFork,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
+pub use stale_branch::{
+    apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
+    StaleBranchPolicy,
+};
+pub use task_packet::{
+    validate_packet, AcceptanceTest, BranchPolicy, CommitPolicy, RepoConfig, ReportingContract,
+    TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
+};
+pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
+pub use worker_boot::{
+    Worker, WorkerEvent, WorkerEventKind, WorkerFailure, WorkerFailureKind, WorkerReadySnapshot,
+    WorkerRegistry, WorkerStatus,
+};
 
 #[cfg(windows)]
 pub use windows_shell::windows_path_to_posix_path;
