@@ -5463,6 +5463,7 @@ mod tests {
         let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
         let titled_summary = titled_output["result"].as_str().expect("result string");
         assert!(titled_summary.contains("Title: Ignored"));
+        server.assert_clean();
     }
 
     #[test]
@@ -5497,6 +5498,7 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+        server.assert_clean();
     }
 
     #[test]
@@ -5541,6 +5543,7 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Reqwest docs");
         assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+        server.assert_clean();
     }
 
     #[test]
@@ -5549,7 +5552,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
+            assert!(
+                request_line.contains("GET /fallback?q=generic+links ")
+                    || request_line.contains("GET /fallback?q=generic%20links "),
+                "unexpected request line: {request_line}"
+            );
             HttpResponse::html(
                 200,
                 "OK",
@@ -5586,6 +5593,7 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        server.assert_clean();
 
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
@@ -7326,16 +7334,26 @@ printf 'pwsh:%s' "$1"
         fn addr(&self) -> SocketAddr {
             self.addr
         }
-    }
 
-    impl Drop for TestServer {
-        fn drop(&mut self) {
+        fn assert_clean(mut self) {
+            self.shutdown_and_join().expect("join test server");
+        }
+
+        fn shutdown_and_join(&mut self) -> thread::Result<()> {
             if let Some(tx) = self.shutdown.take() {
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                handle.join()
+            } else {
+                Ok(())
             }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.shutdown_and_join();
         }
     }
 
