@@ -57,9 +57,11 @@ jobs:
             'C:\Users\esp3j\AppData\Local\Programs\Python\Python312\Scripts'
             'C:\Program Files\Git\cmd'
             'C:\Program Files\Git\bin'
+            'C:\actions-runner\tools\libclang\clang\native'
           ) | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
           Add-Content -Path $env:GITHUB_ENV -Value 'CARGO_HOME=C:\Users\esp3j\.cargo'
           Add-Content -Path $env:GITHUB_ENV -Value 'RUSTUP_HOME=C:\Users\esp3j\.rustup'
+          Add-Content -Path $env:GITHUB_ENV -Value 'LIBCLANG_PATH=C:\actions-runner\tools\libclang\clang\native'
 
       - name: Run HTTP demo integration smoke test
         shell: powershell
