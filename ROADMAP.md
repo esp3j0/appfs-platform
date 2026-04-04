@@ -274,6 +274,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 1. Isolate `render_diff_report` tests into tmpdir — flaky under `cargo test --workspace`; reads real working-tree state; breaks CI during active worktree ops
 2. Expand GitHub CI from single-crate coverage to workspace-grade verification — current `rust-ci.yml` runs `cargo fmt` and `cargo test -p rusty-claude-cli`, but misses broader `cargo test --workspace` coverage that already passes locally
 3. Add release-grade binary workflow — repo has a Rust CLI and release intent, but no GitHub Actions path that builds tagged artifacts / checks release packaging before a publish step
+4. Add container-first test/run docs — runtime detects Docker/Podman/container state, but docs do not show a canonical container workflow for `cargo test --workspace`, binary execution, or bind-mounted repo usage
 
 **P1 — Next (integration wiring, unblocks verification)**
 2. Add cross-module integration tests — **done**: 12 integration tests covering worker→recovery→policy, stale_branch→policy, green_contract→policy, reconciliation flows
