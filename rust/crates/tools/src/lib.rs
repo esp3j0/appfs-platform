@@ -12,7 +12,7 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    check_freshness, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -21,10 +21,11 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
-    ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
-    OAuthConfig, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind,
+    Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1693,8 +1694,149 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
+    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+    }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+    if !is_workspace_test_command(command) {
+        return None;
+    }
+
+    let branch = git_stdout(&["branch", "--show-current"])?;
+    let main_ref = resolve_main_ref(&branch)?;
+    let freshness = check_freshness(&branch, &main_ref);
+    match freshness {
+        BranchFreshness::Fresh => None,
+        BranchFreshness::Stale {
+            commits_behind,
+            missing_fixes,
+        } => Some(branch_divergence_output(
+            command,
+            &branch,
+            &main_ref,
+            commits_behind,
+            None,
+            &missing_fixes,
+        )),
+        BranchFreshness::Diverged {
+            ahead,
+            behind,
+            missing_fixes,
+        } => Some(branch_divergence_output(
+            command,
+            &branch,
+            &main_ref,
+            behind,
+            Some(ahead),
+            &missing_fixes,
+        )),
+    }
+}
+
+fn is_workspace_test_command(command: &str) -> bool {
+    let normalized = normalize_shell_command(command);
+    [
+        "cargo test --workspace",
+        "cargo test --all",
+        "cargo nextest run --workspace",
+        "cargo nextest run --all",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn resolve_main_ref(branch: &str) -> Option<String> {
+    let has_local_main = git_ref_exists("main");
+    let has_remote_main = git_ref_exists("origin/main");
+
+    if branch == "main" && has_remote_main {
+        Some("origin/main".to_string())
+    } else if has_local_main {
+        Some("main".to_string())
+    } else if has_remote_main {
+        Some("origin/main".to_string())
+    } else {
+        None
+    }
+}
+
+fn git_ref_exists(reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!stdout.is_empty()).then_some(stdout)
+}
+
+fn branch_divergence_output(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> BashCommandOutput {
+    let relation = commits_ahead.map_or_else(
+        || format!("is {commits_behind} commit(s) behind"),
+        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
+    );
+    let missing_summary = if missing_fixes.is_empty() {
+        "(none surfaced)".to_string()
+    } else {
+        missing_fixes.join("; ")
+    };
+    let stderr = format!(
+        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    );
+
+    BashCommandOutput {
+        stdout: String::new(),
+        stderr,
+        raw_output_path: None,
+        interrupted: false,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: None,
+        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
+        no_output_expected: Some(false),
+        structured_content: Some(vec![json!({
+            "event": "branch.stale_against_main",
+            "failureClass": "branch_divergence",
+            "branch": branch,
+            "mainRef": main_ref,
+            "commitsBehind": commits_behind,
+            "commitsAhead": commits_ahead,
+            "missingCommits": missing_fixes,
+            "blockedCommand": command,
+            "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+        })]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: None,
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2166,9 +2308,6 @@ enum LaneFailureClass {
     Test,
     PluginStartup,
     McpStartup,
-    McpHandshake,
-    GatewayRouting,
-    ToolRuntime,
     Infra,
 }
 
@@ -3249,18 +3388,8 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         LaneFailureClass::Test
     } else if normalized.contains("plugin") {
         LaneFailureClass::PluginStartup
-    } else if normalized.contains("mcp") && normalized.contains("handshake") {
-        LaneFailureClass::McpHandshake
     } else if normalized.contains("mcp") {
         LaneFailureClass::McpStartup
-    } else if normalized.contains("gateway") || normalized.contains("routing") {
-        LaneFailureClass::GatewayRouting
-    } else if normalized.contains("tool")
-        || normalized.contains("hook")
-        || normalized.contains("permission")
-        || normalized.contains("denied")
-    {
-        LaneFailureClass::ToolRuntime
     } else {
         LaneFailureClass::Infra
     }
@@ -4643,6 +4772,9 @@ fn iso8601_timestamp() -> String {
 #[allow(clippy::needless_pass_by_value)]
 fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
+    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+        return Ok(output);
+    }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
         shell,
@@ -4897,7 +5029,8 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -4926,6 +5059,35 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap_or_else(|error| panic!("git {} failed: {error}", args.join(" ")));
+        assert!(
+            status.success(),
+            "git {} exited with {status}",
+            args.join(" ")
+        );
+    }
+
+    fn init_git_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repo");
+        run_git(path, &["init", "--quiet", "-b", "main"]);
+        run_git(path, &["config", "user.email", "tests@example.com"]);
+        run_git(path, &["config", "user.name", "Tools Tests"]);
+        std::fs::write(path.join("README.md"), "initial\n").expect("write readme");
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "initial commit", "--quiet"]);
+    }
+
+    fn commit_file(path: &Path, file: &str, contents: &str, message: &str) {
+        std::fs::write(path.join(file), contents).expect("write file");
+        run_git(path, &["add", file]);
+        run_git(path, &["commit", "-m", message, "--quiet"]);
     }
 
     fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
@@ -5859,19 +6021,16 @@ mod tests {
             ),
             ("targeted tests failed", LaneFailureClass::Test),
             ("plugin bootstrap failed", LaneFailureClass::PluginStartup),
-            ("mcp handshake timed out", LaneFailureClass::McpHandshake),
+            ("mcp handshake timed out", LaneFailureClass::McpStartup),
             (
                 "mcp startup failed before listing tools",
                 LaneFailureClass::McpStartup,
             ),
             (
                 "gateway routing rejected the request",
-                LaneFailureClass::GatewayRouting,
+                LaneFailureClass::Infra,
             ),
-            (
-                "denied tool execution from hook",
-                LaneFailureClass::ToolRuntime,
-            ),
+            ("denied tool execution from hook", LaneFailureClass::Infra),
             ("thread creation failed", LaneFailureClass::Infra),
         ];
 
@@ -6165,6 +6324,90 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn bash_workspace_tests_are_blocked_when_branch_is_behind_main() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("workspace-test-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/stale-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: unblock workspace tests",
+        );
+        run_git(&root, &["checkout", "feature/stale-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "bash",
+            &json!({ "command": "cargo test --workspace --all-targets" }),
+        )
+        .expect("preflight should return structured output");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+        assert!(output_json["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("branch divergence detected before workspace tests"));
+        assert_eq!(
+            output_json["structuredContent"][0]["event"],
+            "branch.stale_against_main"
+        );
+        assert_eq!(
+            output_json["structuredContent"][0]["failureClass"],
+            "branch_divergence"
+        );
+        assert_eq!(
+            output_json["structuredContent"][0]["missingCommits"][0],
+            "fix: unblock workspace tests"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bash_targeted_tests_skip_branch_preflight() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("targeted-test-no-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/targeted-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: only broad tests should block",
+        );
+        run_git(&root, &["checkout", "feature/targeted-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "bash",
+            &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
+        )
+        .expect("targeted commands should still execute");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_ne!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
