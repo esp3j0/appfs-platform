@@ -445,21 +445,40 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+fn absolute_candidate(path: &str) -> io::Result<PathBuf> {
+    if Path::new(path).is_absolute() {
+        Ok(PathBuf::from(path))
     } else {
-        std::env::current_dir()?.join(path)
-    };
-    candidate.canonicalize()
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn canonicalize_with_fallback<F>(candidate: PathBuf, canonicalize: F) -> io::Result<PathBuf>
+where
+    F: FnOnce(&Path) -> io::Result<PathBuf>,
+{
+    match canonicalize(&candidate) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) => {
+            if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn canonicalize_with_existing_fallback(candidate: PathBuf) -> io::Result<PathBuf> {
+    canonicalize_with_fallback(candidate, Path::canonicalize)
+}
+
+fn normalize_path(path: &str) -> io::Result<PathBuf> {
+    canonicalize_with_existing_fallback(absolute_candidate(path)?)
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let candidate = absolute_candidate(path)?;
 
     if let Ok(canonical) = candidate.canonicalize() {
         return Ok(canonical);
@@ -479,9 +498,13 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput};
+    use super::{
+        canonicalize_with_fallback, edit_file, glob_search, grep_search, read_file, write_file,
+        GrepSearchInput,
+    };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -546,5 +569,28 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn falls_back_to_existing_absolute_path_when_canonicalize_fails() {
+        let path = temp_path("canonicalize-fallback.txt");
+        write_file(path.to_string_lossy().as_ref(), "hello").expect("write should succeed");
+
+        let resolved = canonicalize_with_fallback(path.clone(), |_| {
+            Err(io::Error::from_raw_os_error(1005))
+        })
+            .expect("existing path should fall back to candidate");
+
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
+    fn preserves_not_found_when_canonicalize_fails_for_missing_path() {
+        let path = temp_path("missing-canonicalize-fallback.txt");
+
+        let error = canonicalize_with_fallback(path, |_| Err(io::Error::from_raw_os_error(1005)))
+            .expect_err("missing path should still error");
+
+        assert_eq!(error.raw_os_error(), Some(1005));
     }
 }
