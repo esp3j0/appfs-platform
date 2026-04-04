@@ -282,6 +282,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 9. Promote `doctor` from slash-only to top-level CLI entrypoint — users naturally try `claw doctor`, but today it errors and tells them to enter a REPL or resume path first; healthcheck flows should be callable directly from the shell
 10. Make machine-readable status commands actually machine-readable — `status` and `sandbox` accept the global `--output-format json` flag path, but currently still render prose tables, which breaks shell automation and agent-friendly health polling
 11. Unify legacy config/skill namespaces in user-facing output — `skills` currently surfaces mixed project roots like `.codex` and `.claude`, which leaks historical layers into the current product and makes it unclear which config namespace is canonical
+12. Honor JSON output on inventory commands like `skills` and `mcp` — these are exactly the commands agents and shell scripts want to inspect programmatically, but `--output-format json` still yields prose, forcing text scraping where structured inventory should exist
 
 **P1 — Next (integration wiring, unblocks verification)**
 2. Add cross-module integration tests — **done**: 12 integration tests covering worker→recovery→policy, stale_branch→policy, green_contract→policy, reconciliation flows
