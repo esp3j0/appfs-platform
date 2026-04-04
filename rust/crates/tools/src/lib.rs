@@ -4888,6 +4888,8 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+pub mod lane_completion;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
