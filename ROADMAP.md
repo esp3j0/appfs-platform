@@ -272,6 +272,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 
 **P0 — Fix first (CI reliability)**
 1. Isolate `render_diff_report` tests into tmpdir — flaky under `cargo test --workspace`; reads real working-tree state; breaks CI during active worktree ops
+2. Expand GitHub CI from single-crate coverage to workspace-grade verification — current `rust-ci.yml` runs `cargo fmt` and `cargo test -p rusty-claude-cli`, but misses broader `cargo test --workspace` coverage that already passes locally
 
 **P1 — Next (integration wiring, unblocks verification)**
 2. Add cross-module integration tests — **done**: 12 integration tests covering worker→recovery→policy, stale_branch→policy, green_contract→policy, reconciliation flows
