@@ -258,6 +258,7 @@ impl ConfigLoader {
             let Some(value) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
+            validate_optional_hooks_config(&value, &entry.path)?;
             merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
             deep_merge_objects(&mut merged, &value);
             loaded_entries.push(entry);
@@ -720,22 +721,30 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
     let Some(object) = root.as_object() else {
         return Ok(RuntimeHookConfig::default());
     };
+    parse_optional_hooks_config_object(object, "merged settings.hooks")
+}
+
+fn parse_optional_hooks_config_object(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<RuntimeHookConfig, ConfigError> {
     let Some(hooks_value) = object.get("hooks") else {
         return Ok(RuntimeHookConfig::default());
     };
-    let hooks = expect_object(hooks_value, "merged settings.hooks")?;
+    let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", "merged settings.hooks")?
+        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
+        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
+        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
             .unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
-            .unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(
-            hooks,
-            "PostToolUseFailure",
-            "merged settings.hooks",
-        )?
-        .unwrap_or_default(),
     })
+}
+
+fn validate_optional_hooks_config(
+    root: &BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    parse_optional_hooks_config_object(root, &format!("{}: hooks", path.display())).map(|_| ())
 }
 
 fn parse_optional_permission_rules(
@@ -1679,6 +1688,43 @@ mod tests {
         );
         assert_eq!(env.get("C"), Some(&JsonValue::String("3".to_string())));
         assert!(target.contains_key("sandbox"));
+    }
+
+    #[test]
+    fn rejects_invalid_hook_entries_before_merge() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let project_settings = cwd.join(".claw").join("settings.json");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":["base"]}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            &project_settings,
+            r#"{"hooks":{"PreToolUse":["project",42]}}"#,
+        )
+        .expect("write invalid project settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(rendered.contains(&format!(
+            "{}: hooks: field PreToolUse must contain only strings",
+            project_settings.display()
+        )));
+        assert!(!rendered.contains("merged settings.hooks"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
