@@ -15,6 +15,8 @@ jobs:
       - winfsp
     env:
       CHECKOUT_PATH: repo-${{ github.run_id }}-http-demo
+      CARGO_HOME: ${{ runner.temp }}\cargo-home
+      RUSTUP_HOME: ${{ runner.temp }}\rustup-home
 
     steps:
       - name: Check out repository
@@ -47,6 +49,13 @@ jobs:
               cmd /c "rmdir /s /q `"$path`"" 2>$null | Out-Null
             }
           }
+
+      - name: Prepare isolated Rust homes
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
+          New-Item -ItemType Directory -Path $env:RUSTUP_HOME -Force | Out-Null
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:CARGO_HOME "bin")
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
