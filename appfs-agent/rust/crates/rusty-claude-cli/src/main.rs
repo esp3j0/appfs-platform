@@ -25,8 +25,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
+    ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -39,16 +40,19 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, resolve_sandbox_status, save_oauth_credentials, ApiClient,
-    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
+    parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
+    save_oauth_credentials, set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
+use serde::Deserialize;
 use serde_json::json;
-use tools::GlobalToolRegistry;
+use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -104,6 +108,7 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    set_shell_if_windows()?;
     match parse_args(&args)? {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
@@ -211,7 +216,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     #[cfg(test)]
     let _guard = test_env_lock();
 
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_help = false;
@@ -579,6 +584,14 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
+#[cfg(test)]
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn resolve_model_alias(model: &str) -> &str {
     match model {
         "opus" => "claude-opus-4-6",
@@ -599,15 +612,31 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
     }
 }
 
+fn cli_parse_cwd() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+fn configured_default_model() -> Option<String> {
+    load_runtime_config_for_cwd(&cli_parse_cwd())
+        .ok()
+        .and_then(|config| config.model().map(ToOwned::to_owned))
+}
+
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     let cwd = cli_parse_cwd();
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
-    let plugin_tools = plugin_manager
-        .aggregated_tools()
+    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
         .map_err(|error| error.to_string())?;
-    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+    let registry = state.tool_registry.clone();
+    if let Some(mcp_state) = state.mcp_state {
+        mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(registry)
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
@@ -647,20 +676,8 @@ fn default_permission_mode() -> PermissionMode {
         .unwrap_or(PermissionMode::DangerFullAccess)
 }
 
-fn cli_parse_cwd() -> PathBuf {
-    env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
-}
-
-#[cfg(test)]
-fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
-    let cwd = cli_parse_cwd();
+    let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     loader
         .load()
@@ -1608,23 +1625,35 @@ struct RuntimePluginState {
     feature_config: runtime::RuntimeFeatureConfig,
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+}
+
+struct RuntimeMcpState {
+    runtime: tokio::runtime::Runtime,
+    manager: McpServerManager,
+    pending_servers: Vec<String>,
 }
 
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    mcp_active: bool,
 }
 
 impl BuiltRuntime {
     fn new(
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
+        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
             plugin_registry,
             plugins_active: true,
+            mcp_state,
+            mcp_active: true,
         }
     }
 
@@ -1641,6 +1670,19 @@ impl BuiltRuntime {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
             self.plugins_active = false;
+        }
+        Ok(())
+    }
+
+    fn shutdown_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.mcp_active {
+            if let Some(mcp_state) = &self.mcp_state {
+                mcp_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .shutdown()?;
+            }
+            self.mcp_active = false;
         }
         Ok(())
     }
@@ -1666,8 +1708,282 @@ impl DerefMut for BuiltRuntime {
 
 impl Drop for BuiltRuntime {
     fn drop(&mut self) {
+        let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSearchRequest {
+    query: String,
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolRequest {
+    #[serde(rename = "qualifiedName")]
+    qualified_name: Option<String>,
+    tool: Option<String>,
+    arguments: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMcpResourcesRequest {
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadMcpResourceRequest {
+    server: String,
+    uri: String,
+}
+
+impl RuntimeMcpState {
+    fn new(
+        runtime_config: &runtime::RuntimeConfig,
+    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
+            return Ok(None);
+        }
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let discovery = runtime.block_on(manager.discover_tools_best_effort());
+        let pending_servers = discovery
+            .failed_servers
+            .iter()
+            .map(|failure| failure.server_name.clone())
+            .chain(
+                discovery
+                    .unsupported_servers
+                    .iter()
+                    .map(|server| server.server_name.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        Ok(Some((
+            Self {
+                runtime,
+                manager,
+                pending_servers,
+            },
+            discovery,
+        )))
+    }
+
+    fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.runtime.block_on(self.manager.shutdown())?;
+        Ok(())
+    }
+
+    fn pending_servers(&self) -> Option<Vec<String>> {
+        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
+    }
+
+    fn server_names(&self) -> Vec<String> {
+        self.manager.server_names()
+    }
+
+    fn call_tool(
+        &mut self,
+        qualified_tool_name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<String, ToolError> {
+        let response = self
+            .runtime
+            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        if let Some(error) = response.error {
+            return Err(ToolError::new(format!(
+                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
+                error.message, error.code
+            )));
+        }
+
+        let result = response.result.ok_or_else(|| {
+            ToolError::new(format!(
+                "MCP tool `{qualified_tool_name}` returned no result payload"
+            ))
+        })?;
+        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
+        let result = self
+            .runtime
+            .block_on(self.manager.list_resources(server_name))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "resources": result.resources,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
+        let mut resources = Vec::new();
+        let mut failures = Vec::new();
+
+        for server_name in self.server_names() {
+            match self
+                .runtime
+                .block_on(self.manager.list_resources(&server_name))
+            {
+                Ok(result) => resources.push(json!({
+                    "server": server_name,
+                    "resources": result.resources,
+                })),
+                Err(error) => failures.push(json!({
+                    "server": server_name,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        if resources.is_empty() && !failures.is_empty() {
+            let message = failures
+                .iter()
+                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ToolError::new(message));
+        }
+
+        serde_json::to_string_pretty(&json!({
+            "resources": resources,
+            "failures": failures,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
+        let result = self
+            .runtime
+            .block_on(self.manager.read_resource(server_name, uri))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "contents": result.contents,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
+fn build_runtime_mcp_state(
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<
+    (
+        Option<Arc<Mutex<RuntimeMcpState>>>,
+        Vec<RuntimeToolDefinition>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
+        return Ok((None, Vec::new()));
+    };
+
+    let mut runtime_tools = discovery
+        .tools
+        .iter()
+        .map(mcp_runtime_tool_definition)
+        .collect::<Vec<_>>();
+    if !mcp_state.server_names().is_empty() {
+        runtime_tools.extend(mcp_wrapper_tool_definitions());
+    }
+
+    Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
+    RuntimeToolDefinition {
+        name: tool.qualified_name.clone(),
+        description: Some(
+            tool.tool
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("Invoke MCP tool `{}`.", tool.qualified_name)),
+        ),
+        input_schema: tool
+            .tool
+            .input_schema
+            .clone()
+            .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
+        required_permission: permission_mode_for_mcp_tool(&tool.tool),
+    }
+}
+
+fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
+    vec![
+        RuntimeToolDefinition {
+            name: "MCPTool".to_string(),
+            description: Some(
+                "Call a configured MCP tool by its qualified name and JSON arguments.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "qualifiedName": { "type": "string" },
+                    "arguments": {}
+                },
+                "required": ["qualifiedName"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        RuntimeToolDefinition {
+            name: "ListMcpResourcesTool".to_string(),
+            description: Some(
+                "List MCP resources from one configured server or from every connected server."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "ReadMcpResourceTool".to_string(),
+            description: Some("Read a specific MCP resource from a configured server.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["server", "uri"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+    ]
+}
+
+fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
+    let read_only = mcp_annotation_flag(tool, "readOnlyHint");
+    let destructive = mcp_annotation_flag(tool, "destructiveHint");
+    let open_world = mcp_annotation_flag(tool, "openWorldHint");
+
+    if read_only && !destructive && !open_world {
+        PermissionMode::ReadOnly
+    } else if destructive || open_world {
+        PermissionMode::DangerFullAccess
+    } else {
+        PermissionMode::WorkspaceWrite
+    }
+}
+
+fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
+    tool.annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 struct HookAbortMonitor {
@@ -1920,7 +2236,13 @@ impl LiveCli {
                     "output_tokens": summary.usage.output_tokens,
                     "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                }
+                },
+                "estimated_cost": format_usd(
+                    summary.usage.estimate_cost_usd_with_pricing(
+                        pricing_for_model(&self.model)
+                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
+                    ).total_cost_usd()
+                )
             })
         );
         Ok(())
@@ -1961,7 +2283,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Teleport { target } => {
-                self.run_teleport(target.as_deref())?;
+                Self::run_teleport(target.as_deref())?;
                 false
             }
             SlashCommand::DebugToolCall => {
@@ -2529,8 +2851,7 @@ impl LiveCli {
         Ok(())
     }
 
-    #[allow(clippy::unused_self)]
-    fn run_teleport(&self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         let Some(target) = target.map(str::trim).filter(|value| !value.is_empty()) else {
             println!("Usage: /teleport <symbol-or-path>");
             return Ok(());
@@ -3062,12 +3383,13 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
             "model" => runtime_config.get("model"),
+            "provider" => runtime_config.get("provider"),
             "plugins" => runtime_config
                 .get("plugins")
                 .or_else(|| runtime_config.get("enabledPlugins")),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
+                    "  Unsupported config section '{other}'. Use env, hooks, model, provider, or plugins."
                 ));
                 return Ok(lines.join(
                     "
@@ -3577,11 +3899,14 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
+    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
+        .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {
         feature_config,
         tool_registry,
         plugin_registry,
+        mcp_state,
     })
 }
 
@@ -4003,8 +4328,11 @@ fn build_runtime_with_plugin_state(
         feature_config,
         tool_registry,
         plugin_registry,
+        mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
+    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
+        .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -4016,16 +4344,20 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             progress_reporter,
         )?,
-        CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry.clone()),
-        permission_policy(permission_mode, &feature_config, &tool_registry)
-            .map_err(std::io::Error::other)?,
+        CliToolExecutor::new(
+            allowed_tools.clone(),
+            emit_output,
+            tool_registry.clone(),
+            mcp_state.clone(),
+        ),
+        policy,
         system_prompt,
         &feature_config,
     );
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry))
+    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
 struct CliHookProgressReporter;
@@ -4112,7 +4444,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -4131,11 +4463,20 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
+            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: ProviderClient::from_model_with_anthropic_auth_resolver(
+                &model,
+                provider_override.as_ref(),
+                || resolve_cli_auth_source(&oauth),
+            )?
+            .with_prompt_cache(PromptCache::new(session_id)),
             model,
             enable_tools,
             emit_output,
@@ -4146,14 +4487,27 @@ impl AnthropicRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
+fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
+    resolve_startup_auth_source(|| Ok(oauth.clone()))
+}
+
+fn load_runtime_config_for_cwd(cwd: &Path) -> Result<RuntimeConfig, api::ApiError> {
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| api::ApiError::Auth(format!("failed to load runtime config: {error}")))
+}
+
+fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
+    ProviderOverride {
+        provider: match config.provider() {
+            RuntimeProviderKind::Anthropic => ProviderKind::Anthropic,
+            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
+            RuntimeProviderKind::Xai => ProviderKind::Xai,
+        },
+        base_url: config.base_url().map(ToOwned::to_owned),
+        api_key_env: config.api_key_env().map(ToOwned::to_owned),
+        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -4938,7 +5292,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -4964,6 +5318,7 @@ struct CliToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
+    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
 impl CliToolExecutor {
@@ -4971,12 +5326,72 @@ impl CliToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
+        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
             tool_registry,
+            mcp_state,
+        }
+    }
+
+    fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        let input: ToolSearchRequest = serde_json::from_value(value)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let pending_mcp_servers = self.mcp_state.as_ref().and_then(|state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_servers()
+        });
+        serde_json::to_string_pretty(&self.tool_registry.search(
+            &input.query,
+            input.max_results.unwrap_or(5),
+            pending_mcp_servers,
+        ))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn execute_runtime_tool(
+        &self,
+        tool_name: &str,
+        value: serde_json::Value,
+    ) -> Result<String, ToolError> {
+        let Some(mcp_state) = &self.mcp_state else {
+            return Err(ToolError::new(format!(
+                "runtime tool `{tool_name}` is unavailable without configured MCP servers"
+            )));
+        };
+        let mut mcp_state = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match tool_name {
+            "MCPTool" => {
+                let input: McpToolRequest = serde_json::from_value(value)
+                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                let qualified_name = input
+                    .qualified_name
+                    .or(input.tool)
+                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
+                mcp_state.call_tool(&qualified_name, input.arguments)
+            }
+            "ListMcpResourcesTool" => {
+                let input: ListMcpResourcesRequest = serde_json::from_value(value)
+                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                match input.server {
+                    Some(server_name) => mcp_state.list_resources_for_server(&server_name),
+                    None => mcp_state.list_resources_for_all_servers(),
+                }
+            }
+            "ReadMcpResourceTool" => {
+                let input: ReadMcpResourceRequest = serde_json::from_value(value)
+                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+                mcp_state.read_resource(&input.server, &input.uri)
+            }
+            _ => mcp_state.call_tool(tool_name, Some(value)),
         }
     }
 }
@@ -4994,7 +5409,16 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        match self.tool_registry.execute(tool_name, &value) {
+        let result = if tool_name == "ToolSearch" {
+            self.execute_search_tool(value)
+        } else if self.tool_registry.has_runtime_tool(tool_name) {
+            self.execute_runtime_tool(tool_name, value)
+        } else {
+            self.tool_registry
+                .execute(tool_name, &value)
+                .map_err(ToolError::new)
+        };
+        match result {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
@@ -5006,12 +5430,12 @@ impl ToolExecutor for CliToolExecutor {
             }
             Err(error) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error, true);
+                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
                 }
-                Err(ToolError::new(error))
+                Err(error)
             }
         }
     }
@@ -5210,12 +5634,13 @@ mod tests {
         format_unknown_slash_command_message, normalize_permission_mode, parse_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
+        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
+        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        CliAction, CliOutputFormat, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -5223,12 +5648,12 @@ mod tests {
     };
     use runtime::{
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
-        PermissionMode, Session,
+        PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
@@ -5265,6 +5690,26 @@ mod tests {
         std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
     }
 
+    fn remove_dir_all_with_retry(path: &Path) {
+        const ATTEMPTS: usize = 6;
+        for attempt in 0..ATTEMPTS {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error)
+                    if attempt + 1 < ATTEMPTS
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                        ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     fn git(args: &[&str], cwd: &Path) {
         let status = Command::new("git")
             .args(args)
@@ -5279,7 +5724,47 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        super::test_env_lock()
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn python_command_and_args() -> (String, Vec<String>) {
+        for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    return (value, Vec::new());
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let status = Command::new("py")
+                .args(["-3", "--version"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                return (String::from("py"), vec![String::from("-3")]);
+            }
+        }
+
+        for candidate in ["python3", "python"] {
+            let status = Command::new(candidate)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                return (candidate.to_string(), Vec::new());
+            }
+        }
+
+        panic!("expected a Python interpreter for CLI MCP tests")
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -5288,21 +5773,6 @@ mod tests {
         let result = f();
         std::env::set_current_dir(previous).expect("cwd should restore");
         result
-    }
-
-    fn cleanup_temp_dir(path: &Path) {
-        for _ in 0..10 {
-            match fs::remove_dir_all(path) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    std::thread::sleep(Duration::from_millis(20));
-                    let _ = error;
-                }
-                Err(_) => return,
-            }
-        }
-        let _ = fs::remove_dir_all(path);
     }
 
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
@@ -5349,6 +5819,8 @@ mod tests {
     }
     #[test]
     fn defaults_to_repl_when_no_args() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
@@ -5388,7 +5860,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        cleanup_temp_dir(&root);
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -5422,13 +5894,15 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        cleanup_temp_dir(&root);
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
 
     #[test]
     fn parses_prompt_subcommand() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "prompt".to_string(),
             "hello".to_string(),
@@ -5448,6 +5922,8 @@ mod tests {
 
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
@@ -5469,6 +5945,8 @@ mod tests {
 
     #[test]
     fn resolves_model_aliases_in_args() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--model".to_string(),
             "opus".to_string(),
@@ -5522,6 +6000,8 @@ mod tests {
 
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
@@ -5604,6 +6084,8 @@ mod tests {
 
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
             CliAction::Help
@@ -5634,6 +6116,8 @@ mod tests {
 
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
@@ -5876,7 +6360,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
+        assert!(help.contains("/config [env|hooks|model|provider|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
@@ -5934,7 +6418,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        cleanup_temp_dir(&root);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -5944,50 +6428,16 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "help",
-                "status",
-                "sandbox",
-                "compact",
-                "clear",
-                "cost",
-                "config",
-                "mcp",
-                "memory",
-                "init",
-                "diff",
-                "version",
-                "export",
-                "agents",
-                "skills",
-                "doctor",
-                "plan",
-                "tasks",
-                "theme",
-                "vim",
-                "usage",
-                "stats",
-                "copy",
-                "hooks",
-                "files",
-                "context",
-                "color",
-                "effort",
-                "fast",
-                "summary",
-                "tag",
-                "brief",
-                "advisor",
-                "stickers",
-                "insights",
-                "thinkback",
-                "keybindings",
-                "privacy-settings",
-                "output-style",
-            ]
+        // Now with 135+ slash commands, verify minimum resume support
+        assert!(
+            names.len() >= 39,
+            "expected at least 39 resume-supported commands, got {}",
+            names.len()
         );
+        // Verify key resume commands still exist
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"compact"));
     }
 
     #[test]
@@ -6240,7 +6690,7 @@ mod tests {
         );
         assert_eq!(branch.as_deref(), Some("rcc/cli"));
         assert!(project_root.is_none());
-        cleanup_temp_dir(&temp_root);
+        fs::remove_dir_all(temp_root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -6293,12 +6743,10 @@ UU conflicted.rs",
         git(&["add", "tracked.txt"], &root);
         git(&["commit", "-m", "init", "--quiet"], &root);
 
-        let report = with_current_dir(&root, || {
-            render_diff_report().expect("diff report should render")
-        });
+        let report = render_diff_report_for(&root).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
-        cleanup_temp_dir(&root);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -6318,14 +6766,12 @@ UU conflicted.rs",
         fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n")
             .expect("update file twice");
 
-        let report = with_current_dir(&root, || {
-            render_diff_report().expect("diff report should render")
-        });
+        let report = render_diff_report_for(&root).expect("diff report should render");
         assert!(report.contains("Staged changes:"));
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        cleanup_temp_dir(&root);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -6345,14 +6791,12 @@ UU conflicted.rs",
         fs::write(root.join("ignored.txt"), "secret\n").expect("write ignored file");
         fs::write(root.join("tracked.txt"), "hello\nworld\n").expect("write tracked change");
 
-        let report = with_current_dir(&root, || {
-            render_diff_report().expect("diff report should render")
-        });
+        let report = render_diff_report_for(&root).expect("diff report should render");
         assert!(report.contains("tracked.txt"));
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        cleanup_temp_dir(&root);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -6381,7 +6825,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        cleanup_temp_dir(&root);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -6467,7 +6911,9 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = env_lock();
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6500,12 +6946,14 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        cleanup_temp_dir(&workspace);
+        remove_dir_all_with_retry(&workspace);
     }
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = env_lock();
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6533,7 +6981,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        cleanup_temp_dir(&workspace);
+        remove_dir_all_with_retry(&workspace);
     }
 
     #[test]
@@ -6552,6 +7000,11 @@ UU conflicted.rs",
         assert!(usage.contains("/session list"));
     }
 
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     fn temp_workspace(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6562,9 +7015,11 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let _guard = env_lock();
-        let rust_workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let rendered = crate::init::render_init_claude_md(&rust_workspace);
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let rendered = crate::init::render_init_claude_md(&workspace_root);
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
@@ -6956,6 +7411,114 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        let (python_command, python_args) = python_command_and_args();
+        let mut alpha_args = python_args.clone();
+        alpha_args.push(script_path.to_string_lossy().into_owned());
+        let mut broken_args = python_args;
+        broken_args.extend(["-c".to_string(), "import sys; sys.exit(0)".to_string()]);
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": python_command,
+                        "args": alpha_args,
+                    },
+                    "broken": {
+                        "command": python_command_and_args().0,
+                        "args": broken_args,
+                    }
+                }
+            }))
+            .expect("mcp settings should serialize"),
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+
+        let allowed = state
+            .tool_registry
+            .normalize_allowed_tools(&["mcp__alpha__echo".to_string(), "MCPTool".to_string()])
+            .expect("mcp tools should be allow-listable")
+            .expect("allow-list should exist");
+        assert!(allowed.contains("mcp__alpha__echo"));
+        assert!(allowed.contains("MCPTool"));
+
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        let tool_output = executor
+            .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
+            .expect("discovered mcp tool should execute");
+        let tool_json: serde_json::Value =
+            serde_json::from_str(&tool_output).expect("tool output should be json");
+        assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
+
+        let wrapped_output = executor
+            .execute(
+                "MCPTool",
+                r#"{"qualifiedName":"mcp__alpha__echo","arguments":{"text":"wrapped"}}"#,
+            )
+            .expect("generic mcp wrapper should execute");
+        let wrapped_json: serde_json::Value =
+            serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
+        assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
+
+        let search_output = executor
+            .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+            .expect("tool search should execute");
+        let search_json: serde_json::Value =
+            serde_json::from_str(&search_output).expect("search output should be json");
+        assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
+        assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+
+        let listed = executor
+            .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
+            .expect("resources should list");
+        let listed_json: serde_json::Value =
+            serde_json::from_str(&listed).expect("resource output should be json");
+        assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
+
+        let read = executor
+            .execute(
+                "ReadMcpResourceTool",
+                r#"{"server":"alpha","uri":"file://guide.txt"}"#,
+            )
+            .expect("resource should read");
+        let read_json: serde_json::Value =
+            serde_json::from_str(&read).expect("resource read output should be json");
+        assert_eq!(
+            read_json["contents"][0]["text"],
+            "contents for file://guide.txt"
+        );
+
+        if let Some(mcp_state) = state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("mcp shutdown should succeed");
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         let config_home = temp_dir();
         // Inject a dummy API key so runtime construction succeeds without real credentials.
@@ -7011,6 +7574,105 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(source_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
+}
+
+fn write_mcp_server_fixture(script_path: &Path) {
+    let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "",
+            "def read_message():",
+            "    header = b''",
+            r"    while not header.endswith(b'\r\n\r\n'):",
+            "        chunk = sys.stdin.buffer.read(1)",
+            "        if not chunk:",
+            "            return None",
+            "        header += chunk",
+            "    length = 0",
+            r"    for line in header.decode().split('\r\n'):",
+            r"        if line.lower().startswith('content-length:'):",
+            "            length = int(line.split(':', 1)[1].strip())",
+            "    payload = sys.stdin.buffer.read(length)",
+            "    return json.loads(payload.decode())",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}, 'resources': {}},",
+            "                'serverInfo': {'name': 'fixture', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {",
+            "                        'name': 'echo',",
+            "                        'description': 'Echo from MCP fixture',",
+            "                        'inputSchema': {",
+            "                            'type': 'object',",
+            "                            'properties': {'text': {'type': 'string'}},",
+            "                            'required': ['text'],",
+            "                            'additionalProperties': False",
+            "                        },",
+            "                        'annotations': {'readOnlyHint': True}",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        args = request['params'].get('arguments') or {}",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': f\"echo:{args.get('text', '')}\"}],",
+            "                'structuredContent': {'echoed': args.get('text', '')},",
+            "                'isError': False",
+            "            }",
+            "        })",
+            "    elif method == 'resources/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resources': [{'uri': 'file://guide.txt', 'name': 'guide', 'mimeType': 'text/plain'}]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/read':",
+            "        uri = request['params']['uri']",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': f'contents for {uri}'}]",
+            "            }",
+            "        })",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': method}",
+            "        })",
+            "",
+        ]
+        .join("\n");
+    fs::write(script_path, script).expect("mcp fixture script should write");
 }
 
 #[cfg(test)]

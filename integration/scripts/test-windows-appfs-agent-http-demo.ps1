@@ -412,7 +412,7 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
 "@
     Write-Utf8TextFile -Path $demoScriptPath -Content $demoScript
 
-    $prompt = "Use bash only. Run `bash ./.ci-http-demo.sh` exactly once. Do not rewrite the script. Return the exact command output."
+    $prompt = 'Use bash only. Run `bash ./.ci-http-demo.sh` exactly once. Do not rewrite the script. Return the exact command output.'
     Push-Location $appRoot
     try {
         $promptResponse = Invoke-LoggedCommand -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
