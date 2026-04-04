@@ -7132,6 +7132,10 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn powershell_runs_real_shell_smoke_when_available() {
+        if !cfg!(windows) {
+            return;
+        }
+
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
