@@ -360,7 +360,8 @@ impl McpServerManagerError {
     }
 
     fn recoverable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::Timeout { .. })
+        !matches!(self.lifecycle_phase(), McpLifecyclePhase::InitializeHandshake)
+            && matches!(self, Self::Transport { .. } | Self::Timeout { .. })
     }
 
     fn discovery_failure(&self, server_name: &str) -> McpDiscoveryFailure {

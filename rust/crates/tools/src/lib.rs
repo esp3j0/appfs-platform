@@ -5138,6 +5138,14 @@ mod tests {
         let observed_output: serde_json::Value = serde_json::from_str(&observed).expect("json");
         assert_eq!(observed_output["status"], "spawning");
         assert_eq!(observed_output["trust_gate_cleared"], true);
+        assert_eq!(
+            observed_output["events"][1]["payload"]["type"],
+            "trust_prompt"
+        );
+        assert_eq!(
+            observed_output["events"][2]["payload"]["resolution"],
+            "auto_allowlisted"
+        );
 
         let ready = execute_tool(
             "WorkerObserve",
@@ -5170,8 +5178,9 @@ mod tests {
         )
         .expect("WorkerSendPrompt should succeed after ready");
         let accepted_output: serde_json::Value = serde_json::from_str(&accepted).expect("json");
-        assert_eq!(accepted_output["status"], "prompt_accepted");
+        assert_eq!(accepted_output["status"], "running");
         assert_eq!(accepted_output["prompt_delivery_attempts"], 1);
+        assert_eq!(accepted_output["prompt_in_flight"], true);
     }
 
     #[test]
@@ -5219,6 +5228,14 @@ mod tests {
         assert_eq!(recovered_output["status"], "ready_for_prompt");
         assert_eq!(recovered_output["last_error"]["kind"], "prompt_delivery");
         assert_eq!(recovered_output["replay_prompt"], "Investigate flaky boot");
+        assert_eq!(
+            recovered_output["events"][3]["payload"]["observed_target"],
+            "shell"
+        );
+        assert_eq!(
+            recovered_output["events"][4]["payload"]["recovery_armed"],
+            true
+        );
 
         let replayed = execute_tool(
             "WorkerSendPrompt",
@@ -5228,8 +5245,9 @@ mod tests {
         )
         .expect("WorkerSendPrompt should replay recovered prompt");
         let replayed_output: serde_json::Value = serde_json::from_str(&replayed).expect("json");
-        assert_eq!(replayed_output["status"], "prompt_accepted");
+        assert_eq!(replayed_output["status"], "running");
         assert_eq!(replayed_output["prompt_delivery_attempts"], 2);
+        assert_eq!(replayed_output["prompt_in_flight"], true);
     }
 
     #[test]

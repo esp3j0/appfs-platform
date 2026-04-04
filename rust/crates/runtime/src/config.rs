@@ -889,7 +889,8 @@ fn parse_mcp_server_config(
     context: &str,
 ) -> Result<McpServerConfig, ConfigError> {
     let object = expect_object(value, context)?;
-    let server_type = optional_string(object, "type", context)?.unwrap_or("stdio");
+    let server_type =
+        optional_string(object, "type", context)?.unwrap_or_else(|| infer_mcp_server_type(object));
     match server_type {
         "stdio" => Ok(McpServerConfig::Stdio(McpStdioServerConfig {
             command: expect_string(object, "command", context)?.to_string(),
@@ -918,6 +919,14 @@ fn parse_mcp_server_config(
         other => Err(ConfigError::Parse(format!(
             "{context}: unsupported MCP server type for {server_name}: {other}"
         ))),
+    }
+}
+
+fn infer_mcp_server_type(object: &BTreeMap<String, JsonValue>) -> &'static str {
+    if object.contains_key("url") {
+        "http"
+    } else {
+        "stdio"
     }
 }
 
@@ -1397,6 +1406,41 @@ mod tests {
         assert_eq!(oauth.client_id, "runtime-client");
         assert_eq!(oauth.callback_port, Some(54_545));
         assert_eq!(oauth.scopes, vec!["org:read", "user:write"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn infers_http_mcp_servers_from_url_only_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "remote": {
+                  "url": "https://example.test/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let remote_server = loaded.mcp().get("remote").expect("remote server should exist");
+        assert_eq!(remote_server.transport(), McpTransport::Http);
+        match &remote_server.config {
+            McpServerConfig::Http(config) => {
+                assert_eq!(config.url, "https://example.test/mcp");
+            }
+            other => panic!("expected http config, got {other:?}"),
+        }
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

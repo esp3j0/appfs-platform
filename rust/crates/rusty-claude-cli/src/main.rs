@@ -218,7 +218,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
-    let mut permission_mode = default_permission_mode();
+    let mut permission_mode_override = None;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
@@ -257,7 +257,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --permission-mode".to_string())?;
-                permission_mode = parse_permission_mode_arg(value)?;
+                permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
             flag if flag.starts_with("--output-format=") => {
@@ -265,11 +265,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
-                permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
-                permission_mode = PermissionMode::DangerFullAccess;
+                permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
             "-p" => {
@@ -283,7 +283,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     model: resolve_model_alias(&model).to_string(),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
-                    permission_mode,
+                    permission_mode: permission_mode_override
+                        .unwrap_or_else(default_permission_mode),
                 });
             }
             "--print" => {
@@ -336,6 +337,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
+        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
@@ -345,9 +347,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..]);
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode) {
+    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override)
+    {
         return action;
     }
+
+    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests),
@@ -392,7 +397,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
-    permission_mode: PermissionMode,
+    permission_mode_override: Option<PermissionMode>,
 ) -> Option<Result<CliAction, String>> {
     if rest.len() != 1 {
         return None;
@@ -403,7 +408,7 @@ fn parse_single_word_command_alias(
         "version" => Some(Ok(CliAction::Version)),
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
-            permission_mode,
+            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox)),
         other => bare_slash_command_guidance(other).map(Err),
@@ -5829,11 +5834,17 @@ mod tests {
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
-        let result = f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         std::env::set_current_dir(previous).expect("cwd should restore");
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {

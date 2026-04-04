@@ -149,8 +149,9 @@ pub use usage::{
 };
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
-    Worker, WorkerEvent, WorkerEventKind, WorkerFailure, WorkerFailureKind, WorkerReadySnapshot,
-    WorkerRegistry, WorkerStatus,
+    Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
+    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus,
+    WorkerTrustResolution,
 };
 
 #[cfg(windows)]
