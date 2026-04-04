@@ -197,14 +197,17 @@ function Invoke-LoggedCommand {
     $logPath = Join-Path $script:LogDir "$Name.log"
     $stdoutPath = Join-Path $script:LogDir "$Name.stdout.tmp.log"
     $stderrPath = Join-Path $script:LogDir "$Name.stderr.tmp.log"
-    $process = Start-Process -FilePath $FilePath `
-        -ArgumentList $ArgumentList `
-        -WorkingDirectory $WorkingDirectory `
-        -PassThru `
-        -WindowStyle Hidden `
-        -Wait `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath
+    $exitCode = 0
+
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
+        if ($LASTEXITCODE -is [int]) {
+            $exitCode = $LASTEXITCODE
+        }
+    } finally {
+        Pop-Location
+    }
 
     $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
@@ -214,8 +217,8 @@ function Invoke-LoggedCommand {
     Remove-TestPath -Path $stdoutPath
     Remove-TestPath -Path $stderrPath
 
-    if ($process.ExitCode -ne 0) {
-        Fail-WithContext "$Name failed with exit code $($process.ExitCode)"
+    if ($exitCode -ne 0) {
+        Fail-WithContext "$Name failed with exit code $exitCode"
     }
     if ($text) {
         Write-Host $text
