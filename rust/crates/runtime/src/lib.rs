@@ -140,8 +140,7 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{
-    validate_packet, AcceptanceTest, BranchPolicy, CommitPolicy, RepoConfig, ReportingContract,
-    TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
+    validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket,
 };
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{

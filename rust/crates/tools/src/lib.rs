@@ -18,6 +18,7 @@ use runtime::{
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
+    TaskPacket,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
@@ -757,6 +758,38 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "RunTaskPacket",
+            description: "Create a background task from a structured task packet.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "branch_policy": { "type": "string" },
+                    "acceptance_tests": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "commit_policy": { "type": "string" },
+                    "reporting_contract": { "type": "string" },
+                    "escalation_policy": { "type": "string" }
+                },
+                "required": [
+                    "objective",
+                    "scope",
+                    "repo",
+                    "branch_policy",
+                    "acceptance_tests",
+                    "commit_policy",
+                    "reporting_contract",
+                    "escalation_policy"
+                ],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "TaskGet",
             description: "Get the status and details of a background task by ID.",
             input_schema: json!({
@@ -1178,6 +1211,7 @@ fn execute_tool_with_enforcer(
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
@@ -1286,6 +1320,24 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
         "status": task.status,
         "prompt": task.prompt,
         "description": task.description,
+        "task_packet": task.task_packet,
+        "created_at": task.created_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_packet(input: TaskPacket) -> Result<String, String> {
+    let registry = global_task_registry();
+    let task = registry
+        .create_from_packet(input)
+        .map_err(|error| error.to_string())?;
+
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "prompt": task.prompt,
+        "description": task.description,
+        "task_packet": task.task_packet,
         "created_at": task.created_at
     }))
 }
@@ -1299,6 +1351,7 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "status": task.status,
             "prompt": task.prompt,
             "description": task.description,
+            "task_packet": task.task_packet,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "messages": task.messages,
@@ -1319,6 +1372,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "status": t.status,
                 "prompt": t.prompt,
                 "description": t.description,
+                "task_packet": t.task_packet,
                 "created_at": t.created_at,
                 "updated_at": t.updated_at,
                 "team_id": t.team_id
@@ -4992,13 +5046,14 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentInput,
-        AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, ToolExecutor,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -7149,6 +7204,34 @@ printf 'pwsh:%s' "$1"
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
+    }
+
+    #[test]
+    fn run_task_packet_creates_packet_backed_task() {
+        let result = run_task_packet(TaskPacket {
+            objective: "Ship packetized runtime task".to_string(),
+            scope: "runtime/task system".to_string(),
+            repo: "claw-code-parity".to_string(),
+            branch_policy: "origin/main only".to_string(),
+            acceptance_tests: vec![
+                "cargo build --workspace".to_string(),
+                "cargo test --workspace".to_string(),
+            ],
+            commit_policy: "single commit".to_string(),
+            reporting_contract: "print build/test result and sha".to_string(),
+            escalation_policy: "manual escalation".to_string(),
+        })
+        .expect("task packet should create a task");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["status"], "created");
+        assert_eq!(output["prompt"], "Ship packetized runtime task");
+        assert_eq!(output["description"], "runtime/task system");
+        assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(
+            output["task_packet"]["acceptance_tests"][1],
+            "cargo test --workspace"
+        );
     }
 
     struct TestServer {
