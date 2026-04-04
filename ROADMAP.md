@@ -291,6 +291,7 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 
 **P3 — Swarm efficiency**
 13. Swarm branch-lock protocol — detect same-module/same-branch collision before parallel workers drift into duplicate implementation
+14. Commit provenance / worktree-aware push events — emit branch, worktree, superseded-by, and canonical commit lineage so parallel sessions stop producing duplicate-looking push summaries
 
 ## Suggested Session Split
 
