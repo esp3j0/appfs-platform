@@ -6998,6 +6998,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(windows)]
         {
+            let dir = temp_path("pwsh-bin");
+            std::fs::create_dir_all(&dir).expect("create dir");
+            let script = dir.join("pwsh.cmd");
+            std::fs::write(&script, "@echo off\r\necho hello\r\n").expect("write script");
+            let original_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut path_entries = vec![dir.clone()];
+            path_entries.extend(std::env::split_paths(&original_path));
+            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
+            std::env::set_var("PATH", &updated_path);
+
             let result = execute_tool(
                 "PowerShell",
                 &json!({"command": "Write-Output hello", "timeout": 1000}),
@@ -7009,6 +7019,9 @@ mod tests {
                 &json!({"command": "Write-Output hello", "run_in_background": true}),
             )
             .expect("PowerShell background should succeed");
+
+            std::env::set_var("PATH", original_path);
+            let _ = std::fs::remove_dir_all(&dir);
 
             let output: serde_json::Value = serde_json::from_str(&result).expect("json");
             assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
