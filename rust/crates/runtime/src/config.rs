@@ -1442,7 +1442,10 @@ mod tests {
             .load()
             .expect("config should load");
 
-        let remote_server = loaded.mcp().get("remote").expect("remote server should exist");
+        let remote_server = loaded
+            .mcp()
+            .get("remote")
+            .expect("remote server should exist");
         assert_eq!(remote_server.transport(), McpTransport::Http);
         match &remote_server.config {
             McpServerConfig::Http(config) => {

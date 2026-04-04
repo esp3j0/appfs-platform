@@ -139,9 +139,7 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{
-    validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket,
-};
+pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
@@ -149,8 +147,7 @@ pub use usage::{
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus,
-    WorkerTrustResolution,
+    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
 #[cfg(windows)]
