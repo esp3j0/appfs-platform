@@ -54,6 +54,19 @@ jobs:
             }
           }
 
+      - name: Prepare VM tool paths
+        shell: powershell
+        run: |
+          @(
+            'C:\Users\esp3j\.cargo\bin'
+            'C:\Users\esp3j\AppData\Local\Programs\Python\Python312'
+            'C:\Users\esp3j\AppData\Local\Programs\Python\Python312\Scripts'
+            'C:\Program Files\Git\cmd'
+            'C:\Program Files\Git\bin'
+          ) | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value 'CARGO_HOME=C:\Users\esp3j\.cargo'
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTUP_HOME=C:\Users\esp3j\.rustup'
+
       - name: Run Windows smoke test
         shell: powershell
         env:
