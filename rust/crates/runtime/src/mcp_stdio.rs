@@ -230,6 +230,19 @@ pub struct UnsupportedMcpServer {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpDiscoveryFailure {
+    pub server_name: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolDiscoveryReport {
+    pub tools: Vec<ManagedMcpTool>,
+    pub failed_servers: Vec<McpDiscoveryFailure>,
+    pub unsupported_servers: Vec<UnsupportedMcpServer>,
+}
+
 #[derive(Debug)]
 pub enum McpServerManagerError {
     Io(io::Error),
@@ -397,6 +410,11 @@ impl McpServerManager {
         &self.unsupported_servers
     }
 
+    #[must_use]
+    pub fn server_names(&self) -> Vec<String> {
+        self.servers.keys().cloned().collect()
+    }
+
     pub async fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
         let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
         let mut discovered_tools = Vec::new();
@@ -418,6 +436,43 @@ impl McpServerManager {
         }
 
         Ok(discovered_tools)
+    }
+
+    pub async fn discover_tools_best_effort(&mut self) -> McpToolDiscoveryReport {
+        let server_names = self.server_names();
+        let mut discovered_tools = Vec::new();
+        let mut failed_servers = Vec::new();
+
+        for server_name in server_names {
+            match self.discover_tools_for_server(&server_name).await {
+                Ok(server_tools) => {
+                    self.clear_routes_for_server(&server_name);
+                    for tool in server_tools {
+                        self.tool_index.insert(
+                            tool.qualified_name.clone(),
+                            ToolRoute {
+                                server_name: tool.server_name.clone(),
+                                raw_name: tool.raw_name.clone(),
+                            },
+                        );
+                        discovered_tools.push(tool);
+                    }
+                }
+                Err(error) => {
+                    self.clear_routes_for_server(&server_name);
+                    failed_servers.push(McpDiscoveryFailure {
+                        server_name,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        McpToolDiscoveryReport {
+            tools: discovered_tools,
+            failed_servers,
+            unsupported_servers: self.unsupported_servers.clone(),
+        }
     }
 
     pub async fn call_tool(
@@ -470,6 +525,53 @@ impl McpServerManager {
         }
 
         response
+    }
+
+    pub async fn list_resources(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpListResourcesResult, McpServerManagerError> {
+        let mut attempts = 0;
+
+        loop {
+            match self.list_resources_once(server_name).await {
+                Ok(resources) => return Ok(resources),
+                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
+                    self.reset_server(server_name).await?;
+                    attempts += 1;
+                }
+                Err(error) => {
+                    if Self::should_reset_server(&error) {
+                        self.reset_server(server_name).await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, McpServerManagerError> {
+        let mut attempts = 0;
+
+        loop {
+            match self.read_resource_once(server_name, uri).await {
+                Ok(resource) => return Ok(resource),
+                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
+                    self.reset_server(server_name).await?;
+                    attempts += 1;
+                }
+                Err(error) => {
+                    if Self::should_reset_server(&error) {
+                        self.reset_server(server_name).await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
     pub async fn shutdown(&mut self) -> Result<(), McpServerManagerError> {
@@ -621,6 +723,118 @@ impl McpServerManager {
         }
 
         Ok(discovered_tools)
+    }
+
+    async fn list_resources_once(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpListResourcesResult, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+
+        let mut resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request_id = self.take_request_id();
+            let response = {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/list",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                Self::run_process_request(
+                    server_name,
+                    "resources/list",
+                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    process.list_resources(
+                        request_id,
+                        Some(McpListResourcesParams {
+                            cursor: cursor.clone(),
+                        }),
+                    ),
+                )
+                .await?
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            resources.extend(result.resources);
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(McpListResourcesResult {
+            resources,
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource_once(
+        &mut self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+
+        let request_id = self.take_request_id();
+        let response =
+            {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/read",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                Self::run_process_request(
+                    server_name,
+                    "resources/read",
+                    MCP_LIST_TOOLS_TIMEOUT_MS,
+                    process.read_resource(
+                        request_id,
+                        McpReadResourceParams {
+                            uri: uri.to_string(),
+                        },
+                    ),
+                )
+                .await?
+            };
+
+        if let Some(error) = response.error {
+            return Err(McpServerManagerError::JsonRpc {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                error,
+            });
+        }
+
+        response
+            .result
+            .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                details: "missing result payload".to_string(),
+            })
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
@@ -1050,8 +1264,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1085,15 +1299,25 @@ mod tests {
     fn write_echo_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
-        let script_path = root.join("echo-mcp.sh");
+        let script_path = root.join("echo-mcp.py");
         fs::write(
             &script_path,
-            "#!/bin/sh\nprintf 'READY:%s\\n' \"$MCP_TEST_TOKEN\"\nIFS= read -r line\nprintf 'ECHO:%s\\n' \"$line\"\n",
+            [
+                "#!/usr/bin/env python3",
+                "import os, sys",
+                "sys.stdout.buffer.write(",
+                "    f\"READY:{os.environ.get('MCP_TEST_TOKEN', '')}\\n\".encode('utf-8')",
+                ")",
+                "sys.stdout.buffer.flush()",
+                "line = sys.stdin.readline()",
+                "if line:",
+                "    sys.stdout.buffer.write(f\"ECHO:{line}\".encode('utf-8'))",
+                "    sys.stdout.buffer.flush()",
+                "",
+            ]
+            .join("\n"),
         )
         .expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1137,9 +1361,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1271,9 +1492,6 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
@@ -1396,18 +1614,17 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
 
     fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
+        let python = python_invocation();
+        let args = python.script_args(script_path);
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "/bin/sh".to_string(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                command: python.command,
+                args,
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
             }),
@@ -1423,12 +1640,70 @@ mod tests {
         script_path: &Path,
         env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
+        let python = python_invocation();
+        let args = python.script_args(script_path);
         crate::mcp_client::McpStdioTransport {
-            command: "python3".to_string(),
-            args: vec![script_path.to_string_lossy().into_owned()],
+            command: python.command,
+            args,
             env,
             tool_call_timeout_ms: None,
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PythonInvocation {
+        command: String,
+        args: Vec<String>,
+    }
+
+    impl PythonInvocation {
+        fn script_args(&self, script_path: &Path) -> Vec<String> {
+            let mut args = self.args.clone();
+            args.push(script_path.to_string_lossy().into_owned());
+            args
+        }
+    }
+
+    fn python_invocation() -> PythonInvocation {
+        for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    return PythonInvocation {
+                        command: value,
+                        args: Vec::new(),
+                    };
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if command_runs_successfully("py", &["-3", "--version"]) {
+            return PythonInvocation {
+                command: String::from("py"),
+                args: vec![String::from("-3")],
+            };
+        }
+
+        for candidate in ["python3", "python"] {
+            if command_runs_successfully(candidate, &["--version"]) {
+                return PythonInvocation {
+                    command: candidate.to_string(),
+                    args: Vec::new(),
+                };
+            }
+        }
+
+        panic!("expected a Python interpreter for MCP stdio tests")
+    }
+
+    fn command_runs_successfully(command: &str, args: &[&str]) -> bool {
+        Command::new(command)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     fn cleanup_script(script_path: &Path) {
@@ -1470,11 +1745,13 @@ mod tests {
             ),
         ]);
         env.extend(extra_env);
+        let python = python_invocation();
+        let args = python.script_args(script_path);
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                command: python.command,
+                args,
                 env,
                 tool_call_timeout_ms: None,
             }),
@@ -1691,9 +1968,11 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_echo_script();
+            let python = python_invocation();
+            let args = python.script_args(&script_path);
             let transport = crate::mcp_client::McpStdioTransport {
-                command: "/bin/sh".to_string(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                command: python.command,
+                args,
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
             };
@@ -1946,13 +2225,15 @@ mod tests {
             let script_path = write_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("timeout.log");
+            let python = python_invocation();
+            let args = python.script_args(&script_path);
             let servers = BTreeMap::from([(
                 "slow".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        command: python.command,
+                        args,
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
                             "200".to_string(),
@@ -1999,13 +2280,15 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_mcp_server_script();
+            let python = python_invocation();
+            let args = python.script_args(&script_path);
             let servers = BTreeMap::from([(
                 "broken".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        command: python.command,
+                        args,
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
                             "1".to_string(),
@@ -2246,6 +2529,106 @@ mod tests {
                     "initialize",
                     "tools/call",
                 ]
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_lists_and_reads_resources_from_stdio_servers() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("resources.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config(&script_path, "alpha", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let listed = manager
+                .list_resources("alpha")
+                .await
+                .expect("list resources");
+            assert_eq!(listed.resources.len(), 1);
+            assert_eq!(listed.resources[0].uri, "file://guide.txt");
+
+            let read = manager
+                .read_resource("alpha", "file://guide.txt")
+                .await
+                .expect("read resource");
+            assert_eq!(read.contents.len(), 1);
+            assert_eq!(
+                read.contents[0].text.as_deref(),
+                Some("contents for file://guide.txt")
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_discovery_report_keeps_healthy_servers_when_one_server_fails() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let alpha_log = root.join("alpha.log");
+            let python = python_invocation();
+            let mut broken_args = python.args.clone();
+            broken_args.extend(["-c".to_string(), "import sys; sys.exit(0)".to_string()]);
+            let servers = BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    manager_server_config(&script_path, "alpha", &alpha_log),
+                ),
+                (
+                    "broken".to_string(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Local,
+                        config: McpServerConfig::Stdio(McpStdioServerConfig {
+                            command: python.command,
+                            args: broken_args,
+                            env: BTreeMap::new(),
+                            tool_call_timeout_ms: None,
+                        }),
+                    },
+                ),
+            ]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let report = manager.discover_tools_best_effort().await;
+
+            assert_eq!(report.tools.len(), 1);
+            assert_eq!(
+                report.tools[0].qualified_name,
+                mcp_tool_name("alpha", "echo")
+            );
+            assert_eq!(report.failed_servers.len(), 1);
+            assert_eq!(report.failed_servers[0].server_name, "broken");
+            assert!(report.failed_servers[0].error.contains("initialize"));
+
+            let response = manager
+                .call_tool(&mcp_tool_name("alpha", "echo"), Some(json!({"text": "ok"})))
+                .await
+                .expect("healthy server should remain callable");
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.structured_content.as_ref())
+                    .and_then(|value| value.get("echoed")),
+                Some(&json!("ok"))
             );
 
             manager.shutdown().await.expect("shutdown");

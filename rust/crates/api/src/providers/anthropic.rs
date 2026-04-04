@@ -881,6 +881,19 @@ mod tests {
         }
     }
 
+    fn with_empty_config_home(test: impl FnOnce()) {
+        let config_home = temp_config_home();
+        std::fs::create_dir_all(&config_home).expect("create config home");
+        let original_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        test();
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        cleanup_temp_config_home(&config_home);
+    }
+
     fn sample_oauth_config(token_url: String) -> OAuthConfig {
         OAuthConfig {
             client_id: "runtime-client".to_string(),
@@ -914,27 +927,30 @@ mod tests {
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("CLAW_CONFIG_HOME");
-        let error = super::read_api_key().expect_err("missing key should error");
-        assert!(matches!(
-            error,
-            crate::error::ApiError::MissingCredentials { .. }
-        ));
+        with_empty_config_home(|| {
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            let error = super::read_api_key().expect_err("missing key should error");
+            assert!(matches!(
+                error,
+                crate::error::ApiError::MissingCredentials { .. }
+            ));
+        });
     }
 
     #[test]
     fn read_api_key_requires_non_empty_value() {
         let _guard = env_lock();
-        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        let error = super::read_api_key().expect_err("empty key should error");
-        assert!(matches!(
-            error,
-            crate::error::ApiError::MissingCredentials { .. }
-        ));
-        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        with_empty_config_home(|| {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            let error = super::read_api_key().expect_err("empty key should error");
+            assert!(matches!(
+                error,
+                crate::error::ApiError::MissingCredentials { .. }
+            ));
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        });
     }
 
     #[test]

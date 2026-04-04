@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
-use std::path::Path;
 use std::process::Command;
 
 use serde_json::json;
 
+use crate::shell::prepare_hook_command;
 use crate::{PluginError, PluginHooks, PluginRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ impl HookRunner {
 
     #[must_use]
     pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PreToolUse,
             &self.hooks.pre_tool_use,
             tool_name,
@@ -91,7 +91,7 @@ impl HookRunner {
         tool_output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PostToolUse,
             &self.hooks.post_tool_use,
             tool_name,
@@ -108,7 +108,7 @@ impl HookRunner {
         tool_input: &str,
         tool_error: &str,
     ) -> HookRunResult {
-        self.run_commands(
+        Self::run_commands(
             HookEvent::PostToolUseFailure,
             &self.hooks.post_tool_use_failure,
             tool_name,
@@ -119,7 +119,6 @@ impl HookRunner {
     }
 
     fn run_commands(
-        &self,
         event: HookEvent,
         commands: &[String],
         tool_name: &str,
@@ -136,7 +135,7 @@ impl HookRunner {
         let mut messages = Vec::new();
 
         for command in commands {
-            match self.run_command(
+            match Self::run_command(
                 command,
                 event,
                 tool_name,
@@ -174,9 +173,8 @@ impl HookRunner {
         HookRunResult::allow(messages)
     }
 
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
+    #[allow(clippy::too_many_arguments)]
     fn run_command(
-        &self,
         command: &str,
         event: HookEvent,
         tool_name: &str,
@@ -185,7 +183,17 @@ impl HookRunner {
         is_error: bool,
         payload: &str,
     ) -> HookCommandOutcome {
-        let mut child = shell_command(command);
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return HookCommandOutcome::Failed {
+                    message: format!(
+                        "{} hook `{command}` failed to start for `{tool_name}`: {error}",
+                        event.as_str()
+                    ),
+                };
+            }
+        };
         child.stdin(std::process::Stdio::piped());
         child.stdout(std::process::Stdio::piped());
         child.stderr(std::process::Stdio::piped());
@@ -280,26 +288,8 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
     message
 }
 
-fn shell_command(command: &str) -> CommandWithStdin {
-    #[cfg(windows)]
-    let command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    #[cfg(not(windows))]
-    let command_builder = if Path::new(command).exists() {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg(command);
-        CommandWithStdin::new(command_builder)
-    } else {
-        let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
-        CommandWithStdin::new(command_builder)
-    };
-
-    command_builder
+fn shell_command(command: &str) -> std::io::Result<CommandWithStdin> {
+    prepare_hook_command(command).map(CommandWithStdin::new)
 }
 
 struct CommandWithStdin {
@@ -370,14 +360,16 @@ mod tests {
     ) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         fs::create_dir_all(root.join("hooks")).expect("hooks dir");
+        let pre_hook = hook_script_name("pre");
+        let post_hook = hook_script_name("post");
         fs::write(
-            root.join("hooks").join("pre.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{pre_message}'\n"),
+            root.join("hooks").join(&pre_hook),
+            hook_script_contents(pre_message),
         )
         .expect("write pre hook");
         fs::write(
-            root.join("hooks").join("post.sh"),
-            format!("#!/bin/sh\nprintf '%s\\n' '{post_message}'\n"),
+            root.join("hooks").join(&post_hook),
+            hook_script_contents(post_message),
         )
         .expect("write post hook");
         fs::write(
@@ -388,7 +380,7 @@ mod tests {
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
             format!(
-                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.sh\"],\n    \"PostToolUse\": [\"./hooks/post.sh\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
+                "{{\n  \"name\": \"{name}\",\n  \"version\": \"1.0.0\",\n  \"description\": \"hook plugin\",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/{pre_hook}\"],\n    \"PostToolUse\": [\"./hooks/{post_hook}\"],\n    \"PostToolUseFailure\": [\"./hooks/failure.sh\"]\n  }}\n}}"
             ),
         )
         .expect("write plugin manifest");
@@ -459,7 +451,7 @@ mod tests {
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
         // given
         let runner = HookRunner::new(crate::PluginHooks {
-            pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
+            pre_tool_use: vec![shell_echo_and_exit("blocked by plugin", 2)],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
         });
@@ -497,5 +489,17 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message == "later plugin hook"));
+    }
+
+    fn hook_script_name(stem: &str) -> String {
+        format!("{stem}.sh")
+    }
+
+    fn hook_script_contents(message: &str) -> String {
+        format!("#!/bin/sh\nprintf '%s\\n' '{message}'\n")
+    }
+
+    fn shell_echo_and_exit(message: &str, code: i32) -> String {
+        format!("printf '{message}'; exit {code}")
     }
 }
