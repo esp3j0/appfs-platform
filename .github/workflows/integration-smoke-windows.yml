@@ -54,9 +54,6 @@ jobs:
             }
           }
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Run Windows smoke test
         shell: powershell
         env:
