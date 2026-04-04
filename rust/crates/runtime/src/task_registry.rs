@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::{validate_packet, TaskPacket, TaskPacketValidationError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -33,6 +35,7 @@ pub struct Task {
     pub task_id: String,
     pub prompt: String,
     pub description: Option<String>,
+    pub task_packet: Option<TaskPacket>,
     pub status: TaskStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -73,14 +76,40 @@ impl TaskRegistry {
     }
 
     pub fn create(&self, prompt: &str, description: Option<&str>) -> Task {
+        self.create_task(
+            prompt.to_owned(),
+            description.map(str::to_owned),
+            None,
+        )
+    }
+
+    pub fn create_from_packet(
+        &self,
+        packet: TaskPacket,
+    ) -> Result<Task, TaskPacketValidationError> {
+        let packet = validate_packet(packet)?.into_inner();
+        Ok(self.create_task(
+            packet.objective.clone(),
+            Some(packet.scope.clone()),
+            Some(packet),
+        ))
+    }
+
+    fn create_task(
+        &self,
+        prompt: String,
+        description: Option<String>,
+        task_packet: Option<TaskPacket>,
+    ) -> Task {
         let mut inner = self.inner.lock().expect("registry lock poisoned");
         inner.counter += 1;
         let ts = now_secs();
         let task_id = format!("task_{:08x}_{}", ts, inner.counter);
         let task = Task {
             task_id: task_id.clone(),
-            prompt: prompt.to_owned(),
-            description: description.map(str::to_owned),
+            prompt,
+            description,
+            task_packet,
             status: TaskStatus::Created,
             created_at: ts,
             updated_at: ts,
@@ -215,9 +244,36 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Created);
         assert_eq!(task.prompt, "Do something");
         assert_eq!(task.description.as_deref(), Some("A test task"));
+        assert_eq!(task.task_packet, None);
 
         let fetched = registry.get(&task.task_id).expect("task should exist");
         assert_eq!(fetched.task_id, task.task_id);
+    }
+
+    #[test]
+    fn creates_task_from_packet() {
+        let registry = TaskRegistry::new();
+        let packet = TaskPacket {
+            objective: "Ship task packet support".to_string(),
+            scope: "runtime/task system".to_string(),
+            repo: "claw-code-parity".to_string(),
+            branch_policy: "origin/main only".to_string(),
+            acceptance_tests: vec!["cargo test --workspace".to_string()],
+            commit_policy: "single commit".to_string(),
+            reporting_contract: "print commit sha".to_string(),
+            escalation_policy: "manual escalation".to_string(),
+        };
+
+        let task = registry
+            .create_from_packet(packet.clone())
+            .expect("packet-backed task should be created");
+
+        assert_eq!(task.prompt, packet.objective);
+        assert_eq!(task.description.as_deref(), Some("runtime/task system"));
+        assert_eq!(task.task_packet, Some(packet.clone()));
+
+        let fetched = registry.get(&task.task_id).expect("task should exist");
+        assert_eq!(fetched.task_packet, Some(packet));
     }
 
     #[test]
@@ -417,6 +473,7 @@ mod tests {
         // then
         assert!(task.task_id.starts_with("task_"));
         assert_eq!(task.description, None);
+        assert_eq!(task.task_packet, None);
         assert!(task.messages.is_empty());
         assert!(task.output.is_empty());
         assert_eq!(task.team_id, None);
