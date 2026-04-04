@@ -197,11 +197,14 @@ function Invoke-LoggedCommand {
 
     Push-Location $WorkingDirectory
     try {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
         if ($LASTEXITCODE -is [int]) {
             $exitCode = $LASTEXITCODE
         }
     } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
         Pop-Location
     }
 
