@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::Session;
+use serde_json::json;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -156,6 +157,52 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             .to_str()
             .expect("utf8 path")
     ));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn config_show_command_prints_merged_runtime_config_as_json() {
+    // given
+    let temp_dir = unique_temp_dir("config-show");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(temp_dir.join(".claw")).expect("project config dir should exist");
+    fs::create_dir_all(&config_home).expect("home config dir should exist");
+
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"model":"haiku","sandbox":{"enabled":true}}"#,
+    )
+    .expect("write user settings");
+    fs::write(
+        temp_dir.join(".claw.json"),
+        r#"{"permissions":{"allow":["git status"]},"sandbox":{"networkIsolation":true}}"#,
+    )
+    .expect("write project settings");
+    fs::write(
+        temp_dir.join(".claw").join("settings.local.json"),
+        r#"{"model":"opus","sandbox":{"filesystemMode":"workspace-only"}}"#,
+    )
+    .expect("write local settings");
+
+    // when
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .args(["config", "show"])
+        .output()
+        .expect("claw should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("config show output should be valid json");
+    assert_eq!(parsed["model"], "opus");
+    assert_eq!(parsed["permissions"]["allow"], json!(["git status"]));
+    assert_eq!(parsed["sandbox"]["enabled"], true);
+    assert_eq!(parsed["sandbox"]["networkIsolation"], true);
+    assert_eq!(parsed["sandbox"]["filesystemMode"], "workspace-only");
+    assert!(stdout.starts_with("{\n"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }

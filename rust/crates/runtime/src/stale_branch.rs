@@ -11,6 +11,7 @@ pub enum BranchFreshness {
     Diverged {
         ahead: usize,
         behind: usize,
+        missing_fixes: Vec<String>,
     },
 }
 
@@ -77,15 +78,21 @@ pub fn apply_policy(freshness: &BranchFreshness, policy: StaleBranchPolicy) -> S
             StaleBranchPolicy::AutoRebase => StaleBranchAction::Rebase,
             StaleBranchPolicy::AutoMergeForward => StaleBranchAction::MergeForward,
         },
-        BranchFreshness::Diverged { ahead, behind } => match policy {
+        BranchFreshness::Diverged {
+            ahead,
+            behind,
+            missing_fixes,
+        } => match policy {
             StaleBranchPolicy::WarnOnly => StaleBranchAction::Warn {
                 message: format!(
-                    "Branch has diverged: {ahead} commit(s) ahead, {behind} commit(s) behind main."
+                    "Branch has diverged: {ahead} commit(s) ahead, {behind} commit(s) behind main. Missing fixes: {}",
+                    format_missing_fixes(missing_fixes)
                 ),
             },
             StaleBranchPolicy::Block => StaleBranchAction::Block {
                 message: format!(
-                    "Branch has diverged ({ahead} ahead, {behind} behind) and must be reconciled before proceeding."
+                    "Branch has diverged ({ahead} ahead, {behind} behind) and must be reconciled before proceeding. Missing fixes: {}",
+                    format_missing_fixes(missing_fixes)
                 ),
             },
             StaleBranchPolicy::AutoRebase => StaleBranchAction::Rebase,
@@ -107,13 +114,25 @@ pub(crate) fn check_freshness_in(
     }
 
     if ahead > 0 {
-        return BranchFreshness::Diverged { ahead, behind };
+        return BranchFreshness::Diverged {
+            ahead,
+            behind,
+            missing_fixes: missing_fix_subjects(main_ref, branch, repo_path),
+        };
     }
 
     let missing_fixes = missing_fix_subjects(main_ref, branch, repo_path);
     BranchFreshness::Stale {
         commits_behind: behind,
         missing_fixes,
+    }
+}
+
+fn format_missing_fixes(missing_fixes: &[String]) -> String {
+    if missing_fixes.is_empty() {
+        "(none)".to_string()
+    } else {
+        missing_fixes.join("; ")
     }
 }
 
@@ -271,9 +290,14 @@ mod tests {
 
         // then
         match freshness {
-            BranchFreshness::Diverged { ahead, behind } => {
+            BranchFreshness::Diverged {
+                ahead,
+                behind,
+                missing_fixes,
+            } => {
                 assert_eq!(ahead, 1);
                 assert_eq!(behind, 1);
+                assert_eq!(missing_fixes, vec!["main fix".to_string()]);
             }
             other => panic!("expected Diverged, got {other:?}"),
         }
@@ -356,6 +380,7 @@ mod tests {
         let freshness = BranchFreshness::Diverged {
             ahead: 5,
             behind: 2,
+            missing_fixes: vec!["fix: merge main".into()],
         };
 
         // when
@@ -371,6 +396,7 @@ mod tests {
         let freshness = BranchFreshness::Diverged {
             ahead: 3,
             behind: 1,
+            missing_fixes: vec!["main hotfix".into()],
         };
 
         // when
@@ -382,6 +408,7 @@ mod tests {
                 assert!(message.contains("diverged"));
                 assert!(message.contains("3 commit(s) ahead"));
                 assert!(message.contains("1 commit(s) behind"));
+                assert!(message.contains("main hotfix"));
             }
             other => panic!("expected Warn, got {other:?}"),
         }
