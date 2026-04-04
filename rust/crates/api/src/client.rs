@@ -27,6 +27,14 @@ pub enum ProviderClient {
     OpenAi(OpenAiCompatClient),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOverride {
+    pub provider: ProviderKind,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auth_token_env: Option<String>,
+}
+
 impl ProviderClient {
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
         Self::from_model_with_provider_override(model, None)
@@ -41,6 +49,13 @@ impl ProviderClient {
         })
     }
 
+    pub fn from_model_with_default_auth(
+        model: &str,
+        anthropic_auth: Option<AuthSource>,
+    ) -> Result<Self, ApiError> {
+        Self::from_model_with_anthropic_auth(model, anthropic_auth)
+    }
+
     pub fn from_model_with_provider_override(
         model: &str,
         provider_override: Option<&ProviderOverride>,
@@ -50,6 +65,17 @@ impl ProviderClient {
             provider_override,
             anthropic::AuthSource::from_env_or_saved,
         )
+    }
+
+    pub fn from_model_with_claw_auth_resolver<F>(
+        model: &str,
+        provider_override: Option<&ProviderOverride>,
+        resolve_claw_auth: F,
+    ) -> Result<Self, ApiError>
+    where
+        F: FnOnce() -> Result<AuthSource, ApiError>,
+    {
+        Self::from_model_with_anthropic_auth_resolver(model, provider_override, resolve_claw_auth)
     }
 
     pub fn from_model_with_anthropic_auth_resolver<F>(
@@ -69,12 +95,10 @@ impl ProviderClient {
                 provider_override,
                 resolve_anthropic_auth,
             )?)),
-            ProviderKind::Xai => Ok(Self::Xai(build_openai_compat_client(
-                provider_override,
+            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(build_openai_compat_client(
-                provider_override,
+            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
             )?)),
         }
@@ -136,14 +160,6 @@ impl ProviderClient {
                 .map(MessageStream::OpenAiCompat),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderOverride {
-    pub provider: ProviderKind,
-    pub base_url: Option<String>,
-    pub api_key_env: Option<String>,
-    pub auth_token_env: Option<String>,
 }
 
 fn build_anthropic_client<F>(
