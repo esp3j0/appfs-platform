@@ -1632,6 +1632,7 @@ struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
     pending_servers: Vec<String>,
+    degraded_report: Option<runtime::McpDegradedReport>,
 }
 
 struct BuiltRuntime {
@@ -1762,12 +1763,63 @@ impl RuntimeMcpState {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let available_tools = discovery
+            .tools
+            .iter()
+            .map(|tool| tool.qualified_name.clone())
+            .collect::<Vec<_>>();
+        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
+        let working_servers = manager
+            .server_names()
+            .into_iter()
+            .filter(|server_name| !failed_server_names.contains(server_name))
+            .collect::<Vec<_>>();
+        let failed_servers = discovery
+            .failed_servers
+            .iter()
+            .map(|failure| runtime::McpFailedServer {
+                server_name: failure.server_name.clone(),
+                phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                error: runtime::McpErrorSurface::new(
+                    runtime::McpLifecyclePhase::ToolDiscovery,
+                    Some(failure.server_name.clone()),
+                    failure.error.clone(),
+                    std::collections::BTreeMap::new(),
+                    true,
+                ),
+            })
+            .chain(discovery.unsupported_servers.iter().map(|server| {
+                runtime::McpFailedServer {
+                    server_name: server.server_name.clone(),
+                    phase: runtime::McpLifecyclePhase::ServerRegistration,
+                    error: runtime::McpErrorSurface::new(
+                        runtime::McpLifecyclePhase::ServerRegistration,
+                        Some(server.server_name.clone()),
+                        server.reason.clone(),
+                        std::collections::BTreeMap::from([(
+                            "transport".to_string(),
+                            format!("{:?}", server.transport).to_ascii_lowercase(),
+                        )]),
+                        false,
+                    ),
+                }
+            }))
+            .collect::<Vec<_>>();
+        let degraded_report = (!failed_servers.is_empty()).then(|| {
+            runtime::McpDegradedReport::new(
+                working_servers,
+                failed_servers,
+                available_tools.clone(),
+                available_tools,
+            )
+        });
 
         Ok(Some((
             Self {
                 runtime,
                 manager,
                 pending_servers,
+                degraded_report,
             },
             discovery,
         )))
@@ -1780,6 +1832,10 @@ impl RuntimeMcpState {
 
     fn pending_servers(&self) -> Option<Vec<String>> {
         (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
+    }
+
+    fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
+        self.degraded_report.clone()
     }
 
     fn server_names(&self) -> Vec<String> {
@@ -5340,16 +5396,21 @@ impl CliToolExecutor {
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let pending_mcp_servers = self.mcp_state.as_ref().and_then(|state| {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_servers()
-        });
+        let (pending_mcp_servers, mcp_degraded) = self
+            .mcp_state
+            .as_ref()
+            .map(|state| {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.pending_servers(), state.degraded_report())
+            })
+            .unwrap_or((None, None));
         serde_json::to_string_pretty(&self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
             pending_mcp_servers,
+            mcp_degraded,
         ))
         .map_err(|error| ToolError::new(error.to_string()))
     }
@@ -7485,6 +7546,18 @@ UU conflicted.rs",
             serde_json::from_str(&search_output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
         assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
+            "broken"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["phase"],
+            "tool_discovery"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["available_tools"][0],
+            "mcp__alpha__echo"
+        );
 
         let listed = executor
             .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
@@ -7513,6 +7586,54 @@ UU conflicted.rs",
                 .shutdown()
                 .expect("mcp shutdown should succeed");
         }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "remote": {
+                  "url": "https://example.test/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+        let mut executor =
+            CliToolExecutor::new(None, false, state.tool_registry.clone(), state.mcp_state.clone());
+
+        let search_output = executor
+            .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
+            .expect("tool search should execute");
+        let search_json: serde_json::Value =
+            serde_json::from_str(&search_output).expect("search output should be json");
+        assert_eq!(search_json["pending_mcp_servers"][0], "remote");
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
+            "remote"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["phase"],
+            "server_registration"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["error"]["context"]["transport"],
+            "http"
+        );
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);

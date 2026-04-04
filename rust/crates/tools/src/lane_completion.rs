@@ -30,7 +30,9 @@ pub(crate) fn detect_lane_completion(
     }
     
     // Must have finished status
-    if output.status != "Finished" {
+    if !output.status.eq_ignore_ascii_case("completed")
+        && !output.status.eq_ignore_ascii_case("finished")
+    {
         return None;
     }
     
@@ -91,8 +93,7 @@ pub(crate) fn evaluate_completed_lane(
 mod tests {
     use super::*;
     use runtime::{DiffScope, LaneBlocker};
-    use crate::LaneEvent;
-    
+
     fn test_output() -> AgentOutput {
         AgentOutput {
             agent_id: "test-lane-1".to_string(),

@@ -23,9 +23,10 @@ use runtime::{
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind,
-    Session, TokenUsage, ToolError, ToolExecutor,
+    GrepSearchInput, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -314,6 +315,7 @@ impl GlobalToolRegistry {
         query: &str,
         max_results: usize,
         pending_mcp_servers: Option<Vec<String>>,
+        mcp_degraded: Option<McpDegradedReport>,
     ) -> ToolSearchOutput {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
@@ -325,6 +327,7 @@ impl GlobalToolRegistry {
             normalized_query,
             total_deferred_tools: self.searchable_tool_specs().len(),
             pending_mcp_servers,
+            mcp_degraded,
         }
     }
 
@@ -1812,7 +1815,7 @@ fn branch_divergence_output(
 
     BashCommandOutput {
         stdout: String::new(),
-        stderr,
+        stderr: stderr.clone(),
         raw_output_path: None,
         interrupted: false,
         is_image: None,
@@ -1822,17 +1825,27 @@ fn branch_divergence_output(
         dangerously_disable_sandbox: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         no_output_expected: Some(false),
-        structured_content: Some(vec![json!({
-            "event": "branch.stale_against_main",
-            "failureClass": "branch_divergence",
-            "branch": branch,
-            "mainRef": main_ref,
-            "commitsBehind": commits_behind,
-            "commitsAhead": commits_ahead,
-            "missingCommits": missing_fixes,
-            "blockedCommand": command,
-            "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
-        })]),
+        structured_content: Some(vec![
+            serde_json::to_value(
+                LaneEvent::new(
+                    LaneEventName::BranchStaleAgainstMain,
+                    LaneEventStatus::Blocked,
+                    iso8601_now(),
+                )
+                    .with_failure_class(LaneFailureClass::BranchDivergence)
+                    .with_detail(stderr.clone())
+                    .with_data(json!({
+                        "branch": branch,
+                        "mainRef": main_ref,
+                        "commitsBehind": commits_behind,
+                        "commitsAhead": commits_ahead,
+                        "missingCommits": missing_fixes,
+                        "blockedCommand": command,
+                        "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+                    })),
+            )
+            .expect("lane event should serialize"),
+        ]),
         persisted_output_path: None,
         persisted_output_size: None,
         sandbox_status: None,
@@ -2278,58 +2291,6 @@ struct SkillOutput {
     prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-enum LaneEventName {
-    #[serde(rename = "lane.started")]
-    Started,
-    #[serde(rename = "lane.blocked")]
-    Blocked,
-    #[serde(rename = "lane.finished")]
-    Finished,
-    #[serde(rename = "lane.failed")]
-    Failed,
-    #[serde(rename = "lane.reconciled")]
-    Reconciled,
-    #[serde(rename = "lane.merged")]
-    Merged,
-    #[serde(rename = "lane.superseded")]
-    Superseded,
-    #[serde(rename = "lane.closed")]
-    Closed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LaneFailureClass {
-    PromptDelivery,
-    TrustGate,
-    BranchDivergence,
-    Compile,
-    Test,
-    PluginStartup,
-    McpStartup,
-    Infra,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct LaneBlocker {
-    #[serde(rename = "failureClass")]
-    failure_class: LaneFailureClass,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct LaneEvent {
-    event: LaneEventName,
-    status: String,
-    #[serde(rename = "emittedAt")]
-    emitted_at: String,
-    #[serde(rename = "failureClass", skip_serializing_if = "Option::is_none")]
-    failure_class: Option<LaneFailureClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentOutput {
     #[serde(rename = "agentId")]
@@ -2353,7 +2314,7 @@ struct AgentOutput {
     #[serde(rename = "laneEvents", default, skip_serializing_if = "Vec::is_empty")]
     lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
-    current_blocker: Option<LaneBlocker>,
+    current_blocker: Option<LaneEventBlocker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2375,6 +2336,8 @@ pub struct ToolSearchOutput {
     total_deferred_tools: usize,
     #[serde(rename = "pending_mcp_servers")]
     pending_mcp_servers: Option<Vec<String>>,
+    #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
+    mcp_degraded: Option<McpDegradedReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3065,13 +3028,7 @@ where
         created_at: created_at.clone(),
         started_at: Some(created_at),
         completed_at: None,
-        lane_events: vec![LaneEvent {
-            event: LaneEventName::Started,
-            status: String::from("running"),
-            emitted_at: iso8601_now(),
-            failure_class: None,
-            detail: None,
-        }],
+        lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
         error: None,
     };
@@ -3294,32 +3251,20 @@ fn persist_agent_terminal_state(
     next_manifest.current_blocker = blocker.clone();
     next_manifest.error = error;
     if let Some(blocker) = blocker {
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Blocked,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: Some(blocker.failure_class.clone()),
-            detail: Some(blocker.detail.clone()),
-        });
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Failed,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: Some(blocker.failure_class),
-            detail: Some(blocker.detail),
-        });
+        next_manifest.lane_events.push(
+            LaneEvent::blocked(iso8601_now(), &blocker),
+        );
+        next_manifest.lane_events.push(
+            LaneEvent::failed(iso8601_now(), &blocker),
+        );
     } else {
         next_manifest.current_blocker = None;
         let compressed_detail = result
             .filter(|value| !value.trim().is_empty())
             .map(|value| compress_summary_text(value.trim()));
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Finished,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: None,
-            detail: compressed_detail,
-        });
+        next_manifest
+            .lane_events
+            .push(LaneEvent::finished(iso8601_now(), compressed_detail));
     }
     write_agent_manifest(&next_manifest)
 }
@@ -3338,7 +3283,7 @@ fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
 fn format_agent_terminal_output(
     status: &str,
     result: Option<&str>,
-    blocker: Option<&LaneBlocker>,
+    blocker: Option<&LaneEventBlocker>,
     error: Option<&str>,
 ) -> String {
     let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
@@ -3360,9 +3305,9 @@ fn format_agent_terminal_output(
     sections.join("")
 }
 
-fn classify_lane_blocker(error: &str) -> LaneBlocker {
+fn classify_lane_blocker(error: &str) -> LaneEventBlocker {
     let detail = error.trim().to_string();
-    LaneBlocker {
+    LaneEventBlocker {
         failure_class: classify_lane_failure(error),
         detail,
     }
@@ -3379,6 +3324,8 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         && (normalized.contains("stale") || normalized.contains("diverg"))
     {
         LaneFailureClass::BranchDivergence
+    } else if normalized.contains("gateway") || normalized.contains("routing") {
+        LaneFailureClass::GatewayRouting
     } else if normalized.contains("compile")
         || normalized.contains("build failed")
         || normalized.contains("cargo check")
@@ -3386,8 +3333,15 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         LaneFailureClass::Compile
     } else if normalized.contains("test") {
         LaneFailureClass::Test
+    } else if normalized.contains("tool failed")
+        || normalized.contains("runtime tool")
+        || normalized.contains("tool runtime")
+    {
+        LaneFailureClass::ToolRuntime
     } else if normalized.contains("plugin") {
         LaneFailureClass::PluginStartup
+    } else if normalized.contains("mcp") && normalized.contains("handshake") {
+        LaneFailureClass::McpHandshake
     } else if normalized.contains("mcp") {
         LaneFailureClass::McpStartup
     } else {
@@ -3728,7 +3682,7 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
 
 #[allow(clippy::needless_pass_by_value)]
 fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
-    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None)
+    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
@@ -5039,7 +4993,7 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentInput,
-        AgentJob, GlobalToolRegistry, LaneFailureClass, SubagentToolExecutor,
+        AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5371,10 +5325,34 @@ mod tests {
             )]
         );
 
-        let search = registry.search("demo echo", 5, Some(vec!["pending-server".to_string()]));
+        let search = registry.search(
+            "demo echo",
+            5,
+            Some(vec!["pending-server".to_string()]),
+            Some(runtime::McpDegradedReport::new(
+                vec!["demo".to_string()],
+                vec![runtime::McpFailedServer {
+                    server_name: "pending-server".to_string(),
+                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                    error: runtime::McpErrorSurface::new(
+                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        Some("pending-server".to_string()),
+                        "tool discovery failed",
+                        BTreeMap::new(),
+                        true,
+                    ),
+                }],
+                vec!["mcp__demo__echo".to_string()],
+                vec!["mcp__demo__echo".to_string()],
+            )),
+        );
         let output = serde_json::to_value(search).expect("search output should serialize");
         assert_eq!(output["matches"][0], "mcp__demo__echo");
         assert_eq!(output["pending_mcp_servers"][0], "pending-server");
+        assert_eq!(
+            output["mcp_degraded"]["failed_servers"][0]["phase"],
+            "tool_discovery"
+        );
     }
 
     #[test]
@@ -6021,21 +5999,43 @@ mod tests {
             ),
             ("targeted tests failed", LaneFailureClass::Test),
             ("plugin bootstrap failed", LaneFailureClass::PluginStartup),
-            ("mcp handshake timed out", LaneFailureClass::McpStartup),
+            ("mcp handshake timed out", LaneFailureClass::McpHandshake),
             (
                 "mcp startup failed before listing tools",
                 LaneFailureClass::McpStartup,
             ),
             (
                 "gateway routing rejected the request",
-                LaneFailureClass::Infra,
+                LaneFailureClass::GatewayRouting,
             ),
-            ("denied tool execution from hook", LaneFailureClass::Infra),
+            ("tool failed: denied tool execution from hook", LaneFailureClass::ToolRuntime),
             ("thread creation failed", LaneFailureClass::Infra),
         ];
 
         for (message, expected) in cases {
             assert_eq!(classify_lane_failure(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn lane_event_schema_serializes_to_canonical_names() {
+        let cases = [
+            (LaneEventName::Started, "lane.started"),
+            (LaneEventName::Ready, "lane.ready"),
+            (LaneEventName::PromptMisdelivery, "lane.prompt_misdelivery"),
+            (LaneEventName::Blocked, "lane.blocked"),
+            (LaneEventName::Red, "lane.red"),
+            (LaneEventName::Green, "lane.green"),
+            (LaneEventName::CommitCreated, "lane.commit.created"),
+            (LaneEventName::PrOpened, "lane.pr.opened"),
+            (LaneEventName::MergeReady, "lane.merge.ready"),
+            (LaneEventName::Finished, "lane.finished"),
+            (LaneEventName::Failed, "lane.failed"),
+            (LaneEventName::BranchStaleAgainstMain, "branch.stale_against_main"),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(serde_json::to_value(event).expect("serialize lane event"), json!(expected));
         }
     }
 
@@ -6368,7 +6368,7 @@ mod tests {
             "branch_divergence"
         );
         assert_eq!(
-            output_json["structuredContent"][0]["missingCommits"][0],
+            output_json["structuredContent"][0]["data"]["missingCommits"][0],
             "fix: unblock workspace tests"
         );
 

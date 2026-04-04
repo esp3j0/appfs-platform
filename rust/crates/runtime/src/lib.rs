@@ -9,6 +9,7 @@ mod file_ops;
 pub mod green_contract;
 mod hooks;
 mod json;
+mod lane_events;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -66,6 +67,9 @@ pub use file_ops::{
 };
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+};
+pub use lane_events::{
+    LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
