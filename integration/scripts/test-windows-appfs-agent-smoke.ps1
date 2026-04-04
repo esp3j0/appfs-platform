@@ -22,8 +22,9 @@ $script:AppfsHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-smoke-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
 $script:HadFailure = $false
-$script:AppfsExe = Join-Path $script:AppfsCliDir "target\debug\agentfs.exe"
-$script:ClawExe = Join-Path $script:AppfsAgentRustDir "target\debug\claw.exe"
+$script:CargoTargetDir = Join-Path $script:LogDir "cargo-target"
+$script:AppfsExe = Join-Path $script:CargoTargetDir "debug\agentfs.exe"
+$script:ClawExe = Join-Path $script:CargoTargetDir "debug\claw.exe"
 
 function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
@@ -238,12 +239,14 @@ function Build-TestBinaries {
 
     Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
         "build",
+        "--target-dir", $script:CargoTargetDir,
         "--bin", "agentfs"
     ) -WorkingDirectory $script:AppfsCliDir | Out-Null
     Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
     Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
         "build",
+        "--target-dir", $script:CargoTargetDir,
         "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
         "-p", "rusty-claude-cli"
     ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
