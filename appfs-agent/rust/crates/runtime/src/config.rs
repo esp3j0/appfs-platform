@@ -1450,10 +1450,10 @@ mod tests {
         fs::write(
             home.join("settings.json"),
             r#"{
-              "enabledPlugins": {
-                "core-helpers@builtin": true
-              },
               "plugins": {
+                "enabled": {
+                  "core-helpers@builtin": true
+                },
                 "externalDirectories": ["./external-plugins"],
                 "installRoot": "plugin-cache/installed",
                 "registryPath": "plugin-cache/installed.json",
