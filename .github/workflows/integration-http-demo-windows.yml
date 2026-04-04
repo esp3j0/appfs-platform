@@ -26,8 +26,8 @@ jobs:
       - name: Clean stale self-hosted state
         shell: powershell
         run: |
-          Get-Process agentfs,claw -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+          cmd /c "taskkill /IM agentfs.exe /F /T >nul 2>nul"
+          cmd /c "taskkill /IM claw.exe /F /T >nul 2>nul"
 
           Get-CimInstance Win32_Process |
             Where-Object {
