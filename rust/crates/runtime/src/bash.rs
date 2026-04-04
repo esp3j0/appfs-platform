@@ -12,7 +12,9 @@ use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
-use crate::ConfigLoader;
+#[cfg(windows)]
+use crate::windows_path_to_posix_path;
+use crate::{bash_shell_path, ConfigLoader};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
@@ -69,7 +71,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -104,7 +106,7 @@ async fn execute_bash_async(
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -134,8 +136,8 @@ async fn execute_bash_async(
     };
 
     let (output, interrupted) = output_result;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
@@ -184,7 +186,7 @@ fn prepare_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> Command {
+) -> io::Result<Command> {
     if create_dirs {
         prepare_sandbox_dirs(cwd);
     }
@@ -194,16 +196,17 @@ fn prepare_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
-        return prepared;
+        return Ok(prepared);
     }
 
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = Command::new(bash_shell_path()?);
+    prepared.arg("-lc").arg(command);
+
+    prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        configure_bash_sandbox_env(&mut prepared, cwd);
     }
-    prepared
+    Ok(prepared)
 }
 
 fn prepare_tokio_command(
@@ -211,7 +214,7 @@ fn prepare_tokio_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> TokioCommand {
+) -> io::Result<TokioCommand> {
     if create_dirs {
         prepare_sandbox_dirs(cwd);
     }
@@ -221,16 +224,17 @@ fn prepare_tokio_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
-        return prepared;
+        return Ok(prepared);
     }
 
-    let mut prepared = TokioCommand::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
+    let mut prepared = TokioCommand::new(bash_shell_path()?);
+    prepared.arg("-lc").arg(command);
+
+    prepared.current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        configure_bash_sandbox_env(&mut prepared, cwd);
     }
-    prepared
+    Ok(prepared)
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
@@ -238,15 +242,66 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
 }
 
+fn configure_bash_sandbox_env<T>(command: &mut T, cwd: &std::path::Path)
+where
+    T: BashEnvCommand,
+{
+    let home = cwd.join(".sandbox-home");
+    let tmpdir = cwd.join(".sandbox-tmp");
+
+    #[cfg(windows)]
+    {
+        command.env("HOME", windows_path_to_posix_path(&home));
+        command.env("TMPDIR", windows_path_to_posix_path(&tmpdir));
+    }
+
+    #[cfg(not(windows))]
+    {
+        command.env("HOME", home);
+        command.env("TMPDIR", tmpdir);
+    }
+}
+
+trait BashEnvCommand {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>;
+}
+
+impl BashEnvCommand for Command {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        Command::env(self, key, value)
+    }
+}
+
+impl BashEnvCommand for TokioCommand {
+    fn env<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        TokioCommand::env(self, key, value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
 
+    fn success_command() -> String {
+        String::from("printf 'hello'")
+    }
+
     #[test]
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
-            command: String::from("printf 'hello'"),
+            command: success_command(),
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
@@ -258,7 +313,7 @@ mod tests {
         })
         .expect("bash command should execute");
 
-        assert_eq!(output.stdout, "hello");
+        assert_eq!(output.stdout.trim(), "hello");
         assert!(!output.interrupted);
         assert!(output.sandbox_status.is_some());
     }
@@ -266,7 +321,7 @@ mod tests {
     #[test]
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
-            command: String::from("printf 'hello'"),
+            command: success_command(),
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
@@ -279,5 +334,55 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+}
+
+/// Maximum output bytes before truncation (16 KiB, matching upstream).
+const MAX_OUTPUT_BYTES: usize = 16_384;
+
+/// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
+fn truncate_output(s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s.to_string();
+    }
+    // Find the last valid UTF-8 boundary at or before MAX_OUTPUT_BYTES
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    truncated
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn short_output_unchanged() {
+        let s = "hello world";
+        assert_eq!(truncate_output(s), s);
+    }
+
+    #[test]
+    fn long_output_truncated() {
+        let s = "x".repeat(20_000);
+        let result = truncate_output(&s);
+        assert!(result.len() < 20_000);
+        assert!(result.ends_with("[output truncated — exceeded 16384 bytes]"));
+    }
+
+    #[test]
+    fn exact_boundary_unchanged() {
+        let s = "a".repeat(MAX_OUTPUT_BYTES);
+        assert_eq!(truncate_output(&s), s);
+    }
+
+    #[test]
+    fn one_over_boundary_truncated() {
+        let s = "a".repeat(MAX_OUTPUT_BYTES + 1);
+        let result = truncate_output(&s);
+        assert!(result.contains("[output truncated"));
     }
 }
