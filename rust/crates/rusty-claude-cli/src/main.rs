@@ -1033,6 +1033,9 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
+    git_freshness: Option<GitBranchFreshness>,
+    git_worktrees: Vec<GitWorktreeEntry>,
+    recent_commits: Vec<GitCommitEntry>,
     sandbox_status: runtime::SandboxStatus,
 }
 
@@ -1083,6 +1086,63 @@ impl GitWorkspaceSummary {
                 details.join(", ")
             )
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitBranchFreshness {
+    base_ref: String,
+    ahead: usize,
+    behind: usize,
+}
+
+impl GitBranchFreshness {
+    fn headline(&self) -> String {
+        match (self.ahead, self.behind) {
+            (0, 0) => format!("up to date with {}", self.base_ref),
+            (ahead, 0) => format!("ahead of {} by {ahead} commit(s)", self.base_ref),
+            (0, behind) => format!("behind {} by {behind} commit(s)", self.base_ref),
+            (ahead, behind) => format!(
+                "diverged from {} ({ahead} ahead, {behind} behind)",
+                self.base_ref
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+    head: Option<String>,
+    is_current: bool,
+}
+
+impl GitWorktreeEntry {
+    fn headline(&self) -> String {
+        let location = self.path.display();
+        let branch = self
+            .branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or("detached HEAD");
+        if self.is_current {
+            format!("* {branch} · {location}")
+        } else {
+            format!("{branch} · {location}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCommitEntry {
+    short_sha: String,
+    subject: String,
+}
+
+impl GitCommitEntry {
+    fn headline(&self) -> String {
+        format!("{} {}", self.short_sha, self.subject)
     }
 }
 
@@ -1238,6 +1298,104 @@ fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<S
     )
 }
 
+fn load_git_branch_freshness(repo_root: &Path) -> Option<GitBranchFreshness> {
+    let base_ref = "origin/main";
+    if !git_ref_exists_in(repo_root, base_ref) {
+        return None;
+    }
+
+    Some(GitBranchFreshness {
+        base_ref: base_ref.to_string(),
+        ahead: git_rev_list_count(repo_root, &format!("{base_ref}..HEAD"))?,
+        behind: git_rev_list_count(repo_root, &format!("HEAD..{base_ref}"))?,
+    })
+}
+
+fn load_git_worktrees(repo_root: &Path, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let Some(output) = run_git_capture_in(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    parse_git_worktrees(&output, current_worktree)
+}
+
+fn parse_git_worktrees(output: &str, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktreeEntry> = None;
+    let current_worktree = normalize_path_for_compare(current_worktree);
+
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+
+            let path = PathBuf::from(path);
+            let is_current = normalize_path_for_compare(&path) == current_worktree;
+            current = Some(GitWorktreeEntry {
+                path,
+                branch: None,
+                head: None,
+                is_current,
+            });
+            continue;
+        }
+
+        let Some(worktree) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some(branch) = line.strip_prefix("branch ") {
+            worktree.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            worktree.head = Some(head.to_string());
+        } else if line == "detached" {
+            worktree.branch = Some("detached HEAD".to_string());
+        }
+    }
+
+    worktrees
+}
+
+fn load_recent_commits(repo_root: &Path, limit: usize) -> Vec<GitCommitEntry> {
+    let Some(output) = run_git_capture_in(
+        repo_root,
+        &["log", "-n", &limit.to_string(), "--format=%h%x09%s"],
+    ) else {
+        return Vec::new();
+    };
+    parse_recent_commits(&output)
+}
+
+fn parse_recent_commits(output: &str) -> Vec<GitCommitEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (short_sha, subject) = line.split_once('\t')?;
+            let short_sha = short_sha.trim();
+            let subject = subject.trim();
+            if short_sha.is_empty() || subject.is_empty() {
+                return None;
+            }
+            Some(GitCommitEntry {
+                short_sha: short_sha.to_string(),
+                subject: subject.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     let status = status?;
     let first_line = status.lines().next()?;
@@ -1309,6 +1467,22 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     }
 }
 
+fn git_ref_exists_in(cwd: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(cwd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_rev_list_count(cwd: &Path, range: &str) -> Option<usize> {
+    run_git_capture_in(cwd, &["rev-list", "--count", range])?
+        .trim()
+        .parse::<usize>()
+        .ok()
+}
+
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -1319,6 +1493,10 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -3237,6 +3415,11 @@ fn status_context(
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_scope = project_root.clone().unwrap_or_else(|| cwd.clone());
+    let current_worktree = project_root.clone().unwrap_or_else(|| cwd.clone());
+    let git_freshness = load_git_branch_freshness(&git_scope);
+    let git_worktrees = load_git_worktrees(&git_scope, &current_worktree);
+    let recent_commits = load_recent_commits(&git_scope, 3);
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     Ok(StatusContext {
         cwd,
@@ -3247,6 +3430,9 @@ fn status_context(
         project_root,
         git_branch,
         git_summary,
+        git_freshness,
+        git_worktrees,
+        recent_commits,
         sandbox_status,
     })
 }
@@ -3257,6 +3443,38 @@ fn format_status_report(
     permission_mode: &str,
     context: &StatusContext,
 ) -> String {
+    let git_section = format!(
+        "Git
+  Freshness        {}
+  Worktrees        {}
+  Entries          {}
+  Recent commits   {}",
+        context
+            .git_freshness
+            .as_ref()
+            .map_or_else(|| "origin/main unavailable".to_string(), GitBranchFreshness::headline),
+        if context.git_worktrees.is_empty() {
+            "unavailable".to_string()
+        } else {
+            format!("{} active", context.git_worktrees.len())
+        },
+        format_multiline_detail(
+            &context
+                .git_worktrees
+                .iter()
+                .map(GitWorktreeEntry::headline)
+                .collect::<Vec<_>>(),
+            "<none>",
+        ),
+        format_multiline_detail(
+            &context
+                .recent_commits
+                .iter()
+                .map(GitCommitEntry::headline)
+                .collect::<Vec<_>>(),
+            "<none>",
+        ),
+    );
     [
         format!(
             "Status
@@ -3311,6 +3529,7 @@ fn format_status_report(
             context.discovered_config_files,
             context.memory_file_count,
         ),
+        git_section,
         format_sandbox_report(&context.sandbox_status),
     ]
     .join(
@@ -3361,6 +3580,23 @@ fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
             .clone()
             .unwrap_or_else(|| "<none>".to_string()),
     )
+}
+
+fn format_multiline_detail(lines: &[String], empty: &str) -> String {
+    if lines.is_empty() {
+        return empty.to_string();
+    }
+
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            output.push_str(line);
+        } else {
+            output.push_str("\n                   ");
+            output.push_str(line);
+        }
+    }
+    output
 }
 
 fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
@@ -5596,7 +5832,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw status")?;
     writeln!(
         out,
-        "      Show the current local workspace status snapshot"
+        "      Show workspace status, origin/main freshness, active worktrees, and recent commits"
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
@@ -5699,12 +5935,14 @@ mod tests {
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, normalize_permission_mode, parse_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        permission_policy, print_help_to, push_output_block, render_config_report,
+        parse_git_worktrees, parse_recent_commits, permission_policy, print_help_to,
+        push_output_block, render_config_report,
         render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
         StatusUsage, DEFAULT_MODEL,
     };
@@ -6639,6 +6877,39 @@ mod tests {
                     untracked_files: 1,
                     conflicted_files: 0,
                 },
+                git_freshness: Some(GitBranchFreshness {
+                    base_ref: "origin/main".to_string(),
+                    ahead: 1,
+                    behind: 2,
+                }),
+                git_worktrees: vec![
+                    GitWorktreeEntry {
+                        path: PathBuf::from("/tmp/project"),
+                        branch: Some("main".to_string()),
+                        head: Some("abc1234".to_string()),
+                        is_current: true,
+                    },
+                    GitWorktreeEntry {
+                        path: PathBuf::from("/tmp/project-feature"),
+                        branch: Some("feature/status".to_string()),
+                        head: Some("def5678".to_string()),
+                        is_current: false,
+                    },
+                ],
+                recent_commits: vec![
+                    GitCommitEntry {
+                        short_sha: "abc1234".to_string(),
+                        subject: "feat: add status output".to_string(),
+                    },
+                    GitCommitEntry {
+                        short_sha: "def5678".to_string(),
+                        subject: "fix: tighten parsing".to_string(),
+                    },
+                    GitCommitEntry {
+                        short_sha: "9876fed".to_string(),
+                        subject: "chore: wire command".to_string(),
+                    },
+                ],
                 sandbox_status: runtime::SandboxStatus::default(),
             },
         );
@@ -6662,6 +6933,66 @@ mod tests {
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+        assert!(status.contains("Freshness        diverged from origin/main (1 ahead, 2 behind)"));
+        assert!(status.contains("Worktrees        2 active"));
+        assert!(status.contains("Entries          * main · /tmp/project"));
+        assert!(status.contains("feature/status · /tmp/project-feature"));
+        assert!(status.contains("Recent commits   abc1234 feat: add status output"));
+        assert!(status.contains("def5678 fix: tighten parsing"));
+        assert!(status.contains("9876fed chore: wire command"));
+    }
+
+    #[test]
+    fn parses_git_worktree_list_output() {
+        let worktrees = parse_git_worktrees(
+            "worktree /tmp/repo\nHEAD abc1234\nbranch refs/heads/main\n\nworktree /tmp/repo-feature\nHEAD def5678\nbranch refs/heads/feature/status\n",
+            Path::new("/tmp/repo"),
+        );
+
+        assert_eq!(
+            worktrees,
+            vec![
+                GitWorktreeEntry {
+                    path: PathBuf::from("/tmp/repo"),
+                    branch: Some("main".to_string()),
+                    head: Some("abc1234".to_string()),
+                    is_current: true,
+                },
+                GitWorktreeEntry {
+                    path: PathBuf::from("/tmp/repo-feature"),
+                    branch: Some("feature/status".to_string()),
+                    head: Some("def5678".to_string()),
+                    is_current: false,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_recent_commit_lines() {
+        let commits = parse_recent_commits(
+            "abc1234\tfeat: add status\n\
+             def5678\tfix: tighten parser\n\
+             9876fed\tchore: update docs\n",
+        );
+
+        assert_eq!(
+            commits,
+            vec![
+                GitCommitEntry {
+                    short_sha: "abc1234".to_string(),
+                    subject: "feat: add status".to_string(),
+                },
+                GitCommitEntry {
+                    short_sha: "def5678".to_string(),
+                    subject: "fix: tighten parser".to_string(),
+                },
+                GitCommitEntry {
+                    short_sha: "9876fed".to_string(),
+                    subject: "chore: update docs".to_string(),
+                }
+            ]
+        );
     }
 
     #[test]
