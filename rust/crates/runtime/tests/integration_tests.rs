@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
+use runtime::green_contract::{GreenContract, GreenContractOutcome, GreenLevel};
 use runtime::{
-    apply_policy, BranchFreshness, DiffScope, LaneBlocker,
-    LaneContext, PolicyAction, PolicyCondition, PolicyEngine, PolicyRule,
-    ReconcileReason, ReviewStatus, StaleBranchAction, StaleBranchPolicy,
+    apply_policy, BranchFreshness, DiffScope, LaneBlocker, LaneContext, PolicyAction,
+    PolicyCondition, PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, StaleBranchAction,
+    StaleBranchPolicy,
 };
-use runtime::green_contract::{GreenLevel, GreenContract, GreenContractOutcome};
 
 /// stale_branch + policy_engine integration:
 /// When a branch is detected stale, does it correctly flow through
@@ -211,7 +211,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
     // when: build context and evaluate policy
     let context = LaneContext::new(
         "lane-9411",
-        3, // Workspace green
+        3,                                // Workspace green
         Duration::from_secs(5 * 60 * 60), // 5 hours stale, definitely over threshold
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -260,7 +260,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
 fn fresh_approved_lane_gets_merge_action() {
     let context = LaneContext::new(
         "fresh-approved-lane",
-        3, // Workspace green
+        3,                            // Workspace green
         Duration::from_secs(30 * 60), // 30 min — under 1 hour threshold = fresh
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -268,18 +268,16 @@ fn fresh_approved_lane_gets_merge_action() {
         false,
     );
 
-    let engine = PolicyEngine::new(vec![
-        PolicyRule::new(
-            "merge-if-green-approved-not-stale",
-            PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: 3 },
-                PolicyCondition::ReviewPassed,
-                // NOT PolicyCondition::StaleBranch — fresh lanes bypass this
-            ]),
-            PolicyAction::MergeToDev,
-            5,
-        ),
-    ]);
+    let engine = PolicyEngine::new(vec![PolicyRule::new(
+        "merge-if-green-approved-not-stale",
+        PolicyCondition::And(vec![
+            PolicyCondition::GreenAt { level: 3 },
+            PolicyCondition::ReviewPassed,
+            // NOT PolicyCondition::StaleBranch — fresh lanes bypass this
+        ]),
+        PolicyAction::MergeToDev,
+        5,
+    )]);
 
     let actions = engine.evaluate(&context);
     assert_eq!(actions, vec![PolicyAction::MergeToDev]);
