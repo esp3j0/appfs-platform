@@ -5042,10 +5042,10 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        SubagentToolExecutor,
+        detect_powershell_shell, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -7128,6 +7128,27 @@ printf 'pwsh:%s' "$1"
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
+    }
+
+    #[test]
+    fn powershell_runs_real_shell_smoke_when_available() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if detect_powershell_shell().is_err() {
+            return;
+        }
+
+        let result = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "timeout": 1000}),
+        )
+        .expect("PowerShell should succeed when a real shell is available");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
+        assert!(output["stderr"].as_str().expect("stderr").trim().is_empty());
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
