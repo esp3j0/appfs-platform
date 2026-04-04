@@ -7083,7 +7083,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -7558,7 +7558,7 @@ UU conflicted.rs",
         let report = render_diff_report_for(&root).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -7583,7 +7583,7 @@ UU conflicted.rs",
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -7608,7 +7608,7 @@ UU conflicted.rs",
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
