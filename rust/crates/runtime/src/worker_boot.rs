@@ -52,6 +52,7 @@ pub enum WorkerFailureKind {
     TrustGate,
     PromptDelivery,
     Protocol,
+    Provider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -390,6 +391,60 @@ impl WorkerRegistry {
         );
         Ok(worker.clone())
     }
+
+    /// Classify session completion and transition worker to appropriate terminal state.
+    /// Detects degraded completions (finish="unknown" with zero tokens) as provider failures.
+    pub fn observe_completion(
+        &self,
+        worker_id: &str,
+        finish_reason: &str,
+        tokens_output: u64,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        // Detect degraded completion: finish=unknown with zero output is provider failure
+        let is_provider_failure =
+            (finish_reason == "unknown" && tokens_output == 0) || finish_reason == "error";
+
+        if is_provider_failure {
+            let message = if finish_reason == "unknown" && tokens_output == 0 {
+                "session completed with finish='unknown' and zero output — provider degraded or context exhausted".to_string()
+            } else {
+                format!("session failed with finish='{finish_reason}' — provider error")
+            };
+
+            worker.last_error = Some(WorkerFailure {
+                kind: WorkerFailureKind::Provider,
+                message,
+                created_at: now_secs(),
+            });
+            worker.status = WorkerStatus::Failed;
+            push_event(
+                worker,
+                WorkerEventKind::Failed,
+                WorkerStatus::Failed,
+                Some("provider failure classified".to_string()),
+            );
+        } else {
+            // Normal completion
+            worker.status = WorkerStatus::Finished;
+            worker.last_error = None;
+            push_event(
+                worker,
+                WorkerEventKind::Finished,
+                WorkerStatus::Finished,
+                Some(format!(
+                    "session completed: finish='{finish_reason}', tokens={tokens_output}"
+                )),
+            );
+        }
+
+        Ok(worker.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,6 +779,56 @@ mod tests {
             .terminate(&worker.worker_id)
             .expect("terminate should succeed");
         assert_eq!(finished.status, WorkerStatus::Finished);
+        assert!(finished
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::Finished));
+    }
+
+    #[test]
+    fn observe_completion_classifies_provider_failure_on_unknown_finish_zero_tokens() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-f", &[], true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        registry
+            .send_prompt(&worker.worker_id, Some("Run tests"))
+            .expect("prompt send should succeed");
+
+        // Simulate degraded completion: finish="unknown", zero output
+        let failed = registry
+            .observe_completion(&worker.worker_id, "unknown", 0)
+            .expect("completion observe should succeed");
+
+        assert_eq!(failed.status, WorkerStatus::Failed);
+        let error = failed.last_error.expect("provider error should exist");
+        assert_eq!(error.kind, WorkerFailureKind::Provider);
+        assert!(error.message.contains("provider degraded"));
+        assert!(failed
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::Failed));
+    }
+
+    #[test]
+    fn observe_completion_accepts_normal_finish_with_tokens() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-g", &[], true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        registry
+            .send_prompt(&worker.worker_id, Some("Run tests"))
+            .expect("prompt send should succeed");
+
+        // Normal completion with output
+        let finished = registry
+            .observe_completion(&worker.worker_id, "stop", 150)
+            .expect("completion observe should succeed");
+
+        assert_eq!(finished.status, WorkerStatus::Finished);
+        assert!(finished.last_error.is_none());
         assert!(finished
             .events
             .iter()
