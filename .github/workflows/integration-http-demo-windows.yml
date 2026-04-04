@@ -14,9 +14,7 @@ jobs:
       - windows
       - winfsp
     env:
-      CHECKOUT_PATH: repo-${{ github.run_id }}-http-demo
-      CARGO_HOME: ${{ runner.temp }}\cargo-home
-      RUSTUP_HOME: ${{ runner.temp }}\rustup-home
+      CHECKOUT_PATH: repo-selfhosted-http-demo
 
     steps:
       - name: Check out repository
@@ -50,22 +48,8 @@ jobs:
             }
           }
 
-      - name: Prepare isolated Rust homes
-        shell: powershell
-        run: |
-          New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
-          New-Item -ItemType Directory -Path $env:RUSTUP_HOME -Force | Out-Null
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:CARGO_HOME "bin")
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            ${{ env.CHECKOUT_PATH }}/appfs/cli
-            ${{ env.CHECKOUT_PATH }}/appfs-agent/rust
 
       - name: Run HTTP demo integration smoke test
         shell: powershell
