@@ -48,9 +48,6 @@ jobs:
             }
           }
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Run HTTP demo integration smoke test
         shell: powershell
         env:
