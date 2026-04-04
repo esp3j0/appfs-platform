@@ -26,13 +26,8 @@ jobs:
       - name: Clean stale self-hosted state
         shell: powershell
         run: |
-          $workspace = $env:GITHUB_WORKSPACE
-          Get-CimInstance Win32_Process |
-            Where-Object {
-              $_.Name -in @('agentfs.exe', 'claw.exe') -and
-              $_.CommandLine -like "*$workspace*"
-            } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          Get-Process agentfs,claw -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
 
           Get-CimInstance Win32_Process |
             Where-Object {
