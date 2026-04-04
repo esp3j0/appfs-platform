@@ -213,6 +213,9 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    #[cfg(test)]
+    let _guard = test_env_lock();
+
     let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
@@ -579,6 +582,14 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     }
 
     previous[right_chars.len()]
+}
+
+#[cfg(test)]
+fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn resolve_model_alias(model: &str) -> &str {

@@ -3,6 +3,7 @@ pub mod bash_validation;
 mod bootstrap;
 mod compact;
 mod config;
+mod context;
 mod conversation;
 mod file_ops;
 pub mod green_contract;
@@ -49,6 +50,9 @@ pub use config::{
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
     RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind,
     ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+};
+pub use context::{
+    analyze_context_usage, ContextCategoryUsage, ContextSectionUsage, ContextUsageReport,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
