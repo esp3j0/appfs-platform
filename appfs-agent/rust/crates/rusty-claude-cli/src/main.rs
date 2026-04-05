@@ -52,7 +52,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{strip_tool_call_prefix, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -5992,10 +5992,11 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let resolved_tool_name = strip_tool_call_prefix(tool_name);
         if self
             .allowed_tools
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
+            .is_some_and(|allowed| !allowed.contains(resolved_tool_name))
         {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
@@ -6003,19 +6004,19 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let result = if resolved_tool_name == "ToolSearch" {
             self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
+        } else if self.tool_registry.has_runtime_tool(resolved_tool_name) {
+            self.execute_runtime_tool(resolved_tool_name, value)
         } else {
             self.tool_registry
-                .execute(tool_name, &value)
+                .execute(resolved_tool_name, &value)
                 .map_err(ToolError::new)
         };
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
+                    let markdown = format_tool_result(resolved_tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -6262,6 +6263,7 @@ mod tests {
         PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -8481,6 +8483,26 @@ UU conflicted.rs",
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn tool_executor_allows_prefixed_tool_call_names_against_allowlist() {
+        let mut executor = CliToolExecutor::new(
+            Some(BTreeSet::from([String::from("ToolSearch")])),
+            false,
+            GlobalToolRegistry::builtin(),
+            None,
+        );
+
+        let output = executor
+            .execute(
+                "<tool_call>ToolSearch",
+                r#"{"query":"bash","max_results":1}"#,
+            )
+            .expect("prefixed tool call name should be allow-listed");
+        let json: serde_json::Value =
+            serde_json::from_str(&output).expect("tool search output should be valid json");
+        assert!(json["query"].is_string());
     }
 
     #[test]

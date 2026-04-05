@@ -772,10 +772,9 @@ mod tests {
         let path = temp_path("canonicalize-fallback.txt");
         write_file(path.to_string_lossy().as_ref(), "hello").expect("write should succeed");
 
-        let resolved = canonicalize_with_fallback(path.clone(), |_| {
-            Err(io::Error::from_raw_os_error(1005))
-        })
-        .expect("existing path should fall back to candidate");
+        let resolved =
+            canonicalize_with_fallback(path.clone(), |_| Err(io::Error::from_raw_os_error(1005)))
+                .expect("existing path should fall back to candidate");
 
         assert_eq!(resolved, path);
     }
