@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::worker_boot::WorkerFailureKind;
+
 /// The six failure scenarios that have known recovery recipes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +21,7 @@ pub enum FailureScenario {
     CompileRedCrossCrate,
     McpHandshakeFailure,
     PartialPluginStartup,
+    ProviderFailure,
 }
 
 impl FailureScenario {
@@ -32,7 +35,20 @@ impl FailureScenario {
             Self::CompileRedCrossCrate,
             Self::McpHandshakeFailure,
             Self::PartialPluginStartup,
+            Self::ProviderFailure,
         ]
+    }
+
+    /// Map a `WorkerFailureKind` to the corresponding `FailureScenario`.
+    /// This is the bridge that lets recovery policy consume worker boot events.
+    #[must_use]
+    pub fn from_worker_failure_kind(kind: WorkerFailureKind) -> Self {
+        match kind {
+            WorkerFailureKind::TrustGate => Self::TrustPromptUnresolved,
+            WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
+            WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
+            WorkerFailureKind::Provider => Self::ProviderFailure,
+        }
     }
 }
 
@@ -45,6 +61,7 @@ impl std::fmt::Display for FailureScenario {
             Self::CompileRedCrossCrate => write!(f, "compile_red_cross_crate"),
             Self::McpHandshakeFailure => write!(f, "mcp_handshake_failure"),
             Self::PartialPluginStartup => write!(f, "partial_plugin_startup"),
+            Self::ProviderFailure => write!(f, "provider_failure"),
         }
     }
 }
@@ -59,6 +76,7 @@ pub enum RecoveryStep {
     CleanBuild,
     RetryMcpHandshake { timeout: u64 },
     RestartPlugin { name: String },
+    RestartWorker,
     EscalateToHuman { reason: String },
 }
 
@@ -195,6 +213,12 @@ pub fn recipe_for(scenario: &FailureScenario) -> RecoveryRecipe {
             ],
             max_attempts: 1,
             escalation_policy: EscalationPolicy::LogAndContinue,
+        },
+        FailureScenario::ProviderFailure => RecoveryRecipe {
+            scenario: *scenario,
+            steps: vec![RecoveryStep::RestartWorker],
+            max_attempts: 1,
+            escalation_policy: EscalationPolicy::AlertHuman,
         },
     }
 }
@@ -550,5 +574,57 @@ mod tests {
         // then
         assert_eq!(recipe.escalation_policy, EscalationPolicy::Abort);
         assert_eq!(recipe.max_attempts, 1);
+    }
+
+    #[test]
+    fn worker_failure_kind_maps_to_failure_scenario() {
+        // given / when / then — verify the bridge is correct
+        assert_eq!(
+            FailureScenario::from_worker_failure_kind(WorkerFailureKind::TrustGate),
+            FailureScenario::TrustPromptUnresolved,
+        );
+        assert_eq!(
+            FailureScenario::from_worker_failure_kind(WorkerFailureKind::PromptDelivery),
+            FailureScenario::PromptMisdelivery,
+        );
+        assert_eq!(
+            FailureScenario::from_worker_failure_kind(WorkerFailureKind::Protocol),
+            FailureScenario::McpHandshakeFailure,
+        );
+        assert_eq!(
+            FailureScenario::from_worker_failure_kind(WorkerFailureKind::Provider),
+            FailureScenario::ProviderFailure,
+        );
+    }
+
+    #[test]
+    fn provider_failure_recipe_uses_restart_worker_step() {
+        // given
+        let recipe = recipe_for(&FailureScenario::ProviderFailure);
+
+        // then
+        assert_eq!(recipe.scenario, FailureScenario::ProviderFailure);
+        assert!(recipe.steps.contains(&RecoveryStep::RestartWorker));
+        assert_eq!(recipe.escalation_policy, EscalationPolicy::AlertHuman);
+        assert_eq!(recipe.max_attempts, 1);
+    }
+
+    #[test]
+    fn provider_failure_recovery_attempt_succeeds_then_escalates() {
+        // given
+        let mut ctx = RecoveryContext::new();
+        let scenario = FailureScenario::ProviderFailure;
+
+        // when — first attempt
+        let first = attempt_recovery(&scenario, &mut ctx);
+        assert!(matches!(first, RecoveryResult::Recovered { .. }));
+
+        // when — second attempt should escalate (max_attempts=1)
+        let second = attempt_recovery(&scenario, &mut ctx);
+        assert!(matches!(second, RecoveryResult::EscalationRequired { .. }));
+        assert!(ctx
+            .events()
+            .iter()
+            .any(|e| matches!(e, RecoveryEvent::Escalated)));
     }
 }

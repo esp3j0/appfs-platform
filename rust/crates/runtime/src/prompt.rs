@@ -509,6 +509,19 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-prompt-{nanos}"))
     }
 
+    fn remove_dir_all_with_retry(path: &Path) {
+        for attempt in 0..5 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 4 => {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+                }
+                Err(error) => panic!("cleanup temp dir: {error:?}"),
+            }
+        }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
     }
@@ -563,7 +576,7 @@ mod tests {
                 "nested instructions"
             ]
         );
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -580,7 +593,7 @@ mod tests {
             normalize_instruction_content(&context.instruction_files[0].content),
             "same rules"
         );
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -628,7 +641,7 @@ mod tests {
         assert!(status.contains("?? tracked.txt"));
         assert!(context.git_diff.is_none());
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -672,7 +685,7 @@ mod tests {
         assert!(diff.contains("Unstaged changes:"));
         assert!(diff.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -715,7 +728,7 @@ mod tests {
 
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -748,7 +761,7 @@ mod tests {
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
@@ -779,7 +792,7 @@ mod tests {
             render_instruction_files(&context.instruction_files).contains("instruction markdown")
         );
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
