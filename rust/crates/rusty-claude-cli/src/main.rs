@@ -7639,7 +7639,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]
