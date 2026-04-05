@@ -17,6 +17,12 @@ cargo build --release
 
 # With specific model
 ./target/release/claw --model sonnet prompt "fix the bug in main.rs"
+
+# JSON output for automation
+cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
+
+# Inspect registered hooks and whether they are enabled
+cargo run -p rusty-claude-cli -- hook list
 ```
 
 ## Configuration
