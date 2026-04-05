@@ -125,6 +125,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             permission_mode,
         } => print_status_snapshot(&model, permission_mode)?,
+        CliAction::ConfigShow => print_config_json()?,
+        CliAction::HookList => print_hook_list()?,
         CliAction::Sandbox => print_sandbox_status_snapshot()?,
         CliAction::Prompt {
             prompt,
@@ -137,6 +139,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
+        CliAction::BranchDelete => print_branch_delete_report()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -173,6 +176,8 @@ enum CliAction {
         model: String,
         permission_mode: PermissionMode,
     },
+    ConfigShow,
+    HookList,
     Sandbox,
     Prompt {
         prompt: String,
@@ -184,6 +189,7 @@ enum CliAction {
     Login,
     Logout,
     Init,
+    BranchDelete,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -218,7 +224,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let mut model = configured_default_model().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let mut output_format = CliOutputFormat::Text;
-    let mut permission_mode = default_permission_mode();
+    let mut permission_mode_override = None;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
@@ -257,7 +263,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --permission-mode".to_string())?;
-                permission_mode = parse_permission_mode_arg(value)?;
+                permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
             flag if flag.starts_with("--output-format=") => {
@@ -265,11 +271,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
-                permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
-                permission_mode = PermissionMode::DangerFullAccess;
+                permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
             "-p" => {
@@ -283,7 +289,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     model: resolve_model_alias(&model).to_string(),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
-                    permission_mode,
+                    permission_mode: permission_mode_override
+                        .unwrap_or_else(default_permission_mode),
                 });
             }
             "--print" => {
@@ -336,6 +343,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
+        let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
@@ -345,9 +353,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..]);
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode) {
+    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
         return action;
     }
+
+    let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests),
@@ -355,6 +365,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
         }),
+        "config" => parse_config_args(&rest[1..]),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
         }),
@@ -362,9 +373,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
         }),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
+        "hook" => parse_hook_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
+        "branch" => parse_branch_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -392,9 +405,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
-    permission_mode: PermissionMode,
+    permission_mode_override: Option<PermissionMode>,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 1 {
+    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config" | "hook") {
         return None;
     }
 
@@ -403,7 +416,7 @@ fn parse_single_word_command_alias(
         "version" => Some(Ok(CliAction::Version)),
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
-            permission_mode,
+            permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox)),
         other => bare_slash_command_guidance(other).map(Err),
@@ -416,6 +429,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         "dump-manifests"
             | "bootstrap-plan"
             | "agents"
+            | "config"
             | "mcp"
             | "skills"
             | "system-prompt"
@@ -719,6 +733,36 @@ fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     Ok(CliAction::PrintSystemPrompt { cwd, date })
+}
+
+fn parse_config_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw config show".to_string()),
+        [action] if action == "show" => Ok(CliAction::ConfigShow),
+        [action, ..] => Err(format!(
+            "unknown config action: {action}. Usage: claw config show"
+        )),
+    }
+}
+
+fn parse_hook_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw hook list".to_string()),
+        [action] if action == "list" => Ok(CliAction::HookList),
+        [action, ..] => Err(format!(
+            "unknown hook action: {action}. Usage: claw hook list"
+        )),
+    }
+}
+
+fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw branch delete".to_string()),
+        [action] if action == "delete" => Ok(CliAction::BranchDelete),
+        [action, ..] => Err(format!(
+            "unknown branch action: {action}. Usage: claw branch delete"
+        )),
+    }
 }
 
 fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
@@ -1028,6 +1072,9 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     git_summary: GitWorkspaceSummary,
+    git_freshness: Option<GitBranchFreshness>,
+    git_worktrees: Vec<GitWorktreeEntry>,
+    recent_commits: Vec<GitCommitEntry>,
     sandbox_status: runtime::SandboxStatus,
 }
 
@@ -1078,6 +1125,63 @@ impl GitWorkspaceSummary {
                 details.join(", ")
             )
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitBranchFreshness {
+    base_ref: String,
+    ahead: usize,
+    behind: usize,
+}
+
+impl GitBranchFreshness {
+    fn headline(&self) -> String {
+        match (self.ahead, self.behind) {
+            (0, 0) => format!("up to date with {}", self.base_ref),
+            (ahead, 0) => format!("ahead of {} by {ahead} commit(s)", self.base_ref),
+            (0, behind) => format!("behind {} by {behind} commit(s)", self.base_ref),
+            (ahead, behind) => format!(
+                "diverged from {} ({ahead} ahead, {behind} behind)",
+                self.base_ref
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+    head: Option<String>,
+    is_current: bool,
+}
+
+impl GitWorktreeEntry {
+    fn headline(&self) -> String {
+        let location = self.path.display();
+        let branch = self
+            .branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or("detached HEAD");
+        if self.is_current {
+            format!("* {branch} · {location}")
+        } else {
+            format!("{branch} · {location}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCommitEntry {
+    short_sha: String,
+    subject: String,
+}
+
+impl GitCommitEntry {
+    fn headline(&self) -> String {
+        format!("{} {}", self.short_sha, self.subject)
     }
 }
 
@@ -1233,6 +1337,104 @@ fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<S
     )
 }
 
+fn load_git_branch_freshness(repo_root: &Path) -> Option<GitBranchFreshness> {
+    let base_ref = "origin/main";
+    if !git_ref_exists_in(repo_root, base_ref) {
+        return None;
+    }
+
+    Some(GitBranchFreshness {
+        base_ref: base_ref.to_string(),
+        ahead: git_rev_list_count(repo_root, &format!("{base_ref}..HEAD"))?,
+        behind: git_rev_list_count(repo_root, &format!("HEAD..{base_ref}"))?,
+    })
+}
+
+fn load_git_worktrees(repo_root: &Path, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let Some(output) = run_git_capture_in(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    parse_git_worktrees(&output, current_worktree)
+}
+
+fn parse_git_worktrees(output: &str, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktreeEntry> = None;
+    let current_worktree = normalize_path_for_compare(current_worktree);
+
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+
+            let path = PathBuf::from(path);
+            let is_current = normalize_path_for_compare(&path) == current_worktree;
+            current = Some(GitWorktreeEntry {
+                path,
+                branch: None,
+                head: None,
+                is_current,
+            });
+            continue;
+        }
+
+        let Some(worktree) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some(branch) = line.strip_prefix("branch ") {
+            worktree.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            worktree.head = Some(head.to_string());
+        } else if line == "detached" {
+            worktree.branch = Some("detached HEAD".to_string());
+        }
+    }
+
+    worktrees
+}
+
+fn load_recent_commits(repo_root: &Path, limit: usize) -> Vec<GitCommitEntry> {
+    let Some(output) = run_git_capture_in(
+        repo_root,
+        &["log", "-n", &limit.to_string(), "--format=%h%x09%s"],
+    ) else {
+        return Vec::new();
+    };
+    parse_recent_commits(&output)
+}
+
+fn parse_recent_commits(output: &str) -> Vec<GitCommitEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (short_sha, subject) = line.split_once('\t')?;
+            let short_sha = short_sha.trim();
+            let subject = subject.trim();
+            if short_sha.is_empty() || subject.is_empty() {
+                return None;
+            }
+            Some(GitCommitEntry {
+                short_sha: short_sha.to_string(),
+                subject: subject.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     let status = status?;
     let first_line = status.lines().next()?;
@@ -1304,6 +1506,22 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     }
 }
 
+fn git_ref_exists_in(cwd: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(cwd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_rev_list_count(cwd: &Path, range: &str) -> Option<usize> {
+    run_git_capture_in(cwd, &["rev-list", "--count", range])?
+        .trim()
+        .parse::<usize>()
+        .ok()
+}
+
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -1314,6 +1532,10 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1632,6 +1854,7 @@ struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
     pending_servers: Vec<String>,
+    degraded_report: Option<runtime::McpDegradedReport>,
 }
 
 struct BuiltRuntime {
@@ -1762,12 +1985,64 @@ impl RuntimeMcpState {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let available_tools = discovery
+            .tools
+            .iter()
+            .map(|tool| tool.qualified_name.clone())
+            .collect::<Vec<_>>();
+        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
+        let working_servers = manager
+            .server_names()
+            .into_iter()
+            .filter(|server_name| !failed_server_names.contains(server_name))
+            .collect::<Vec<_>>();
+        let failed_servers =
+            discovery
+                .failed_servers
+                .iter()
+                .map(|failure| runtime::McpFailedServer {
+                    server_name: failure.server_name.clone(),
+                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                    error: runtime::McpErrorSurface::new(
+                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        Some(failure.server_name.clone()),
+                        failure.error.clone(),
+                        std::collections::BTreeMap::new(),
+                        true,
+                    ),
+                })
+                .chain(discovery.unsupported_servers.iter().map(|server| {
+                    runtime::McpFailedServer {
+                        server_name: server.server_name.clone(),
+                        phase: runtime::McpLifecyclePhase::ServerRegistration,
+                        error: runtime::McpErrorSurface::new(
+                            runtime::McpLifecyclePhase::ServerRegistration,
+                            Some(server.server_name.clone()),
+                            server.reason.clone(),
+                            std::collections::BTreeMap::from([(
+                                "transport".to_string(),
+                                format!("{:?}", server.transport).to_ascii_lowercase(),
+                            )]),
+                            false,
+                        ),
+                    }
+                }))
+                .collect::<Vec<_>>();
+        let degraded_report = (!failed_servers.is_empty()).then(|| {
+            runtime::McpDegradedReport::new(
+                working_servers,
+                failed_servers,
+                available_tools.clone(),
+                available_tools,
+            )
+        });
 
         Ok(Some((
             Self {
                 runtime,
                 manager,
                 pending_servers,
+                degraded_report,
             },
             discovery,
         )))
@@ -1780,6 +2055,10 @@ impl RuntimeMcpState {
 
     fn pending_servers(&self) -> Option<Vec<String>> {
         (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
+    }
+
+    fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
+        self.degraded_report.clone()
     }
 
     fn server_names(&self) -> Vec<String> {
@@ -3176,6 +3455,11 @@ fn status_context(
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_scope = project_root.clone().unwrap_or_else(|| cwd.clone());
+    let current_worktree = project_root.clone().unwrap_or_else(|| cwd.clone());
+    let git_freshness = load_git_branch_freshness(&git_scope);
+    let git_worktrees = load_git_worktrees(&git_scope, &current_worktree);
+    let recent_commits = load_recent_commits(&git_scope, 3);
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     Ok(StatusContext {
         cwd,
@@ -3186,6 +3470,9 @@ fn status_context(
         project_root,
         git_branch,
         git_summary,
+        git_freshness,
+        git_worktrees,
+        recent_commits,
         sandbox_status,
     })
 }
@@ -3196,6 +3483,38 @@ fn format_status_report(
     permission_mode: &str,
     context: &StatusContext,
 ) -> String {
+    let git_section = format!(
+        "Git
+  Freshness        {}
+  Worktrees        {}
+  Entries          {}
+  Recent commits   {}",
+        context.git_freshness.as_ref().map_or_else(
+            || "origin/main unavailable".to_string(),
+            GitBranchFreshness::headline
+        ),
+        if context.git_worktrees.is_empty() {
+            "unavailable".to_string()
+        } else {
+            format!("{} active", context.git_worktrees.len())
+        },
+        format_multiline_detail(
+            &context
+                .git_worktrees
+                .iter()
+                .map(GitWorktreeEntry::headline)
+                .collect::<Vec<_>>(),
+            "<none>",
+        ),
+        format_multiline_detail(
+            &context
+                .recent_commits
+                .iter()
+                .map(GitCommitEntry::headline)
+                .collect::<Vec<_>>(),
+            "<none>",
+        ),
+    );
     [
         format!(
             "Status
@@ -3250,6 +3569,7 @@ fn format_status_report(
             context.discovered_config_files,
             context.memory_file_count,
         ),
+        git_section,
         format_sandbox_report(&context.sandbox_status),
     ]
     .join(
@@ -3302,6 +3622,23 @@ fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
     )
 }
 
+fn format_multiline_detail(lines: &[String], empty: &str) -> String {
+    if lines.is_empty() {
+        return empty.to_string();
+    }
+
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            output.push_str(line);
+        } else {
+            output.push_str("\n                   ");
+            output.push_str(line);
+        }
+    }
+    output
+}
+
 fn format_commit_preflight_report(branch: Option<&str>, summary: GitWorkspaceSummary) -> String {
     format!(
         "Commit
@@ -3336,6 +3673,140 @@ fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
     );
     Ok(())
+}
+
+fn print_config_json() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", render_merged_runtime_config_json()?);
+    Ok(())
+}
+
+fn render_merged_runtime_config_json() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let parsed: serde_json::Value = serde_json::from_str(&runtime_config.as_json().render())?;
+    Ok(serde_json::to_string_pretty(&parsed)?)
+}
+
+fn print_hook_list() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    println!(
+        "{}",
+        render_hook_list_report_for(&cwd, &loader, &runtime_config)?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookListEntry {
+    source: String,
+    event: &'static str,
+    command: String,
+    enabled: bool,
+}
+
+fn render_hook_list_report_for(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entries = collect_hook_list_entries(cwd, loader, runtime_config)?;
+    let enabled_count = entries.iter().filter(|entry| entry.enabled).count();
+    let mut lines = vec![format!(
+        "Hooks\n  Registered       {}\n  Enabled          {}",
+        entries.len(),
+        enabled_count
+    )];
+
+    if entries.is_empty() {
+        lines.push("  No hooks registered.".to_string());
+        return Ok(lines.join("\n"));
+    }
+
+    lines.push("Entries".to_string());
+    lines.push(format!(
+        "  {:<7} {:<32} {:<19} {}",
+        "Enabled", "Source", "Event", "Command"
+    ));
+
+    for entry in entries {
+        lines.push(format!(
+            "  {:<7} {:<32} {:<19} {}",
+            if entry.enabled { "yes" } else { "no" },
+            entry.source,
+            entry.event,
+            entry.command
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn collect_hook_list_entries(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<Vec<HookListEntry>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+    extend_hook_list_entries(
+        &mut entries,
+        "config".to_string(),
+        true,
+        runtime_config.hooks().pre_tool_use(),
+        runtime_config.hooks().post_tool_use(),
+        runtime_config.hooks().post_tool_use_failure(),
+    );
+
+    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
+    let plugin_registry = plugin_manager.plugin_registry()?;
+    for plugin in plugin_registry.plugins() {
+        extend_hook_list_entries(
+            &mut entries,
+            format!("plugin:{}", plugin.metadata().id),
+            plugin.is_enabled(),
+            &plugin.hooks().pre_tool_use,
+            &plugin.hooks().post_tool_use,
+            &plugin.hooks().post_tool_use_failure,
+        );
+    }
+
+    Ok(entries)
+}
+
+fn extend_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: String,
+    enabled: bool,
+    pre_tool_use: &[String],
+    post_tool_use: &[String],
+    post_tool_use_failure: &[String],
+) {
+    append_hook_list_entries(entries, &source, enabled, "PreToolUse", pre_tool_use);
+    append_hook_list_entries(entries, &source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(
+        entries,
+        &source,
+        enabled,
+        "PostToolUseFailure",
+        post_tool_use_failure,
+    );
+}
+
+fn append_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: &str,
+    enabled: bool,
+    event: &'static str,
+    commands: &[String],
+) {
+    entries.extend(commands.iter().cloned().map(|command| HookListEntry {
+        source: source.to_string(),
+        event,
+        command,
+        enabled,
+    }));
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -3683,6 +4154,122 @@ fn format_issue_report(context: Option<&str>) -> String {
     )
 }
 
+fn format_branch_delete_report(
+    repo_root: &Path,
+    current_branch: &str,
+    default_branch: Option<&str>,
+    deleted_branches: &[String],
+) -> String {
+    let result = if deleted_branches.is_empty() {
+        "no merged local branches were eligible for deletion".to_string()
+    } else {
+        format!("deleted {} merged local branch(es)", deleted_branches.len())
+    };
+    let deleted = if deleted_branches.is_empty() {
+        "none".to_string()
+    } else {
+        deleted_branches.join(", ")
+    };
+
+    format!(
+        "Branch cleanup
+  Repository       {}
+  Current branch   {}
+  Protected branch {}
+  Deleted          {}
+  Result           {}",
+        repo_root.display(),
+        current_branch,
+        default_branch.unwrap_or("none"),
+        deleted,
+        result,
+    )
+}
+
+fn print_branch_delete_report() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    println!("{}", delete_merged_local_branches_in(&cwd)?);
+    Ok(())
+}
+
+fn delete_merged_local_branches_in(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = find_git_root_in(cwd)?;
+    let current_branch =
+        resolve_git_branch_for(cwd).ok_or("unable to resolve the current git branch")?;
+    if current_branch == "detached HEAD" {
+        return Err("cannot delete merged branches from detached HEAD".into());
+    }
+
+    let default_branch = resolve_default_branch_name(&repo_root);
+    let mut protected_branches = branches_checked_out_in_worktrees(&repo_root);
+    protected_branches.insert(current_branch.clone());
+    if let Some(branch) = default_branch.as_ref() {
+        protected_branches.insert(branch.clone());
+    }
+
+    let merged_branches = list_merged_local_branches(&repo_root)?;
+    let deleted_branches = merged_branches
+        .into_iter()
+        .filter(|branch| !protected_branches.contains(branch))
+        .map(|branch| {
+            git_status_ok_in(&repo_root, &["branch", "-d", &branch])?;
+            Ok(branch)
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    Ok(format_branch_delete_report(
+        &repo_root,
+        &current_branch,
+        default_branch.as_deref(),
+        &deleted_branches,
+    ))
+}
+
+fn resolve_default_branch_name(cwd: &Path) -> Option<String> {
+    run_git_capture_in(
+        cwd,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .as_deref()
+    .and_then(|remote_head| {
+        remote_head
+            .trim()
+            .strip_prefix("refs/remotes/origin/")
+            .map(str::to_string)
+    })
+    .or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|branch| git_ref_exists_in(cwd, &format!("refs/heads/{branch}")))
+            .map(str::to_string)
+    })
+}
+
+fn branches_checked_out_in_worktrees(cwd: &Path) -> std::collections::HashSet<String> {
+    let Some(output) = run_git_capture_in(cwd, &["worktree", "list", "--porcelain"]) else {
+        return std::collections::HashSet::new();
+    };
+
+    parse_git_worktrees(&output, cwd)
+        .into_iter()
+        .filter_map(|entry| match entry.branch {
+            Some(branch) if branch != "detached HEAD" => Some(branch),
+            _ => None,
+        })
+        .collect()
+}
+
+fn list_merged_local_branches(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = run_git_capture_in(cwd, &["branch", "--format=%(refname:short)", "--merged"])
+        .ok_or("failed to enumerate merged local branches")?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .args(args)
@@ -3696,10 +4283,12 @@ fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(env::current_dir()?)
-        .output()?;
+    let cwd = env::current_dir()?;
+    git_status_ok_in(&cwd, args)
+}
+
+fn git_status_ok_in(cwd: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
@@ -5340,16 +5929,21 @@ impl CliToolExecutor {
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let pending_mcp_servers = self.mcp_state.as_ref().and_then(|state| {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_servers()
-        });
+        let (pending_mcp_servers, mcp_degraded) = self
+            .mcp_state
+            .as_ref()
+            .map(|state| {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (state.pending_servers(), state.degraded_report())
+            })
+            .unwrap_or((None, None));
         serde_json::to_string_pretty(&self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
             pending_mcp_servers,
+            mcp_degraded,
         ))
         .map_err(|error| ToolError::new(error.to_string()))
     }
@@ -5530,7 +6124,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw status")?;
     writeln!(
         out,
-        "      Show the current local workspace status snapshot"
+        "      Show workspace status, origin/main freshness, active worktrees, and recent commits"
+    )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "      Print the merged runtime config as JSON")?;
+    writeln!(out, "  claw hook list")?;
+    writeln!(
+        out,
+        "      Show registered hooks and whether they are enabled"
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
@@ -5543,6 +6144,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw branch delete")?;
+    writeln!(
+        out,
+        "      Delete merged local git branches except the current/default worktree branches"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -5608,6 +6214,9 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "  claw hook list")?;
+    writeln!(out, "  claw branch delete")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
@@ -5624,23 +6233,25 @@ fn print_help() {
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        format_unknown_slash_command_message, git_ref_exists_in, normalize_permission_mode,
+        parse_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_git_worktrees, parse_hook_args, parse_recent_commits,
         permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
+        render_diff_report, render_diff_report_for, render_hook_list_report_for,
+        render_memory_report, render_merged_runtime_config_json, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
+        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -5768,11 +6379,17 @@ mod tests {
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
-        let result = f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         std::env::set_current_dir(previous).expect("cwd should restore");
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
@@ -6080,6 +6697,54 @@ mod tests {
                 args: Some("--help".to_string())
             }
         );
+    }
+
+    #[test]
+    fn parses_branch_delete_subcommand() {
+        assert_eq!(
+            parse_args(&["branch".to_string(), "delete".to_string()])
+                .expect("branch delete should parse"),
+            CliAction::BranchDelete
+        );
+    }
+
+    #[test]
+    fn branch_subcommand_requires_delete_action() {
+        let usage_error =
+            parse_args(&["branch".to_string()]).expect_err("branch should require an action");
+        assert!(usage_error.contains("Usage: claw branch delete"));
+
+        let unknown_error = parse_args(&["branch".to_string(), "prune".to_string()])
+            .expect_err("unknown branch action should fail");
+        assert!(unknown_error.contains("unknown branch action: prune"));
+        assert!(unknown_error.contains("Usage: claw branch delete"));
+    }
+
+    #[test]
+    fn parses_config_show_subcommand() {
+        assert_eq!(
+            parse_args(&["config".to_string(), "show".to_string()])
+                .expect("config show should parse"),
+            CliAction::ConfigShow
+        );
+
+        let error = parse_args(&["config".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw config show"));
+    }
+
+    #[test]
+    fn parses_hook_list_subcommand() {
+        assert_eq!(
+            parse_args(&["hook".to_string(), "list".to_string()]).expect("hook list should parse"),
+            CliAction::HookList
+        );
+
+        let error = parse_args(&["hook".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw hook list"));
+
+        let error = parse_hook_args(&["run".to_string()]).expect_err("unknown action should fail");
+        assert!(error.contains("unknown hook action: run"));
+        assert!(error.contains("Usage: claw hook list"));
     }
 
     #[test]
@@ -6504,6 +7169,7 @@ mod tests {
         assert!(help.contains("claw help"));
         assert!(help.contains("claw version"));
         assert!(help.contains("claw status"));
+        assert!(help.contains("claw hook list"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
         assert!(help.contains("claw agents"));
@@ -6567,6 +7233,39 @@ mod tests {
                     untracked_files: 1,
                     conflicted_files: 0,
                 },
+                git_freshness: Some(GitBranchFreshness {
+                    base_ref: "origin/main".to_string(),
+                    ahead: 1,
+                    behind: 2,
+                }),
+                git_worktrees: vec![
+                    GitWorktreeEntry {
+                        path: PathBuf::from("/tmp/project"),
+                        branch: Some("main".to_string()),
+                        head: Some("abc1234".to_string()),
+                        is_current: true,
+                    },
+                    GitWorktreeEntry {
+                        path: PathBuf::from("/tmp/project-feature"),
+                        branch: Some("feature/status".to_string()),
+                        head: Some("def5678".to_string()),
+                        is_current: false,
+                    },
+                ],
+                recent_commits: vec![
+                    GitCommitEntry {
+                        short_sha: "abc1234".to_string(),
+                        subject: "feat: add status output".to_string(),
+                    },
+                    GitCommitEntry {
+                        short_sha: "def5678".to_string(),
+                        subject: "fix: tighten parsing".to_string(),
+                    },
+                    GitCommitEntry {
+                        short_sha: "9876fed".to_string(),
+                        subject: "chore: wire command".to_string(),
+                    },
+                ],
                 sandbox_status: runtime::SandboxStatus::default(),
             },
         );
@@ -6590,6 +7289,66 @@ mod tests {
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
+        assert!(status.contains("Freshness        diverged from origin/main (1 ahead, 2 behind)"));
+        assert!(status.contains("Worktrees        2 active"));
+        assert!(status.contains("Entries          * main · /tmp/project"));
+        assert!(status.contains("feature/status · /tmp/project-feature"));
+        assert!(status.contains("Recent commits   abc1234 feat: add status output"));
+        assert!(status.contains("def5678 fix: tighten parsing"));
+        assert!(status.contains("9876fed chore: wire command"));
+    }
+
+    #[test]
+    fn parses_git_worktree_list_output() {
+        let worktrees = parse_git_worktrees(
+            "worktree /tmp/repo\nHEAD abc1234\nbranch refs/heads/main\n\nworktree /tmp/repo-feature\nHEAD def5678\nbranch refs/heads/feature/status\n",
+            Path::new("/tmp/repo"),
+        );
+
+        assert_eq!(
+            worktrees,
+            vec![
+                GitWorktreeEntry {
+                    path: PathBuf::from("/tmp/repo"),
+                    branch: Some("main".to_string()),
+                    head: Some("abc1234".to_string()),
+                    is_current: true,
+                },
+                GitWorktreeEntry {
+                    path: PathBuf::from("/tmp/repo-feature"),
+                    branch: Some("feature/status".to_string()),
+                    head: Some("def5678".to_string()),
+                    is_current: false,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_recent_commit_lines() {
+        let commits = parse_recent_commits(
+            "abc1234\tfeat: add status\n\
+             def5678\tfix: tighten parser\n\
+             9876fed\tchore: update docs\n",
+        );
+
+        assert_eq!(
+            commits,
+            vec![
+                GitCommitEntry {
+                    short_sha: "abc1234".to_string(),
+                    subject: "feat: add status".to_string(),
+                },
+                GitCommitEntry {
+                    short_sha: "def5678".to_string(),
+                    subject: "fix: tighten parser".to_string(),
+                },
+                GitCommitEntry {
+                    short_sha: "9876fed".to_string(),
+                    subject: "chore: update docs".to_string(),
+                }
+            ]
+        );
     }
 
     #[test]
@@ -6660,6 +7419,16 @@ mod tests {
     }
 
     #[test]
+    fn merged_runtime_config_json_renders_pretty_valid_json() {
+        let rendered =
+            render_merged_runtime_config_json().expect("runtime config json should render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("runtime config json should parse");
+        assert!(parsed.is_object());
+        assert!(rendered.starts_with("{\n") || rendered == "{}");
+    }
+
+    #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
         assert!(report.contains("Memory"));
@@ -6674,6 +7443,49 @@ mod tests {
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn hook_list_report_shows_config_and_plugin_hooks_with_enabled_state() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let source_root = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&source_root).expect("source root");
+        fs::write(
+            workspace.join(".claw").join("settings.json"),
+            r#"{"hooks":{"PostToolUse":["printf 'config post'"]}}"#,
+        )
+        .expect("workspace settings should write");
+        write_plugin_fixture(&source_root, "hook-report-demo", true, false);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 source path"))
+            .expect("plugin install should succeed");
+        manager
+            .disable("hook-report-demo@external")
+            .expect("plugin disable should succeed");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let report = render_hook_list_report_for(&workspace, &loader, &runtime_config)
+            .expect("hook list report should render");
+
+        assert!(report.contains("Hooks"));
+        assert!(report.contains("Registered       "));
+        assert!(report.contains("Enabled          "));
+        assert!(report.contains("yes     config"));
+        assert!(report.contains("PostToolUse"));
+        assert!(report.contains("printf 'config post'"));
+        assert!(report.contains("no      plugin:hook-report-demo@external"));
+        assert!(report.contains("PreToolUse"));
+        assert!(report.contains("hooks/pre.sh"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -6829,6 +7641,92 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn branch_delete_removes_only_merged_unprotected_local_branches() {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_workspace("branch-delete");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        git(&["init", "--quiet", "-b", "main"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\n").expect("write tracked file");
+        git(&["add", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+
+        git(&["checkout", "-b", "delete-me"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\ndelete me\n")
+            .expect("update delete-me");
+        git(&["commit", "-am", "delete-me", "--quiet"], &workspace);
+        git(&["checkout", "main"], &workspace);
+        git(
+            &[
+                "merge",
+                "--no-ff",
+                "delete-me",
+                "-m",
+                "merge delete-me",
+                "--quiet",
+            ],
+            &workspace,
+        );
+
+        git(&["checkout", "-b", "keep-worktree"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\ndelete me\nkeep me\n")
+            .expect("update keep-worktree");
+        git(&["commit", "-am", "keep-worktree", "--quiet"], &workspace);
+        git(&["checkout", "main"], &workspace);
+        git(
+            &[
+                "merge",
+                "--no-ff",
+                "keep-worktree",
+                "-m",
+                "merge keep-worktree",
+                "--quiet",
+            ],
+            &workspace,
+        );
+
+        let linked_worktree = workspace.join("keep-worktree-linked");
+        git(
+            &[
+                "worktree",
+                "add",
+                "--force",
+                linked_worktree.to_str().expect("utf8 worktree path"),
+                "keep-worktree",
+            ],
+            &workspace,
+        );
+
+        let report =
+            delete_merged_local_branches_in(&workspace).expect("branch delete should succeed");
+        assert!(report.contains("Deleted          delete-me"));
+        assert!(report.contains("Protected branch main"));
+        assert!(git_ref_exists_in(&workspace, "refs/heads/main"));
+        assert!(!git_ref_exists_in(&workspace, "refs/heads/delete-me"));
+        assert!(git_ref_exists_in(&workspace, "refs/heads/keep-worktree"));
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        if linked_worktree.exists() {
+            git(
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    linked_worktree.to_str().expect("utf8 worktree path"),
+                ],
+                &workspace,
+            );
+        }
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
@@ -6903,6 +7801,9 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("claw config show"));
+        assert!(help.contains("claw hook list"));
+        assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("claw --resume latest"));
@@ -7485,6 +8386,18 @@ UU conflicted.rs",
             serde_json::from_str(&search_output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
         assert_eq!(search_json["pending_mcp_servers"][0], "broken");
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
+            "broken"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["phase"],
+            "tool_discovery"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["available_tools"][0],
+            "mcp__alpha__echo"
+        );
 
         let listed = executor
             .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
@@ -7513,6 +8426,58 @@ UU conflicted.rs",
                 .shutdown()
                 .expect("mcp shutdown should succeed");
         }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "remote": {
+                  "url": "https://example.test/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+
+        let search_output = executor
+            .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
+            .expect("tool search should execute");
+        let search_json: serde_json::Value =
+            serde_json::from_str(&search_output).expect("search output should be json");
+        assert_eq!(search_json["pending_mcp_servers"][0], "remote");
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
+            "remote"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["phase"],
+            "server_registration"
+        );
+        assert_eq!(
+            search_json["mcp_degraded"]["failed_servers"][0]["error"]["context"]["transport"],
+            "http"
+        );
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
