@@ -291,15 +291,21 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 4. Wire `SummaryCompressor` into the lane event pipeline — **done**: `compress_summary_text()` feeds into `LaneEvent::Finished` detail field in `tools/src/lib.rs`
 
 **P2 — Clawability hardening (original backlog)**
-5. Worker readiness handshake + trust resolution
-6. Prompt misdelivery detection and recovery
-7. Canonical lane event schema in clawhip
-8. Failure taxonomy + blocker normalization
-9. Stale-branch detection before workspace tests
-10. MCP structured degraded-startup reporting
-11. Structured task packet format
-12. Lane board / machine-readable status API
-13. **Session completion failure classification** — sessions that complete with `finish: "unknown"` or zero output (provider errors, context exhaustion, etc.) are not classified by `WorkerFailureKind`; worker boot state machine cannot surface these as structured failures for recovery policy
+5. Worker readiness handshake + trust resolution — **done**: `WorkerStatus` state machine with `Spawning` → `TrustRequired` → `ReadyForPrompt` → `PromptAccepted` → `Running` lifecycle, `trust_auto_resolve` + `trust_gate_cleared` gating
+6. Prompt misdelivery detection and recovery — **done**: `prompt_delivery_attempts` counter, `PromptMisdelivery` event detection, `auto_recover_prompt_misdelivery` + `replay_prompt` recovery arm
+7. Canonical lane event schema in clawhip — **done**: `LaneEvent` enum with `Started/Blocked/Failed/Finished` variants, `LaneEvent::new()` typed constructor, `tools/src/lib.rs` integration
+8. Failure taxonomy + blocker normalization — **done**: `WorkerFailureKind` enum (`TrustGate/PromptDelivery/Protocol/Provider`), `FailureScenario::from_worker_failure_kind()` bridge to recovery recipes
+9. Stale-branch detection before workspace tests — **done**: `stale_branch.rs` module with freshness detection, behind/ahead metrics, policy integration
+10. MCP structured degraded-startup reporting — **done**: `McpManager` degraded-startup reporting (+183 lines in `mcp_stdio.rs`), failed server classification (startup/handshake/config/partial), structured `failed_servers` + `recovery_recommendations` in tool output
+11. Structured task packet format — **done**: `task_packet.rs` module with `TaskPacket` struct, validation, serialization, `TaskScope` resolution (workspace/module/single-file/custom), integrated into `tools/src/lib.rs`
+12. Lane board / machine-readable status API — **done**: Lane completion hardening + `LaneContext::completed` auto-detection + MCP degraded reporting surface machine-readable state
+13. **Session completion failure classification** — **done**: `WorkerFailureKind::Provider` + `observe_completion()` + recovery recipe bridge landed
+14. **Config merge validation gap** — **done**: `config.rs` hook validation before deep-merge (+56 lines), malformed entries fail with source-path context instead of merged parse errors
+15. **MCP manager discovery flaky test** — `manager_discovery_report_keeps_healthy_servers_when_one_server_fails` has intermittent timing issues in CI; temporarily ignored, needs root cause fix
+
+16. **Commit provenance / worktree-aware push events** — clawhip build stream shows duplicate-looking commit messages and worktree-originated pushes without clear supersession indicators; add worktree/branch metadata to push events and de-dup superseded commits in build stream display
+17. **Orphaned module integration audit** — `session_control` is `pub mod` exported from `runtime` but has zero consumers across the entire workspace (no import, no call site outside its own file). `trust_resolver` types are re-exported from `lib.rs` but never instantiated outside unit tests. These modules implement core clawability contracts (session management, trust resolution) that are structurally dead — built but not wired into the CLI or tools crate. **Action:** audit all `pub mod` / `pub use` exports from `runtime` for actual call sites; either wire orphaned modules into the real execution path or demote to `pub(crate)` / `cfg(test)` to prevent false clawability surface.
+18. **Context-window preflight gap** — claw-code auto-compacts only after cumulative input crosses a static `100_000`-token threshold, while provider requests derive `max_tokens` from a naive model-name heuristic (`opus` => 32k, else 64k) and do not appear to preflight `estimated_prompt_tokens + requested_output_tokens` against the selected model’s actual context window. Result: giant sessions can be sent upstream and fail hard with provider-side `input_exceeds_context_by_*` errors instead of local preflight compaction/rejection. **Action:** add a model-context registry + request-size preflight before provider call; if projected request exceeds context, emit a structured `context_window_blocked` event and auto-compact or force `/compact` before retry.
 
 **P3 — Swarm efficiency**
 13. Swarm branch-lock protocol — detect same-module/same-branch collision before parallel workers drift into duplicate implementation
