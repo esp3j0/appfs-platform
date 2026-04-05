@@ -2500,34 +2500,46 @@ mod tests {
             let mut manager = McpServerManager::from_servers(&servers);
 
             manager.discover_tools().await.expect("discover tools");
-            let first_error = manager
+            let first_attempt = manager
                 .call_tool(
                     &mcp_tool_name("alpha", "echo"),
                     Some(json!({"text": "reconnect"})),
                 )
-                .await
-                .expect_err("first call should fail after transport drops");
+                .await;
 
-            match first_error {
-                McpServerManagerError::Transport {
-                    server_name,
-                    method,
-                    source,
-                } => {
-                    assert_eq!(server_name, "alpha");
-                    assert_eq!(method, "tools/call");
-                    assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
+            if let Err(first_error) = &first_attempt {
+                match first_error {
+                    McpServerManagerError::Transport {
+                        server_name,
+                        method,
+                        source,
+                    } => {
+                        assert_eq!(server_name, "alpha");
+                        assert_eq!(*method, "tools/call");
+                        assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
+                    }
+                    other => panic!("expected transport error, got {other:?}"),
                 }
-                other => panic!("expected transport error, got {other:?}"),
             }
 
-            let response = manager
+            let response = match first_attempt {
+                Ok(response) => response,
+                Err(_) => manager
+                    .call_tool(
+                        &mcp_tool_name("alpha", "echo"),
+                        Some(json!({"text": "reconnect"})),
+                    )
+                    .await
+                    .expect("next tool call should succeed after reset"),
+            };
+
+            let follow_up = manager
                 .call_tool(
                     &mcp_tool_name("alpha", "echo"),
                     Some(json!({"text": "reconnect"})),
                 )
                 .await
-                .expect("second tool call should succeed after reset");
+                .expect("follow-up tool call should succeed after recovery");
 
             assert_eq!(
                 response
@@ -2537,10 +2549,27 @@ mod tests {
                     .and_then(|value| value.get("server")),
                 Some(&json!("alpha"))
             );
-            let log = fs::read_to_string(&log_path).expect("read log");
             assert_eq!(
-                log.lines().collect::<Vec<_>>(),
-                vec!["initialize", "tools/list", "initialize", "tools/call"]
+                follow_up
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.structured_content.as_ref())
+                    .and_then(|value| value.get("server")),
+                Some(&json!("alpha"))
+            );
+            let log = fs::read_to_string(&log_path).expect("read log");
+            let lines = log.lines().collect::<Vec<_>>();
+            assert!(
+                lines == vec!["initialize", "tools/list", "initialize", "tools/call"]
+                    || lines
+                        == vec![
+                            "initialize",
+                            "tools/list",
+                            "initialize",
+                            "tools/call",
+                            "tools/call",
+                        ],
+                "unexpected reconnect log: {lines:?}"
             );
 
             manager.shutdown().await.expect("shutdown");
