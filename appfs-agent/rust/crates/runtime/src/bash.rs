@@ -292,7 +292,6 @@ impl BashEnvCommand for TokioCommand {
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, BashCommandInput};
-    use crate::sandbox::FilesystemIsolationMode;
 
     fn success_command() -> String {
         String::from("printf 'hello'")
@@ -305,17 +304,19 @@ mod tests {
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
-            dangerously_disable_sandbox: Some(false),
-            namespace_restrictions: Some(false),
-            isolate_network: Some(false),
-            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            // Keep the basic execution smoke test independent from sandbox
+            // behavior, which is covered separately below.
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
             allowed_mounts: None,
         })
         .expect("bash command should execute");
 
         assert_eq!(output.stdout.trim(), "hello");
         assert!(!output.interrupted);
-        assert!(output.sandbox_status.is_some());
+        assert!(!output.sandbox_status.expect("sandbox status").enabled);
     }
 
     #[test]
