@@ -122,14 +122,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::ResumeSession {
             session_path,
             commands,
-        } => resume_session(&session_path, &commands),
+            output_format,
+        } => resume_session(&session_path, &commands, output_format),
         CliAction::Status {
             model,
             permission_mode,
-        } => print_status_snapshot(&model, permission_mode)?,
+            output_format,
+        } => print_status_snapshot(&model, permission_mode, output_format)?,
         CliAction::ConfigShow => print_config_json()?,
         CliAction::HookList => print_hook_list()?,
-        CliAction::Sandbox => print_sandbox_status_snapshot()?,
+        CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
             model,
@@ -173,14 +175,18 @@ enum CliAction {
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
+        output_format: CliOutputFormat,
     },
     Status {
         model: String,
         permission_mode: PermissionMode,
+        output_format: CliOutputFormat,
     },
     ConfigShow,
     HookList,
-    Sandbox,
+    Sandbox {
+        output_format: CliOutputFormat,
+    },
     Prompt {
         prompt: String,
         model: String,
@@ -353,9 +359,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..]);
+        return parse_resume_args(&rest[1..], output_format);
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
+    if let Some(action) =
+        parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format)
+    {
         return action;
     }
 
@@ -408,6 +416,7 @@ fn parse_single_word_command_alias(
     rest: &[String],
     model: &str,
     permission_mode_override: Option<PermissionMode>,
+    output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
     if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config" | "hook") {
         return None;
@@ -419,8 +428,9 @@ fn parse_single_word_command_alias(
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
+            output_format,
         })),
-        "sandbox" => Some(Ok(CliAction::Sandbox)),
+        "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -767,7 +777,7 @@ fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
     }
 }
 
-fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -807,6 +817,7 @@ fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::ResumeSession {
         session_path,
         commands,
+        output_format,
     })
 }
 
@@ -1587,7 +1598,7 @@ fn print_version() {
     println!("{}", render_version_report());
 }
 
-fn resume_session(session_path: &Path, commands: &[String]) {
+fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
     let resolved_path = if session_path.exists() {
         session_path.to_path_buf()
     } else {
@@ -1637,7 +1648,30 @@ fn resume_session(session_path: &Path, commands: &[String]) {
             }) => {
                 session = next_session;
                 if let Some(message) = message {
-                    println!("{message}");
+                    if output_format == CliOutputFormat::Json
+                        && matches!(command, SlashCommand::Status)
+                    {
+                        let tracker = UsageTracker::from_session(&session);
+                        let context = status_context(Some(&resolved_path)).expect("status context");
+                        let value = status_json_value(
+                            "restored-session",
+                            StatusUsage {
+                                message_count: session.messages.len(),
+                                turns: tracker.turns(),
+                                latest: tracker.current_turn_usage(),
+                                cumulative: tracker.cumulative_usage(),
+                                estimated_tokens: 0,
+                            },
+                            default_permission_mode().as_str(),
+                            &context,
+                        );
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&value).expect("status json")
+                        );
+                    } else {
+                        println!("{message}");
+                    }
                 }
             }
             Err(error) => {
@@ -4017,23 +4051,83 @@ fn render_repl_help() -> String {
 fn print_status_snapshot(
     model: &str,
     permission_mode: PermissionMode,
+    output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "{}",
-        format_status_report(
-            model,
-            StatusUsage {
-                message_count: 0,
-                turns: 0,
-                latest: TokenUsage::default(),
-                cumulative: TokenUsage::default(),
-                estimated_tokens: 0,
-            },
-            permission_mode.as_str(),
-            &status_context(None)?,
-        )
-    );
+    let usage = StatusUsage {
+        message_count: 0,
+        turns: 0,
+        latest: TokenUsage::default(),
+        cumulative: TokenUsage::default(),
+        estimated_tokens: 0,
+    };
+    let context = status_context(None)?;
+    match output_format {
+        CliOutputFormat::Text => println!(
+            "{}",
+            format_status_report(model, usage, permission_mode.as_str(), &context)
+        ),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json_value(
+                model,
+                usage,
+                permission_mode.as_str(),
+                &context,
+            ))?
+        ),
+    }
     Ok(())
+}
+
+fn status_json_value(
+    model: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    context: &StatusContext,
+) -> serde_json::Value {
+    json!({
+        "kind": "status",
+        "model": model,
+        "permission_mode": permission_mode,
+        "usage": {
+            "messages": usage.message_count,
+            "turns": usage.turns,
+            "latest_total": usage.latest.total_tokens(),
+            "cumulative_input": usage.cumulative.input_tokens,
+            "cumulative_output": usage.cumulative.output_tokens,
+            "cumulative_total": usage.cumulative.total_tokens(),
+            "estimated_tokens": usage.estimated_tokens,
+        },
+        "workspace": {
+            "cwd": context.cwd,
+            "project_root": context.project_root,
+            "git_branch": context.git_branch,
+            "git_state": context.git_summary.headline(),
+            "changed_files": context.git_summary.changed_files,
+            "staged_files": context.git_summary.staged_files,
+            "unstaged_files": context.git_summary.unstaged_files,
+            "untracked_files": context.git_summary.untracked_files,
+            "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
+            "loaded_config_files": context.loaded_config_files,
+            "discovered_config_files": context.discovered_config_files,
+            "memory_file_count": context.memory_file_count,
+        },
+        "sandbox": {
+            "enabled": context.sandbox_status.enabled,
+            "active": context.sandbox_status.active,
+            "supported": context.sandbox_status.supported,
+            "in_container": context.sandbox_status.in_container,
+            "requested_namespace": context.sandbox_status.requested.namespace_restrictions,
+            "active_namespace": context.sandbox_status.namespace_active,
+            "requested_network": context.sandbox_status.requested.network_isolation,
+            "active_network": context.sandbox_status.network_active,
+            "filesystem_mode": context.sandbox_status.filesystem_mode.as_str(),
+            "filesystem_active": context.sandbox_status.filesystem_active,
+            "allowed_mounts": context.sandbox_status.allowed_mounts,
+            "markers": context.sandbox_status.container_markers,
+            "fallback_reason": context.sandbox_status.fallback_reason,
+        }
+    })
 }
 
 fn status_context(
@@ -4254,16 +4348,37 @@ fn format_commit_skipped_report() -> String {
         .to_string()
 }
 
-fn print_sandbox_status_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+fn print_sandbox_status_snapshot(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader
         .load()
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-    println!(
-        "{}",
-        format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
-    );
+    let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    match output_format {
+        CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "sandbox",
+                "enabled": status.enabled,
+                "active": status.active,
+                "supported": status.supported,
+                "in_container": status.in_container,
+                "requested_namespace": status.requested.namespace_restrictions,
+                "active_namespace": status.namespace_active,
+                "requested_network": status.requested.network_isolation,
+                "active_network": status.network_active,
+                "filesystem_mode": status.filesystem_mode.as_str(),
+                "filesystem_active": status.filesystem_active,
+                "allowed_mounts": status.allowed_mounts,
+                "markers": status.container_markers,
+                "fallback_reason": status.fallback_reason,
+            }))?
+        ),
+    }
     Ok(())
 }
 
@@ -7358,11 +7473,14 @@ mod tests {
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
                 permission_mode: PermissionMode::DangerFullAccess,
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
             parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
-            CliAction::Sandbox
+            CliAction::Sandbox {
+                output_format: CliOutputFormat::Text,
+            }
         );
     }
 
@@ -7479,6 +7597,7 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
+                output_format: CliOutputFormat::Text,
             }
         );
     }
@@ -7490,6 +7609,7 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
                 commands: vec![],
+                output_format: CliOutputFormat::Text,
             }
         );
         assert_eq!(
@@ -7498,6 +7618,7 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
                 commands: vec!["/status".to_string()],
+                output_format: CliOutputFormat::Text,
             }
         );
     }
@@ -7520,6 +7641,7 @@ mod tests {
                     "/compact".to_string(),
                     "/cost".to_string(),
                 ],
+                output_format: CliOutputFormat::Text,
             }
         );
     }
@@ -7550,6 +7672,7 @@ mod tests {
                     "/export notes.txt".to_string(),
                     "/clear --confirm".to_string(),
                 ],
+                output_format: CliOutputFormat::Text,
             }
         );
     }
@@ -7568,6 +7691,7 @@ mod tests {
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
+                output_format: CliOutputFormat::Text,
             }
         );
     }
