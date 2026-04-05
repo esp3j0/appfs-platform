@@ -1990,22 +1990,46 @@ pub struct PluginsCommandResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionSource {
+    ProjectClaw,
     ProjectCodex,
     ProjectClaude,
+    UserClawConfigHome,
     UserCodexHome,
+    UserClaw,
     UserCodex,
     UserClaude,
 }
 
-impl DefinitionSource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DefinitionScope {
+    Project,
+    UserConfigHome,
+    UserHome,
+}
+
+impl DefinitionScope {
     fn label(self) -> &'static str {
         match self {
-            Self::ProjectCodex => "Project (.codex)",
-            Self::ProjectClaude => "Project (.claude)",
-            Self::UserCodexHome => "User ($CODEX_HOME)",
-            Self::UserCodex => "User (~/.codex)",
-            Self::UserClaude => "User (~/.claude)",
+            Self::Project => "Project (.claw)",
+            Self::UserConfigHome => "User ($CLAW_CONFIG_HOME)",
+            Self::UserHome => "User (~/.claw)",
         }
+    }
+}
+
+impl DefinitionSource {
+    fn report_scope(self) -> DefinitionScope {
+        match self {
+            Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
+                DefinitionScope::Project
+            }
+            Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
+            Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.report_scope().label()
     }
 }
 
@@ -2556,6 +2580,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     for ancestor in cwd.ancestors() {
         push_unique_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join(leaf),
+        );
+        push_unique_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join(leaf),
         );
@@ -2563,6 +2592,14 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join(leaf),
+        );
+    }
+
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            PathBuf::from(claw_config_home).join(leaf),
         );
     }
 
@@ -2576,6 +2613,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join(leaf),
+        );
         push_unique_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -2598,6 +2640,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     for ancestor in cwd.ancestors() {
         push_unique_skill_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("skills"),
             SkillOrigin::SkillsDir,
@@ -2610,6 +2658,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
         push_unique_skill_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("commands"),
             SkillOrigin::LegacyCommandsDir,
@@ -2618,6 +2672,22 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             &mut roots,
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        let claw_config_home = PathBuf::from(claw_config_home);
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            claw_config_home.join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            claw_config_home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }
@@ -2640,6 +2710,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
 
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -2720,15 +2802,18 @@ fn install_skill_into(
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        return Ok(PathBuf::from(claw_config_home).join("skills"));
+    }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
     if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".codex").join("skills"));
+        return Ok(PathBuf::from(home).join(".claw").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CODEX_HOME or HOME",
+        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
     ))
 }
 
@@ -3094,22 +3179,20 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
         String::new(),
     ];
 
-    for source in [
-        DefinitionSource::ProjectCodex,
-        DefinitionSource::ProjectClaude,
-        DefinitionSource::UserCodexHome,
-        DefinitionSource::UserCodex,
-        DefinitionSource::UserClaude,
+    for scope in [
+        DefinitionScope::Project,
+        DefinitionScope::UserConfigHome,
+        DefinitionScope::UserHome,
     ] {
         let group = agents
             .iter()
-            .filter(|agent| agent.source == source)
+            .filter(|agent| agent.source.report_scope() == scope)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
 
-        lines.push(format!("{}:", source.label()));
+        lines.push(format!("{}:", scope.label()));
         for agent in group {
             let detail = agent_detail(agent);
             match agent.shadowed_by {
@@ -3171,22 +3254,20 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         String::new(),
     ];
 
-    for source in [
-        DefinitionSource::ProjectCodex,
-        DefinitionSource::ProjectClaude,
-        DefinitionSource::UserCodexHome,
-        DefinitionSource::UserCodex,
-        DefinitionSource::UserClaude,
+    for scope in [
+        DefinitionScope::Project,
+        DefinitionScope::UserConfigHome,
+        DefinitionScope::UserHome,
     ] {
         let group = skills
             .iter()
-            .filter(|skill| skill.source == source)
+            .filter(|skill| skill.source.report_scope() == scope)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
 
-        lines.push(format!("{}:", source.label()));
+        lines.push(format!("{}:", scope.label()));
         for skill in group {
             let mut parts = vec![skill.name.clone()];
             if let Some(description) = &skill.description {
@@ -3423,7 +3504,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
         "  Direct CLI       claw agents".to_string(),
-        "  Sources          .codex/agents, .claude/agents, $CODEX_HOME/agents".to_string(),
+        "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3450,8 +3531,8 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $CODEX_HOME/skills or ~/.codex/skills".to_string(),
-        "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
+        "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
+        "  Sources          .claw/skills, ~/.claw/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3467,10 +3548,10 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
-            "install_root": "$CODEX_HOME/skills or ~/.codex/skills",
+            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
-                ".codex/skills",
-                ".claude/skills",
+                ".claw/skills",
+                "~/.claw/skills",
                 "legacy /commands",
                 "legacy fallback dirs still load automatically",
             ],
@@ -4728,7 +4809,7 @@ mod tests {
         let workspace = temp_dir("agents-workspace");
         let project_agents = workspace.join(".codex").join("agents");
         let user_home = temp_dir("agents-home");
-        let user_agents = user_home.join(".codex").join("agents");
+        let user_agents = user_home.join(".claude").join("agents");
 
         write_agent(
             &project_agents,
@@ -4761,10 +4842,10 @@ mod tests {
 
         assert!(report.contains("Agents"));
         assert!(report.contains("2 active agents"));
-        assert!(report.contains("Project (.codex):"));
+        assert!(report.contains("Project (.claw):"));
         assert!(report.contains("planner · Project planner · gpt-5.4 · medium"));
-        assert!(report.contains("User (~/.codex):"));
-        assert!(report.contains("(shadowed by Project (.codex)) planner · User planner"));
+        assert!(report.contains("User (~/.claw):"));
+        assert!(report.contains("(shadowed by Project (.claw)) planner · User planner"));
         assert!(report.contains("verifier · Verification agent · gpt-5.4-mini · high"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4872,12 +4953,11 @@ mod tests {
 
         assert!(report.contains("Skills"));
         assert!(report.contains("3 available skills"));
-        assert!(report.contains("Project (.codex):"));
+        assert!(report.contains("Project (.claw):"));
         assert!(report.contains("plan · Project planning guidance"));
-        assert!(report.contains("Project (.claude):"));
         assert!(report.contains("deploy · Legacy deployment guidance · legacy /commands"));
-        assert!(report.contains("User (~/.codex):"));
-        assert!(report.contains("(shadowed by Project (.codex)) plan · User planning guidance"));
+        assert!(report.contains("User (~/.claw):"));
+        assert!(report.contains("(shadowed by Project (.claw)) plan · User planning guidance"));
         assert!(report.contains("help · Help guidance"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4892,6 +4972,8 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help
+            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -4902,7 +4984,7 @@ mod tests {
         assert!(skills_help
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CODEX_HOME/skills or ~/.codex/skills"));
+        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
@@ -5068,7 +5150,7 @@ mod tests {
         let listed = render_skills_report(
             &load_skills_from_roots(&roots).expect("installed skills should load"),
         );
-        assert!(listed.contains("User ($CODEX_HOME):"));
+        assert!(listed.contains("User ($CLAW_CONFIG_HOME):"));
         assert!(listed.contains("help · Helpful skill"));
 
         let _ = fs::remove_dir_all(workspace);
