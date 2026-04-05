@@ -8295,6 +8295,31 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
+            CliAction::Doctor {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn local_command_help_flags_stay_on_the_local_parser_path() {
+        assert_eq!(
+            parse_args(&["status".to_string(), "--help".to_string()])
+                .expect("status help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Status)
+        );
+        assert_eq!(
+            parse_args(&["sandbox".to_string(), "-h".to_string()])
+                .expect("sandbox help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string(), "--help".to_string()])
+                .expect("doctor help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
     }
 
     #[test]
