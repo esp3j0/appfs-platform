@@ -263,7 +263,10 @@ mod tests {
         std::env::remove_var("CLAUDE_CODE_GIT_BASH_PATH");
         std::env::remove_var("SHELL");
 
-        assert_eq!(bash_shell_path().expect("resolve bash shell"), git_bash_path);
+        assert_eq!(
+            bash_shell_path().expect("resolve bash shell"),
+            git_bash_path
+        );
 
         restore_env("SHELL", old_shell);
         restore_env("CLAW_CODE_SHELL", old_claw_shell);
