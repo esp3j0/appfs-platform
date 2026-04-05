@@ -8323,6 +8323,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_json_output_for_mcp_and_skills_commands() {
+        assert_eq!(
+            parse_args(&["--output-format=json".to_string(), "mcp".to_string()])
+                .expect("json mcp should parse"),
+            CliAction::Mcp {
+                args: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "/skills".to_string(),
+                "help".to_string(),
+            ])
+            .expect("json /skills help should parse"),
+            CliAction::Skills {
+                args: Some("help".to_string()),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
     fn single_word_slash_command_names_return_guidance_instead_of_hitting_prompt_mode() {
         let error = parse_args(&["cost".to_string()]).expect_err("cost should return guidance");
         assert!(error.contains("slash command"));

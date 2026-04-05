@@ -4249,6 +4249,88 @@ mod tests {
     }
 
     #[test]
+    fn renders_mcp_reports_as_json() {
+        let workspace = temp_dir("mcp-json-workspace");
+        let config_home = temp_dir("mcp-json-home");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            workspace.join(".claw").join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "alpha": {
+                  "command": "uvx",
+                  "args": ["alpha-server"],
+                  "env": {"ALPHA_TOKEN": "secret"},
+                  "toolCallTimeoutMs": 1200
+                },
+                "remote": {
+                  "type": "http",
+                  "url": "https://remote.example/mcp",
+                  "headers": {"Authorization": "Bearer secret"},
+                  "headersHelper": "./bin/headers",
+                  "oauth": {
+                    "clientId": "remote-client",
+                    "callbackPort": 7878
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write settings");
+        fs::write(
+            workspace.join(".claw").join("settings.local.json"),
+            r#"{
+              "mcpServers": {
+                "remote": {
+                  "type": "ws",
+                  "url": "wss://remote.example/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write local settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let list =
+            render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
+        assert_eq!(list["kind"], "mcp");
+        assert_eq!(list["action"], "list");
+        assert_eq!(list["configured_servers"], 2);
+        assert_eq!(list["servers"][0]["name"], "alpha");
+        assert_eq!(list["servers"][0]["transport"]["id"], "stdio");
+        assert_eq!(list["servers"][0]["details"]["command"], "uvx");
+        assert_eq!(list["servers"][1]["name"], "remote");
+        assert_eq!(list["servers"][1]["scope"]["id"], "local");
+        assert_eq!(list["servers"][1]["transport"]["id"], "ws");
+        assert_eq!(
+            list["servers"][1]["details"]["url"],
+            "wss://remote.example/mcp"
+        );
+
+        let show = render_mcp_report_json_for(&loader, &workspace, Some("show alpha"))
+            .expect("mcp show json render");
+        assert_eq!(show["action"], "show");
+        assert_eq!(show["found"], true);
+        assert_eq!(show["server"]["name"], "alpha");
+        assert_eq!(show["server"]["details"]["env_keys"][0], "ALPHA_TOKEN");
+        assert_eq!(show["server"]["details"]["tool_call_timeout_ms"], 1200);
+
+        let missing = render_mcp_report_json_for(&loader, &workspace, Some("show missing"))
+            .expect("mcp missing json render");
+        assert_eq!(missing["found"], false);
+        assert_eq!(missing["server_name"], "missing");
+
+        let help =
+            render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
+        assert_eq!(help["action"], "help");
+        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
     fn rejects_invalid_mcp_arguments() {
         let show_error = parse_error_message("/mcp show alpha beta");
         assert!(show_error.contains("Unexpected arguments for /mcp show."));
