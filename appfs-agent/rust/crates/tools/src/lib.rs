@@ -366,8 +366,20 @@ impl GlobalToolRegistry {
     }
 }
 
+pub fn strip_tool_call_prefix(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some((prefix, rest)) = trimmed.split_once('>') {
+        if prefix.starts_with('<') && !rest.trim().is_empty() {
+            return rest.trim();
+        }
+    }
+    trimmed
+}
+
 fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+    strip_tool_call_prefix(value)
+        .replace('-', "_")
+        .to_ascii_lowercase()
 }
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
