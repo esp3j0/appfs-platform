@@ -12,7 +12,7 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    check_freshness, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -21,10 +21,12 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
-    ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
-    OAuthConfig, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
+    McpDegradedReport, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind,
+    Session, TaskPacket, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -313,6 +315,7 @@ impl GlobalToolRegistry {
         query: &str,
         max_results: usize,
         pending_mcp_servers: Option<Vec<String>>,
+        mcp_degraded: Option<McpDegradedReport>,
     ) -> ToolSearchOutput {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
@@ -324,6 +327,7 @@ impl GlobalToolRegistry {
             normalized_query,
             total_deferred_tools: self.searchable_tool_specs().len(),
             pending_mcp_servers,
+            mcp_degraded,
         }
     }
 
@@ -753,6 +757,38 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "RunTaskPacket",
+            description: "Create a background task from a structured task packet.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "branch_policy": { "type": "string" },
+                    "acceptance_tests": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "commit_policy": { "type": "string" },
+                    "reporting_contract": { "type": "string" },
+                    "escalation_policy": { "type": "string" }
+                },
+                "required": [
+                    "objective",
+                    "scope",
+                    "repo",
+                    "branch_policy",
+                    "acceptance_tests",
+                    "commit_policy",
+                    "reporting_contract",
+                    "escalation_policy"
+                ],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "TaskGet",
             description: "Get the status and details of a background task by ID.",
             input_schema: json!({
@@ -1174,6 +1210,7 @@ fn execute_tool_with_enforcer(
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
@@ -1282,6 +1319,24 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
         "status": task.status,
         "prompt": task.prompt,
         "description": task.description,
+        "task_packet": task.task_packet,
+        "created_at": task.created_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_packet(input: TaskPacket) -> Result<String, String> {
+    let registry = global_task_registry();
+    let task = registry
+        .create_from_packet(input)
+        .map_err(|error| error.to_string())?;
+
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "prompt": task.prompt,
+        "description": task.description,
+        "task_packet": task.task_packet,
         "created_at": task.created_at
     }))
 }
@@ -1295,6 +1350,7 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "status": task.status,
             "prompt": task.prompt,
             "description": task.description,
+            "task_packet": task.task_packet,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "messages": task.messages,
@@ -1315,6 +1371,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "status": t.status,
                 "prompt": t.prompt,
                 "description": t.description,
+                "task_packet": t.task_packet,
                 "created_at": t.created_at,
                 "updated_at": t.updated_at,
                 "team_id": t.team_id
@@ -1693,8 +1750,157 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
+    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+        return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
+    }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+    if !is_workspace_test_command(command) {
+        return None;
+    }
+
+    let branch = git_stdout(&["branch", "--show-current"])?;
+    let main_ref = resolve_main_ref(&branch)?;
+    let freshness = check_freshness(&branch, &main_ref);
+    match freshness {
+        BranchFreshness::Fresh => None,
+        BranchFreshness::Stale {
+            commits_behind,
+            missing_fixes,
+        } => Some(branch_divergence_output(
+            command,
+            &branch,
+            &main_ref,
+            commits_behind,
+            None,
+            &missing_fixes,
+        )),
+        BranchFreshness::Diverged {
+            ahead,
+            behind,
+            missing_fixes,
+        } => Some(branch_divergence_output(
+            command,
+            &branch,
+            &main_ref,
+            behind,
+            Some(ahead),
+            &missing_fixes,
+        )),
+    }
+}
+
+fn is_workspace_test_command(command: &str) -> bool {
+    let normalized = normalize_shell_command(command);
+    [
+        "cargo test --workspace",
+        "cargo test --all",
+        "cargo nextest run --workspace",
+        "cargo nextest run --all",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn normalize_shell_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn resolve_main_ref(branch: &str) -> Option<String> {
+    let has_local_main = git_ref_exists("main");
+    let has_remote_main = git_ref_exists("origin/main");
+
+    if branch == "main" && has_remote_main {
+        Some("origin/main".to_string())
+    } else if has_local_main {
+        Some("main".to_string())
+    } else if has_remote_main {
+        Some("origin/main".to_string())
+    } else {
+        None
+    }
+}
+
+fn git_ref_exists(reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!stdout.is_empty()).then_some(stdout)
+}
+
+fn branch_divergence_output(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> BashCommandOutput {
+    let relation = commits_ahead.map_or_else(
+        || format!("is {commits_behind} commit(s) behind"),
+        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
+    );
+    let missing_summary = if missing_fixes.is_empty() {
+        "(none surfaced)".to_string()
+    } else {
+        missing_fixes.join("; ")
+    };
+    let stderr = format!(
+        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    );
+
+    BashCommandOutput {
+        stdout: String::new(),
+        stderr: stderr.clone(),
+        raw_output_path: None,
+        interrupted: false,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: None,
+        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
+        no_output_expected: Some(false),
+        structured_content: Some(vec![serde_json::to_value(
+            LaneEvent::new(
+                LaneEventName::BranchStaleAgainstMain,
+                LaneEventStatus::Blocked,
+                iso8601_now(),
+            )
+            .with_failure_class(LaneFailureClass::BranchDivergence)
+            .with_detail(stderr.clone())
+            .with_data(json!({
+                "branch": branch,
+                "mainRef": main_ref,
+                "commitsBehind": commits_behind,
+                "commitsAhead": commits_ahead,
+                "missingCommits": missing_fixes,
+                "blockedCommand": command,
+                "recommendedAction": format!("merge or rebase {main_ref} before workspace tests")
+            })),
+        )
+        .expect("lane event should serialize")]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: None,
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2136,61 +2342,6 @@ struct SkillOutput {
     prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-enum LaneEventName {
-    #[serde(rename = "lane.started")]
-    Started,
-    #[serde(rename = "lane.blocked")]
-    Blocked,
-    #[serde(rename = "lane.finished")]
-    Finished,
-    #[serde(rename = "lane.failed")]
-    Failed,
-    #[serde(rename = "lane.reconciled")]
-    Reconciled,
-    #[serde(rename = "lane.merged")]
-    Merged,
-    #[serde(rename = "lane.superseded")]
-    Superseded,
-    #[serde(rename = "lane.closed")]
-    Closed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LaneFailureClass {
-    PromptDelivery,
-    TrustGate,
-    BranchDivergence,
-    Compile,
-    Test,
-    PluginStartup,
-    McpStartup,
-    McpHandshake,
-    GatewayRouting,
-    ToolRuntime,
-    Infra,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct LaneBlocker {
-    #[serde(rename = "failureClass")]
-    failure_class: LaneFailureClass,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct LaneEvent {
-    event: LaneEventName,
-    status: String,
-    #[serde(rename = "emittedAt")]
-    emitted_at: String,
-    #[serde(rename = "failureClass", skip_serializing_if = "Option::is_none")]
-    failure_class: Option<LaneFailureClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentOutput {
     #[serde(rename = "agentId")]
@@ -2214,7 +2365,7 @@ struct AgentOutput {
     #[serde(rename = "laneEvents", default, skip_serializing_if = "Vec::is_empty")]
     lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
-    current_blocker: Option<LaneBlocker>,
+    current_blocker: Option<LaneEventBlocker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2236,6 +2387,8 @@ pub struct ToolSearchOutput {
     total_deferred_tools: usize,
     #[serde(rename = "pending_mcp_servers")]
     pending_mcp_servers: Option<Vec<String>>,
+    #[serde(rename = "mcp_degraded", skip_serializing_if = "Option::is_none")]
+    mcp_degraded: Option<McpDegradedReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2926,13 +3079,7 @@ where
         created_at: created_at.clone(),
         started_at: Some(created_at),
         completed_at: None,
-        lane_events: vec![LaneEvent {
-            event: LaneEventName::Started,
-            status: String::from("running"),
-            emitted_at: iso8601_now(),
-            failure_class: None,
-            detail: None,
-        }],
+        lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
         error: None,
     };
@@ -3155,32 +3302,20 @@ fn persist_agent_terminal_state(
     next_manifest.current_blocker = blocker.clone();
     next_manifest.error = error;
     if let Some(blocker) = blocker {
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Blocked,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: Some(blocker.failure_class.clone()),
-            detail: Some(blocker.detail.clone()),
-        });
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Failed,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: Some(blocker.failure_class),
-            detail: Some(blocker.detail),
-        });
+        next_manifest
+            .lane_events
+            .push(LaneEvent::blocked(iso8601_now(), &blocker));
+        next_manifest
+            .lane_events
+            .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
         let compressed_detail = result
             .filter(|value| !value.trim().is_empty())
             .map(|value| compress_summary_text(value.trim()));
-        next_manifest.lane_events.push(LaneEvent {
-            event: LaneEventName::Finished,
-            status: status.to_string(),
-            emitted_at: iso8601_now(),
-            failure_class: None,
-            detail: compressed_detail,
-        });
+        next_manifest
+            .lane_events
+            .push(LaneEvent::finished(iso8601_now(), compressed_detail));
     }
     write_agent_manifest(&next_manifest)
 }
@@ -3199,7 +3334,7 @@ fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
 fn format_agent_terminal_output(
     status: &str,
     result: Option<&str>,
-    blocker: Option<&LaneBlocker>,
+    blocker: Option<&LaneEventBlocker>,
     error: Option<&str>,
 ) -> String {
     let mut sections = vec![format!("\n## Result\n\n- status: {status}\n")];
@@ -3221,9 +3356,9 @@ fn format_agent_terminal_output(
     sections.join("")
 }
 
-fn classify_lane_blocker(error: &str) -> LaneBlocker {
+fn classify_lane_blocker(error: &str) -> LaneEventBlocker {
     let detail = error.trim().to_string();
-    LaneBlocker {
+    LaneEventBlocker {
         failure_class: classify_lane_failure(error),
         detail,
     }
@@ -3240,6 +3375,8 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         && (normalized.contains("stale") || normalized.contains("diverg"))
     {
         LaneFailureClass::BranchDivergence
+    } else if normalized.contains("gateway") || normalized.contains("routing") {
+        LaneFailureClass::GatewayRouting
     } else if normalized.contains("compile")
         || normalized.contains("build failed")
         || normalized.contains("cargo check")
@@ -3247,20 +3384,17 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
         LaneFailureClass::Compile
     } else if normalized.contains("test") {
         LaneFailureClass::Test
+    } else if normalized.contains("tool failed")
+        || normalized.contains("runtime tool")
+        || normalized.contains("tool runtime")
+    {
+        LaneFailureClass::ToolRuntime
     } else if normalized.contains("plugin") {
         LaneFailureClass::PluginStartup
     } else if normalized.contains("mcp") && normalized.contains("handshake") {
         LaneFailureClass::McpHandshake
     } else if normalized.contains("mcp") {
         LaneFailureClass::McpStartup
-    } else if normalized.contains("gateway") || normalized.contains("routing") {
-        LaneFailureClass::GatewayRouting
-    } else if normalized.contains("tool")
-        || normalized.contains("hook")
-        || normalized.contains("permission")
-        || normalized.contains("denied")
-    {
-        LaneFailureClass::ToolRuntime
     } else {
         LaneFailureClass::Infra
     }
@@ -3599,7 +3733,7 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
 
 #[allow(clippy::needless_pass_by_value)]
 fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
-    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None)
+    GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
@@ -4643,6 +4777,9 @@ fn iso8601_timestamp() -> String {
 #[allow(clippy::needless_pass_by_value)]
 fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
+    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+        return Ok(output);
+    }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
         shell,
@@ -4888,6 +5025,8 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+pub mod lane_completion;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -4895,21 +5034,23 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentInput,
-        AgentJob, GlobalToolRegistry, LaneFailureClass, SubagentToolExecutor,
+        detect_powershell_shell, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, ToolExecutor,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -4924,6 +5065,35 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap_or_else(|error| panic!("git {} failed: {error}", args.join(" ")));
+        assert!(
+            status.success(),
+            "git {} exited with {status}",
+            args.join(" ")
+        );
+    }
+
+    fn init_git_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repo");
+        run_git(path, &["init", "--quiet", "-b", "main"]);
+        run_git(path, &["config", "user.email", "tests@example.com"]);
+        run_git(path, &["config", "user.name", "Tools Tests"]);
+        std::fs::write(path.join("README.md"), "initial\n").expect("write readme");
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-m", "initial commit", "--quiet"]);
+    }
+
+    fn commit_file(path: &Path, file: &str, contents: &str, message: &str) {
+        std::fs::write(path.join(file), contents).expect("write file");
+        run_git(path, &["add", file]);
+        run_git(path, &["commit", "-m", message, "--quiet"]);
     }
 
     fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
@@ -5020,6 +5190,14 @@ mod tests {
         let observed_output: serde_json::Value = serde_json::from_str(&observed).expect("json");
         assert_eq!(observed_output["status"], "spawning");
         assert_eq!(observed_output["trust_gate_cleared"], true);
+        assert_eq!(
+            observed_output["events"][1]["payload"]["type"],
+            "trust_prompt"
+        );
+        assert_eq!(
+            observed_output["events"][2]["payload"]["resolution"],
+            "auto_allowlisted"
+        );
 
         let ready = execute_tool(
             "WorkerObserve",
@@ -5052,8 +5230,9 @@ mod tests {
         )
         .expect("WorkerSendPrompt should succeed after ready");
         let accepted_output: serde_json::Value = serde_json::from_str(&accepted).expect("json");
-        assert_eq!(accepted_output["status"], "prompt_accepted");
+        assert_eq!(accepted_output["status"], "running");
         assert_eq!(accepted_output["prompt_delivery_attempts"], 1);
+        assert_eq!(accepted_output["prompt_in_flight"], true);
     }
 
     #[test]
@@ -5101,6 +5280,14 @@ mod tests {
         assert_eq!(recovered_output["status"], "ready_for_prompt");
         assert_eq!(recovered_output["last_error"]["kind"], "prompt_delivery");
         assert_eq!(recovered_output["replay_prompt"], "Investigate flaky boot");
+        assert_eq!(
+            recovered_output["events"][3]["payload"]["observed_target"],
+            "shell"
+        );
+        assert_eq!(
+            recovered_output["events"][4]["payload"]["recovery_armed"],
+            true
+        );
 
         let replayed = execute_tool(
             "WorkerSendPrompt",
@@ -5110,8 +5297,9 @@ mod tests {
         )
         .expect("WorkerSendPrompt should replay recovered prompt");
         let replayed_output: serde_json::Value = serde_json::from_str(&replayed).expect("json");
-        assert_eq!(replayed_output["status"], "prompt_accepted");
+        assert_eq!(replayed_output["status"], "running");
         assert_eq!(replayed_output["prompt_delivery_attempts"], 2);
+        assert_eq!(replayed_output["prompt_in_flight"], true);
     }
 
     #[test]
@@ -5207,10 +5395,34 @@ mod tests {
             )]
         );
 
-        let search = registry.search("demo echo", 5, Some(vec!["pending-server".to_string()]));
+        let search = registry.search(
+            "demo echo",
+            5,
+            Some(vec!["pending-server".to_string()]),
+            Some(runtime::McpDegradedReport::new(
+                vec!["demo".to_string()],
+                vec![runtime::McpFailedServer {
+                    server_name: "pending-server".to_string(),
+                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                    error: runtime::McpErrorSurface::new(
+                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        Some("pending-server".to_string()),
+                        "tool discovery failed",
+                        BTreeMap::new(),
+                        true,
+                    ),
+                }],
+                vec!["mcp__demo__echo".to_string()],
+                vec!["mcp__demo__echo".to_string()],
+            )),
+        );
         let output = serde_json::to_value(search).expect("search output should serialize");
         assert_eq!(output["matches"][0], "mcp__demo__echo");
         assert_eq!(output["pending_mcp_servers"][0], "pending-server");
+        assert_eq!(
+            output["mcp_degraded"]["failed_servers"][0]["phase"],
+            "tool_discovery"
+        );
     }
 
     #[test]
@@ -5251,6 +5463,7 @@ mod tests {
         let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
         let titled_summary = titled_output["result"].as_str().expect("result string");
         assert!(titled_summary.contains("Title: Ignored"));
+        server.assert_clean();
     }
 
     #[test]
@@ -5285,10 +5498,14 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+        server.assert_clean();
     }
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -5329,6 +5546,7 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Reqwest docs");
         assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+        server.assert_clean();
     }
 
     #[test]
@@ -5337,7 +5555,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
+            assert!(
+                request_line.contains("GET /fallback?q=generic+links ")
+                    || request_line.contains("GET /fallback?q=generic%20links "),
+                "unexpected request line: {request_line}"
+            );
             HttpResponse::html(
                 200,
                 "OK",
@@ -5374,6 +5596,7 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        server.assert_clean();
 
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
@@ -5867,7 +6090,7 @@ mod tests {
                 LaneFailureClass::GatewayRouting,
             ),
             (
-                "denied tool execution from hook",
+                "tool failed: denied tool execution from hook",
                 LaneFailureClass::ToolRuntime,
             ),
             ("thread creation failed", LaneFailureClass::Infra),
@@ -5875,6 +6098,34 @@ mod tests {
 
         for (message, expected) in cases {
             assert_eq!(classify_lane_failure(message), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn lane_event_schema_serializes_to_canonical_names() {
+        let cases = [
+            (LaneEventName::Started, "lane.started"),
+            (LaneEventName::Ready, "lane.ready"),
+            (LaneEventName::PromptMisdelivery, "lane.prompt_misdelivery"),
+            (LaneEventName::Blocked, "lane.blocked"),
+            (LaneEventName::Red, "lane.red"),
+            (LaneEventName::Green, "lane.green"),
+            (LaneEventName::CommitCreated, "lane.commit.created"),
+            (LaneEventName::PrOpened, "lane.pr.opened"),
+            (LaneEventName::MergeReady, "lane.merge.ready"),
+            (LaneEventName::Finished, "lane.finished"),
+            (LaneEventName::Failed, "lane.failed"),
+            (
+                LaneEventName::BranchStaleAgainstMain,
+                "branch.stale_against_main",
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize lane event"),
+                json!(expected)
+            );
         }
     }
 
@@ -6163,6 +6414,90 @@ mod tests {
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
         assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn bash_workspace_tests_are_blocked_when_branch_is_behind_main() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("workspace-test-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/stale-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: unblock workspace tests",
+        );
+        run_git(&root, &["checkout", "feature/stale-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "bash",
+            &json!({ "command": "cargo test --workspace --all-targets" }),
+        )
+        .expect("preflight should return structured output");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+        assert!(output_json["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("branch divergence detected before workspace tests"));
+        assert_eq!(
+            output_json["structuredContent"][0]["event"],
+            "branch.stale_against_main"
+        );
+        assert_eq!(
+            output_json["structuredContent"][0]["failureClass"],
+            "branch_divergence"
+        );
+        assert_eq!(
+            output_json["structuredContent"][0]["data"]["missingCommits"][0],
+            "fix: unblock workspace tests"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bash_targeted_tests_skip_branch_preflight() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("targeted-test-no-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/targeted-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: only broad tests should block",
+        );
+        run_git(&root, &["checkout", "feature/targeted-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "bash",
+            &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
+        )
+        .expect("targeted commands should still execute");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_ne!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6674,6 +7009,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(windows)]
         {
+            let dir = temp_path("pwsh-bin");
+            std::fs::create_dir_all(&dir).expect("create dir");
+            let script = dir.join("pwsh.cmd");
+            std::fs::write(&script, "@echo off\r\necho hello\r\n").expect("write script");
+            let original_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut path_entries = vec![dir.clone()];
+            path_entries.extend(std::env::split_paths(&original_path));
+            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
+            std::env::set_var("PATH", &updated_path);
+
             let result = execute_tool(
                 "PowerShell",
                 &json!({"command": "Write-Output hello", "timeout": 1000}),
@@ -6685,6 +7030,9 @@ mod tests {
                 &json!({"command": "Write-Output hello", "run_in_background": true}),
             )
             .expect("PowerShell background should succeed");
+
+            std::env::set_var("PATH", original_path);
+            let _ = std::fs::remove_dir_all(&dir);
 
             let output: serde_json::Value = serde_json::from_str(&result).expect("json");
             assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
@@ -6793,6 +7141,31 @@ printf 'pwsh:%s' "$1"
         assert!(err.contains("PowerShell executable not found"));
     }
 
+    #[test]
+    fn powershell_runs_real_shell_smoke_when_available() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if detect_powershell_shell().is_err() {
+            return;
+        }
+
+        let result = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "timeout": 1000}),
+        )
+        .expect("PowerShell should succeed when a real shell is available");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
+        assert!(output["stderr"].as_str().expect("stderr").trim().is_empty());
+    }
+
     fn read_only_registry() -> super::GlobalToolRegistry {
         use runtime::permission_enforcer::PermissionEnforcer;
         use runtime::PermissionPolicy;
@@ -6888,6 +7261,34 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["stdout"], "ok");
     }
 
+    #[test]
+    fn run_task_packet_creates_packet_backed_task() {
+        let result = run_task_packet(TaskPacket {
+            objective: "Ship packetized runtime task".to_string(),
+            scope: "runtime/task system".to_string(),
+            repo: "claw-code-parity".to_string(),
+            branch_policy: "origin/main only".to_string(),
+            acceptance_tests: vec![
+                "cargo build --workspace".to_string(),
+                "cargo test --workspace".to_string(),
+            ],
+            commit_policy: "single commit".to_string(),
+            reporting_contract: "print build/test result and sha".to_string(),
+            escalation_policy: "manual escalation".to_string(),
+        })
+        .expect("task packet should create a task");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["status"], "created");
+        assert_eq!(output["prompt"], "Ship packetized runtime task");
+        assert_eq!(output["description"], "runtime/task system");
+        assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert_eq!(
+            output["task_packet"]["acceptance_tests"][1],
+            "cargo test --workspace"
+        );
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -6936,16 +7337,26 @@ printf 'pwsh:%s' "$1"
         fn addr(&self) -> SocketAddr {
             self.addr
         }
-    }
 
-    impl Drop for TestServer {
-        fn drop(&mut self) {
+        fn assert_clean(mut self) {
+            self.shutdown_and_join().expect("join test server");
+        }
+
+        fn shutdown_and_join(&mut self) -> thread::Result<()> {
             if let Some(tx) = self.shutdown.take() {
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                handle.join()
+            } else {
+                Ok(())
             }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.shutdown_and_join();
         }
     }
 
