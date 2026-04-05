@@ -239,12 +239,10 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
 
 #[test]
 fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
-    // given
     let temp_dir = unique_temp_dir("subcommand-help");
     let config_home = temp_dir.join("home").join(".claw");
     fs::create_dir_all(&config_home).expect("config home should exist");
 
-    // when
     let doctor_help = command_in(&temp_dir)
         .env("CLAW_CONFIG_HOME", &config_home)
         .env_remove("ANTHROPIC_API_KEY")
@@ -262,7 +260,6 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
         .output()
         .expect("status help should launch");
 
-    // then
     assert_success(&doctor_help);
     let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
     assert!(doctor_stdout.contains("Usage            claw doctor"));
@@ -279,121 +276,6 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     let status_stderr = String::from_utf8(status_help.stderr).expect("stderr should be utf8");
     assert!(!doctor_stderr.contains("auth_unavailable"));
     assert!(!status_stderr.contains("auth_unavailable"));
-
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
-}
-
-#[test]
-fn nested_help_flags_render_usage_instead_of_falling_through() {
-    let temp_dir = unique_temp_dir("nested-help");
-    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-
-    let mcp_output = command_in(&temp_dir)
-        .args(["mcp", "show", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&mcp_output);
-    let mcp_stdout = String::from_utf8(mcp_output.stdout).expect("stdout should be utf8");
-    assert!(mcp_stdout.contains("Usage            /mcp [list|show <server>|help]"));
-    assert!(mcp_stdout.contains("Unexpected       show"));
-    assert!(!mcp_stdout.contains("server `--help` is not configured"));
-
-    let skills_output = command_in(&temp_dir)
-        .args(["skills", "install", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&skills_output);
-    let skills_stdout = String::from_utf8(skills_output.stdout).expect("stdout should be utf8");
-    assert!(skills_stdout.contains("Usage            /skills [list|install <path>|help]"));
-    assert!(skills_stdout.contains("Unexpected       install"));
-
-    let unknown_output = command_in(&temp_dir)
-        .args(["mcp", "inspect", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&unknown_output);
-    let unknown_stdout = String::from_utf8(unknown_output.stdout).expect("stdout should be utf8");
-    assert!(unknown_stdout.contains("Usage            /mcp [list|show <server>|help]"));
-    assert!(unknown_stdout.contains("Unexpected       inspect"));
-
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
-}
-
-#[test]
-fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
-    // given
-    let temp_dir = unique_temp_dir("subcommand-help");
-    let config_home = temp_dir.join("home").join(".claw");
-    fs::create_dir_all(&config_home).expect("config home should exist");
-
-    // when
-    let doctor_help = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
-        .args(["doctor", "--help"])
-        .output()
-        .expect("doctor help should launch");
-    let status_help = command_in(&temp_dir)
-        .env("CLAW_CONFIG_HOME", &config_home)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
-        .args(["status", "--help"])
-        .output()
-        .expect("status help should launch");
-
-    // then
-    assert_success(&doctor_help);
-    let doctor_stdout = String::from_utf8(doctor_help.stdout).expect("stdout should be utf8");
-    assert!(doctor_stdout.contains("Usage            claw doctor"));
-    assert!(doctor_stdout.contains("local-only health report"));
-    assert!(!doctor_stdout.contains("Thinking"));
-
-    assert_success(&status_help);
-    let status_stdout = String::from_utf8(status_help.stdout).expect("stdout should be utf8");
-    assert!(status_stdout.contains("Usage            claw status"));
-    assert!(status_stdout.contains("local workspace snapshot"));
-    assert!(!status_stdout.contains("Thinking"));
-
-    let doctor_stderr = String::from_utf8(doctor_help.stderr).expect("stderr should be utf8");
-    let status_stderr = String::from_utf8(status_help.stderr).expect("stderr should be utf8");
-    assert!(!doctor_stderr.contains("auth_unavailable"));
-    assert!(!status_stderr.contains("auth_unavailable"));
-=======
-fn nested_help_flags_render_usage_instead_of_falling_through() {
-    let temp_dir = unique_temp_dir("nested-help");
-    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-
-    let mcp_output = command_in(&temp_dir)
-        .args(["mcp", "show", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&mcp_output);
-    let mcp_stdout = String::from_utf8(mcp_output.stdout).expect("stdout should be utf8");
-    assert!(mcp_stdout.contains("Usage            /mcp [list|show <server>|help]"));
-    assert!(mcp_stdout.contains("Unexpected       show"));
-    assert!(!mcp_stdout.contains("server `--help` is not configured"));
-
-    let skills_output = command_in(&temp_dir)
-        .args(["skills", "install", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&skills_output);
-    let skills_stdout = String::from_utf8(skills_output.stdout).expect("stdout should be utf8");
-    assert!(skills_stdout.contains("Usage            /skills [list|install <path>|help]"));
-    assert!(skills_stdout.contains("Unexpected       install"));
-
-    let unknown_output = command_in(&temp_dir)
-        .args(["mcp", "inspect", "--help"])
-        .output()
-        .expect("claw should launch");
-    assert_success(&unknown_output);
-    let unknown_stdout = String::from_utf8(unknown_output.stdout).expect("stdout should be utf8");
-    assert!(unknown_stdout.contains("Usage            /mcp [list|show <server>|help]"));
-    assert!(unknown_stdout.contains("Unexpected       inspect"));
->>>>>>> 1f53d96 (Route nested CLI help requests to usage instead of operand fallthrough)
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
