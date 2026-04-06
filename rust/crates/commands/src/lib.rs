@@ -2192,6 +2192,16 @@ pub fn handle_mcp_slash_command_json(
 }
 
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_skills_usage(None),
+                ["install", ..] => render_skills_usage(Some("install")),
+                _ => render_skills_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
@@ -3773,8 +3783,7 @@ mod tests {
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_plugins_report, render_skills_report,
-        resolve_skill_path,
-        render_slash_command_help, render_slash_command_help_detail,
+        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
         resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
         validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
         SlashCommand,
@@ -4168,8 +4177,8 @@ mod tests {
     #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
-        let project_skills = workspace.join(".claw").join("skills");
-        let legacy_commands = workspace.join(".claw").join("commands");
+        let project_skills = workspace.join(".codex").join("skills");
+        let legacy_commands = workspace.join(".claude").join("commands");
 
         write_skill(&project_skills, "plan", "Project planning guidance");
         write_legacy_command(&legacy_commands, "handoff", "Legacy handoff guidance");
@@ -4214,8 +4223,9 @@ mod tests {
                 origin: SkillOrigin::SkillsDir,
             },
         ];
-        let report =
-            super::render_skills_report_json(&load_skills_from_roots(&roots).expect("skills should load"));
+        let report = super::render_skills_report_json(
+            &load_skills_from_roots(&roots).expect("skills should load"),
+        );
         assert_eq!(report["kind"], "skills");
         assert_eq!(report["action"], "list");
         assert_eq!(report["summary"]["active"], 3);

@@ -6366,9 +6366,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -7457,14 +7463,13 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
-        normalize_permission_mode,
-        parse_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_git_worktrees, parse_hook_args, parse_recent_commits,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_hook_list_report_for,
-        render_memory_report, render_merged_runtime_config_json, render_repl_help,
-        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
+        parse_hook_args, parse_recent_commits, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for,
+        render_hook_list_report_for, render_memory_report, render_merged_runtime_config_json,
+        render_repl_help, render_resume_usage, resolve_model_alias, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
         GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
