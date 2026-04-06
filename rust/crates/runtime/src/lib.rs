@@ -26,14 +26,16 @@ pub mod recovery_recipes;
 mod remote;
 pub mod sandbox;
 mod session;
-pub mod session_control;
+#[cfg(test)]
+mod session_control;
 mod sse;
 pub mod stale_branch;
 pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
-pub mod trust_resolver;
+#[cfg(test)]
+mod trust_resolver;
 mod usage;
 mod windows_shell;
 pub mod worker_boot;
@@ -140,6 +142,7 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+#[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

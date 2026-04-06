@@ -7473,7 +7473,8 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
         GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, SlashCommand, StatusUsage,
+        DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8293,6 +8294,55 @@ mod tests {
             parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
             CliAction::Sandbox {
                 output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
+            CliAction::Doctor {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn local_command_help_flags_stay_on_the_local_parser_path() {
+        assert_eq!(
+            parse_args(&["status".to_string(), "--help".to_string()])
+                .expect("status help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Status)
+        );
+        assert_eq!(
+            parse_args(&["sandbox".to_string(), "-h".to_string()])
+                .expect("sandbox help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Sandbox)
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string(), "--help".to_string()])
+                .expect("doctor help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
+    }
+
+    #[test]
+    fn parses_json_output_for_mcp_and_skills_commands() {
+        assert_eq!(
+            parse_args(&["--output-format=json".to_string(), "mcp".to_string()])
+                .expect("json mcp should parse"),
+            CliAction::Mcp {
+                args: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--output-format=json".to_string(),
+                "/skills".to_string(),
+                "help".to_string(),
+            ])
+            .expect("json /skills help should parse"),
+            CliAction::Skills {
+                args: Some("help".to_string()),
+                output_format: CliOutputFormat::Json,
             }
         );
     }
