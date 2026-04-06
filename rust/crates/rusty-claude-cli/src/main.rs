@@ -6277,7 +6277,9 @@ impl ApiClient for AnthropicRuntimeClient {
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.is_generic_fatal_wrapper() {
+    if error.safe_failure_class() == "context_window" {
+        format_context_window_blocked_error(session_id, error)
+    } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
         if let Some(request_id) = error.request_id() {
             qualifiers.push(format!("trace {request_id}"));
@@ -6291,6 +6293,72 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
     } else {
         error.to_string()
     }
+}
+
+fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Context window blocked".to_string(),
+        "  Failure class    context_window_blocked".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    match error {
+        api::ApiError::ContextWindowExceeded {
+            model,
+            estimated_input_tokens,
+            requested_output_tokens,
+            estimated_total_tokens,
+            context_window_tokens,
+        } => {
+            lines.push(format!("  Model            {model}"));
+            lines.push(format!("  Estimated input  {estimated_input_tokens}"));
+            lines.push(format!("  Requested output {requested_output_tokens}"));
+            lines.push(format!("  Estimated total  {estimated_total_tokens}"));
+            lines.push(format!("  Context window   {context_window_tokens}"));
+        }
+        api::ApiError::Api { message, body, .. } => {
+            let detail = message.as_deref().unwrap_or(body).trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        api::ApiError::RetriesExhausted { last_error, .. } => {
+            let detail = match last_error.as_ref() {
+                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
+                other => return format_context_window_blocked_error(session_id, other),
+            }
+            .trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push("  Compact          /compact".to_string());
+    lines.push(format!(
+        "  Resume compact   claw --resume {session_id} /compact"
+    ));
+    lines.push("  Fresh session    /clear --confirm".to_string());
+    lines.push(
+        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
+            .to_string(),
+    );
+    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
+
+    lines.join("\n")
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -7400,6 +7468,73 @@ mod tests {
         assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
         assert!(rendered.contains("session session-issue-22"));
         assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn context_window_preflight_errors_render_recovery_steps() {
+        let error = ApiError::ContextWindowExceeded {
+            model: "claude-sonnet-4-6".to_string(),
+            estimated_input_tokens: 182_000,
+            requested_output_tokens: 64_000,
+            estimated_total_tokens: 246_000,
+            context_window_tokens: 200_000,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Session          session-issue-32"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Model            claude-sonnet-4-6"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Estimated total  246000"), "{rendered}");
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Reduce scope"), "{rendered}");
+        assert!(rendered.contains("Retry            rerun"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_context_window_errors_are_reframed_with_same_guidance() {
+        let error = ApiError::Api {
+            status: "400".parse().expect("status"),
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 200000 tokens, but your request used 230000 tokens."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_456".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_456"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           This model's maximum context length is 200000 tokens"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
     }
 
     fn temp_dir() -> PathBuf {
