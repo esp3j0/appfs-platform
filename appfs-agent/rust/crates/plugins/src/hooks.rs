@@ -392,6 +392,9 @@ mod tests {
 
     #[test]
     fn collects_and_runs_hooks_from_enabled_plugins() {
+        if !crate::shell::windows_bash_smoke_ok() {
+            return;
+        }
         // given
         let config_home = temp_dir("config");
         let first_source_root = temp_dir("source-a");
@@ -453,6 +456,9 @@ mod tests {
 
     #[test]
     fn pre_tool_use_denies_when_plugin_hook_exits_two() {
+        if !crate::shell::windows_bash_smoke_ok() {
+            return;
+        }
         // given
         let runner = HookRunner::new(crate::PluginHooks {
             pre_tool_use: vec![shell_echo_and_exit("blocked by plugin", 2)],
@@ -470,6 +476,9 @@ mod tests {
 
     #[test]
     fn propagates_plugin_hook_failures() {
+        if !crate::shell::windows_bash_smoke_ok() {
+            return;
+        }
         // given
         let runner = HookRunner::new(crate::PluginHooks {
             pre_tool_use: vec![
