@@ -272,16 +272,82 @@ impl From<VarError> for ApiError {
     }
 }
 
-fn looks_like_generic_fatal_wrapper(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
+fn looks_like_generic_fatal_wrapper(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
     GENERIC_FATAL_WRAPPER_MARKERS
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| lowered.contains(marker))
 }
 
-fn looks_like_context_window_error(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
+fn looks_like_context_window_error(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
     CONTEXT_WINDOW_ERROR_MARKERS
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| lowered.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiError;
+
+    #[test]
+    fn detects_generic_fatal_wrapper_and_classifies_it_as_provider_internal() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: Some("api_error".to_string()),
+            message: Some(
+                "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                    .to_string(),
+            ),
+            request_id: Some("req_jobdori_123".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+
+        assert!(error.is_generic_fatal_wrapper());
+        assert_eq!(error.safe_failure_class(), "provider_internal");
+        assert_eq!(error.request_id(), Some("req_jobdori_123"));
+        assert!(error.to_string().contains("[trace req_jobdori_123]"));
+    }
+
+    #[test]
+    fn retries_exhausted_preserves_nested_request_id_and_failure_class() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(ApiError::Api {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                error_type: Some("api_error".to_string()),
+                message: Some(
+                    "Something went wrong while processing your request. Please try again, or use /new to start a fresh session."
+                        .to_string(),
+                ),
+                request_id: Some("req_nested_456".to_string()),
+                body: String::new(),
+                retryable: true,
+            }),
+        };
+
+        assert!(error.is_generic_fatal_wrapper());
+        assert_eq!(error.safe_failure_class(), "provider_retry_exhausted");
+        assert_eq!(error.request_id(), Some("req_nested_456"));
+    }
+
+    #[test]
+    fn classifies_provider_context_window_errors() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request_error".to_string()),
+            message: Some(
+                "This model's maximum context length is 200000 tokens, but your request used 230000 tokens."
+                    .to_string(),
+            ),
+            request_id: Some("req_ctx_123".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        assert!(error.is_context_window_failure());
+        assert_eq!(error.safe_failure_class(), "context_window");
+        assert_eq!(error.request_id(), Some("req_ctx_123"));
+    }
 }
