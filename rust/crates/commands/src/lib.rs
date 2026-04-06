@@ -2182,6 +2182,163 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     }
 }
 
+pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::io::Result<Value> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_skills_usage_json(None),
+                ["install", ..] => render_skills_usage_json(Some("install")),
+                _ => render_skills_usage_json(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
+    match normalize_optional_args(args) {
+        None | Some("list") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_report_json(&skills))
+        }
+        Some("install") => Ok(render_skills_usage_json(Some("install"))),
+        Some(args) if args.starts_with("install ") => {
+            let target = args["install ".len()..].trim();
+            if target.is_empty() {
+                return Ok(render_skills_usage_json(Some("install")));
+            }
+            let install = install_skill(target, cwd)?;
+            Ok(render_skill_install_report_json(&install))
+        }
+        Some(args) if is_help_arg(args) => Ok(render_skills_usage_json(None)),
+        Some(args) => Ok(render_skills_usage_json(Some(args))),
+    }
+}
+
+#[must_use]
+pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
+    match normalize_optional_args(args) {
+        None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        Some(args) if args == "install" || args.starts_with("install ") => {
+            SkillSlashDispatch::Local
+        }
+        Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
+    }
+}
+
+/// Resolve a skill invocation by validating the skill exists on disk before
+/// returning the dispatch.  When the skill is not found, returns `Err` with a
+/// human-readable message that lists nearby skill names.
+pub fn resolve_skill_invocation(
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<SkillSlashDispatch, String> {
+    let dispatch = classify_skills_slash_command(args);
+    if let SkillSlashDispatch::Invoke(ref prompt) = dispatch {
+        // Extract the skill name from the "$skill [args]" prompt.
+        let skill_token = prompt
+            .trim_start_matches('$')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if !skill_token.is_empty() {
+            if let Err(error) = resolve_skill_path(cwd, skill_token) {
+                let mut message =
+                    format!("Unknown skill: {skill_token} ({error})");
+                let roots = discover_skill_roots(cwd);
+                if let Ok(available) = load_skills_from_roots(&roots) {
+                    let names: Vec<String> = available
+                        .iter()
+                        .filter(|s| s.shadowed_by.is_none())
+                        .map(|s| s.name.clone())
+                        .collect();
+                    if !names.is_empty() {
+                        message.push_str(&format!(
+                            "\n  Available skills: {}",
+                            names.join(", ")
+                        ));
+                    }
+                }
+                message.push_str(
+                    "\n  Usage: /skills [list|install <path>|help|<skill> [args]]",
+                );
+                return Err(message);
+            }
+        }
+    }
+    Ok(dispatch)
+}
+
+pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
+    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
+    if requested.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "skill must not be empty",
+        ));
+    }
+
+    let roots = discover_skill_roots(cwd);
+    for root in &roots {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&root.path)? {
+            let entry = entry?;
+            match root.origin {
+                SkillOrigin::SkillsDir => {
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    let skill_path = entry.path().join("SKILL.md");
+                    if !skill_path.is_file() {
+                        continue;
+                    }
+                    let contents = fs::read_to_string(&skill_path)?;
+                    let (name, _) = parse_skill_frontmatter(&contents);
+                    entries.push((
+                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                        skill_path,
+                    ));
+                }
+                SkillOrigin::LegacyCommandsDir => {
+                    let path = entry.path();
+                    let markdown_path = if path.is_dir() {
+                        let skill_path = path.join("SKILL.md");
+                        if !skill_path.is_file() {
+                            continue;
+                        }
+                        skill_path
+                    } else if path
+                        .extension()
+                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+                    {
+                        path
+                    } else {
+                        continue;
+                    };
+
+                    let contents = fs::read_to_string(&markdown_path)?;
+                    let fallback_name = markdown_path.file_stem().map_or_else(
+                        || entry.file_name().to_string_lossy().to_string(),
+                        |stem| stem.to_string_lossy().to_string(),
+                    );
+                    let (name, _) = parse_skill_frontmatter(&contents);
+                    entries.push((name.unwrap_or(fallback_name), markdown_path));
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        if let Some((_, path)) = entries
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+        {
+            return Ok(path);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("unknown skill: {requested}"),
+    ))
+}
+
 fn render_mcp_report_for(
     loader: &ConfigLoader,
     cwd: &Path,
@@ -3631,6 +3788,28 @@ mod tests {
             "Unexpected arguments for /skills: show help. Use /skills, /skills list, /skills install <path>, or /skills help."
         ));
         assert!(skills_error.contains("  Usage            /skills [list|install <path>|help]"));
+    }
+
+    #[test]
+    fn accepts_skills_invocation_arguments_for_prompt_dispatch() {
+        assert_eq!(
+            SlashCommand::parse("/skills help overview"),
+            Ok(Some(SlashCommand::Skills {
+                args: Some("help overview".to_string()),
+            }))
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("help overview")),
+            SkillSlashDispatch::Invoke("$help overview".to_string())
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("/test")),
+            SkillSlashDispatch::Invoke("$test".to_string())
+        );
+        assert_eq!(
+            classify_skills_slash_command(Some("install ./skill-pack")),
+            SkillSlashDispatch::Local
+        );
     }
 
     #[test]
