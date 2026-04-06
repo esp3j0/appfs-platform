@@ -2,6 +2,8 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 const GIT_BASH_ENV_VARS: [&str; 2] = ["CLAW_CODE_GIT_BASH_PATH", "CLAUDE_CODE_GIT_BASH_PATH"];
@@ -76,6 +78,31 @@ fn is_bash_script(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+}
+
+#[cfg(test)]
+pub(crate) fn windows_bash_smoke_ok() -> bool {
+    #[cfg(windows)]
+    {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            let Ok(shell) = resolve_windows_bash_shell_path() else {
+                return false;
+            };
+            Command::new(shell)
+                .args(["-lc", "printf ok"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                })
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 #[cfg(windows)]

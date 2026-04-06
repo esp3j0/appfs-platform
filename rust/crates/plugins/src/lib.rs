@@ -3257,6 +3257,9 @@ mod tests {
 
     #[test]
     fn plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins() {
+        if !crate::shell::windows_bash_smoke_ok() {
+            return;
+        }
         let config_home = temp_dir("lifecycle-home");
         let source_root = temp_dir("lifecycle-source");
         let _ = write_lifecycle_plugin(&source_root, "lifecycle-demo", "1.0.0");
@@ -3280,6 +3283,9 @@ mod tests {
 
     #[test]
     fn aggregates_and_executes_plugin_tools() {
+        if !crate::shell::windows_bash_smoke_ok() {
+            return;
+        }
         let config_home = temp_dir("tool-home");
         let source_root = temp_dir("tool-source");
         write_tool_plugin(&source_root, "tool-demo", "1.0.0");

@@ -91,6 +91,10 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 ];
 
 type AllowedToolSet = BTreeSet<String>;
+type RuntimePluginStateBuildOutput = (
+    Option<Arc<Mutex<RuntimeMcpState>>>,
+    Vec<RuntimeToolDefinition>,
+);
 
 fn main() {
     if let Err(error) = run() {
@@ -895,7 +899,6 @@ fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
         )),
     }
 }
-
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1715,7 +1718,6 @@ fn emit_login_browser_open_failure(
         CliOutputFormat::Json => writeln!(stderr, "Open this URL manually:\n{authorize_url}"),
     }
 }
-
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
     match output_format {
@@ -3033,13 +3035,7 @@ impl RuntimeMcpState {
 
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
-) -> Result<
-    (
-        Option<Arc<Mutex<RuntimeMcpState>>>,
-        Vec<RuntimeToolDefinition>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, Vec::new()));
     };
@@ -7137,16 +7133,13 @@ impl CliToolExecutor {
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) = self
-            .mcp_state
-            .as_ref()
-            .map(|state| {
+        let (pending_mcp_servers, mcp_degraded) =
+            self.mcp_state.as_ref().map_or((None, None), |state| {
                 let state = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (state.pending_servers(), state.degraded_report())
-            })
-            .unwrap_or((None, None));
+            });
         serde_json::to_string_pretty(&self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
@@ -7481,8 +7474,9 @@ mod tests {
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig,
+        PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -7720,6 +7714,33 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     fn python_command_and_args() -> (String, Vec<String>) {
@@ -8163,6 +8184,12 @@ mod tests {
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
+            CliAction::Doctor {
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -9959,6 +9986,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         let config_home = temp_dir();
         let workspace = temp_dir();
@@ -10152,6 +10180,9 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let config_home = temp_dir();
         // Inject a dummy API key so runtime construction succeeds without real credentials.
         // This test only exercises plugin lifecycle (init/shutdown), never calls the API.

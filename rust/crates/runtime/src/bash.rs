@@ -294,6 +294,31 @@ mod tests {
     use super::{execute_bash, BashCommandInput};
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows, test_env_lock};
+    #[cfg(windows)]
+    use std::process::Command;
+    #[cfg(windows)]
+    use std::sync::OnceLock;
+
+    #[cfg(windows)]
+    fn windows_bash_smoke_ok() -> bool {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            let _guard = test_env_lock();
+            if set_shell_if_windows().is_err() {
+                return false;
+            }
+            let Ok(shell_path) = bash_shell_path() else {
+                return false;
+            };
+            Command::new(shell_path)
+                .args(["-lc", "printf ok"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                })
+        })
+    }
 
     fn success_command() -> String {
         String::from("printf 'hello'")
@@ -303,6 +328,10 @@ mod tests {
 
     #[test]
     fn executes_simple_command() {
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         #[cfg(windows)]
         let _guard = test_env_lock();
         #[cfg(windows)]
@@ -344,6 +373,10 @@ mod tests {
 
     #[test]
     fn disables_sandbox_when_requested() {
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         #[cfg(windows)]
         let _guard = test_env_lock();
         #[cfg(windows)]
