@@ -1,14 +1,43 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::task_registry::{TaskRegistry, TaskStatus};
 use runtime::{
-    validate_packet, ConfigLoader, HookRunner, LaneEvent, LaneEventBlocker, LaneFailureClass,
-    RuntimeHookConfig, TaskPacket, WorkerEventKind, WorkerFailureKind, WorkerRegistry,
-    WorkerStatus,
+    bash_shell_path, set_shell_if_windows, validate_packet, ConfigLoader, HookRunner, LaneEvent,
+    LaneEventBlocker, LaneFailureClass, RuntimeHookConfig, TaskPacket, WorkerEventKind,
+    WorkerFailureKind, WorkerRegistry, WorkerStatus,
 };
 use serde_json::json;
+
+fn windows_bash_smoke_ok() -> bool {
+    #[cfg(windows)]
+    {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            if set_shell_if_windows().is_err() {
+                return false;
+            }
+            let Ok(shell_path) = bash_shell_path() else {
+                return false;
+            };
+            Command::new(shell_path)
+                .args(["-lc", "printf ok"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                })
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 struct TestDir {
     path: PathBuf,
@@ -124,6 +153,9 @@ fn lane_event_emission_serializes_worker_prompt_delivery_failure() {
 
 #[test]
 fn hook_merge_runs_loaded_config_hooks_and_overlay_once_each() {
+    if !windows_bash_smoke_ok() {
+        return;
+    }
     let temp = TestDir::new("runtime-hooks-integration");
     let cwd = temp.path().join("project");
     let home = temp.path().join("home").join(".claw");

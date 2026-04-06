@@ -717,6 +717,10 @@ enum CommandExecution {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::process::Command;
+    #[cfg(windows)]
+    use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;
 
@@ -726,6 +730,8 @@ mod tests {
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
+    #[cfg(windows)]
+    use crate::{bash_shell_path, set_shell_if_windows};
 
     struct RecordingReporter {
         events: Vec<HookProgressEvent>,
@@ -737,8 +743,38 @@ mod tests {
         }
     }
 
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_echo("pre ok")],
             Vec::new(),
@@ -752,6 +788,9 @@ mod tests {
 
     #[test]
     fn denies_exit_code_two() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_echo_and_exit("blocked by hook", 2)],
             Vec::new(),
@@ -788,6 +827,9 @@ mod tests {
 
     #[test]
     fn parses_pre_hook_permission_override_and_updated_input() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet(
                 r#"printf '%s' '{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}'"#,
@@ -809,6 +851,9 @@ mod tests {
 
     #[test]
     fn runs_post_tool_use_failure_hooks() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
             Vec::new(),
@@ -855,6 +900,9 @@ mod tests {
 
     #[test]
     fn executes_hooks_in_configured_order() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![
