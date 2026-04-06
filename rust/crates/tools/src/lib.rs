@@ -5011,18 +5011,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Some(path) = resolve_command_path("pwsh") {
+        Ok(path.display().to_string())
+    } else if let Some(path) = resolve_command_path("powershell") {
+        Ok(path.display().to_string())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -5032,37 +5032,43 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
+    resolve_command_path(command).is_some()
+}
+
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
     let command_path = Path::new(command);
     if command_path.components().count() > 1 || command_path.is_absolute() {
-        return command_path.exists();
+        return command_path.exists().then(|| command_path.to_path_buf());
     }
 
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| executable_exists_in_dir(&dir, command))
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| executable_path_in_dir(&dir, command))
     })
 }
 
 #[cfg(windows)]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
+fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
     let candidate = dir.join(command);
     if candidate.exists() {
-        return true;
+        return Some(candidate);
     }
 
     if Path::new(command).extension().is_some() {
-        return false;
+        return None;
     }
 
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
     pathext
         .split(';')
         .filter(|ext| !ext.is_empty())
-        .any(|ext| dir.join(format!("{command}{ext}")).exists())
+        .map(|ext| dir.join(format!("{command}{ext}")))
+        .find(|candidate| candidate.exists())
 }
 
 #[cfg(not(windows))]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
-    dir.join(command).exists()
+fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
+    let candidate = dir.join(command);
+    candidate.exists().then_some(candidate)
 }
 
 #[allow(clippy::too_many_lines)]

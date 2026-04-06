@@ -9,6 +9,7 @@ use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     ScopedMcpServerConfig, Session,
 };
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -47,6 +48,12 @@ pub struct SlashCommandSpec {
     pub summary: &'static str,
     pub argument_hint: Option<&'static str>,
     pub resume_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillSlashDispatch {
+    Local,
+    Invoke(String),
 }
 
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
@@ -1685,13 +1692,7 @@ fn parse_skills_args(args: Option<&str>) -> Result<Option<String>, SlashCommandP
         }
     }
 
-    Err(command_error(
-        &format!(
-            "Unexpected arguments for /skills: {args}. Use /skills, /skills list, /skills install <path>, or /skills help."
-        ),
-        "skills",
-        "/skills [list|install <path>|help]",
-    ))
+    Ok(Some(args.to_string()))
 }
 
 fn usage_error(command: &str, argument_hint: &str) -> SlashCommandParseError {
@@ -2182,6 +2183,14 @@ pub fn handle_mcp_slash_command(
     render_mcp_report_for(&loader, cwd, args)
 }
 
+pub fn handle_mcp_slash_command_json(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<Value, runtime::ConfigError> {
+    let loader = ConfigLoader::default_for(cwd);
+    render_mcp_report_json_for(&loader, cwd, args)
+}
+
 pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
     match normalize_optional_args(args) {
         None | Some("list") => {
@@ -2262,8 +2271,7 @@ pub fn resolve_skill_invocation(
             .unwrap_or_default();
         if !skill_token.is_empty() {
             if let Err(error) = resolve_skill_path(cwd, skill_token) {
-                let mut message =
-                    format!("Unknown skill: {skill_token} ({error})");
+                let mut message = format!("Unknown skill: {skill_token} ({error})");
                 let roots = discover_skill_roots(cwd);
                 if let Ok(available) = load_skills_from_roots(&roots) {
                     let names: Vec<String> = available
@@ -2272,15 +2280,10 @@ pub fn resolve_skill_invocation(
                         .map(|s| s.name.clone())
                         .collect();
                     if !names.is_empty() {
-                        message.push_str(&format!(
-                            "\n  Available skills: {}",
-                            names.join(", ")
-                        ));
+                        message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
                     }
                 }
-                message.push_str(
-                    "\n  Usage: /skills [list|install <path>|help|<skill> [args]]",
-                );
+                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
                 return Err(message);
             }
         }
@@ -2365,6 +2368,16 @@ fn render_mcp_report_for(
     cwd: &Path,
     args: Option<&str>,
 ) -> Result<String, runtime::ConfigError> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_mcp_usage(None),
+                ["show", ..] => render_mcp_usage(Some("show")),
+                _ => render_mcp_usage(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
@@ -2373,7 +2386,7 @@ fn render_mcp_report_for(
                 runtime_config.mcp().servers(),
             ))
         }
-        Some("-h" | "--help" | "help") => Ok(render_mcp_usage(None)),
+        Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
         Some("show") => Ok(render_mcp_usage(Some("show"))),
         Some(args) if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
@@ -2392,6 +2405,51 @@ fn render_mcp_report_for(
             ))
         }
         Some(args) => Ok(render_mcp_usage(Some(args))),
+    }
+}
+
+fn render_mcp_report_json_for(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<Value, runtime::ConfigError> {
+    if let Some(args) = normalize_optional_args(args) {
+        if let Some(help_path) = help_path_from_args(args) {
+            return Ok(match help_path.as_slice() {
+                [] => render_mcp_usage_json(None),
+                ["show", ..] => render_mcp_usage_json(Some("show")),
+                _ => render_mcp_usage_json(Some(&help_path.join(" "))),
+            });
+        }
+    }
+
+    match normalize_optional_args(args) {
+        None | Some("list") => {
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_summary_report_json(
+                cwd,
+                runtime_config.mcp().servers(),
+            ))
+        }
+        Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
+        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
+        Some(args) if args.split_whitespace().next() == Some("show") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let Some(server_name) = parts.next() else {
+                return Ok(render_mcp_usage_json(Some("show")));
+            };
+            if parts.next().is_some() {
+                return Ok(render_mcp_usage_json(Some(args)));
+            }
+            let runtime_config = loader.load()?;
+            Ok(render_mcp_server_report_json(
+                cwd,
+                server_name,
+                runtime_config.mcp().get(server_name),
+            ))
+        }
+        Some(args) => Ok(render_mcp_usage_json(Some(args))),
     }
 }
 
@@ -3103,6 +3161,23 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     lines.join("\n").trim_end().to_string()
 }
 
+fn render_skills_report_json(skills: &[SkillSummary]) -> Value {
+    let active = skills
+        .iter()
+        .filter(|skill| skill.shadowed_by.is_none())
+        .count();
+    json!({
+        "kind": "skills",
+        "action": "list",
+        "summary": {
+            "total": skills.len(),
+            "active": active,
+            "shadowed": skills.len().saturating_sub(active),
+        },
+        "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
+    })
+}
+
 fn render_skill_install_report(skill: &InstalledSkill) -> String {
     let mut lines = vec![
         "Skills".to_string(),
@@ -3122,6 +3197,20 @@ fn render_skill_install_report(skill: &InstalledSkill) -> String {
         skill.installed_path.display()
     ));
     lines.join("\n")
+}
+
+fn render_skill_install_report_json(skill: &InstalledSkill) -> Value {
+    json!({
+        "kind": "skills",
+        "action": "install",
+        "result": "installed",
+        "invocation_name": &skill.invocation_name,
+        "invoke_as": format!("${}", skill.invocation_name),
+        "display_name": &skill.display_name,
+        "source": skill.source.display().to_string(),
+        "registry_root": skill.registry_root.display().to_string(),
+        "installed_path": skill.installed_path.display().to_string(),
+    })
 }
 
 fn render_mcp_summary_report(
@@ -3149,6 +3238,22 @@ fn render_mcp_summary_report(
     }
 
     lines.join("\n")
+}
+
+fn render_mcp_summary_report_json(
+    cwd: &Path,
+    servers: &BTreeMap<String, ScopedMcpServerConfig>,
+) -> Value {
+    json!({
+        "kind": "mcp",
+        "action": "list",
+        "working_directory": cwd.display().to_string(),
+        "configured_servers": servers.len(),
+        "servers": servers
+            .iter()
+            .map(|(name, server)| mcp_server_json(name, server))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn render_mcp_server_report(
@@ -3229,8 +3334,42 @@ fn render_mcp_server_report(
 
     lines.join("\n")
 }
+
+fn render_mcp_server_report_json(
+    cwd: &Path,
+    server_name: &str,
+    server: Option<&ScopedMcpServerConfig>,
+) -> Value {
+    match server {
+        Some(server) => json!({
+            "kind": "mcp",
+            "action": "show",
+            "working_directory": cwd.display().to_string(),
+            "found": true,
+            "server": mcp_server_json(server_name, server),
+        }),
+        None => json!({
+            "kind": "mcp",
+            "action": "show",
+            "working_directory": cwd.display().to_string(),
+            "found": false,
+            "server_name": server_name,
+            "message": format!("server `{server_name}` is not configured"),
+        }),
+    }
+}
 fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
     args.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    matches!(arg, "help" | "-h" | "--help")
+}
+
+fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    let help_index = parts.iter().position(|part| is_help_arg(part))?;
+    Some(parts[..help_index].to_vec())
 }
 
 fn render_agents_usage(unexpected: Option<&str>) -> String {
@@ -3273,6 +3412,25 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
     lines.join("\n")
 }
 
+fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
+    json!({
+        "kind": "skills",
+        "action": "help",
+        "usage": {
+            "slash_command": "/skills [list|install <path>|help]",
+            "direct_cli": "claw skills [list|install <path>|help]",
+            "install_root": "$CODEX_HOME/skills or ~/.codex/skills",
+            "sources": [
+                ".codex/skills",
+                ".claude/skills",
+                "legacy /commands",
+                "legacy fallback dirs still load automatically",
+            ],
+        },
+        "unexpected": unexpected,
+    })
+}
+
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
@@ -3284,6 +3442,19 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
         lines.push(format!("  Unexpected       {args}"));
     }
     lines.join("\n")
+}
+
+fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
+    json!({
+        "kind": "mcp",
+        "action": "help",
+        "usage": {
+            "slash_command": "/mcp [list|show <server>|help]",
+            "direct_cli": "claw mcp [list|show <server>|help]",
+            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+        },
+        "unexpected": unexpected,
+    })
 }
 
 fn config_source_label(source: ConfigSource) -> &'static str {
@@ -3364,15 +3535,9 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectClaw
-        | DefinitionSource::ProjectCodex
-        | DefinitionSource::ProjectClaude => "project_claw",
-        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
-            "user_claw_config_home"
-        }
-        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
-            "user_claw"
-        }
+        DefinitionSource::ProjectCodex | DefinitionSource::ProjectClaude => "project_claw",
+        DefinitionSource::UserCodexHome => "user_claw_config_home",
+        DefinitionSource::UserCodex | DefinitionSource::UserClaude => "user_claw",
     }
 }
 
@@ -3602,13 +3767,14 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_agents_slash_command_json, handle_plugins_slash_command,
-        handle_skills_slash_command_json, handle_slash_command, load_agents_from_roots,
-        load_skills_from_roots, render_agents_report, render_agents_report_json,
-        render_mcp_report_json_for, render_plugins_report, render_skills_report,
+        classify_skills_slash_command, handle_agents_slash_command_json,
+        handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
+        load_agents_from_roots, load_skills_from_roots, render_agents_report,
+        render_agents_report_json, render_plugins_report, render_skills_report,
         render_slash_command_help, render_slash_command_help_detail,
         resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
-        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SlashCommand,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -3959,7 +4125,7 @@ mod tests {
     fn rejects_invalid_agents_and_skills_arguments() {
         // given
         let agents_input = "/agents show planner";
-        let skills_input = "/skills show help";
+        let skills_input = "/skills install";
 
         // when
         let agents_error = parse_error_message(agents_input);
@@ -3970,10 +4136,8 @@ mod tests {
             "Unexpected arguments for /agents: show planner. Use /agents, /agents list, or /agents help."
         ));
         assert!(agents_error.contains("  Usage            /agents [list|help]"));
-        assert!(skills_error.contains(
-            "Unexpected arguments for /skills: show help. Use /skills, /skills list, /skills install <path>, or /skills help."
-        ));
-        assert!(skills_error.contains("  Usage            /skills [list|install <path>|help]"));
+        assert!(skills_error.contains("Usage: /skills install <path>"));
+        assert!(skills_error.contains("  Usage            /skills install <path>"));
     }
 
     #[test]
