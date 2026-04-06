@@ -292,16 +292,25 @@ impl BashEnvCommand for TokioCommand {
 #[cfg(test)]
 mod tests {
     use super::{execute_bash, BashCommandInput};
+    #[cfg(windows)]
+    use crate::{bash_shell_path, set_shell_if_windows, test_env_lock};
 
     fn success_command() -> String {
         String::from("printf 'hello'")
     }
 
+    const TEST_TIMEOUT_MS: u64 = 5_000;
+
     #[test]
     fn executes_simple_command() {
+        #[cfg(windows)]
+        let _guard = test_env_lock();
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
         let output = execute_bash(BashCommandInput {
             command: success_command(),
-            timeout: Some(1_000),
+            timeout: Some(TEST_TIMEOUT_MS),
             description: None,
             run_in_background: Some(false),
             // Keep the basic execution smoke test independent from sandbox
@@ -314,16 +323,37 @@ mod tests {
         })
         .expect("bash command should execute");
 
-        assert_eq!(output.stdout.trim(), "hello");
+        #[cfg(windows)]
+        let shell_path = bash_shell_path()
+            .expect("resolve shell")
+            .display()
+            .to_string();
+        #[cfg(not(windows))]
+        let shell_path = String::from("sh");
+
+        assert_eq!(
+            output.stdout.trim(),
+            "hello",
+            "shell={shell_path} stderr={:?} cwd={}",
+            output.stderr,
+            std::env::current_dir()
+                .expect("cwd")
+                .display()
+        );
         assert!(!output.interrupted);
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
     }
 
     #[test]
     fn disables_sandbox_when_requested() {
+        #[cfg(windows)]
+        let _guard = test_env_lock();
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
         let output = execute_bash(BashCommandInput {
             command: success_command(),
-            timeout: Some(1_000),
+            timeout: Some(TEST_TIMEOUT_MS),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
