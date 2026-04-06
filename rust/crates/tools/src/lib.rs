@@ -12,7 +12,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
+    grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -23,10 +24,10 @@ use runtime::{
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass,
-    McpDegradedReport, MessageRole, OAuthConfig, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind,
-    Session, TaskPacket, TokenUsage, ToolError, ToolExecutor,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -366,8 +367,20 @@ impl GlobalToolRegistry {
     }
 }
 
+pub fn strip_tool_call_prefix(value: &str) -> &str {
+    let trimmed = value.trim();
+    if let Some((prefix, rest)) = trimmed.split_once('>') {
+        if prefix.starts_with('<') && !rest.trim().is_empty() {
+            return rest.trim();
+        }
+    }
+    trimmed
+}
+
 fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+    strip_tool_call_prefix(value)
+        .replace('-', "_")
+        .to_ascii_lowercase()
 }
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
@@ -1705,7 +1718,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
                 "method": method,
                 "status_code": status,
                 "body": truncated_body,
-                "success": status >= 200 && status < 300
+                "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
@@ -2366,6 +2379,8 @@ struct AgentOutput {
     lane_events: Vec<LaneEvent>,
     #[serde(rename = "currentBlocker", skip_serializing_if = "Option::is_none")]
     current_blocker: Option<LaneEventBlocker>,
+    #[serde(rename = "derivedState")]
+    derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -2971,47 +2986,264 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    match commands::resolve_skill_path(&cwd, skill) {
+        Ok(path) => Ok(path),
+        Err(_) => resolve_skill_path_from_compat_roots(skill),
+    }
+}
+
+fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBuf, String> {
     let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
     if requested.is_empty() {
         return Err(String::from("skill must not be empty"));
     }
 
-    let mut candidates = Vec::new();
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
+    for root in skill_lookup_roots() {
+        if let Some(path) = resolve_skill_path_in_root(&root, requested) {
+            return Ok(path);
         }
     }
 
     Err(format!("unknown skill: {requested}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillLookupOrigin {
+    SkillsDir,
+    LegacyCommandsDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillLookupRoot {
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+}
+
+fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
+    let mut roots = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        push_project_skill_lookup_roots(&mut roots, &cwd);
+    }
+
+    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+    }
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
+    }
+    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills").join("omc-learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("commands"),
+            SkillLookupOrigin::LegacyCommandsDir,
+        );
+    }
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.claw/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.codex/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+
+    roots
+}
+
+fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
+    for ancestor in cwd.ancestors() {
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
+    }
+}
+
+fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
+    push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
+    push_skill_lookup_root(
+        roots,
+        home.join(".agents").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".config").join("opencode").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".claude").join("skills").join("omc-learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
+}
+
+fn push_prefixed_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, prefix: &std::path::Path) {
+    push_skill_lookup_root(roots, prefix.join("skills"), SkillLookupOrigin::SkillsDir);
+    push_skill_lookup_root(
+        roots,
+        prefix.join("commands"),
+        SkillLookupOrigin::LegacyCommandsDir,
+    );
+}
+
+fn push_skill_lookup_root(
+    roots: &mut Vec<SkillLookupRoot>,
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+) {
+    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
+        roots.push(SkillLookupRoot { path, origin });
+    }
+}
+
+fn resolve_skill_path_in_root(
+    root: &SkillLookupRoot,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    match root.origin {
+        SkillLookupOrigin::SkillsDir => resolve_skill_path_in_skills_dir(&root.path, requested),
+        SkillLookupOrigin::LegacyCommandsDir => {
+            resolve_skill_path_in_legacy_commands_dir(&root.path, requested)
+        }
+    }
+}
+
+fn resolve_skill_path_in_skills_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct = root.join(requested).join("SKILL.md");
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let skill_path = entry.path().join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(requested)
+            || skill_frontmatter_name_matches(&skill_path, requested)
+        {
+            return Some(skill_path);
+        }
+    }
+
+    None
+}
+
+fn resolve_skill_path_in_legacy_commands_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct_dir = root.join(requested).join("SKILL.md");
+    if direct_dir.is_file() {
+        return Some(direct_dir);
+    }
+
+    let direct_markdown = root.join(format!("{requested}.md"));
+    if direct_markdown.is_file() {
+        return Some(direct_markdown);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate_path = if path.is_dir() {
+            let skill_path = path.join("SKILL.md");
+            if !skill_path.is_file() {
+                continue;
+            }
+            skill_path
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+        {
+            path
+        } else {
+            continue;
+        };
+
+        let matches_entry_name = candidate_path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .trim_end_matches(".md")
+                .eq_ignore_ascii_case(requested);
+        if matches_entry_name || skill_frontmatter_name_matches(&candidate_path, requested) {
+            return Some(candidate_path);
+        }
+    }
+
+    None
+}
+
+fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_skill_name(&contents))
+        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+}
+
+fn parse_skill_name(contents: &str) -> Option<String> {
+    parse_skill_frontmatter_value(contents, "name")
+}
+
+fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
+            let value = value
+                .trim()
+                .trim_matches(|ch| matches!(ch, '"' | '\''))
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3081,6 +3313,7 @@ where
         completed_at: None,
         lane_events: vec![LaneEvent::started(iso8601_now())],
         current_blocker: None,
+        derived_state: String::from("working"),
         error: None,
     };
     write_agent_manifest(&manifest)?;
@@ -3278,9 +3511,11 @@ fn agent_permission_policy() -> PermissionPolicy {
 }
 
 fn write_agent_manifest(manifest: &AgentOutput) -> Result<(), String> {
+    let mut normalized = manifest.clone();
+    normalized.lane_events = dedupe_superseded_commit_events(&normalized.lane_events);
     std::fs::write(
-        &manifest.manifest_file,
-        serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?,
+        &normalized.manifest_file,
+        serde_json::to_string_pretty(&normalized).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -3299,7 +3534,9 @@ fn persist_agent_terminal_state(
     let mut next_manifest = manifest.clone();
     next_manifest.status = status.to_string();
     next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker = blocker.clone();
+    next_manifest.current_blocker.clone_from(&blocker);
+    next_manifest.derived_state =
+        derive_agent_state(status, result, error.as_deref(), blocker.as_ref()).to_string();
     next_manifest.error = error;
     if let Some(blocker) = blocker {
         next_manifest
@@ -3316,8 +3553,90 @@ fn persist_agent_terminal_state(
         next_manifest
             .lane_events
             .push(LaneEvent::finished(iso8601_now(), compressed_detail));
+        if let Some(provenance) = maybe_commit_provenance(result) {
+            next_manifest.lane_events.push(LaneEvent::commit_created(
+                iso8601_now(),
+                Some(format!("commit {}", provenance.commit)),
+                provenance,
+            ));
+        }
     }
     write_agent_manifest(&next_manifest)
+}
+
+fn derive_agent_state(
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+    blocker: Option<&LaneEventBlocker>,
+) -> &'static str {
+    let normalized_status = status.trim().to_ascii_lowercase();
+    let normalized_error = error.unwrap_or_default().to_ascii_lowercase();
+
+    if normalized_status == "running" {
+        return "working";
+    }
+    if normalized_status == "completed" {
+        return if result.is_some_and(|value| !value.trim().is_empty()) {
+            "finished_cleanable"
+        } else {
+            "finished_pending_report"
+        };
+    }
+    if normalized_error.contains("background") {
+        return "blocked_background_job";
+    }
+    if normalized_error.contains("merge conflict") || normalized_error.contains("cherry-pick") {
+        return "blocked_merge_conflict";
+    }
+    if normalized_error.contains("mcp") {
+        return "degraded_mcp";
+    }
+    if normalized_error.contains("transport")
+        || normalized_error.contains("broken pipe")
+        || normalized_error.contains("connection")
+        || normalized_error.contains("interrupted")
+    {
+        return "interrupted_transport";
+    }
+    if blocker.is_some() {
+        return "truly_idle";
+    }
+    "truly_idle"
+}
+
+fn maybe_commit_provenance(result: Option<&str>) -> Option<LaneCommitProvenance> {
+    let commit = extract_commit_sha(result?)?;
+    let branch = current_git_branch().unwrap_or_else(|| "unknown".to_string());
+    let worktree = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    Some(LaneCommitProvenance {
+        commit: commit.clone(),
+        branch,
+        worktree,
+        canonical_commit: Some(commit.clone()),
+        superseded_by: None,
+        lineage: vec![commit],
+    })
+}
+
+fn extract_commit_sha(result: &str) -> Option<String> {
+    result
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|token| token.len() >= 7 && token.len() <= 40)
+        .map(str::to_string)
+}
+
+fn current_git_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn append_agent_output(path: &str, suffix: &str) -> Result<(), String> {
@@ -4782,18 +5101,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Some(path) = resolve_command_path("pwsh") {
+        Ok(path.display().to_string())
+    } else if let Some(path) = resolve_command_path("powershell") {
+        Ok(path.display().to_string())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -4803,37 +5122,43 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
+    resolve_command_path(command).is_some()
+}
+
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
     let command_path = Path::new(command);
     if command_path.components().count() > 1 || command_path.is_absolute() {
-        return command_path.exists();
+        return command_path.exists().then(|| command_path.to_path_buf());
     }
 
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| executable_exists_in_dir(&dir, command))
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| executable_path_in_dir(&dir, command))
     })
 }
 
 #[cfg(windows)]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
+fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
     let candidate = dir.join(command);
     if candidate.exists() {
-        return true;
+        return Some(candidate);
     }
 
     if Path::new(command).extension().is_some() {
-        return false;
+        return None;
     }
 
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
     pathext
         .split(';')
         .filter(|ext| !ext.is_empty())
-        .any(|ext| dir.join(format!("{command}{ext}")).exists())
+        .map(|ext| dir.join(format!("{command}{ext}")))
+        .find(|candidate| candidate.exists())
 }
 
 #[cfg(not(windows))]
-fn executable_exists_in_dir(dir: &Path, command: &str) -> bool {
-    dir.join(command).exists()
+fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
+    let candidate = dir.join(command);
+    candidate.exists().then_some(candidate)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5042,21 +5367,49 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        detect_powershell_shell, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
-        push_output_block, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
-        LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        derive_agent_state, detect_powershell_shell, execute_agent_with_spawn, execute_tool,
+        final_assistant_text, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        bash_shell_path, permission_enforcer::PermissionEnforcer, set_shell_if_windows, ApiRequest,
+        AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError,
+        Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -5932,6 +6285,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
             .lock()
@@ -5951,7 +6305,7 @@ mod tests {
                 persist_agent_terminal_state(
                     &job.manifest,
                     "completed",
-                    Some("Finished successfully"),
+                    Some("Finished successfully in commit abc1234"),
                     None,
                 )
             },
@@ -5974,7 +6328,19 @@ mod tests {
             completed_manifest_json["laneEvents"][1]["event"],
             "lane.finished"
         );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["event"],
+            "lane.commit.created"
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][2]["data"]["commit"],
+            "abc1234"
+        );
         assert!(completed_manifest_json["currentBlocker"].is_null());
+        assert_eq!(
+            completed_manifest_json["derivedState"],
+            "finished_cleanable"
+        );
 
         let failed = execute_agent_with_spawn(
             AgentInput {
@@ -6021,6 +6387,7 @@ mod tests {
             failed_manifest_json["laneEvents"][2]["failureClass"],
             "tool_runtime"
         );
+        assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {
@@ -6054,11 +6421,59 @@ mod tests {
             spawn_error_manifest_json["currentBlocker"]["failureClass"],
             "infra"
         );
+        assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
 
         std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn agent_state_classification_covers_finished_and_specific_blockers() {
+        assert_eq!(derive_agent_state("running", None, None, None), "working");
+        assert_eq!(
+            derive_agent_state("completed", Some("done"), None, None),
+            "finished_cleanable"
+        );
+        assert_eq!(
+            derive_agent_state("completed", None, None, None),
+            "finished_pending_report"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("mcp handshake timed out"), None),
+            "degraded_mcp"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("background terminal still running"),
+                None
+            ),
+            "blocked_background_job"
+        );
+        assert_eq!(
+            derive_agent_state("failed", None, Some("merge conflict while rebasing"), None),
+            "blocked_merge_conflict"
+        );
+        assert_eq!(
+            derive_agent_state(
+                "failed",
+                None,
+                Some("transport interrupted after partial progress"),
+                None
+            ),
+            "interrupted_transport"
+        );
+    }
+
+    #[test]
+    fn commit_provenance_is_extracted_from_agent_results() {
+        let provenance = maybe_commit_provenance(Some("landed as commit deadbee with clean push"))
+            .expect("commit provenance");
+        assert_eq!(provenance.commit, "deadbee");
+        assert_eq!(provenance.canonical_commit.as_deref(), Some("deadbee"));
+        assert_eq!(provenance.lineage, vec!["deadbee".to_string()]);
+    }
     #[test]
     fn lane_failure_taxonomy_normalizes_common_blockers() {
         let cases = [
@@ -6375,6 +6790,9 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let success = execute_tool("bash", &json!({ "command": bash_echo_command() }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
@@ -7250,6 +7668,9 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn given_no_enforcer_when_bash_then_executes_normally() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -149,6 +149,8 @@ async fn handle_connection(
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
 
+    let response = build_http_response(&path, &request, scenario);
+
     requests.lock().await.push(CapturedRequest {
         method,
         path,
@@ -158,7 +160,6 @@ async fn handle_connection(
         raw_body,
     });
 
-    let response = build_http_response(&request, scenario);
     socket.write_all(response.as_bytes()).await?;
     Ok(())
 }
@@ -308,7 +309,19 @@ fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> Strin
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
+fn build_http_response(path: &str, request: &MessageRequest, scenario: Scenario) -> String {
+    if path == "/v1/messages/count_tokens" {
+        return http_response(
+            "200 OK",
+            "application/json",
+            &serde_json::to_string(&json!({
+                "input_tokens": count_tokens_for_scenario(scenario),
+            }))
+            .expect("count tokens response should serialize"),
+            &[("request-id", request_id_for(scenario))],
+        );
+    }
+
     let response = if request.stream {
         let body = build_stream_body(request, scenario);
         return http_response(
@@ -327,6 +340,14 @@ fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
         &serde_json::to_string(&response).expect("message response should serialize"),
         &[("request-id", request_id_for(scenario))],
     )
+}
+
+fn count_tokens_for_scenario(scenario: Scenario) -> u32 {
+    match scenario {
+        Scenario::AutoCompactTriggered => 50_000,
+        Scenario::TokenCostReporting => 1_000,
+        _ => 10,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
