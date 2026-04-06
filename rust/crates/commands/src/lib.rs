@@ -3401,8 +3401,9 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|install <path>|help]".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help]".to_string(),
+        "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CODEX_HOME/skills or ~/.codex/skills".to_string(),
         "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
     ];
@@ -3417,8 +3418,9 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "skills",
         "action": "help",
         "usage": {
-            "slash_command": "/skills [list|install <path>|help]",
-            "direct_cli": "claw skills [list|install <path>|help]",
+            "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "invoke": "/skills help overview -> $help overview",
             "install_root": "$CODEX_HOME/skills or ~/.codex/skills",
             "sources": [
                 ".codex/skills",
@@ -3771,6 +3773,7 @@ mod tests {
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_plugins_report, render_skills_report,
+        resolve_skill_path,
         render_slash_command_help, render_slash_command_help_detail,
         resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
         validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
@@ -4160,6 +4163,79 @@ mod tests {
             classify_skills_slash_command(Some("install ./skill-pack")),
             SkillSlashDispatch::Local
         );
+    }
+
+    #[test]
+    fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
+        let workspace = temp_dir("resolve-project-skills");
+        let project_skills = workspace.join(".claw").join("skills");
+        let legacy_commands = workspace.join(".claw").join("commands");
+
+        write_skill(&project_skills, "plan", "Project planning guidance");
+        write_legacy_command(&legacy_commands, "handoff", "Legacy handoff guidance");
+
+        assert_eq!(
+            resolve_skill_path(&workspace, "$plan").expect("project skill should resolve"),
+            project_skills.join("plan").join("SKILL.md")
+        );
+        assert_eq!(
+            resolve_skill_path(&workspace, "/handoff").expect("legacy command should resolve"),
+            legacy_commands.join("handoff.md")
+        );
+    }
+
+    #[test]
+    fn renders_skills_reports_as_json() {
+        let workspace = temp_dir("skills-json-workspace");
+        let project_skills = workspace.join(".codex").join("skills");
+        let project_commands = workspace.join(".claude").join("commands");
+        let user_home = temp_dir("skills-json-home");
+        let user_skills = user_home.join(".codex").join("skills");
+
+        write_skill(&project_skills, "plan", "Project planning guidance");
+        write_legacy_command(&project_commands, "deploy", "Legacy deployment guidance");
+        write_skill(&user_skills, "plan", "User planning guidance");
+        write_skill(&user_skills, "help", "Help guidance");
+
+        let roots = vec![
+            SkillRoot {
+                source: DefinitionSource::ProjectCodex,
+                path: project_skills,
+                origin: SkillOrigin::SkillsDir,
+            },
+            SkillRoot {
+                source: DefinitionSource::ProjectClaude,
+                path: project_commands,
+                origin: SkillOrigin::LegacyCommandsDir,
+            },
+            SkillRoot {
+                source: DefinitionSource::UserCodex,
+                path: user_skills,
+                origin: SkillOrigin::SkillsDir,
+            },
+        ];
+        let report =
+            super::render_skills_report_json(&load_skills_from_roots(&roots).expect("skills should load"));
+        assert_eq!(report["kind"], "skills");
+        assert_eq!(report["action"], "list");
+        assert_eq!(report["summary"]["active"], 3);
+        assert_eq!(report["summary"]["shadowed"], 1);
+        assert_eq!(report["skills"][0]["name"], "plan");
+        assert_eq!(report["skills"][0]["source"]["id"], "project_claw");
+        assert_eq!(report["skills"][1]["name"], "deploy");
+        assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
+        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_claw");
+
+        let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
+        assert_eq!(help["kind"], "skills");
+        assert_eq!(help["action"], "help");
+        assert_eq!(
+            help["usage"]["direct_cli"],
+            "claw skills [list|install <path>|help|<skill> [args]]"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(user_home);
     }
 
     #[test]
@@ -4604,13 +4680,27 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help.contains("Usage            /skills [list|install <path>|help]"));
+        assert!(skills_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     $CODEX_HOME/skills or ~/.codex/skills"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
             super::handle_skills_slash_command(Some("show help"), &cwd).expect("skills usage");
-        assert!(skills_unexpected.contains("Unexpected       show help"));
+        assert!(skills_unexpected.contains("Unexpected       show"));
+
+        let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
+            .expect("nested skills help");
+        assert!(skills_install_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_install_help.contains("Unexpected       install"));
+
+        let skills_unknown_help =
+            super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
+        assert!(skills_unknown_help
+            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_unknown_help.contains("Unexpected       show"));
 
         let _ = fs::remove_dir_all(cwd);
     }
