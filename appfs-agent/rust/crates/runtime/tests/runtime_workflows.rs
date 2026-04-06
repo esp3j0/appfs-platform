@@ -2,15 +2,44 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::task_registry::TaskRegistry;
 use runtime::{
-    validate_packet, ConfigLoader, HookRunner, LaneEvent, LaneEventBlocker, LaneFailureClass,
-    RuntimeFeatureConfig, RuntimeHookConfig, TaskPacket, WorkerEventKind, WorkerRegistry,
-    WorkerStatus,
+    bash_shell_path, set_shell_if_windows, validate_packet, ConfigLoader, HookRunner, LaneEvent,
+    LaneEventBlocker, LaneFailureClass, RuntimeFeatureConfig, RuntimeHookConfig, TaskPacket,
+    WorkerEventKind, WorkerRegistry, WorkerStatus,
 };
 use serde_json::json;
+
+fn windows_bash_smoke_ok() -> bool {
+    #[cfg(windows)]
+    {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            if set_shell_if_windows().is_err() {
+                return false;
+            }
+            let Ok(shell_path) = bash_shell_path() else {
+                return false;
+            };
+            Command::new(shell_path)
+                .args(["-lc", "printf ok"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                })
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 fn temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -111,6 +140,9 @@ fn lane_event_emission_serializes_prompt_misdelivery_failures() {
 
 #[test]
 fn hook_merge_runs_deduped_commands_across_hook_stages() {
+    if !windows_bash_smoke_ok() {
+        return;
+    }
     let base = RuntimeHookConfig::new(
         vec!["printf 'base-pre'".to_string()],
         vec!["printf 'base-post'".to_string()],

@@ -2,6 +2,8 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 const GIT_BASH_ENV_VARS: [&str; 2] = ["CLAW_CODE_GIT_BASH_PATH", "CLAUDE_CODE_GIT_BASH_PATH"];
@@ -78,16 +80,41 @@ fn is_bash_script(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
 }
 
+#[cfg(test)]
+pub(crate) fn windows_bash_smoke_ok() -> bool {
+    #[cfg(windows)]
+    {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| {
+            let Ok(shell) = resolve_windows_bash_shell_path() else {
+                return false;
+            };
+            Command::new(shell)
+                .args(["-lc", "printf ok"])
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                })
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 #[cfg(windows)]
 fn resolve_windows_bash_shell_path() -> io::Result<PathBuf> {
-    if let Some(path) = resolve_supported_shell_from_env()? {
+    if let Some(path) = resolve_supported_shell_from_env() {
         return Ok(path);
     }
     find_git_bash_path()
 }
 
 #[cfg(windows)]
-fn resolve_supported_shell_from_env() -> io::Result<Option<PathBuf>> {
+fn resolve_supported_shell_from_env() -> Option<PathBuf> {
     for name in SHELL_OVERRIDE_ENV_VARS {
         if let Some(value) = env::var_os(name) {
             let candidate = PathBuf::from(value);
@@ -95,12 +122,12 @@ fn resolve_supported_shell_from_env() -> io::Result<Option<PathBuf>> {
                 continue;
             }
             if is_supported_shell_path(&candidate) {
-                return Ok(Some(candidate));
+                return Some(candidate);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(windows)]
