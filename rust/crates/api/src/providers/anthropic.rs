@@ -14,11 +14,10 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-<<<<<<< HEAD
-use super::{preflight_message_request, Provider, ProviderFuture};
-=======
-use super::{preflight_message_request, Provider, ProviderFuture};
->>>>>>> fa72cd6 (Block oversized requests before providers hard-fail)
+use super::{
+    model_token_limit, preflight_message_request as estimate_preflight_message_request,
+    resolve_model_alias, Provider, ProviderFuture,
+};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -298,7 +297,8 @@ impl AnthropicClient {
             }
         }
 
-        preflight_message_request(&request)?;
+        estimate_preflight_message_request(&request)?;
+        self.preflight_message_request(&request).await?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let mut response = response
@@ -342,7 +342,8 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        preflight_message_request(request)?;
+        estimate_preflight_message_request(request)?;
+        self.preflight_message_request(request).await?;
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;

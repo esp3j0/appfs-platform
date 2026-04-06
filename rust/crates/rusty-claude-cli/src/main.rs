@@ -7473,7 +7473,8 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
         GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, SlashCommand, StatusUsage,
+        DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
