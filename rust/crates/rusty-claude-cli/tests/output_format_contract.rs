@@ -259,6 +259,104 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(resumed["sandbox"]["filesystem_mode"].as_str().is_some());
 }
 
+#[test]
+fn resumed_inventory_commands_emit_structured_json_when_requested() {
+    let root = unique_temp_dir("resume-inventory-json");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        "{\"type\":\"session_meta\",\"version\":3,\"session_id\":\"resume-inventory-json\",\"created_at_ms\":0,\"updated_at_ms\":0}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"blocks\":[{\"type\":\"text\",\"text\":\"inventory\"}]}}\n",
+    )
+    .expect("session should write");
+
+    let mcp = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/mcp",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(mcp["kind"], "mcp");
+    assert_eq!(mcp["action"], "list");
+    assert!(mcp["servers"].is_array());
+
+    let skills = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/skills",
+        ],
+        &[
+            (
+                "CLAW_CONFIG_HOME",
+                config_home.to_str().expect("utf8 config home"),
+            ),
+            ("HOME", home.to_str().expect("utf8 home")),
+        ],
+    );
+    assert_eq!(skills["kind"], "skills");
+    assert_eq!(skills["action"], "list");
+    assert!(skills["summary"]["total"].is_number());
+    assert!(skills["skills"].is_array());
+}
+
+#[test]
+fn resumed_version_and_init_emit_structured_json_when_requested() {
+    let root = unique_temp_dir("resume-version-init-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        "{\"type\":\"session_meta\",\"version\":3,\"session_id\":\"resume-version-init-json\",\"created_at_ms\":0,\"updated_at_ms\":0}\n",
+    )
+    .expect("session should write");
+
+    let version = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/version",
+        ],
+    );
+    assert_eq!(version["kind"], "version");
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
+
+    let init = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "/init",
+        ],
+    );
+    assert_eq!(init["kind"], "init");
+    assert!(root.join("CLAUDE.md").exists());
+}
+
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
 }

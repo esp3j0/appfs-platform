@@ -118,7 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Mcp { args } => LiveCli::print_mcp(args.as_deref())?,
         CliAction::Skills { args } => LiveCli::print_skills(args.as_deref())?,
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
-        CliAction::Version => print_version(),
+        CliAction::Version { output_format } => print_version(output_format)?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -142,7 +142,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
-        CliAction::Init => run_init()?,
+        CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::BranchDelete => print_branch_delete_report()?,
         CliAction::Repl {
             model,
@@ -171,7 +171,9 @@ enum CliAction {
         cwd: PathBuf,
         date: String,
     },
-    Version,
+    Version {
+        output_format: CliOutputFormat,
+    },
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -196,7 +198,9 @@ enum CliAction {
     },
     Login,
     Logout,
-    Init,
+    Init {
+        output_format: CliOutputFormat,
+    },
     BranchDelete,
     Repl {
         model: String,
@@ -345,7 +349,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     if wants_version {
-        return Ok(CliAction::Version);
+        return Ok(CliAction::Version { output_format });
     }
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
@@ -386,7 +390,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "hook" => parse_hook_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
-        "init" => Ok(CliAction::Init),
+        "init" => Ok(CliAction::Init { output_format }),
         "branch" => parse_branch_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -424,7 +428,7 @@ fn parse_single_word_command_alias(
 
     match rest[0].as_str() {
         "help" => Some(Ok(CliAction::Help)),
-        "version" => Some(Ok(CliAction::Version)),
+        "version" => Some(Ok(CliAction::Version { output_format })),
         "status" => Some(Ok(CliAction::Status {
             model: model.to_string(),
             permission_mode: permission_mode_override.unwrap_or_else(default_permission_mode),
@@ -1594,8 +1598,24 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
     }
 }
 
-fn print_version() {
-    println!("{}", render_version_report());
+fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => println!("{}", render_version_report()),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&version_json_value())?);
+        }
+    }
+    Ok(())
+}
+
+fn version_json_value() -> serde_json::Value {
+    json!({
+        "kind": "version",
+        "message": render_version_report(),
+        "version": VERSION,
+        "git_sha": GIT_SHA,
+        "target": BUILD_TARGET,
+    })
 }
 
 fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
@@ -1645,33 +1665,21 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
+                json,
             }) => {
                 session = next_session;
-                if let Some(message) = message {
-                    if output_format == CliOutputFormat::Json
-                        && matches!(command, SlashCommand::Status)
-                    {
-                        let tracker = UsageTracker::from_session(&session);
-                        let context = status_context(Some(&resolved_path)).expect("status context");
-                        let value = status_json_value(
-                            "restored-session",
-                            StatusUsage {
-                                message_count: session.messages.len(),
-                                turns: tracker.turns(),
-                                latest: tracker.current_turn_usage(),
-                                cumulative: tracker.cumulative_usage(),
-                                estimated_tokens: 0,
-                            },
-                            default_permission_mode().as_str(),
-                            &context,
-                        );
+                if output_format == CliOutputFormat::Json {
+                    if let Some(value) = json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&value).expect("status json")
+                            serde_json::to_string_pretty(&value)
+                                .expect("resume command json output")
                         );
-                    } else {
+                    } else if let Some(message) = message {
                         println!("{message}");
                     }
+                } else if let Some(message) = message {
+                    println!("{message}");
                 }
             }
             Err(error) => {
@@ -1686,6 +1694,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
 struct ResumeCommandOutcome {
     session: Session,
     message: Option<String>,
+    json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -2198,6 +2207,7 @@ fn run_resume_command(
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_repl_help()),
+            json: None,
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -2214,6 +2224,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(format_compact_report(removed, kept, skipped)),
+                json: None,
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -2223,6 +2234,7 @@ fn run_resume_command(
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
+                    json: None,
                 });
             }
             let backup_path = write_session_clear_backup(session, session_path)?;
@@ -2238,11 +2250,13 @@ fn run_resume_command(
                     backup_path.display(),
                     session_path.display()
                 )),
+                json: None,
             })
         }
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
+            let context = status_context(Some(session_path))?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
@@ -2255,7 +2269,19 @@ fn run_resume_command(
                         estimated_tokens: 0,
                     },
                     default_permission_mode().as_str(),
-                    &status_context(Some(session_path))?,
+                    &context,
+                )),
+                json: Some(status_json_value(
+                    "restored-session",
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    &context,
                 )),
             })
         }
@@ -2263,12 +2289,11 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
+            let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_sandbox_report(&resolve_sandbox_status(
-                    runtime_config.sandbox(),
-                    &cwd,
-                ))),
+                message: Some(format_sandbox_report(&status)),
+                json: Some(sandbox_json_value(&status)),
             })
         }
         SlashCommand::Cost => {
@@ -2276,11 +2301,13 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_cost_report(usage)),
+                json: None,
             })
         }
         SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_config_report(section.as_deref())?),
+            json: None,
         }),
         SlashCommand::Mcp { action, target } => {
             let cwd = env::current_dir()?;
@@ -2293,25 +2320,33 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_memory_report()?),
+            json: None,
         }),
-        SlashCommand::Init => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(init_claude_md()?),
-        }),
+        SlashCommand::Init => {
+            let message = init_claude_md()?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message.clone()),
+                json: Some(init_json_value(&message)),
+            })
+        }
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_diff_report_for(
                 session_path.parent().unwrap_or_else(|| Path::new(".")),
             )?),
+            json: None,
         }),
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
+            json: Some(version_json_value()),
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
@@ -2323,6 +2358,7 @@ fn run_resume_command(
                     export_path.display(),
                     session.messages.len(),
                 )),
+                json: None,
             })
         }
         SlashCommand::Agents { args } => {
@@ -2330,6 +2366,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
+                json: None,
             })
         }
         SlashCommand::Skills { args } => {
@@ -2337,8 +2374,14 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(handle_skills_slash_command(args.as_deref(), &cwd)?),
+                json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::Doctor => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_doctor_report()?.render()),
+            json: None,
+        }),
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -2352,7 +2395,6 @@ fn run_resume_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
-        | SlashCommand::Doctor
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -4361,25 +4403,52 @@ fn print_sandbox_status_snapshot(
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "sandbox",
-                "enabled": status.enabled,
-                "active": status.active,
-                "supported": status.supported,
-                "in_container": status.in_container,
-                "requested_namespace": status.requested.namespace_restrictions,
-                "active_namespace": status.namespace_active,
-                "requested_network": status.requested.network_isolation,
-                "active_network": status.network_active,
-                "filesystem_mode": status.filesystem_mode.as_str(),
-                "filesystem_active": status.filesystem_active,
-                "allowed_mounts": status.allowed_mounts,
-                "markers": status.container_markers,
-                "fallback_reason": status.fallback_reason,
-            }))?
+            serde_json::to_string_pretty(&sandbox_json_value(&status))?
         ),
     }
     Ok(())
+}
+
+fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
+    json!({
+        "kind": "sandbox",
+        "enabled": status.enabled,
+        "active": status.active,
+        "supported": status.supported,
+        "in_container": status.in_container,
+        "requested_namespace": status.requested.namespace_restrictions,
+        "active_namespace": status.namespace_active,
+        "requested_network": status.requested.network_isolation,
+        "active_network": status.network_active,
+        "filesystem_mode": status.filesystem_mode.as_str(),
+        "filesystem_active": status.filesystem_active,
+        "allowed_mounts": status.allowed_mounts,
+        "markers": status.container_markers,
+        "fallback_reason": status.fallback_reason,
+    })
+}
+
+fn render_help_topic(topic: LocalHelpTopic) -> String {
+    match topic {
+        LocalHelpTopic::Status => "Status
+  Usage            claw status
+  Purpose          show the local workspace snapshot without entering the REPL
+  Output           model, permissions, git state, config files, and sandbox status
+  Related          /status · claw --resume latest /status"
+            .to_string(),
+        LocalHelpTopic::Sandbox => "Sandbox
+  Usage            claw sandbox
+  Purpose          inspect the resolved sandbox and isolation state for the current directory
+  Output           namespace, network, filesystem, and fallback details
+  Related          /sandbox · claw status"
+            .to_string(),
+        LocalHelpTopic::Doctor => "Doctor
+  Usage            claw doctor
+  Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
+  Output           local-only health report; no provider request or session resume required
+  Related          /doctor · claw --resume latest /doctor"
+            .to_string(),
+    }
 }
 
 fn print_config_json() -> Result<(), Box<dyn std::error::Error>> {
@@ -4640,9 +4709,23 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     Ok(initialize_repo(&cwd)?.render())
 }
 
-fn run_init() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", init_claude_md()?);
+fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let message = init_claude_md()?;
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&init_json_value(&message))?
+        ),
+    }
     Ok(())
+}
+
+fn init_json_value(message: &str) -> serde_json::Value {
+    json!({
+        "kind": "init",
+        "message": message,
+    })
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -7466,7 +7549,9 @@ mod tests {
         );
         assert_eq!(
             parse_args(&["version".to_string()]).expect("version should parse"),
-            CliAction::Version
+            CliAction::Version {
+                output_format: CliOutputFormat::Text,
+            }
         );
         assert_eq!(
             parse_args(&["status".to_string()]).expect("status should parse"),
