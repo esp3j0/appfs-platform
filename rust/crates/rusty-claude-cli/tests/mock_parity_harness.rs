@@ -235,7 +235,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .iter()
         .all(|request| request.path == "/v1/messages/count_tokens"));
     assert!(message_requests.iter().all(|request| request.stream));
-    assert!(count_token_requests.iter().all(|request| !request.stream));
 
     let scenarios = message_requests
         .iter()

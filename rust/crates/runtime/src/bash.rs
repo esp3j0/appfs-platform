@@ -336,9 +336,7 @@ mod tests {
             "hello",
             "shell={shell_path} stderr={:?} cwd={}",
             output.stderr,
-            std::env::current_dir()
-                .expect("cwd")
-                .display()
+            std::env::current_dir().expect("cwd").display()
         );
         assert!(!output.interrupted);
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
