@@ -3782,11 +3782,11 @@ mod tests {
         classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_plugins_report, render_skills_report,
-        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
-        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
-        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
-        SlashCommand,
+        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
+        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
+        resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
+        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
+        SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
