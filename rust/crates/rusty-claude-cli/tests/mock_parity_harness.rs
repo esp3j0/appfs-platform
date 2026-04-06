@@ -14,6 +14,30 @@ use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const EXPECTED_REQUEST_SCENARIOS: &[&str] = &[
+    "streaming_text",
+    "read_file_roundtrip",
+    "read_file_roundtrip",
+    "grep_chunk_assembly",
+    "grep_chunk_assembly",
+    "write_file_allowed",
+    "write_file_allowed",
+    "write_file_denied",
+    "write_file_denied",
+    "multi_tool_turn_roundtrip",
+    "multi_tool_turn_roundtrip",
+    "bash_stdout_roundtrip",
+    "bash_stdout_roundtrip",
+    "bash_permission_prompt_approved",
+    "bash_permission_prompt_approved",
+    "bash_permission_prompt_denied",
+    "bash_permission_prompt_denied",
+    "plugin_tool_roundtrip",
+    "plugin_tool_roundtrip",
+    "auto_compact_triggered",
+    "token_cost_reporting",
+];
+
 #[cfg(not(windows))]
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -186,49 +210,51 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     }
 
     let captured = runtime.block_on(server.captured_requests());
+    let message_requests = captured
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .collect::<Vec<_>>();
+    let count_token_requests = captured
+        .iter()
+        .filter(|request| request.path == "/v1/messages/count_tokens")
+        .collect::<Vec<_>>();
     assert_eq!(
-        captured.len(),
+        message_requests.len(),
         21,
-        "twelve scenarios should produce twenty-one requests"
+        "twelve scenarios should produce twenty-one message requests"
     );
-    assert!(captured
+    assert_eq!(
+        count_token_requests.len(),
+        21,
+        "twelve scenarios should produce twenty-one count_tokens preflight requests"
+    );
+    assert!(message_requests
         .iter()
         .all(|request| request.path == "/v1/messages"));
-    assert!(captured.iter().all(|request| request.stream));
+    assert!(count_token_requests
+        .iter()
+        .all(|request| request.path == "/v1/messages/count_tokens"));
+    assert!(message_requests.iter().all(|request| request.stream));
 
-    let scenarios = captured
+    let scenarios = message_requests
         .iter()
         .map(|request| request.scenario.as_str())
         .collect::<Vec<_>>();
     assert_eq!(
-        scenarios,
-        vec![
-            "streaming_text",
-            "read_file_roundtrip",
-            "read_file_roundtrip",
-            "grep_chunk_assembly",
-            "grep_chunk_assembly",
-            "write_file_allowed",
-            "write_file_allowed",
-            "write_file_denied",
-            "write_file_denied",
-            "multi_tool_turn_roundtrip",
-            "multi_tool_turn_roundtrip",
-            "bash_stdout_roundtrip",
-            "bash_stdout_roundtrip",
-            "bash_permission_prompt_approved",
-            "bash_permission_prompt_approved",
-            "bash_permission_prompt_denied",
-            "bash_permission_prompt_denied",
-            "plugin_tool_roundtrip",
-            "plugin_tool_roundtrip",
-            "auto_compact_triggered",
-            "token_cost_reporting",
-        ]
+        scenarios, EXPECTED_REQUEST_SCENARIOS,
+        "message request order should stay aligned with parity scenarios"
+    );
+    let preflight_scenarios = count_token_requests
+        .iter()
+        .map(|request| request.scenario.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        preflight_scenarios, EXPECTED_REQUEST_SCENARIOS,
+        "count_tokens preflight order should stay aligned with parity scenarios"
     );
 
     let mut request_counts = BTreeMap::new();
-    for request in &captured {
+    for request in &message_requests {
         *request_counts
             .entry(request.scenario.as_str())
             .or_insert(0_usize) += 1;

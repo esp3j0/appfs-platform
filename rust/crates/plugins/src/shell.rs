@@ -80,14 +80,14 @@ fn is_bash_script(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn resolve_windows_bash_shell_path() -> io::Result<PathBuf> {
-    if let Some(path) = resolve_supported_shell_from_env()? {
+    if let Some(path) = resolve_supported_shell_from_env() {
         return Ok(path);
     }
     find_git_bash_path()
 }
 
 #[cfg(windows)]
-fn resolve_supported_shell_from_env() -> io::Result<Option<PathBuf>> {
+fn resolve_supported_shell_from_env() -> Option<PathBuf> {
     for name in SHELL_OVERRIDE_ENV_VARS {
         if let Some(value) = env::var_os(name) {
             let candidate = PathBuf::from(value);
@@ -95,12 +95,12 @@ fn resolve_supported_shell_from_env() -> io::Result<Option<PathBuf>> {
                 continue;
             }
             if is_supported_shell_path(&candidate) {
-                return Ok(Some(candidate));
+                return Some(candidate);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(windows)]

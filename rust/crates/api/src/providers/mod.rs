@@ -40,6 +40,12 @@ pub struct ProviderMetadata {
     pub default_base_url: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTokenLimit {
+    pub max_output_tokens: u32,
+    pub context_window_tokens: u32,
+}
+
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
     (
         "opus",
@@ -202,17 +208,45 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
+    model_token_limit(model).map_or_else(
+        || {
+            let canonical = resolve_model_alias(model);
+            if canonical.contains("opus") {
+                32_000
+            } else {
+                64_000
+            }
+        },
+        |limit| limit.max_output_tokens,
+    )
+}
+
+#[must_use]
+pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    if canonical.contains("opus") {
-        32_000
-    } else {
-        64_000
+    match canonical.as_str() {
+        "claude-opus-4-6" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 200_000,
+        }),
+        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 200_000,
+        }),
+        "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 131_072,
+        }),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_provider_kind, max_tokens_for_model, resolve_model_alias, ProviderKind};
+    use super::{
+        detect_provider_kind, max_tokens_for_model, model_token_limit, resolve_model_alias,
+        ProviderKind,
+    };
 
     #[test]
     fn resolves_grok_aliases() {
@@ -236,5 +270,18 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn exposes_known_model_context_windows() {
+        assert_eq!(
+            model_token_limit("claude-sonnet-4-6").map(|limit| limit.context_window_tokens),
+            Some(200_000)
+        );
+        assert_eq!(
+            model_token_limit("grok-3").map(|limit| limit.context_window_tokens),
+            Some(131_072)
+        );
+        assert_eq!(model_token_limit("gpt-4.1"), None);
     }
 }
