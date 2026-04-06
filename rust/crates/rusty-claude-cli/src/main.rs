@@ -6287,7 +6287,7 @@ impl ApiClient for AnthropicRuntimeClient {
 }
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.safe_failure_class() == "context_window" {
+    if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
@@ -7543,6 +7543,39 @@ mod tests {
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
             rendered.contains("Fresh session    /clear --confirm"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn retry_wrapped_context_window_errors_keep_recovery_guidance() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: "413".parse().expect("status"),
+                error_type: Some("invalid_request_error".to_string()),
+                message: Some("Request is too large for this model's context window.".to_string()),
+                request_id: Some("req_ctx_retry_789".to_string()),
+                body: String::new(),
+                retryable: false,
+            }),
+        };
+
+        let rendered = format_user_visible_api_error("session-issue-32", &error);
+        assert!(rendered.contains("Context window blocked"), "{rendered}");
+        assert!(rendered.contains("context_window_blocked"), "{rendered}");
+        assert!(
+            rendered.contains("Trace            req_ctx_retry_789"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Detail           Request is too large for this model's context window."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Compact          /compact"), "{rendered}");
+        assert!(
+            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
             "{rendered}"
         );
     }
