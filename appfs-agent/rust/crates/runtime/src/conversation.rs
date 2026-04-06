@@ -786,9 +786,15 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    #[cfg(windows)]
+    use crate::{bash_shell_path, set_shell_if_windows};
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(windows)]
+    use std::process::Command;
     use std::sync::Arc;
+    #[cfg(windows)]
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -1130,6 +1136,9 @@ mod tests {
 
     #[test]
     fn appends_post_tool_hook_feedback_to_tool_result() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
         struct TwoCallApiClient {
             calls: usize,
         }
@@ -1451,6 +1460,33 @@ mod tests {
 
     fn shell_echo_and_exit(message: &str, code: i32) -> String {
         format!("printf '{message}'; exit {code}")
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     #[test]
