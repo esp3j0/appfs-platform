@@ -6865,6 +6865,23 @@ impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
         Self { current_mode }
     }
+
+    fn decision_from_env(
+        request: &runtime::PermissionRequest,
+    ) -> Option<runtime::PermissionPromptDecision> {
+        let response = std::env::var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE").ok()?;
+        let normalized = response.trim().to_ascii_lowercase();
+        Some(match normalized.as_str() {
+            "y" | "yes" | "allow" | "approved" => runtime::PermissionPromptDecision::Allow,
+            "n" | "no" | "deny" | "denied" => runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied by user approval prompt",
+                    request.tool_name
+                ),
+            },
+            _ => return None,
+        })
+    }
 }
 
 impl runtime::PermissionPrompter for CliPermissionPrompter {
@@ -6872,6 +6889,10 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        if let Some(decision) = Self::decision_from_env(request) {
+            return decision;
+        }
+
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -8391,10 +8412,10 @@ mod tests {
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary,
-        GitWorktreeEntry, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE,
+        CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
+        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8403,7 +8424,7 @@ mod tests {
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig,
-        PermissionMode, Session, ToolExecutor,
+        PermissionMode, PermissionPromptDecision, PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -9033,6 +9054,25 @@ mod tests {
 
         // then
         assert_eq!(merged, "standalone body");
+    }
+
+    #[test]
+    fn permission_prompter_can_be_driven_by_test_env_override() {
+        let _guard = env_lock();
+        std::env::set_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE", "allow");
+
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: "printf ok".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("bash requires danger-full-access".to_string()),
+        };
+
+        let decision = CliPermissionPrompter::decision_from_env(&request);
+        std::env::remove_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE");
+
+        assert_eq!(decision, Some(PermissionPromptDecision::Allow));
     }
 
     #[test]

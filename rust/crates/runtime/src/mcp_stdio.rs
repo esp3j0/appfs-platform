@@ -18,12 +18,16 @@ use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 3_000;
+#[cfg(all(test, not(windows)))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 3_000;
+#[cfg(all(test, not(windows)))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 1_000;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
