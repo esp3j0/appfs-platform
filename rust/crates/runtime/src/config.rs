@@ -55,6 +55,16 @@ pub struct RuntimeFeatureConfig {
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+    provider_fallbacks: ProviderFallbackConfig,
+}
+
+/// Ordered chain of fallback model identifiers used when the primary
+/// provider returns a retryable failure (429/500/503/etc.). The chain is
+/// strict: each entry is tried in order until one succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderFallbackConfig {
+    primary: Option<String>,
+    fallbacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +288,7 @@ impl ConfigLoader {
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -367,6 +378,11 @@ impl RuntimeConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
+
+    #[must_use]
+    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
+        &self.feature_config.provider_fallbacks
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -425,6 +441,33 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
+    }
+
+    #[must_use]
+    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
+        &self.provider_fallbacks
+    }
+}
+
+impl ProviderFallbackConfig {
+    #[must_use]
+    pub fn new(primary: Option<String>, fallbacks: Vec<String>) -> Self {
+        Self { primary, fallbacks }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    #[must_use]
+    pub fn fallbacks(&self) -> &[String] {
+        &self.fallbacks
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fallbacks.is_empty()
     }
 }
 
@@ -854,6 +897,23 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
     })
+}
+
+fn parse_optional_provider_fallbacks(
+    root: &JsonValue,
+) -> Result<ProviderFallbackConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ProviderFallbackConfig::default());
+    };
+    let Some(value) = object.get("providerFallbacks") else {
+        return Ok(ProviderFallbackConfig::default());
+    };
+    let entry = expect_object(value, "merged settings.providerFallbacks")?;
+    let primary =
+        optional_string(entry, "primary", "merged settings.providerFallbacks")?.map(str::to_string);
+    let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
+        .unwrap_or_default();
+    Ok(ProviderFallbackConfig { primary, fallbacks })
 }
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
@@ -1324,6 +1384,66 @@ mod tests {
             Some(FilesystemIsolationMode::AllowList)
         );
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_provider_fallbacks_chain_with_primary_and_ordered_fallbacks() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "providerFallbacks": {
+                "primary": "claude-opus-4-6",
+                "fallbacks": ["grok-3", "grok-3-mini"]
+              }
+            }"#,
+        )
+        .expect("write provider fallback settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.provider_fallbacks();
+        assert_eq!(chain.primary(), Some("claude-opus-4-6"));
+        assert_eq!(
+            chain.fallbacks(),
+            &["grok-3".to_string(), "grok-3-mini".to_string()]
+        );
+        assert!(!chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_fallbacks_default_is_empty_when_unset() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.provider_fallbacks();
+        assert_eq!(chain.primary(), None);
+        assert!(chain.fallbacks().is_empty());
+        assert!(chain.is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
