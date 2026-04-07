@@ -129,20 +129,20 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             name: "bash_permission_prompt_approved",
             permission_mode: "workspace-write",
             allowed_tools: Some("bash"),
-            stdin: Some("y\n"),
+            stdin: None,
             prepare: prepare_noop,
             assert: assert_bash_permission_prompt_approved,
-            extra_env: None,
+            extra_env: Some(("CLAW_TEST_PERMISSION_PROMPT_RESPONSE", "y")),
             resume_session: None,
         },
         ScenarioCase {
             name: "bash_permission_prompt_denied",
             permission_mode: "workspace-write",
             allowed_tools: Some("bash"),
-            stdin: Some("n\n"),
+            stdin: None,
             prepare: prepare_noop,
             assert: assert_bash_permission_prompt_denied,
-            extra_env: None,
+            extra_env: Some(("CLAW_TEST_PERMISSION_PROMPT_RESPONSE", "n")),
             resume_session: None,
         },
         ScenarioCase {
@@ -368,12 +368,12 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
             .stderr(Stdio::piped())
             .spawn()
             .expect("claw should launch");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin should be piped")
+        let mut child_stdin = child.stdin.take().expect("stdin should be piped");
+        child_stdin
             .write_all(stdin.as_bytes())
             .expect("stdin should write");
+        child_stdin.flush().expect("stdin should flush");
+        drop(child_stdin);
         child.wait_with_output().expect("claw should finish")
     } else {
         command.output().expect("claw should launch")
