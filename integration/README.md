@@ -6,9 +6,10 @@ This directory is reserved for scenarios that span both `appfs` and `appfs-agent
 
 1. [AppFS Platform Unified Roadmap v0.1](./APPFS-platform-roadmap-v0.1.md)
 2. [AppFS x appfs-agent Attach Contract v1.1](./APPFS-appfs-agent-attach-contract-v1.1.md)
-3. `integration/scripts/test-windows-appfs-agent-smoke.ps1`
-4. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
-5. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
+3. [AppFS Joint Startup / Launcher Contract v0.1](./APPFS-joint-startup-launcher-contract-v0.1.md)
+4. `integration/scripts/test-windows-appfs-agent-smoke.ps1`
+5. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
+6. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
 
 ## Intended Contents
 
@@ -130,3 +131,24 @@ Example:
 
 The corresponding manual workflow is `.github/workflows/integration-multi-attach-windows.yml`.
 It is `workflow_dispatch` only for now so we can validate the scenario on the self-hosted WinFsp runner before promoting it into required PR CI.
+
+## Next Design Focus
+
+With `IC-2` in place, the next design step is explicit launcher-driven startup.
+
+The current direction is:
+
+1. AppFS startup should wait for mount and runtime manifest readiness;
+2. a launcher should start `appfs-agent` inside an AppFS-backed workspace;
+3. the launcher should inject `APPFS_ATTACH_*` explicitly instead of relying on heuristic discovery;
+4. future overlay-backed "start from existing directory" flows should reuse the same launch contract.
+
+Current prototype command:
+
+```powershell
+agentfs appfs launch <id-or-path> <mountpoint> --agent-bin <path-to-appfs-agent> -- status --output-format json
+```
+
+Tracked in:
+
+1. [AppFS Joint Startup / Launcher Contract v0.1](./APPFS-joint-startup-launcher-contract-v0.1.md)

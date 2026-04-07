@@ -24,12 +24,13 @@ The current baseline is:
 2. `appfs-agent` resolves AppFS attach in the order `env > manifest > heuristic`.
 3. multi-agent attach is supported at the contract level through one shared `runtime_session_id` plus distinct per-agent `attach_id` values.
 4. `/status` exposes AppFS attach metadata in both text and JSON output.
-5. `IC-0` and `IC-1` Windows integration checkpoints are automated and green.
+5. `IC-0`, `IC-1`, and `IC-2` now exist as concrete Windows integration checkpoints.
 
 Primary source documents:
 
 1. [AppFS x appfs-agent Attach Contract v1.1](./APPFS-appfs-agent-attach-contract-v1.1.md)
-2. [AppFS Principal Visibility And Agent Identity Design](../appfs/docs/plans/2026-04-07-appfs-principal-visibility-and-agent-identity.md)
+2. [AppFS Joint Startup / Launcher Contract v0.1](./APPFS-joint-startup-launcher-contract-v0.1.md)
+3. [AppFS Principal Visibility And Agent Identity Design](../appfs/docs/plans/2026-04-07-appfs-principal-visibility-and-agent-identity.md)
 
 ## 3. Guiding Principle
 
@@ -38,8 +39,9 @@ The next work should move in this order:
 1. stabilize attach;
 2. stabilize multi-agent attach;
 3. stabilize launcher-driven startup;
-4. improve AppFS-aware agent UX;
-5. only then add principal-aware visibility and app identity semantics.
+4. establish an overlay-backed existing-directory entry path;
+5. improve AppFS-aware agent UX;
+6. only then add principal-aware visibility and app identity semantics.
 
 This keeps the base platform debuggable. If we mix attach, launch, identity, and connector session isolation too early, regressions will be difficult to localize.
 
@@ -64,7 +66,7 @@ Exit criteria:
 
 ### R1. Multi-Agent Baseline Automation
 
-**Status:** Next priority
+**Status:** Landed as the current multi-agent baseline
 
 Goal:
 
@@ -80,12 +82,12 @@ Deliverables:
 Why this is next:
 
 1. the contract already says multi-agent attach is first-class
-2. current proof is mostly manual
-3. this is the highest-value regression guard before deeper runtime or UX changes
+2. it replaced what used to be mostly manual proof
+3. it is the highest-value regression guard before deeper runtime or UX changes
 
 ### R2. Launcher-Driven Startup
 
-**Status:** Planned after `IC-2`
+**Status:** Current next design and implementation target
 
 Goal:
 
@@ -108,8 +110,37 @@ Exit criteria:
 
 1. one documented and supported launch path for "AppFS + appfs-agent together"
 2. attach works without relying on control-plane directory naming
+3. the launched agent runs inside an AppFS-backed workspace rather than relying on a raw host directory
 
-### R3. AppFS-Aware Agent UX
+### R3. Overlay-Backed Existing Directory Entry
+
+**Status:** Future work after launcher-driven startup
+
+Goal:
+
+1. let a user start `appfs-agent` from a known host directory while still running on an AppFS-backed workspace
+2. use overlay as the compatibility bridge between an existing host directory and the AppFS runtime view
+
+Target shape:
+
+1. a host directory may be used as AppFS overlay `--base`
+2. AppFS mounts a separate runtime view path by default
+3. `appfs-agent` starts with its `cwd` inside that mounted AppFS view, not inside the raw host directory
+4. the user experience should feel like "start from this directory", even if the runtime view lives at a generated mount path
+
+Cross-platform note:
+
+1. Windows should not require in-place mounting over an already existing directory path, because the current WinFsp path expects a non-existent mountpoint
+2. Linux and macOS may later support tighter same-path workflows, but that is not the baseline contract for this phase
+3. the stable cross-platform target is "existing directory as overlay base, separate AppFS runtime view, agent launched inside the view"
+
+Non-goals for this phase:
+
+1. do not require true same-path mount parity across all platforms
+2. do not mix this phase with principal-aware visibility or app identity policy
+3. do not replace the current attach contract with overlay-specific rules
+
+### R4. AppFS-Aware Agent UX
 
 **Status:** Planned after launcher-driven startup
 
@@ -128,7 +159,7 @@ Non-goal for this phase:
 
 1. do not turn `appfs-agent` into an AppFS-only agent
 
-### R4. Principal And Visibility Model
+### R5. Principal And Visibility Model
 
 **Status:** Future work, intentionally deferred
 
@@ -157,6 +188,7 @@ The following are not current mainline goals:
 3. connector-side account/profile isolation across principals
 4. broad brand or narrative migration before runtime behavior is ready
 5. large-scale parity chasing with upstream `claw` that is not directly justified by AppFS integration needs
+6. requiring same-path in-place mount behavior on every platform before AppFS-backed workspace mode can ship
 
 ## 6. Suggested Near-Term Milestones
 
@@ -166,13 +198,21 @@ The following are not current mainline goals:
 2. run it locally first
 3. promote it into self-hosted Windows CI once stable
 
+**Current note:** The baseline now exists; the ongoing task is to keep it green.
+
 ### M2. Explicit Joint Startup
 
 1. choose the first supported launcher entrypoint
 2. inject manifest path, mount root, runtime session, and attach id explicitly
 3. document the supported startup flow in `integration/`
 
-### M3. AppFS-Aware Quality-Of-Life Pass
+### M3. Overlay-Backed Workspace Entry
+
+1. choose the first supported "start from existing directory" flow
+2. use overlay `--base` plus a separate AppFS runtime mount as the primary cross-platform model
+3. document clearly that Windows does not need same-path mount semantics for this milestone
+
+### M4. AppFS-Aware Quality-Of-Life Pass
 
 1. expose mounted app context better in `appfs-agent`
 2. improve operator visibility for current app, control plane, and events
@@ -193,6 +233,6 @@ This roadmap is cross-project, but code ownership still follows repository bound
 
 If we pick one concrete next task from this roadmap, it should be:
 
-1. implement `IC-2` multi-agent attach automation in `appfs-platform/integration`
+1. define and implement the first launcher-driven startup path for AppFS-backed agent execution
 
-That is the shortest path to turning the current contract from "validated by hand" into "protected by automation".
+That is the shortest path to making AppFS-backed agent execution feel explicit and productized instead of manually assembled.

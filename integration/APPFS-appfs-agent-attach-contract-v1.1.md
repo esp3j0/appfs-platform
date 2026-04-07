@@ -266,6 +266,10 @@ The next planned step after this contract is:
 3. implement Phase 2 launcher-driven startup that injects attach env explicitly;
 4. keep directory heuristic detection only as a compatibility fallback.
 
+Launcher design note:
+
+1. the current Phase 2 design is tracked in `integration/APPFS-joint-startup-launcher-contract-v0.1.md`.
+
 Future design note:
 
 1. principal-aware shared/private app visibility is intentionally deferred and tracked in `appfs/docs/plans/2026-04-07-appfs-principal-visibility-and-agent-identity.md`.
