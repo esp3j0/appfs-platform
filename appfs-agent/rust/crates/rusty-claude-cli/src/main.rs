@@ -42,15 +42,16 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
-    pricing_for_model, resolve_sandbox_status, save_oauth_credentials, set_shell_if_windows,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    clear_oauth_credentials, detect_appfs_environment, format_usd, generate_pkce_pair,
+    generate_state, load_oauth_credentials, load_system_prompt,
+    parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
+    save_oauth_credentials, set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -1126,6 +1127,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         git_worktrees: load_git_worktrees(&git_scope, &current_worktree),
         recent_commits: load_recent_commits(&git_scope, 3),
         sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        appfs_environment: detect_appfs_environment(&cwd),
     };
     Ok(DoctorReport {
         checks: vec![
@@ -1921,6 +1923,7 @@ struct StatusContext {
     git_worktrees: Vec<GitWorktreeEntry>,
     recent_commits: Vec<GitCommitEntry>,
     sandbox_status: runtime::SandboxStatus,
+    appfs_environment: Option<runtime::AppfsEnvironment>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4395,6 +4398,33 @@ fn status_json_value(
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
         },
+        "appfs": context.appfs_environment.as_ref().map(|environment| {
+            json!({
+                "detected": true,
+                "attach_source": environment.attach_source.as_str(),
+                "mount_root": environment.mount_root,
+                "runtime_session_id": environment.runtime_session_id,
+                "attach_id": environment.attach_id,
+                "attach_role": environment.attach_role,
+                "multi_agent_mode": environment.multi_agent_mode,
+                "manifest_path": environment.manifest_path,
+                "control_dir": environment.control_dir,
+                "control_events_path": environment.control_events_path,
+                "registry_path": environment.registry_path,
+                "register_app_path": environment.register_app_path,
+                "unregister_app_path": environment.unregister_app_path,
+                "list_apps_path": environment.list_apps_path,
+                "current_app_id": environment.current_app_id,
+                "current_app_root": environment.current_app_root,
+                "current_app_events_path": environment.current_app_events_path,
+                "registered_apps": environment.registered_apps,
+                "warnings": environment.warnings,
+            })
+        }).unwrap_or_else(|| {
+            json!({
+                "detected": false
+            })
+        }),
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
             "active": context.sandbox_status.active,
@@ -4430,6 +4460,7 @@ fn status_context(
     let git_worktrees = load_git_worktrees(&git_scope, &current_worktree);
     let recent_commits = load_recent_commits(&git_scope, 3);
     let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let appfs_environment = detect_appfs_environment(&cwd);
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
@@ -4443,6 +4474,7 @@ fn status_context(
         git_worktrees,
         recent_commits,
         sandbox_status,
+        appfs_environment,
     })
 }
 
@@ -4539,12 +4571,77 @@ fn format_status_report(
             context.memory_file_count,
         ),
         git_section,
+        format_appfs_report(context.appfs_environment.as_ref()),
         format_sandbox_report(&context.sandbox_status),
     ]
     .join(
         "
 
 ",
+    )
+}
+
+fn format_appfs_report(environment: Option<&runtime::AppfsEnvironment>) -> String {
+    let Some(environment) = environment else {
+        return "AppFS\n  Detected          no".to_string();
+    };
+
+    let registered_apps = if environment.registered_apps.is_empty() {
+        "<none>".to_string()
+    } else {
+        environment
+            .registered_apps
+            .iter()
+            .map(|app| {
+                app.active_scope.as_ref().map_or_else(
+                    || app.app_id.clone(),
+                    |scope| format!("{} (scope {scope})", app.app_id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let warnings = if environment.warnings.is_empty() {
+        "<none>".to_string()
+    } else {
+        environment.warnings.join(" | ")
+    };
+
+    format!(
+        "AppFS
+  Detected          yes
+  Attach source     {}
+  Mount root        {}
+  Runtime session   {}
+  Attach id         {}
+  Attach role       {}
+  Multi-agent mode  {}
+  Control plane     {}
+  Registered apps   {}
+  Current app       {}
+  Current events    {}
+  Warnings          {}",
+        environment.attach_source.as_str(),
+        environment.mount_root.display(),
+        environment
+            .runtime_session_id
+            .as_deref()
+            .unwrap_or("<unknown>"),
+        environment.attach_id,
+        environment.attach_role.as_deref().unwrap_or("<none>"),
+        environment.multi_agent_mode,
+        environment
+            .control_dir
+            .as_ref()
+            .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+        registered_apps,
+        environment.current_app_id.as_deref().unwrap_or("<none>"),
+        environment
+            .current_app_events_path
+            .as_ref()
+            .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+        warnings,
     )
 }
 
@@ -7463,11 +7560,11 @@ mod tests {
         render_hook_list_report_for, render_memory_report, render_merged_runtime_config_json,
         render_repl_help, render_resume_usage, resolve_model_alias, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command,
-        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness,
-        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, SlashCommand, StatusUsage,
-        DEFAULT_MODEL,
+        slash_command_completion_candidates_with_sessions, status_context, status_json_value,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8910,6 +9007,41 @@ mod tests {
                     },
                 ],
                 sandbox_status: runtime::SandboxStatus::default(),
+                appfs_environment: Some(runtime::AppfsEnvironment {
+                    attach_source: runtime::AppfsAttachSource::Manifest,
+                    mount_root: PathBuf::from("/mnt/appfs"),
+                    runtime_session_id: Some("rt-shared-01".to_string()),
+                    attach_id: "agent-planner".to_string(),
+                    attach_role: Some("planner".to_string()),
+                    multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+                    manifest_path: Some(PathBuf::from("/mnt/appfs/.well-known/appfs/runtime.json")),
+                    control_dir: Some(PathBuf::from("/mnt/appfs/_appfs")),
+                    control_events_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/_stream/events.evt.jsonl",
+                    )),
+                    registry_path: Some(PathBuf::from("/mnt/appfs/_appfs/apps.registry.json")),
+                    register_app_path: Some(PathBuf::from("/mnt/appfs/_appfs/register_app.act")),
+                    unregister_app_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/unregister_app.act",
+                    )),
+                    list_apps_path: Some(PathBuf::from("/mnt/appfs/_appfs/list_apps.act")),
+                    current_app_id: Some("aiim".to_string()),
+                    current_app_root: Some(PathBuf::from("/mnt/appfs/aiim")),
+                    current_app_events_path: Some(PathBuf::from(
+                        "/mnt/appfs/aiim/_stream/events.evt.jsonl",
+                    )),
+                    registered_apps: vec![
+                        runtime::AppfsRegisteredApp {
+                            app_id: "aiim".to_string(),
+                            active_scope: Some("chat-long".to_string()),
+                        },
+                        runtime::AppfsRegisteredApp {
+                            app_id: "notion".to_string(),
+                            active_scope: None,
+                        },
+                    ],
+                    warnings: Vec::new(),
+                }),
             },
         );
         assert!(status.contains("Status"));
@@ -8931,6 +9063,12 @@ mod tests {
         assert!(status.contains("Session          session.jsonl"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
+        assert!(status.contains("AppFS"));
+        assert!(status.contains("Attach source     manifest"));
+        assert!(status.contains("Runtime session   rt-shared-01"));
+        assert!(status.contains("Attach id         agent-planner"));
+        assert!(status.contains("Attach role       planner"));
+        assert!(status.contains("Multi-agent mode  shared_mount_distinct_attach"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
         assert!(status.contains("Freshness        diverged from origin/main (1 ahead, 2 behind)"));
         assert!(status.contains("Worktrees        2 active"));
@@ -8939,6 +9077,110 @@ mod tests {
         assert!(status.contains("Recent commits   abc1234 feat: add status output"));
         assert!(status.contains("def5678 fix: tighten parsing"));
         assert!(status.contains("9876fed chore: wire command"));
+    }
+
+    #[test]
+    fn status_json_reports_appfs_attach_contract_fields() {
+        let payload = status_json_value(
+            "claude-sonnet",
+            StatusUsage {
+                message_count: 2,
+                turns: 1,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 32,
+            },
+            "workspace-write",
+            &super::StatusContext {
+                cwd: PathBuf::from("/tmp/project"),
+                session_path: None,
+                loaded_config_files: 0,
+                discovered_config_files: 0,
+                memory_file_count: 0,
+                project_root: Some(PathBuf::from("/tmp")),
+                git_branch: Some("main".to_string()),
+                git_summary: GitWorkspaceSummary::default(),
+                git_freshness: None,
+                git_worktrees: Vec::new(),
+                recent_commits: Vec::new(),
+                sandbox_status: runtime::SandboxStatus::default(),
+                appfs_environment: Some(runtime::AppfsEnvironment {
+                    attach_source: runtime::AppfsAttachSource::Env,
+                    mount_root: PathBuf::from("/mnt/appfs"),
+                    runtime_session_id: Some("rt-shared-09".to_string()),
+                    attach_id: "agent-reviewer".to_string(),
+                    attach_role: Some("reviewer".to_string()),
+                    multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+                    manifest_path: Some(PathBuf::from("/mnt/appfs/.well-known/appfs/runtime.json")),
+                    control_dir: Some(PathBuf::from("/mnt/appfs/_appfs")),
+                    control_events_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/_stream/events.evt.jsonl",
+                    )),
+                    registry_path: Some(PathBuf::from("/mnt/appfs/_appfs/apps.registry.json")),
+                    register_app_path: Some(PathBuf::from("/mnt/appfs/_appfs/register_app.act")),
+                    unregister_app_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/unregister_app.act",
+                    )),
+                    list_apps_path: Some(PathBuf::from("/mnt/appfs/_appfs/list_apps.act")),
+                    current_app_id: Some("aiim".to_string()),
+                    current_app_root: Some(PathBuf::from("/mnt/appfs/aiim")),
+                    current_app_events_path: Some(PathBuf::from(
+                        "/mnt/appfs/aiim/_stream/events.evt.jsonl",
+                    )),
+                    registered_apps: vec![runtime::AppfsRegisteredApp {
+                        app_id: "aiim".to_string(),
+                        active_scope: Some("chat-long".to_string()),
+                    }],
+                    warnings: vec!["env mount root mismatch".to_string()],
+                }),
+            },
+        );
+
+        assert_eq!(payload["appfs"]["detected"], json!(true));
+        assert_eq!(payload["appfs"]["attach_source"], json!("env"));
+        assert_eq!(payload["appfs"]["mount_root"], json!("/mnt/appfs"));
+        assert_eq!(
+            payload["appfs"]["runtime_session_id"],
+            json!("rt-shared-09")
+        );
+        assert_eq!(payload["appfs"]["attach_id"], json!("agent-reviewer"));
+        assert_eq!(payload["appfs"]["attach_role"], json!("reviewer"));
+        assert_eq!(
+            payload["appfs"]["multi_agent_mode"],
+            json!(runtime::APPFS_MULTI_AGENT_MODE_SHARED)
+        );
+    }
+
+    #[test]
+    fn status_json_marks_appfs_as_not_detected_when_absent() {
+        let payload = status_json_value(
+            "claude-sonnet",
+            StatusUsage {
+                message_count: 0,
+                turns: 0,
+                latest: runtime::TokenUsage::default(),
+                cumulative: runtime::TokenUsage::default(),
+                estimated_tokens: 0,
+            },
+            "workspace-write",
+            &super::StatusContext {
+                cwd: PathBuf::from("/tmp/project"),
+                session_path: None,
+                loaded_config_files: 0,
+                discovered_config_files: 0,
+                memory_file_count: 0,
+                project_root: None,
+                git_branch: None,
+                git_summary: GitWorkspaceSummary::default(),
+                git_freshness: None,
+                git_worktrees: Vec::new(),
+                recent_commits: Vec::new(),
+                sandbox_status: runtime::SandboxStatus::default(),
+                appfs_environment: None,
+            },
+        );
+
+        assert_eq!(payload["appfs"], json!({ "detected": false }));
     }
 
     #[test]

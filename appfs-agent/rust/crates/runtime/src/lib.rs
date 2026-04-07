@@ -1,3 +1,4 @@
+mod appfs;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -41,6 +42,12 @@ mod usage;
 mod windows_shell;
 pub mod worker_boot;
 
+pub use appfs::{
+    detect_appfs_environment, resolve_appfs_environment, AppfsAttachSource, AppfsEnvironment,
+    AppfsRegisteredApp, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
+    AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED,
+    APPFS_RUNTIME_MANIFEST_REL_PATH,
+};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

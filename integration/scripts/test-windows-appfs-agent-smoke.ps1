@@ -1,5 +1,6 @@
 # AppFS + appfs-agent Windows smoke test
 # Covers: appfs init + appfs up + mounted workspace + claw status (+ optional prompt)
+# Contract checkpoint: IC-0 in integration/APPFS-appfs-agent-attach-contract-v1.1.md
 
 param(
     [string]$AgentId = "appfs-agent-smoke",
@@ -148,6 +149,33 @@ function Assert-True {
     Write-Success $Message
 }
 
+function Read-AppfsRuntimeManifest {
+    param([string]$MountRoot)
+
+    $manifestPath = Join-Path $MountRoot ".well-known\appfs\runtime.json"
+    Assert-True (Test-Path $manifestPath) "AppFS runtime manifest exists at $manifestPath"
+
+    $raw = Get-Content $manifestPath -Raw -ErrorAction Stop
+    $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
+
+    Assert-True ($manifest.schema_version -eq 1) "AppFS runtime manifest schema_version is 1"
+    Assert-True ($manifest.runtime_kind -eq "appfs") "AppFS runtime manifest runtime_kind is appfs"
+    Assert-True (
+        $manifest.multi_agent_mode -eq "shared_mount_distinct_attach"
+    ) "AppFS runtime manifest multi_agent_mode is shared_mount_distinct_attach"
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace([string]$manifest.runtime_session_id)
+    ) "AppFS runtime manifest runtime_session_id is populated"
+    Assert-True (
+        $manifest.capabilities.multi_agent_attach -eq $true
+    ) "AppFS runtime manifest advertises multi_agent_attach capability"
+
+    return [pscustomobject]@{
+        Path = $manifestPath
+        Document = $manifest
+    }
+}
+
 function Ensure-ProcessRunning {
     param($Handle)
 
@@ -293,6 +321,7 @@ function Main {
             (Test-Path (Join-Path $controlDir "list_apps.act"))
     }
     Write-Success "AppFS mount is ready"
+    $runtimeManifest = Read-AppfsRuntimeManifest -MountRoot $MountPoint
 
     Write-Section "Prepare Workspace"
     New-Item -ItemType Directory -Path $workspaceDir -Force | Out-Null
@@ -311,6 +340,13 @@ function Main {
     }
     Assert-True ($statusOutput.Contains("Workspace")) "claw status rendered a workspace snapshot inside the mount"
     Assert-True ($statusOutput.Contains($workspaceDir)) "claw status reported the mounted workspace path"
+    Assert-True ($statusOutput.Contains("Attach source     manifest")) "claw status attached through the AppFS runtime manifest"
+    Assert-True (
+        $statusOutput.Contains("Runtime session   $($runtimeManifest.Document.runtime_session_id)")
+    ) "claw status reported the shared AppFS runtime session"
+    Assert-True (
+        $statusOutput.Contains("Multi-agent mode  shared_mount_distinct_attach")
+    ) "claw status reported the shared multi-agent attach mode"
 
     if ($RunPrompt) {
         Write-Section "Run appfs-agent Prompt"
