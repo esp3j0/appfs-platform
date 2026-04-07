@@ -140,10 +140,48 @@ fn run_claw(
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("CLAW_CONFIG_HOME", config_home)
         .env("HOME", home)
-        .env("NO_COLOR", "1")
-        .env("PATH", "/usr/bin:/bin")
-        .args(args);
+        .env("NO_COLOR", "1");
+    configure_child_env(&mut command);
+    command.args(args);
     command.output().expect("claw should launch")
+}
+
+fn configure_child_env(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        for name in [
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+            "TMP",
+            "TEMP",
+            "USERPROFILE",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+
+        for git_bash in [
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files\Git\usr\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Git\usr\bin\bash.exe"),
+        ] {
+            if git_bash.is_file() {
+                command.env("CLAW_CODE_GIT_BASH_PATH", git_bash);
+                break;
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        command.env("PATH", "/usr/bin:/bin");
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

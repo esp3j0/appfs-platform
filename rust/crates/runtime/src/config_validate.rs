@@ -162,11 +162,31 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "allowedTools",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "ignorePatterns",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
         name: "mcpServers",
         expected: FieldType::Object,
     },
     FieldSpec {
         name: "oauth",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "provider",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "providerFallbacks",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "aliases",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -298,6 +318,36 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
     },
 ];
 
+const PROVIDER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "type",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "baseUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "apiKeyEnv",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "authTokenEnv",
+        expected: FieldType::String,
+    },
+];
+
+const PROVIDER_FALLBACKS_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "primary",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "fallbacks",
+        expected: FieldType::StringArray,
+    },
+];
+
 const DEPRECATED_FIELDS: &[DeprecatedField] = &[
     DeprecatedField {
         name: "permissionMode",
@@ -306,6 +356,14 @@ const DEPRECATED_FIELDS: &[DeprecatedField] = &[
     DeprecatedField {
         name: "enabledPlugins",
         replacement: "plugins.enabled",
+    },
+    DeprecatedField {
+        name: "allowedTools",
+        replacement: "permissions.allow",
+    },
+    DeprecatedField {
+        name: "ignorePatterns",
+        replacement: "permissions.deny",
     },
 ];
 
@@ -483,6 +541,27 @@ pub fn validate_config_file(
             oauth,
             OAUTH_FIELDS,
             "oauth",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(provider) = object.get("provider").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            provider,
+            PROVIDER_FIELDS,
+            "provider",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(provider_fallbacks) = object
+        .get("providerFallbacks")
+        .and_then(JsonValue::as_object)
+    {
+        result.merge(validate_object_keys(
+            provider_fallbacks,
+            PROVIDER_FALLBACKS_FIELDS,
+            "providerFallbacks",
             source,
             &path_display,
         ));

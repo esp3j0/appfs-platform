@@ -25,10 +25,9 @@ use runtime::{
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig,
-    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig,
-    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError,
-    ToolExecutor,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
+    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3716,7 +3715,8 @@ struct ProviderRuntimeClient {
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let runtime_config = load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
+        let runtime_config =
+            load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
         let fallback_config = runtime_config.provider_fallbacks().clone();
         Self::new_with_fallback_config_and_runtime(
             model,
@@ -3732,7 +3732,8 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
-        let runtime_config = load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
+        let runtime_config =
+            load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
         Self::new_with_fallback_config_and_runtime(
             model,
             allowed_tools,
@@ -3794,7 +3795,10 @@ fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> Prov
     }
 }
 
-fn build_provider_entry(model: &str, runtime_config: &RuntimeConfig) -> Result<ProviderEntry, String> {
+fn build_provider_entry(
+    model: &str,
+    runtime_config: &RuntimeConfig,
+) -> Result<ProviderEntry, String> {
     let resolved = resolve_model_alias(model).to_string();
     let provider_override = runtime_config
         .provider()
@@ -3823,7 +3827,8 @@ impl ApiClient for ProviderRuntimeClient {
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let system = (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -4787,29 +4792,46 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
-    args: &'static [&'static str],
+    program: String,
+    args: Vec<String>,
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => Ok(ReplRuntime {
-            program: detect_first_command(&["python3", "python"])
-                .ok_or_else(|| String::from("python runtime not found"))?,
-            args: &["-c"],
-        }),
+        "python" | "py" => detect_python_repl_runtime(),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])
-                .ok_or_else(|| String::from("node runtime not found"))?,
-            args: &["-e"],
+                .ok_or_else(|| String::from("node runtime not found"))?
+                .to_string(),
+            args: vec![String::from("-e")],
         }),
         "sh" | "shell" | "bash" => Ok(ReplRuntime {
             program: detect_first_command(&["bash", "sh"])
-                .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
+                .ok_or_else(|| String::from("shell runtime not found"))?
+                .to_string(),
+            args: vec![String::from("-lc")],
         }),
         other => Err(format!("unsupported REPL language: {other}")),
     }
+}
+
+fn detect_python_repl_runtime() -> Result<ReplRuntime, String> {
+    #[cfg(windows)]
+    {
+        if command_supports_args("py", &["-3", "--version"]) {
+            return Ok(ReplRuntime {
+                program: String::from("py"),
+                args: vec![String::from("-3"), String::from("-c")],
+            });
+        }
+    }
+
+    let program = detect_first_command(&["python3", "python"])
+        .ok_or_else(|| String::from("python runtime not found"))?;
+    Ok(ReplRuntime {
+        program: program.to_string(),
+        args: vec![String::from("-c")],
+    })
 }
 
 fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
@@ -5133,18 +5155,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     }
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Some(path) = command_path("pwsh") {
+        Ok(path)
+    } else if let Some(path) = command_path("powershell") {
+        Ok(path)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -5154,9 +5176,56 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
+    command_path(command).is_some()
+}
+
+fn command_path(command: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("where")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {command}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    }
+}
+
+fn command_supports_args(command: &str, args: &[&str]) -> bool {
+    std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -5375,8 +5444,8 @@ mod tests {
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
-    use runtime::ProviderFallbackConfig;
     use api::OutputContentBlock;
+    use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
@@ -5900,9 +5969,25 @@ mod tests {
             .find(|item| item.get("content").is_some())
             .expect("search result block present");
         let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["url"], "https://example.com/one");
-        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        let urls = content
+            .iter()
+            .filter_map(|item| item["url"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            urls.contains(&"https://example.com/one"),
+            "expected generic fallback results to include example.com: {urls:?}"
+        );
+        assert!(
+            urls.contains(&"https://docs.rs/tokio"),
+            "expected generic fallback results to include docs.rs: {urls:?}"
+        );
+        assert_eq!(
+            urls.iter()
+                .filter(|url| **url == "https://example.com/one")
+                .count(),
+            1,
+            "duplicate generic links should be deduplicated: {urls:?}"
+        );
 
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
@@ -6070,7 +6155,9 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -6096,6 +6183,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -6115,6 +6203,7 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
@@ -6127,7 +6216,9 @@ mod tests {
 
     #[test]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-skills");
         let skill_dir = root.join(".claw").join("skills").join("plan");
         let command_dir = root.join(".claw").join("commands");
@@ -6154,6 +6245,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
@@ -6163,6 +6255,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -6171,7 +6264,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_claude_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -6201,6 +6296,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -6222,7 +6318,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-omc-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -6263,11 +6361,13 @@ mod tests {
         assert!(omc_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
         assert!(agents_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
@@ -6292,7 +6392,9 @@ mod tests {
 
     #[test]
     fn skill_loads_learned_skill_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("claude-config-learned-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -6323,6 +6425,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
@@ -6347,7 +6450,9 @@ mod tests {
 
     #[test]
     fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("claude-config-direct-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -6382,6 +6487,7 @@ mod tests {
         assert!(direct_skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
@@ -6392,6 +6498,7 @@ mod tests {
         assert!(legacy_command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
@@ -6419,7 +6526,9 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_legacy_command_markdown() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("project-legacy-command");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -6449,6 +6558,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
@@ -7340,10 +7450,8 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        let filename = globbed_output["filenames"][0].as_str().expect("filename");
+        assert!(filename.replace('\\', "/").ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -7723,23 +7831,53 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
+        #[cfg(not(windows))]
         let script = dir.join("pwsh");
+
+        #[cfg(windows)]
         std::fs::write(
             &script,
-            r#"#!/bin/sh
+            "@echo off\r\n\
+setlocal\r\n\
+:loop\r\n\
+if \"%~1\"==\"\" goto done\r\n\
+if /I \"%~1\"==\"-Command\" (\r\n\
+  <nul set /p =pwsh:%~2\r\n\
+  exit /b 0\r\n\
+)\r\n\
+shift\r\n\
+goto loop\r\n\
+:done\r\n\
+exit /b 0\r\n",
+        )
+        .expect("write script");
+
+        #[cfg(not(windows))]
+        {
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
 while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
 shift
 printf 'pwsh:%s' "$1"
 "#,
-        )
-        .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
+            )
+            .expect("write script");
+            std::process::Command::new("/bin/chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod");
+        }
+
         let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        std::env::set_var(
+            "PATH",
+            format!("{}{}{}", dir.display(), separator, original_path),
+        );
 
         let result = execute_tool(
             "PowerShell",

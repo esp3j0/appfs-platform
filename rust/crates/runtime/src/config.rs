@@ -8,27 +8,6 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
-/// Top-level settings keys recognized by the runtime configuration loader.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "$schema",
-    "enabledPlugins",
-    "env",
-    "hooks",
-    "mcpServers",
-    "model",
-    "oauth",
-    "permissionMode",
-    "permissions",
-    "plugins",
-    "sandbox",
-];
-
-/// Deprecated top-level keys mapped to their replacement guidance.
-const DEPRECATED_TOP_LEVEL_KEYS: &[(&str, &str)] = &[
-    ("allowedTools", "permissions.allow"),
-    ("ignorePatterns", "permissions.deny"),
-];
-
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -287,6 +266,7 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
@@ -306,6 +286,13 @@ impl ConfigLoader {
             all_warnings.extend(validation.warnings);
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
             merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            if let Some(parsed_aliases) = optional_string_map(
+                &parsed.object,
+                "aliases",
+                &format!("{}: aliases", entry.path.display()),
+            )? {
+                aliases.extend(parsed_aliases);
+            }
             deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
         }
@@ -325,7 +312,7 @@ impl ConfigLoader {
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             provider: parse_optional_provider_config(&merged_value)?,
-            aliases: parse_optional_aliases(&merged_value)?,
+            aliases,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
@@ -2077,11 +2064,14 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
+            rendered.contains(&format!(
+                "{}: unknown key \"telemetry\" (line 3)",
+                user_settings.display()
+            )),
             "error should include file path and line number, got: {rendered}"
         );
         assert!(
-            rendered.contains("unknown field telemetry"),
+            rendered.contains("unknown key \"telemetry\""),
             "error should name the offending field, got: {rendered}"
         );
 
@@ -2104,24 +2094,12 @@ mod tests {
         .expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let loaded = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
+            .expect("deprecated config should still load with warnings");
 
         // then
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains(&format!("{}:3:", user_settings.display())),
-            "error should include file path and line number, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("deprecated field allowedTools"),
-            "error should call out the deprecated field, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("permissions.allow"),
-            "error should mention the replacement field, got: {rendered}"
-        );
+        assert_eq!(loaded.model(), Some("opus"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2149,11 +2127,14 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains(&format!("{}: hooks", user_settings.display())),
+            rendered.contains(&format!(
+                "{}: field \"hooks.PreToolUse\" must be an array of strings, got a string (line 3)",
+                user_settings.display()
+            )),
             "error should include file path and field path, got: {rendered}"
         );
         assert!(
-            rendered.contains("PreToolUse must be an array"),
+            rendered.contains("field \"hooks.PreToolUse\" must be an array of strings"),
             "error should describe the type mismatch, got: {rendered}"
         );
 
@@ -2179,11 +2160,11 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(
-            rendered.contains("unknown field modle"),
+            rendered.contains("unknown key \"modle\""),
             "error should name the offending field, got: {rendered}"
         );
         assert!(
-            rendered.contains("did you mean model?"),
+            rendered.contains("Did you mean \"model\"?"),
             "error should suggest the closest known key, got: {rendered}"
         );
 

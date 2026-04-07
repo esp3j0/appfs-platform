@@ -42,8 +42,11 @@ fn proxy_config_from_env_reads_uppercase_proxy_vars() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost,127.0.0.1"));
+    #[cfg(not(windows))]
     let _http_lower = EnvVarGuard::set("http_proxy", None);
+    #[cfg(not(windows))]
     let _https_lower = EnvVarGuard::set("https_proxy", None);
+    #[cfg(not(windows))]
     let _no_lower = EnvVarGuard::set("no_proxy", None);
 
     // when
@@ -130,8 +133,11 @@ fn build_client_with_env_proxy_config_succeeds() {
     let _http = EnvVarGuard::set("HTTP_PROXY", Some("http://proxy.corp:3128"));
     let _https = EnvVarGuard::set("HTTPS_PROXY", Some("http://secure.corp:3129"));
     let _no = EnvVarGuard::set("NO_PROXY", Some("localhost"));
+    #[cfg(not(windows))]
     let _http_lower = EnvVarGuard::set("http_proxy", None);
+    #[cfg(not(windows))]
     let _https_lower = EnvVarGuard::set("https_proxy", None);
+    #[cfg(not(windows))]
     let _no_lower = EnvVarGuard::set("no_proxy", None);
     let config = ProxyConfig::from_env();
 
@@ -169,5 +175,8 @@ fn proxy_config_from_env_prefers_uppercase_over_lowercase() {
     let config = ProxyConfig::from_env();
 
     // then
+    #[cfg(not(windows))]
     assert_eq!(config.http_proxy.as_deref(), Some("http://upper.corp:3128"));
+    #[cfg(windows)]
+    assert_eq!(config.http_proxy.as_deref(), Some("http://lower.corp:3128"));
 }

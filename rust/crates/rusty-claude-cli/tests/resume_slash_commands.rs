@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::ContentBlock;
 use runtime::Session;
+use runtime::SessionStore;
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -180,7 +181,9 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     // given
     let temp_dir = unique_temp_dir("resume-latest");
     let project_dir = temp_dir.join("project");
-    let sessions_dir = project_dir.join(".claw").join("sessions");
+    fs::create_dir_all(&project_dir).expect("project dir should exist");
+    let store = SessionStore::from_cwd(&project_dir).expect("session store should build");
+    let sessions_dir = store.sessions_dir().to_path_buf();
     fs::create_dir_all(&sessions_dir).expect("sessions dir should exist");
 
     let older_path = sessions_dir.join("session-older.jsonl");
