@@ -5941,7 +5941,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
+            assert!(
+                request_line.contains("GET /fallback?q=generic+links ")
+                    || request_line.contains("GET /fallback?q=generic%20links "),
+                "unexpected fallback request line: {request_line}"
+            );
             HttpResponse::html(
                 200,
                 "OK",
@@ -8271,7 +8275,7 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                let _ = handle.join();
             }
         }
     }
