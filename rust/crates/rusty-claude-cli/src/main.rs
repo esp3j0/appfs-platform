@@ -9053,6 +9053,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
+                base_commit: None,
             }
         );
     }
@@ -9081,6 +9082,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
+                base_commit: None,
             }
         );
     }
@@ -9121,6 +9123,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
+                base_commit: None,
             }
         );
     }
@@ -9197,6 +9200,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                base_commit: None,
             }
         );
     }
@@ -9215,6 +9219,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
             }
         );
     }
@@ -9241,6 +9246,8 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
+                base_commit: None,
             }
         );
     }
@@ -9265,6 +9272,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
             }
         );
     }
@@ -9356,6 +9364,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
+                base_commit: None,
             }
         );
         assert_eq!(
@@ -9783,12 +9792,13 @@ mod tests {
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
-                prompt: "help me debug".to_string(),
+                prompt: "$help overview".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: crate::default_permission_mode(),
                 compact: false,
+                base_commit: None,
             }
         );
     }
@@ -9839,6 +9849,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
+                base_commit: None,
             }
         );
         assert_eq!(
@@ -9863,6 +9874,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
+                base_commit: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
