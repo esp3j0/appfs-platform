@@ -8,6 +8,28 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
+/// Top-level settings keys recognized by the runtime configuration loader.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "$schema",
+    "enabledPlugins",
+    "env",
+    "hooks",
+    "mcpServers",
+    "model",
+    "oauth",
+    "permissionMode",
+    "permissions",
+    "plugins",
+    "sandbox",
+];
+
+/// Deprecated top-level keys mapped to their replacement guidance.
+const DEPRECATED_TOP_LEVEL_KEYS: &[(&str, &str)] = &[
+    ("allowedTools", "permissions.allow"),
+    ("ignorePatterns", "permissions.deny"),
+];
+
+/// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
     User,
@@ -266,9 +288,10 @@ impl ConfigLoader {
         let mut mcp_servers = BTreeMap::new();
 
         for entry in self.discover() {
-            let Some(value) = read_optional_json_object(&entry.path)? else {
+            let Some((value, source)) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
+            validate_known_top_level_keys(&value, source.as_deref(), &entry.path)?;
             validate_optional_hooks_config(&value, &entry.path)?;
             merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
             deep_merge_objects(&mut merged, &value);
@@ -655,7 +678,7 @@ impl McpServerConfig {
 
 fn read_optional_json_object(
     path: &Path,
-) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
+) -> Result<Option<(BTreeMap<String, JsonValue>, Option<String>)>, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -664,7 +687,7 @@ fn read_optional_json_object(
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some(BTreeMap::new()));
+        return Ok(Some((BTreeMap::new(), None)));
     }
 
     let parsed = match JsonValue::parse(&contents) {
@@ -681,7 +704,168 @@ fn read_optional_json_object(
             path.display()
         )));
     };
-    Ok(Some(object.clone()))
+    Ok(Some((object.clone(), Some(contents))))
+}
+
+fn validate_known_top_level_keys(
+    root: &BTreeMap<String, JsonValue>,
+    source: Option<&str>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    for key in root.keys() {
+        if let Some((_, replacement)) = DEPRECATED_TOP_LEVEL_KEYS
+            .iter()
+            .find(|(name, _)| *name == key.as_str())
+        {
+            return Err(ConfigError::Parse(format_field_error(
+                path,
+                source,
+                key,
+                &format!("deprecated field {key}; use {replacement} instead"),
+            )));
+        }
+
+        if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+            let mut message = format!("unknown field {key}");
+            if let Some(suggestion) = closest_known_top_level_key(key) {
+                message.push_str(&format!("; did you mean {suggestion}?"));
+            }
+            return Err(ConfigError::Parse(format_field_error(
+                path, source, key, &message,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn format_field_error(path: &Path, source: Option<&str>, key: &str, message: &str) -> String {
+    let location = source
+        .and_then(|text| find_top_level_key_line(text, key))
+        .map_or_else(
+            || format!("{}", path.display()),
+            |line| format!("{}:{line}", path.display()),
+        );
+    format!("{location}: {message}")
+}
+
+fn find_top_level_key_line(source: &str, key: &str) -> Option<usize> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut index = 0;
+    let mut line = 1_usize;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            if escape {
+                escape = false;
+                if ch == '\n' {
+                    line += 1;
+                }
+                index += 1;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escape = true;
+                    index += 1;
+                    continue;
+                }
+                '"' => {
+                    in_string = false;
+                    index += 1;
+                    continue;
+                }
+                '\n' => {
+                    line += 1;
+                    index += 1;
+                    continue;
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+
+        match ch {
+            '"' => {
+                if depth == 1 {
+                    let start_line = line;
+                    let mut cursor = index + 1;
+                    let mut matched = true;
+                    for expected in key.chars() {
+                        if cursor >= chars.len() || chars[cursor] != expected {
+                            matched = false;
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                    if matched && cursor < chars.len() && chars[cursor] == '"' {
+                        return Some(start_line);
+                    }
+                }
+                in_string = true;
+                index += 1;
+            }
+            '{' | '[' => {
+                depth += 1;
+                index += 1;
+            }
+            '}' | ']' => {
+                depth -= 1;
+                index += 1;
+            }
+            '\n' => {
+                line += 1;
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    None
+}
+
+fn closest_known_top_level_key(input: &str) -> Option<&'static str> {
+    let lowered = input.to_ascii_lowercase();
+    KNOWN_TOP_LEVEL_KEYS
+        .iter()
+        .filter_map(|candidate| {
+            let distance = ascii_lowercase_edit_distance(&lowered, candidate);
+            (distance <= 3).then_some((distance, *candidate))
+        })
+        .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)))
+        .map(|(_, candidate)| candidate)
+}
+
+fn ascii_lowercase_edit_distance(left: &str, right: &str) -> usize {
+    let right_lower: String = right.to_ascii_lowercase();
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right_lower.chars().collect();
+    if left_chars.is_empty() {
+        return right_chars.len();
+    }
+    if right_chars.is_empty() {
+        return left_chars.len();
+    }
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0_usize; right_chars.len() + 1];
+    for (i, left_char) in left_chars.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_char != right_char);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        previous.clone_from(&current);
+    }
+    previous[right_chars.len()]
 }
 
 fn merge_mcp_servers(
@@ -1971,5 +2155,141 @@ mod tests {
         assert!(config.state_for("known", false));
         assert!(config.state_for("missing", true));
         assert!(!config.state_for("missing", false));
+    }
+
+    #[test]
+    fn validates_unknown_top_level_keys_with_line_and_field_name() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"model\": \"opus\",\n  \"telemetry\": true\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}:3:", user_settings.display())),
+            "error should include file path and line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("unknown field telemetry"),
+            "error should name the offending field, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validates_deprecated_top_level_keys_with_replacement_guidance() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"model\": \"opus\",\n  \"allowedTools\": [\"Read\"]\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}:3:", user_settings.display())),
+            "error should include file path and line number, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("deprecated field allowedTools"),
+            "error should call out the deprecated field, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("permissions.allow"),
+            "error should mention the replacement field, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn validates_wrong_type_for_known_field_with_field_path() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            &user_settings,
+            "{\n  \"hooks\": {\n    \"PreToolUse\": \"not-an-array\"\n  }\n}\n",
+        )
+        .expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!("{}: hooks", user_settings.display())),
+            "error should include file path and field path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("PreToolUse must be an array"),
+            "error should describe the type mismatch, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn unknown_top_level_key_suggests_closest_match() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let user_settings = home.join("settings.json");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(&user_settings, "{\n  \"modle\": \"opus\"\n}\n").expect("write user settings");
+
+        // when
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        // then
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown field modle"),
+            "error should name the offending field, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("did you mean model?"),
+            "error should suggest the closest known key, got: {rendered}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }
