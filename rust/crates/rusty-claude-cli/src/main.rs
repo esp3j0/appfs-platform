@@ -24,10 +24,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, ProviderOverride,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
+    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -827,6 +828,46 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
         .ok()?
         .permission_mode()
         .map(permission_mode_from_resolved)
+}
+
+fn config_model_for_current_dir() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load()
+        .ok()?
+        .model()
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_repl_model(cli_model: String) -> String {
+    if cli_model != DEFAULT_MODEL {
+        return cli_model;
+    }
+    if let Some(env_model) = env::var("ANTHROPIC_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return resolve_model_alias(&env_model).to_string();
+    }
+    if let Some(config_model) = config_model_for_current_dir() {
+        return resolve_model_alias(&config_model).to_string();
+    }
+    cli_model
+}
+
+fn provider_label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Xai => "xai",
+        ProviderKind::OpenAi => "openai",
+    }
+}
+
+fn format_connected_line(model: &str) -> String {
+    let provider = provider_label(detect_provider_kind(model));
+    format!("Connected: {model} via {provider}")
 }
 
 fn filter_tool_specs(
@@ -1630,17 +1671,6 @@ fn default_oauth_config() -> OAuthConfig {
 }
 
 fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(base_url) = read_openai_base_url_override() {
-        emit_openai_base_url_login_conflict(
-            output_format,
-            &base_url,
-            &mut io::stdout(),
-            &mut io::stderr(),
-        )?;
-        return Err(
-            io::Error::other("claw login is unavailable when OPENAI_BASE_URL is set").into(),
-        );
-    }
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let default_oauth = default_oauth_config();
@@ -2707,10 +2737,12 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let resolved_model = resolve_repl_model(model);
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
+    println!("{}", format_connected_line(&cli.model));
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -7055,111 +7087,6 @@ fn format_grep_result(icon: &str, parsed: &serde_json::Value) -> String {
     }
 }
 
-/// Detects multi-agent OMC/orchestrator output where the model labels lines with
-/// `Explore:`, `Implementation:`, etc., and rewrites them so each agent type
-/// becomes its own visually grouped section. This is display-only — the
-/// underlying text persisted to the session is left untouched by callers.
-///
-/// The emitted section headers use HTML numeric entities for the surrounding
-/// hyphens (`&#45;&#45;&#45; Explore &#45;&#45;&#45;`) so the shared markdown
-/// renderer's smart-punctuation pass cannot collapse them into a single em-dash.
-/// After rendering, the user sees the literal `--- Explore ---` form requested
-/// in the bug report.
-///
-/// Returns `Some(grouped)` only when at least two distinct canonical agent
-/// types are present, so single-agent output is left unchanged.
-fn regroup_omc_agent_sections(text: &str) -> Option<String> {
-    if text.is_empty() {
-        return None;
-    }
-
-    let mut preamble: Vec<String> = Vec::new();
-    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-    let mut current: Option<usize> = None;
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-
-    for raw_line in text.lines() {
-        if let Some((label, content)) = parse_omc_agent_section_line(raw_line) {
-            seen.insert(label.clone());
-            let index = sections
-                .iter()
-                .position(|(existing, _)| existing == &label)
-                .unwrap_or_else(|| {
-                    sections.push((label, Vec::new()));
-                    sections.len() - 1
-                });
-            current = Some(index);
-            if !content.is_empty() {
-                sections[index].1.push(content);
-            }
-        } else if let Some(index) = current {
-            sections[index].1.push(raw_line.to_string());
-        } else {
-            preamble.push(raw_line.to_string());
-        }
-    }
-
-    if seen.len() < 2 {
-        return None;
-    }
-
-    let mut out = String::new();
-    if !preamble.is_empty() {
-        out.push_str(preamble.join("\n").trim_end());
-        if !out.is_empty() {
-            out.push('\n');
-        }
-    }
-    for (idx, (label, lines)) in sections.iter().enumerate() {
-        if idx > 0 || !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&omc_agent_section_header(label));
-        if !lines.is_empty() {
-            out.push('\n');
-            out.push_str(lines.join("\n").trim_end());
-        }
-        out.push('\n');
-    }
-    Some(out.trim_end_matches('\n').to_string())
-}
-
-/// Builds the markdown-safe form of an OMC agent section header. The hyphens
-/// are emitted as numeric character references so the shared markdown renderer
-/// does not transform `---` into `—` via smart punctuation.
-fn omc_agent_section_header(label: &str) -> String {
-    format!("&#45;&#45;&#45; {label} &#45;&#45;&#45;")
-}
-
-/// Parses a single line for an OMC agent-section prefix like
-/// `Explore: <body>`. Returns the canonical label and the trailing body if the
-/// line opens with one of the recognised agent types.
-fn parse_omc_agent_section_line(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim_start();
-    let (head, rest) = trimmed.split_once(':')?;
-    let label = canonical_omc_agent_label(head.trim())?;
-    let body = rest.trim_start().to_string();
-    Some((label, body))
-}
-
-/// Maps a free-form agent label to its canonical display name. Returns `None`
-/// for unrecognised labels so unrelated `Foo:` prefixes are left as plain text.
-fn canonical_omc_agent_label(label: &str) -> Option<String> {
-    let normalized = label.trim().to_ascii_lowercase();
-    let canonical = match normalized.as_str() {
-        "explore" | "exploring" | "research" => "Explore",
-        "implementation" | "implementing" | "implement" => "Implementation",
-        "verification" | "verifying" | "verify" => "Verification",
-        "plan" | "planning" => "Plan",
-        "review" | "reviewing" => "Review",
-        "oracle" => "Oracle",
-        "librarian" => "Librarian",
-        "general" | "general-purpose" => "General",
-        _ => return None,
-    };
-    Some(canonical.to_string())
-}
-
 fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
     let rendered_output = match parsed {
         serde_json::Value::String(text) => text.clone(),
@@ -7169,10 +7096,8 @@ fn format_generic_tool_result(icon: &str, name: &str, parsed: &serde_json::Value
         }
         _ => parsed.to_string(),
     };
-    let grouped = regroup_omc_agent_sections(&rendered_output);
-    let display_source = grouped.as_deref().unwrap_or(&rendered_output);
     let preview = truncate_output_for_display(
-        display_source,
+        &rendered_output,
         TOOL_OUTPUT_DISPLAY_MAX_LINES,
         TOOL_OUTPUT_DISPLAY_MAX_CHARS,
     );
@@ -7276,14 +7201,7 @@ fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                // Display-only: when the orchestrator emits multi-agent
-                // labelled lines (`Explore: ...`, `Implementation: ...`),
-                // group them under section headers so the transcript stops
-                // reading as a flat wall of text. The unmodified `text` is
-                // still pushed onto `events` so persistence is unchanged.
-                let display_text =
-                    regroup_omc_agent_sections(&text).unwrap_or_else(|| text.clone());
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&display_text);
+                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -7709,6 +7627,8 @@ mod tests {
         create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_connected_line, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
@@ -7720,7 +7640,7 @@ mod tests {
         regroup_omc_agent_sections, render_config_report, render_diff_report,
         render_diff_report_for, render_hook_list_report_for, render_memory_report,
         render_merged_runtime_config_json, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
+        resolve_model_alias, resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
@@ -8990,6 +8910,73 @@ mod tests {
     }
 
     #[test]
+    fn format_connected_line_renders_anthropic_provider_for_claude_model() {
+        let model = "claude-sonnet-4-6";
+
+        let line = format_connected_line(model);
+
+        assert_eq!(line, "Connected: claude-sonnet-4-6 via anthropic");
+    }
+
+    #[test]
+    fn format_connected_line_renders_xai_provider_for_grok_model() {
+        let model = "grok-3";
+
+        let line = format_connected_line(model);
+
+        assert_eq!(line, "Connected: grok-3 via xai");
+    }
+
+    #[test]
+    fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
+        let user_model = "claude-sonnet-4-6".to_string();
+
+        let resolved = resolve_repl_model(user_model);
+
+        assert_eq!(resolved, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn resolve_repl_model_falls_back_to_anthropic_model_env_when_default() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::set_var("ANTHROPIC_MODEL", "sonnet");
+
+        let resolved =
+            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+        assert_eq!(resolved, "claude-sonnet-4-6");
+
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn resolve_repl_model_returns_default_when_env_unset_and_no_config() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_MODEL");
+
+        let resolved =
+            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+        assert_eq!(resolved, DEFAULT_MODEL);
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn resume_supported_command_list_matches_expected_surface() {
         let names = resume_supported_slash_commands()
             .into_iter()
@@ -10108,144 +10095,6 @@ UU conflicted.rs",
         assert!(output.contains("raw 119"));
     }
 
-    const ENTITY_DASHES: &str = "&#45;&#45;&#45;";
-
-    #[test]
-    fn regroup_omc_agent_sections_inserts_headers_when_multiple_agent_types_present() {
-        // given
-        let raw = "Here is the multi-agent transcript:\n\
-                   Explore: Located main.rs renderer\n\
-                   Explore: Mapped tool result paths\n\
-                   Implementation: Added section helper\n\
-                   Implementation: Wired helper into format_generic_tool_result\n\
-                   Verification: Ran cargo check";
-        let explore_header = format!("{ENTITY_DASHES} Explore {ENTITY_DASHES}");
-        let impl_header = format!("{ENTITY_DASHES} Implementation {ENTITY_DASHES}");
-        let verify_header = format!("{ENTITY_DASHES} Verification {ENTITY_DASHES}");
-
-        // when
-        let grouped = regroup_omc_agent_sections(raw).expect("multi-agent text should regroup");
-
-        // then
-        assert!(grouped.contains("Here is the multi-agent transcript:"));
-        assert!(grouped.contains(&explore_header), "{grouped}");
-        assert!(grouped.contains(&impl_header), "{grouped}");
-        assert!(grouped.contains(&verify_header), "{grouped}");
-        assert!(grouped.contains("Located main.rs renderer"));
-        assert!(grouped.contains("Wired helper into format_generic_tool_result"));
-        let explore_pos = grouped
-            .find(&explore_header)
-            .expect("Explore header should be present");
-        let impl_pos = grouped
-            .find(&impl_header)
-            .expect("Implementation header should be present");
-        let verify_pos = grouped
-            .find(&verify_header)
-            .expect("Verification header should be present");
-        assert!(
-            explore_pos < impl_pos && impl_pos < verify_pos,
-            "agent sections should preserve first-seen ordering: {grouped}"
-        );
-    }
-
-    #[test]
-    fn regroup_omc_agent_sections_returns_none_when_only_single_agent_type_present() {
-        // given
-        let raw = "Explore: Found the renderer\nExplore: Found the test file";
-
-        // when
-        let grouped = regroup_omc_agent_sections(raw);
-
-        // then
-        assert!(
-            grouped.is_none(),
-            "single-agent transcript should not be regrouped: {grouped:?}"
-        );
-    }
-
-    #[test]
-    fn regroup_omc_agent_sections_ignores_unrelated_colon_prefixes() {
-        // given
-        let raw = "Note: this is fine\nFooBar: still fine\nDetails: nothing to group";
-
-        // when
-        let grouped = regroup_omc_agent_sections(raw);
-
-        // then
-        assert!(
-            grouped.is_none(),
-            "non-agent prefixes should not trigger grouping: {grouped:?}"
-        );
-    }
-
-    #[test]
-    fn format_tool_result_groups_agent_output_by_type_headers() {
-        // given
-        let output = "Explore: Mapped the OMC renderer surface\n\
-                      Implementation: Added grouped section headers\n\
-                      Implementation: Preserved truncation behavior\n\
-                      Verification: Ran cargo check on rusty-claude-cli";
-        let explore_header = format!("{ENTITY_DASHES} Explore {ENTITY_DASHES}");
-        let impl_header = format!("{ENTITY_DASHES} Implementation {ENTITY_DASHES}");
-        let verify_header = format!("{ENTITY_DASHES} Verification {ENTITY_DASHES}");
-
-        // when
-        let rendered = format_tool_result("Agent", output, false);
-
-        // then
-        assert!(rendered.contains("Agent"));
-        assert!(rendered.contains(&explore_header), "{rendered}");
-        assert!(rendered.contains(&impl_header), "{rendered}");
-        assert!(rendered.contains(&verify_header), "{rendered}");
-        assert!(rendered.contains("Mapped the OMC renderer surface"));
-        assert!(rendered.contains("Preserved truncation behavior"));
-    }
-
-    #[test]
-    fn push_output_block_groups_assistant_text_by_agent_type_for_display_only() {
-        // given
-        let mut out = Vec::new();
-        let mut events: Vec<AssistantEvent> = Vec::new();
-        let mut pending_tool = None;
-        let mut block_has_thinking_summary = false;
-        let assistant_text = "Explore: Found flat OMC transcript rendering\n\
-                              Implementation: Added grouped output headers\n\
-                              Verification: Added rendering coverage";
-
-        // when
-        push_output_block(
-            OutputContentBlock::Text {
-                text: assistant_text.to_string(),
-            },
-            &mut out,
-            &mut events,
-            &mut pending_tool,
-            false,
-            &mut block_has_thinking_summary,
-        )
-        .expect("text block should render");
-
-        // then
-        // After the shared markdown renderer expands the numeric character
-        // references in the section headers, the user-visible output contains
-        // the literal `--- Explore ---` form requested by the bug report.
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert!(rendered.contains("--- Explore ---"), "{rendered}");
-        assert!(rendered.contains("--- Implementation ---"), "{rendered}");
-        assert!(rendered.contains("--- Verification ---"), "{rendered}");
-        assert!(
-            rendered.contains("Added grouped output headers"),
-            "{rendered}"
-        );
-        // The original, unmodified assistant text is still pushed onto the
-        // event stream so persisted sessions are byte-identical to the API
-        // response.
-        assert!(matches!(
-            events.as_slice(),
-            [AssistantEvent::TextDelta(text)] if text == assistant_text
-        ));
-    }
-
     #[test]
     fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
         let snapshot = InternalPromptProgressState {
@@ -10495,87 +10344,6 @@ UU conflicted.rs",
         assert!(stderr.contains("failed to open browser automatically"));
         assert!(stderr.contains("Open this URL manually:"));
         assert!(stderr.contains("https://example.test/oauth/authorize"));
-    }
-
-    #[test]
-    fn login_with_openai_base_url_emits_actionable_text_error() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        super::emit_openai_base_url_login_conflict(
-            CliOutputFormat::Text,
-            "https://proxy.example.test/v1",
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect("conflict message should render");
-
-        assert!(stdout.is_empty());
-        let stderr = String::from_utf8(stderr).expect("utf8");
-        assert!(stderr.contains("error: claw login uses Anthropic OAuth"));
-        assert!(stderr.contains("OPENAI_BASE_URL"));
-        assert!(stderr.contains("https://proxy.example.test/v1"));
-        assert!(stderr.contains("ANTHROPIC_API_KEY"));
-    }
-
-    #[test]
-    fn login_with_openai_base_url_json_output_emits_machine_readable_error() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-
-        super::emit_openai_base_url_login_conflict(
-            CliOutputFormat::Json,
-            "https://proxy.example.test/v1",
-            &mut stdout,
-            &mut stderr,
-        )
-        .expect("conflict message should render");
-
-        let stdout = String::from_utf8(stdout).expect("utf8");
-        let payload: serde_json::Value =
-            serde_json::from_str(&stdout).expect("stdout should be valid json");
-        assert_eq!(payload["kind"], serde_json::json!("login_error"));
-        assert_eq!(payload["reason"], serde_json::json!("openai_base_url_set"));
-        assert_eq!(
-            payload["openai_base_url"],
-            serde_json::json!("https://proxy.example.test/v1")
-        );
-        assert!(payload["message"]
-            .as_str()
-            .expect("message string")
-            .contains("OPENAI_BASE_URL"));
-        assert!(payload["suggestion"]
-            .as_str()
-            .expect("suggestion string")
-            .contains("ANTHROPIC_API_KEY"));
-
-        let stderr = String::from_utf8(stderr).expect("utf8");
-        assert!(stderr.contains("error: claw login uses Anthropic OAuth"));
-        assert!(stderr.contains("ANTHROPIC_API_KEY"));
-    }
-
-    #[test]
-    fn read_openai_base_url_override_reports_set_value_and_ignores_blank() {
-        let _guard = env_lock();
-        let original = std::env::var("OPENAI_BASE_URL").ok();
-
-        std::env::remove_var("OPENAI_BASE_URL");
-        let absent = super::read_openai_base_url_override();
-
-        std::env::set_var("OPENAI_BASE_URL", "   ");
-        let blank = super::read_openai_base_url_override();
-
-        std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.test/v1");
-        let present = super::read_openai_base_url_override();
-
-        match original {
-            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
-            None => std::env::remove_var("OPENAI_BASE_URL"),
-        }
-
-        assert!(absent.is_none());
-        assert!(blank.is_none());
-        assert_eq!(present.as_deref(), Some("https://proxy.example.test/v1"));
     }
 
     #[test]
