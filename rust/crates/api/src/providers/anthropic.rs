@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
+use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
@@ -130,7 +131,7 @@ impl AnthropicClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             auth: AuthSource::ApiKey(api_key.into()),
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -146,7 +147,7 @@ impl AnthropicClient {
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client_or_default(),
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
