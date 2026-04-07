@@ -87,7 +87,7 @@ Why this is next:
 
 ### R2. Launcher-Driven Startup
 
-**Status:** Current next design and implementation target
+**Status:** Prototype implemented in the integration workspace; stabilization is the next target
 
 Goal:
 
@@ -111,6 +111,7 @@ Exit criteria:
 1. one documented and supported launch path for "AppFS + appfs-agent together"
 2. attach works without relying on control-plane directory naming
 3. the launched agent runs inside an AppFS-backed workspace rather than relying on a raw host directory
+4. `IC-3` stays green on the self-hosted Windows launcher workflow
 
 ### R3. Overlay-Backed Existing Directory Entry
 
@@ -202,9 +203,9 @@ The following are not current mainline goals:
 
 ### M2. Explicit Joint Startup
 
-1. choose the first supported launcher entrypoint
-2. inject manifest path, mount root, runtime session, and attach id explicitly
-3. document the supported startup flow in `integration/`
+1. stabilize the first supported launcher entrypoint
+2. keep manifest path, mount root, runtime session, and attach id injection explicit
+3. document and keep the supported startup flow green in `integration/`
 
 ### M3. Overlay-Backed Workspace Entry
 
@@ -233,6 +234,6 @@ This roadmap is cross-project, but code ownership still follows repository bound
 
 If we pick one concrete next task from this roadmap, it should be:
 
-1. define and implement the first launcher-driven startup path for AppFS-backed agent execution
+1. stabilize `IC-3` and the first launcher-driven startup path for AppFS-backed agent execution
 
 That is the shortest path to making AppFS-backed agent execution feel explicit and productized instead of manually assembled.

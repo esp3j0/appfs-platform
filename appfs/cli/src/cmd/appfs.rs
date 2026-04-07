@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -253,6 +253,7 @@ async fn wait_for_runtime_manifest_ready(
 ) -> Result<(PathBuf, runtime_manifest::AppfsRuntimeManifestDoc)> {
     let manifest_path = runtime_manifest::runtime_manifest_path(mount_root);
     let started = Instant::now();
+    let mut last_manifest_error: Option<String> = None;
 
     loop {
         if let Some(status) = appfs_child.try_wait()? {
@@ -263,23 +264,32 @@ async fn wait_for_runtime_manifest_ready(
         }
 
         if manifest_path.exists() {
-            let bytes = std::fs::read(&manifest_path).with_context(|| {
-                format!(
-                    "failed to read AppFS runtime manifest {}",
-                    manifest_path.display()
-                )
-            })?;
-            let manifest: runtime_manifest::AppfsRuntimeManifestDoc =
-                serde_json::from_slice(&bytes).with_context(|| {
-                    format!(
-                        "failed to parse AppFS runtime manifest {}",
+            match std::fs::read(&manifest_path) {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(manifest) => return Ok((manifest_path, manifest)),
+                    Err(err) => {
+                        last_manifest_error = Some(format!(
+                            "failed to parse AppFS runtime manifest {}: {err}",
+                            manifest_path.display()
+                        ));
+                    }
+                },
+                Err(err) => {
+                    last_manifest_error = Some(format!(
+                        "failed to read AppFS runtime manifest {}: {err}",
                         manifest_path.display()
-                    )
-                })?;
-            return Ok((manifest_path, manifest));
+                    ));
+                }
+            }
         }
 
         if started.elapsed() >= timeout {
+            if let Some(last_error) = last_manifest_error {
+                anyhow::bail!(
+                    "timed out waiting for AppFS runtime manifest readiness at {} ({last_error})",
+                    manifest_path.display()
+                );
+            }
             anyhow::bail!(
                 "timed out waiting for AppFS runtime manifest readiness at {}",
                 manifest_path.display()
@@ -290,12 +300,41 @@ async fn wait_for_runtime_manifest_ready(
     }
 }
 
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+
+        if started.elapsed() >= timeout {
+            return false;
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn terminate_launcher_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) => {
             let _ = child.kill();
-            let _ = child.wait();
+            if wait_for_child_exit(child, Duration::from_secs(5)) {
+                return;
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let _ = ProcessCommand::new("taskkill")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = wait_for_child_exit(child, Duration::from_secs(5));
+            }
         }
         Err(_) => {}
     }
