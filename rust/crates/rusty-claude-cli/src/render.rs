@@ -635,7 +635,7 @@ fn apply_code_block_background(line: &str) -> String {
 }
 
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
-    let mut in_fence = false;
+    let mut open_fence: Option<FenceMarker> = None;
     let mut last_boundary = None;
 
     for (offset, line) in markdown.split_inclusive('\n').scan(0usize, |cursor, line| {
@@ -643,25 +643,66 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
         *cursor += line.len();
         Some((start, line))
     }) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            if !in_fence {
+        let line_without_newline = line.trim_end_matches('\n');
+        if let Some(opener) = open_fence {
+            if line_closes_fence(line_without_newline, opener) {
+                open_fence = None;
                 last_boundary = Some(offset + line.len());
             }
             continue;
         }
 
-        if in_fence {
+        if let Some(opener) = parse_fence_opener(line_without_newline) {
+            open_fence = Some(opener);
             continue;
         }
 
-        if trimmed.is_empty() {
+        if line_without_newline.trim().is_empty() {
             last_boundary = Some(offset + line.len());
         }
     }
 
     last_boundary
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FenceMarker {
+    character: char,
+    length: usize,
+}
+
+fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let character = rest.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = rest.chars().take_while(|c| *c == character).count();
+    if length < 3 {
+        return None;
+    }
+    let info_string = &rest[length..];
+    if character == '`' && info_string.contains('`') {
+        return None;
+    }
+    Some(FenceMarker { character, length })
+}
+
+fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let length = rest.chars().take_while(|c| *c == opener.character).count();
+    if length < opener.length {
+        return false;
+    }
+    rest[length..].chars().all(|c| c == ' ' || c == '\t')
 }
 
 fn visible_width(input: &str) -> usize {
@@ -776,6 +817,60 @@ mod tests {
             .push(&renderer, "```\n")
             .expect("closed code fence flushes");
         assert!(strip_ansi(&code).contains("fn main()"));
+    }
+
+    #[test]
+    fn streaming_state_holds_outer_fence_with_nested_inner_fence() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(
+            state.push(&renderer, "````markdown\n```rust\nfn inner() {}\n"),
+            None,
+            "inner triple backticks must not close the outer four-backtick fence"
+        );
+        assert_eq!(
+            state.push(&renderer, "```\n"),
+            None,
+            "closing the inner fence must not flush the outer fence"
+        );
+        let flushed = state
+            .push(&renderer, "````\n")
+            .expect("closing the outer four-backtick fence flushes the buffered block");
+        let plain_text = strip_ansi(&flushed);
+        assert!(plain_text.contains("fn inner()"));
+        assert!(plain_text.contains("```rust"));
+    }
+
+    #[test]
+    fn streaming_state_distinguishes_backtick_and_tilde_fences() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(state.push(&renderer, "~~~text\n"), None);
+        assert_eq!(
+            state.push(&renderer, "```\nstill inside tilde fence\n"),
+            None,
+            "a backtick fence cannot close a tilde-opened fence"
+        );
+        assert_eq!(state.push(&renderer, "```\n"), None);
+        let flushed = state
+            .push(&renderer, "~~~\n")
+            .expect("matching tilde marker closes the fence");
+        let plain_text = strip_ansi(&flushed);
+        assert!(plain_text.contains("still inside tilde fence"));
+    }
+
+    #[test]
+    fn renders_nested_fenced_code_block_preserves_inner_markers() {
+        let terminal_renderer = TerminalRenderer::new();
+        let markdown_output =
+            terminal_renderer.markdown_to_ansi("````markdown\n```rust\nfn nested() {}\n```\n````");
+        let plain_text = strip_ansi(&markdown_output);
+
+        assert!(plain_text.contains("╭─ markdown"));
+        assert!(plain_text.contains("```rust"));
+        assert!(plain_text.contains("fn nested()"));
     }
 
     #[test]
