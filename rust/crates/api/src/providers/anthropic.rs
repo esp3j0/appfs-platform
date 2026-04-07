@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,9 +26,9 @@ use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEve
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
-const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
+const DEFAULT_MAX_RETRIES: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSource {
@@ -457,7 +458,7 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -573,6 +574,40 @@ impl AnthropicClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn jittered_backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
+        let base = self.backoff_for_attempt(attempt)?;
+        Ok(base + jitter_for_base(base))
+    }
+}
+
+/// Process-wide counter that guarantees distinct jitter samples even when
+/// the system clock resolution is coarser than consecutive retry sleeps.
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a random additive jitter in `[0, base]` to decorrelate retries
+/// from multiple concurrent clients. Entropy is drawn from the nanosecond
+/// wall clock mixed with a monotonic counter and run through a splitmix64
+/// finalizer; adequate for retry jitter (no cryptographic requirement).
+fn jitter_for_base(base: Duration) -> Duration {
+    let base_nanos = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let raw_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // splitmix64 finalizer — mixes the low bits so large bases still see
+    // jitter across their full range instead of being clamped to subsec nanos.
+    let mut mixed = raw_nanos.wrapping_add(tick).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^= mixed >> 31;
+    // Inclusive upper bound: jitter may equal `base`, matching "up to base".
+    let jitter_nanos = mixed % base_nanos.saturating_add(1);
+    Duration::from_nanos(jitter_nanos)
 }
 
 impl AuthSource {
@@ -1267,6 +1302,58 @@ mod tests {
         assert_eq!(
             client.backoff_for_attempt(3).expect("attempt 3"),
             Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_additive_bounds_and_varies() {
+        let client = AnthropicClient::new("test-key").with_retry_policy(
+            8,
+            Duration::from_secs(1),
+            Duration::from_secs(128),
+        );
+        let mut samples = Vec::with_capacity(64);
+        for _ in 0..64 {
+            let base = client.backoff_for_attempt(3).expect("base attempt 3");
+            let jittered = client
+                .jittered_backoff_for_attempt(3)
+                .expect("jittered attempt 3");
+            assert!(
+                jittered >= base,
+                "jittered delay {jittered:?} must be at least the base {base:?}"
+            );
+            assert!(
+                jittered <= base * 2,
+                "jittered delay {jittered:?} must not exceed base*2 {:?}",
+                base * 2
+            );
+            samples.push(jittered);
+        }
+        let distinct: std::collections::HashSet<_> = samples.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "jitter should produce varied delays across samples, got {samples:?}"
+        );
+    }
+
+    #[test]
+    fn default_retry_policy_matches_exponential_schedule() {
+        let client = AnthropicClient::new("test-key");
+        assert_eq!(
+            client.backoff_for_attempt(1).expect("attempt 1"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            client.backoff_for_attempt(2).expect("attempt 2"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            client.backoff_for_attempt(3).expect("attempt 3"),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            client.backoff_for_attempt(8).expect("attempt 8"),
+            Duration::from_secs(128)
         );
     }
 
