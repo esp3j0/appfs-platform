@@ -6889,10 +6889,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        if let Some(decision) = Self::decision_from_env(request) {
-            return decision;
-        }
-
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -6904,6 +6900,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         println!("  Input            {}", request.input);
         print!("Approve this tool call? [y/N]: ");
         let _ = io::stdout().flush();
+
+        if let Some(decision) = Self::decision_from_env(request) {
+            println!();
+            return decision;
+        }
 
         let mut response = String::new();
         match io::stdin().read_line(&mut response) {
