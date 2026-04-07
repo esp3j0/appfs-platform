@@ -8390,7 +8390,11 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
         CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
         GitWorkspaceSummary, GitWorktreeEntry,
-        resolve_model_alias_with_config,
+        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context, status_json_value,
+        PromptHistoryEntry, render_prompt_history_report,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
