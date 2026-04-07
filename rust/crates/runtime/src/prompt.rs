@@ -321,10 +321,14 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
-    if let Some(commits) = &project_context.git_recent_commits {
-        lines.push(String::new());
-        lines.push("Recent commits (last 5):".to_string());
-        lines.push(commits.clone());
+    if let Some(ref gc) = project_context.git_context {
+        if !gc.recent_commits.is_empty() {
+            lines.push(String::new());
+            lines.push("Recent commits (last 5):".to_string());
+            for c in &gc.recent_commits {
+                lines.push(format!("  {} {}", c.hash, c.subject));
+            }
+        }
     }
     if let Some(diff) = &project_context.git_diff {
         lines.push(String::new());
@@ -740,14 +744,12 @@ mod tests {
             .render();
 
         // then: branch, recent commits and staged files are present in context
-        let commits = context
-            .git_recent_commits
-            .as_deref()
-            .expect("recent commits should be present");
+        let gc = context.git_context.as_ref().expect("git context should be present");
+        let commits: String = gc.recent_commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>().join("\n");
         assert!(commits.contains("first commit"));
         assert!(commits.contains("second commit"));
         assert!(commits.contains("third commit"));
-        assert_eq!(commits.lines().count(), 3);
+        assert_eq!(gc.recent_commits.len(), 3);
 
         let status = context.git_status.as_deref().expect("status snapshot");
         assert!(status.contains("## main"));
