@@ -494,6 +494,10 @@ where
         &self.session
     }
 
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
     #[must_use]
     pub fn fork_session(&self, branch_name: Option<String>) -> Session {
         self.session.fork(branch_name)

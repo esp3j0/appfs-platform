@@ -3899,10 +3899,14 @@ impl LiveCli {
             .map_or(self.runtime.session().updated_at_ms, |duration| {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
             });
-        self.prompt_history.push(PromptHistoryEntry {
+        let entry = PromptHistoryEntry {
             timestamp_ms,
             text: prompt.to_string(),
-        });
+        };
+        self.prompt_history.push(entry);
+        if let Err(error) = self.runtime.session_mut().push_prompt_entry(prompt) {
+            eprintln!("warning: failed to persist prompt history: {error}");
+        }
     }
 
     fn print_prompt_history(&self, count: Option<&str>) {
@@ -3913,10 +3917,27 @@ impl LiveCli {
                 return;
             }
         };
-        let entries = if self.prompt_history.is_empty() {
-            collect_session_prompt_history(self.runtime.session())
+        let session_entries = &self.runtime.session().prompt_history;
+        let entries = if session_entries.is_empty() {
+            if self.prompt_history.is_empty() {
+                collect_session_prompt_history(self.runtime.session())
+            } else {
+                self.prompt_history
+                    .iter()
+                    .map(|entry| PromptHistoryEntry {
+                        timestamp_ms: entry.timestamp_ms,
+                        text: entry.text.clone(),
+                    })
+                    .collect()
+            }
         } else {
-            self.prompt_history.clone()
+            session_entries
+                .iter()
+                .map(|entry| PromptHistoryEntry {
+                    timestamp_ms: entry.timestamp_ms,
+                    text: entry.text.clone(),
+                })
+                .collect()
         };
         println!("{}", render_prompt_history_report(&entries, limit));
     }
@@ -5781,7 +5802,7 @@ fn write_temp_text_file(
     Ok(path)
 }
 
-const DEFAULT_HISTORY_LIMIT: usize = 10;
+const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 fn parse_history_count(raw: Option<&str>) -> Result<usize, String> {
     let Some(raw) = raw else {
@@ -5858,6 +5879,16 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
 }
 
 fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> {
+    if !session.prompt_history.is_empty() {
+        return session
+            .prompt_history
+            .iter()
+            .map(|entry| PromptHistoryEntry {
+                timestamp_ms: entry.timestamp_ms,
+                text: entry.text.clone(),
+            })
+            .collect();
+    }
     let timestamp_ms = session.updated_at_ms;
     session
         .messages
