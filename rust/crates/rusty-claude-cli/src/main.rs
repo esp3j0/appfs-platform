@@ -11169,7 +11169,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn parse_history_count_defaults_to_ten_when_missing() {
+    fn parse_history_count_defaults_to_twenty_when_missing() {
         // given
         let raw: Option<&str> = None;
 
@@ -11177,7 +11177,7 @@ UU conflicted.rs",
         let parsed = parse_history_count(raw);
 
         // then
-        assert_eq!(parsed, Ok(10));
+        assert_eq!(parsed, Ok(20));
     }
 
     #[test]
