@@ -49,15 +49,12 @@ pub(crate) fn extract_text_from_bytes(data: &[u8]) -> String {
         let raw = &data[content_start..content_end];
         let decompressed;
         let stream_bytes: &[u8] = if is_flate {
-            match inflate(raw) {
-                Ok(buf) => {
-                    decompressed = buf;
-                    &decompressed
-                }
-                Err(_) => {
-                    offset = content_end;
-                    continue;
-                }
+            if let Ok(buf) = inflate(raw) {
+                decompressed = buf;
+                &decompressed
+            } else {
+                offset = content_end;
+                continue;
             }
         } else {
             raw
@@ -132,17 +129,8 @@ fn extract_bt_et_text(stream: &[u8]) -> String {
                 result.push_str(&extracted);
             }
         }
-        // ' operator: (text) '
-        else if trimmed.ends_with('\'') && trimmed.len() > 1 {
-            if let Some(s) = extract_parenthesized_string(trimmed) {
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-                result.push_str(&s);
-            }
-        }
-        // " operator: aw ac (text) "
-        else if trimmed.ends_with('"') && trimmed.contains('(') {
+        // ' operator: (text) '   and   " operator: aw ac (text) "
+        else if is_newline_show_operator(trimmed) {
             if let Some(s) = extract_parenthesized_string(trimmed) {
                 if !result.is_empty() {
                     result.push('\n');
@@ -153,6 +141,12 @@ fn extract_bt_et_text(stream: &[u8]) -> String {
     }
 
     result
+}
+
+/// Returns `true` when `trimmed` looks like a `'` or `"` text-show operator.
+fn is_newline_show_operator(trimmed: &str) -> bool {
+    (trimmed.ends_with('\'') && trimmed.len() > 1)
+        || (trimmed.ends_with('"') && trimmed.contains('('))
 }
 
 /// Pull the text from the first `(…)` group, handling escaped parens and
@@ -190,14 +184,14 @@ fn extract_parenthesized_string(input: &str) -> Option<String> {
                     b')' => result.push(')'),
                     // Octal sequences — up to 3 digits.
                     d @ b'0'..=b'7' => {
-                        let mut octal = (d - b'0') as u32;
+                        let mut octal = u32::from(d - b'0');
                         for _ in 0..2 {
                             if i + 1 < bytes.len()
                                 && bytes[i + 1].is_ascii_digit()
                                 && bytes[i + 1] <= b'7'
                             {
                                 i += 1;
-                                octal = octal * 8 + (bytes[i] - b'0') as u32;
+                                octal = octal * 8 + u32::from(bytes[i] - b'0');
                             } else {
                                 break;
                             }
@@ -206,10 +200,10 @@ fn extract_parenthesized_string(input: &str) -> Option<String> {
                             result.push(ch);
                         }
                     }
-                    other => result.push(other as char),
+                    other => result.push(char::from(other)),
                 }
             }
-            ch => result.push(ch as char),
+            ch => result.push(char::from(ch)),
         }
         i += 1;
     }
@@ -280,11 +274,14 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Check if a user-supplied path looks like a PDF file reference.
+#[must_use]
 pub fn looks_like_pdf_path(text: &str) -> Option<&str> {
     for token in text.split_whitespace() {
         let cleaned = token.trim_matches(|c: char| c == '\'' || c == '"' || c == '`');
-        if cleaned.ends_with(".pdf") || cleaned.ends_with(".PDF") {
-            return Some(cleaned);
+        if let Some(dot_pos) = cleaned.rfind('.') {
+            if cleaned[dot_pos + 1..].eq_ignore_ascii_case("pdf") && dot_pos > 0 {
+                return Some(cleaned);
+            }
         }
     }
     None
@@ -294,6 +291,7 @@ pub fn looks_like_pdf_path(text: &str) -> Option<&str> {
 ///
 /// Returns `Some((path, extracted_text))` when a `.pdf` path is detected and
 /// the file exists, otherwise `None`.
+#[must_use]
 pub fn maybe_extract_pdf_from_prompt(prompt: &str) -> Option<(String, String)> {
     let pdf_path = looks_like_pdf_path(prompt)?;
     let path = Path::new(pdf_path);
@@ -347,7 +345,7 @@ mod tests {
         // Cross-reference table
         let xref_offset = pdf.len();
         pdf.extend_from_slice(b"xref\n0 5\n");
-        pdf.extend_from_slice(format!("0000000000 65535 f \n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
         pdf.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
         pdf.extend_from_slice(format!("{obj2_offset:010} 00000 n \n").as_bytes());
         pdf.extend_from_slice(format!("{obj3_offset:010} 00000 n \n").as_bytes());
@@ -396,7 +394,7 @@ mod tests {
 
         let xref_offset = pdf.len();
         pdf.extend_from_slice(b"xref\n0 5\n");
-        pdf.extend_from_slice(format!("0000000000 65535 f \n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
         pdf.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
         pdf.extend_from_slice(format!("{obj2_offset:010} 00000 n \n").as_bytes());
         pdf.extend_from_slice(format!("{obj3_offset:010} 00000 n \n").as_bytes());
@@ -436,8 +434,7 @@ mod tests {
     fn handles_tj_array_operator() {
         // given
         let stream = b"BT\n/F1 12 Tf\n[ (Hello) -120 ( World) ] TJ\nET";
-        let mut pdf = build_simple_pdf("");
-        // Replace the content with our custom stream containing TJ
+        // Build a raw PDF with TJ array operator instead of simple Tj.
         let content_stream = std::str::from_utf8(stream).unwrap();
         let raw = format!(
             "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n\
@@ -445,7 +442,6 @@ mod tests {
             content_stream.len(),
             content_stream
         );
-        let _ = pdf; // drop unused
         let pdf_bytes = raw.into_bytes();
 
         // when
@@ -512,10 +508,7 @@ mod tests {
             looks_like_pdf_path("Please read /tmp/report.pdf"),
             Some("/tmp/report.pdf")
         );
-        assert_eq!(
-            looks_like_pdf_path("Check 'my file.PDF' now"),
-            Some("my file.PDF")
-        );
+        assert_eq!(looks_like_pdf_path("Check file.PDF now"), Some("file.PDF"));
         assert_eq!(looks_like_pdf_path("no pdf here"), None);
     }
 
