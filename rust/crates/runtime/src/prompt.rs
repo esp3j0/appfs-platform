@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::git_context::GitContext;
 
 #[derive(Debug)]
 pub enum PromptBuildError {
@@ -51,7 +52,7 @@ pub struct ProjectContext {
     pub current_date: String,
     pub git_status: Option<String>,
     pub git_diff: Option<String>,
-    pub git_recent_commits: Option<String>,
+    pub git_context: Option<GitContext>,
     pub instruction_files: Vec<ContextFile>,
 }
 
@@ -67,7 +68,7 @@ impl ProjectContext {
             current_date: current_date.into(),
             git_status: None,
             git_diff: None,
-            git_recent_commits: None,
+            git_context: None,
             instruction_files,
         })
     }
@@ -79,7 +80,7 @@ impl ProjectContext {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
         context.git_diff = read_git_diff(&context.cwd);
-        context.git_recent_commits = read_git_recent_commits(&context.cwd);
+        context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
     }
 }
@@ -329,6 +330,13 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push(String::new());
         lines.push("Git diff snapshot:".to_string());
         lines.push(diff.clone());
+    }
+    if let Some(git_context) = &project_context.git_context {
+        let rendered = git_context.render();
+        if !rendered.is_empty() {
+            lines.push(String::new());
+            lines.push(rendered);
+        }
     }
     lines.join("\n")
 }

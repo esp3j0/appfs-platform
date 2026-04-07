@@ -9,6 +9,7 @@ mod context;
 pub mod config_validate;
 mod conversation;
 mod file_ops;
+mod git_context;
 pub mod green_contract;
 mod hooks;
 mod json;
@@ -77,6 +78,7 @@ pub use conversation::{
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
     ToolExecutor, TurnSummary,
 };
+pub use git_context::{GitCommitEntry, GitContext};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
