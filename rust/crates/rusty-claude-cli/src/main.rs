@@ -13,7 +13,7 @@ mod render;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -118,6 +118,45 @@ Run `claw --help` for usage."
     }
 }
 
+/// Read piped stdin content when stdin is not a terminal.
+///
+/// Returns `None` when stdin is attached to a terminal (interactive REPL use),
+/// when reading fails, or when the piped content is empty after trimming.
+/// Returns `Some(raw_content)` when a pipe delivered non-empty content.
+fn read_piped_stdin() -> Option<String> {
+    if io::stdin().is_terminal() {
+        return None;
+    }
+    let mut buffer = String::new();
+    if io::stdin().read_to_string(&mut buffer).is_err() {
+        return None;
+    }
+    if buffer.trim().is_empty() {
+        return None;
+    }
+    Some(buffer)
+}
+
+/// Merge a piped stdin payload into a prompt argument.
+///
+/// When `stdin_content` is `None` or empty after trimming, the prompt is
+/// returned unchanged. Otherwise the trimmed stdin content is appended to the
+/// prompt separated by a blank line so the model sees the prompt first and the
+/// piped context immediately after it.
+fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String {
+    let Some(raw) = stdin_content else {
+        return prompt.to_string();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return prompt.to_string();
+    }
+    if prompt.is_empty() {
+        return trimmed.to_string();
+    }
+    format!("{prompt}\n\n{trimmed}")
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     set_shell_if_windows()?;
@@ -161,9 +200,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-            compact,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format, compact)?,
+        } => {
+            let stdin_context = read_piped_stdin();
+            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            LiveCli::new(model, true, allowed_tools, permission_mode)?
+                .run_turn_with_output(&effective_prompt, output_format)?;
+        }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -8102,21 +8144,20 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
-        format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
-        normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
-        parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
-        print_help_to, push_output_block, regroup_omc_agent_sections, render_config_report,
-        render_diff_report, render_diff_report_for, render_hook_list_report_for,
-        render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
-        render_repl_help, render_resume_usage, resolve_model_alias, resolve_repl_model,
-        resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_git_worktrees, parse_history_count, parse_hook_args, parse_recent_commits,
+        permission_policy, print_help_to, push_output_block, regroup_omc_agent_sections,
+        render_config_report, render_diff_report, render_diff_report_for,
+        render_hook_list_report_for, render_memory_report, render_merged_runtime_config_json,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
-        parse_export_args, print_help_to, render_session_markdown, short_tool_id,
-        summarize_tool_payload_for_markdown,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
+        CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
+        GitWorkspaceSummary, GitWorktreeEntry,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
@@ -8691,6 +8732,70 @@ mod tests {
                 compact: false,
             }
         );
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_returns_prompt_unchanged_when_no_pipe() {
+        // given
+        let prompt = "Review this";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, None);
+
+        // then
+        assert_eq!(merged, "Review this");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_ignores_whitespace_only_pipe() {
+        // given
+        let prompt = "Review this";
+        let piped = "   \n\t\n  ";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Review this");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_appends_piped_content_as_context() {
+        // given
+        let prompt = "Review this";
+        let piped = "fn main() { println!(\"hi\"); }\n";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Review this\n\nfn main() { println!(\"hi\"); }");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_trims_surrounding_whitespace_on_pipe() {
+        // given
+        let prompt = "Summarize";
+        let piped = "\n\n  some notes  \n\n";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "Summarize\n\nsome notes");
+    }
+
+    #[test]
+    fn merge_prompt_with_stdin_returns_pipe_when_prompt_is_empty() {
+        // given
+        let prompt = "";
+        let piped = "standalone body";
+
+        // when
+        let merged = merge_prompt_with_stdin(prompt, Some(piped));
+
+        // then
+        assert_eq!(merged, "standalone body");
     }
 
     #[test]
