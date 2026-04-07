@@ -224,6 +224,14 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     )
 }
 
+/// Returns the effective max output tokens for a model, preferring a plugin
+/// override when present. Falls back to [`max_tokens_for_model`] when the
+/// override is `None`.
+#[must_use]
+pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
+    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
+}
+
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
@@ -278,6 +286,61 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
         .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
+/// Parse a `.env` file body into key/value pairs using a minimal `KEY=VALUE`
+/// grammar. Lines that are blank, start with `#`, or do not contain `=` are
+/// ignored. Surrounding double or single quotes are stripped from the value.
+/// An optional leading `export ` prefix on the key is also stripped so files
+/// shared with shell `source` workflows still parse cleanly.
+pub(crate) fn parse_dotenv(content: &str) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let trimmed_key = raw_key.trim();
+        let key = trimmed_key
+            .strip_prefix("export ")
+            .map_or(trimmed_key, str::trim)
+            .to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let trimmed_value = raw_value.trim();
+        let unquoted = if (trimmed_value.starts_with('"') && trimmed_value.ends_with('"')
+            || trimmed_value.starts_with('\'') && trimmed_value.ends_with('\''))
+            && trimmed_value.len() >= 2
+        {
+            &trimmed_value[1..trimmed_value.len() - 1]
+        } else {
+            trimmed_value
+        };
+        values.insert(key, unquoted.to_string());
+    }
+    values
+}
+
+/// Load and parse a `.env` file from the given path. Missing files yield
+/// `None` instead of an error so callers can use this as a soft fallback.
+pub(crate) fn load_dotenv_file(
+    path: &std::path::Path,
+) -> Option<std::collections::HashMap<String, String>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(parse_dotenv(&content))
+}
+
+/// Look up `key` in a `.env` file located in the current working directory.
+/// Returns `None` when the file is missing, the key is absent, or the value
+/// is empty.
+pub(crate) fn dotenv_value(key: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let values = load_dotenv_file(&cwd.join(".env"))?;
+    values.get(key).filter(|value| !value.is_empty()).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -288,8 +351,9 @@ mod tests {
     };
 
     use super::{
-        detect_provider_kind, max_tokens_for_model, model_token_limit, preflight_message_request,
-        resolve_model_alias, ProviderKind,
+        detect_provider_kind, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     #[test]
@@ -314,6 +378,56 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+    }
+
+    #[test]
+    fn plugin_config_max_output_tokens_overrides_model_default() {
+        // given
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("api-plugin-max-tokens-{nanos}"));
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        std::fs::create_dir_all(&home).expect("home config dir");
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{
+              "plugins": {
+                "maxOutputTokens": 12345
+              }
+            }"#,
+        )
+        .expect("write plugin settings");
+
+        // when
+        let loaded = runtime::ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let plugin_override = loaded.plugins().max_output_tokens();
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+
+        // then
+        assert_eq!(plugin_override, Some(12345));
+        assert_eq!(effective, 12345);
+        assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
+
+        std::fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn max_tokens_for_model_with_override_falls_back_when_plugin_unset() {
+        // given
+        let plugin_override: Option<u32> = None;
+
+        // when
+        let effective = max_tokens_for_model_with_override("claude-opus-4-6", plugin_override);
+
+        // then
+        assert_eq!(effective, max_tokens_for_model("claude-opus-4-6"));
+        assert_eq!(effective, 32_000);
     }
 
     #[test]
@@ -397,5 +511,86 @@ mod tests {
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
         assert_eq!(model_token_limit("gpt-4.1"), None);
+    }
+
+    #[test]
+    fn parse_dotenv_extracts_keys_handles_comments_quotes_and_export_prefix() {
+        // given
+        let body = "\
+# this is a comment
+
+ANTHROPIC_API_KEY=plain-value
+XAI_API_KEY=\"quoted-value\"
+OPENAI_API_KEY='single-quoted'
+export GROK_API_KEY=exported-value
+   PADDED_KEY  =  padded-value  
+EMPTY_VALUE=
+NO_EQUALS_LINE
+";
+
+        // when
+        let values = parse_dotenv(body);
+
+        // then
+        assert_eq!(
+            values.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("plain-value")
+        );
+        assert_eq!(
+            values.get("XAI_API_KEY").map(String::as_str),
+            Some("quoted-value")
+        );
+        assert_eq!(
+            values.get("OPENAI_API_KEY").map(String::as_str),
+            Some("single-quoted")
+        );
+        assert_eq!(
+            values.get("GROK_API_KEY").map(String::as_str),
+            Some("exported-value")
+        );
+        assert_eq!(
+            values.get("PADDED_KEY").map(String::as_str),
+            Some("padded-value")
+        );
+        assert_eq!(values.get("EMPTY_VALUE").map(String::as_str), Some(""));
+        assert!(!values.contains_key("NO_EQUALS_LINE"));
+        assert!(!values.contains_key("# this is a comment"));
+    }
+
+    #[test]
+    fn load_dotenv_file_reads_keys_from_disk_and_returns_none_when_missing() {
+        // given
+        let temp_root = std::env::temp_dir().join(format!(
+            "api-dotenv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        std::fs::create_dir_all(&temp_root).expect("create temp dir");
+        let env_path = temp_root.join(".env");
+        std::fs::write(
+            &env_path,
+            "ANTHROPIC_API_KEY=secret-from-file\n# comment\nXAI_API_KEY=\"xai-secret\"\n",
+        )
+        .expect("write .env");
+        let missing_path = temp_root.join("does-not-exist.env");
+
+        // when
+        let loaded = load_dotenv_file(&env_path).expect("file should load");
+        let missing = load_dotenv_file(&missing_path);
+
+        // then
+        assert_eq!(
+            loaded.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("secret-from-file")
+        );
+        assert_eq!(
+            loaded.get("XAI_API_KEY").map(String::as_str),
+            Some("xai-secret")
+        );
+        assert!(missing.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

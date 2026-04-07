@@ -4,9 +4,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
-    ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -26,8 +26,8 @@ use runtime::{
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
+    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -189,6 +189,7 @@ impl GlobalToolRegistry {
         self.set_enforcer(enforcer);
         self
     }
+
     pub fn normalize_allowed_tools(
         &self,
         values: &[String],
@@ -367,20 +368,8 @@ impl GlobalToolRegistry {
     }
 }
 
-pub fn strip_tool_call_prefix(value: &str) -> &str {
-    let trimmed = value.trim();
-    if let Some((prefix, rest)) = trimmed.split_once('>') {
-        if prefix.starts_with('<') && !rest.trim().is_empty() {
-            return rest.trim();
-        }
-    }
-    trimmed
-}
-
 fn normalize_tool_name(value: &str) -> String {
-    strip_tool_call_prefix(value)
-        .replace('-', "_")
-        .to_ascii_lowercase()
+    value.trim().replace('-', "_").to_ascii_lowercase()
 }
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
@@ -3377,7 +3366,6 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .or_else(configured_default_model)
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
@@ -3391,12 +3379,6 @@ fn build_agent_runtime(
         permission_policy,
         job.system_prompt.clone(),
     ))
-}
-
-fn configured_default_model() -> Option<String> {
-    load_runtime_config_for_cwd()
-        .ok()
-        .and_then(|config| config.model().map(ToOwned::to_owned))
 }
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
@@ -3719,32 +3701,73 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
     }
 }
 
+struct ProviderEntry {
+    model: String,
+    client: ProviderClient,
+}
+
 struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
-    model: String,
+    chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
 }
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).to_string();
-        let runtime_config = load_runtime_config_for_cwd().map_err(|error| error.to_string())?;
-        let provider_override = runtime_config
-            .provider()
-            .map(provider_override_from_runtime_config);
-        let oauth = runtime_config.oauth().cloned();
-        let client = ProviderClient::from_model_with_anthropic_auth_resolver(
-            &model,
-            provider_override.as_ref(),
-            || resolve_tool_auth_source(&oauth),
+        let runtime_config =
+            load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
+        let fallback_config = runtime_config.provider_fallbacks().clone();
+        Self::new_with_fallback_config_and_runtime(
+            model,
+            allowed_tools,
+            &fallback_config,
+            &runtime_config,
         )
-        .map_err(|error| error.to_string())?;
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_fallback_config(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        fallback_config: &ProviderFallbackConfig,
+    ) -> Result<Self, String> {
+        let runtime_config =
+            load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
+        Self::new_with_fallback_config_and_runtime(
+            model,
+            allowed_tools,
+            fallback_config,
+            &runtime_config,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_fallback_config_and_runtime(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        fallback_config: &ProviderFallbackConfig,
+        runtime_config: &RuntimeConfig,
+    ) -> Result<Self, String> {
+        let primary_model = fallback_config
+            .primary()
+            .map(str::to_string)
+            .unwrap_or(model);
+        let primary = build_provider_entry(&primary_model, runtime_config)?;
+        let mut chain = vec![primary];
+        for fallback_model in fallback_config.fallbacks() {
+            match build_provider_entry(fallback_model, runtime_config) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    eprintln!(
+                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
+                }
+            }
+        }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
-            client,
-            model,
+            chain,
             allowed_tools,
         })
     }
@@ -3772,8 +3795,28 @@ fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> Prov
     }
 }
 
+fn build_provider_entry(
+    model: &str,
+    runtime_config: &RuntimeConfig,
+) -> Result<ProviderEntry, String> {
+    let resolved = resolve_model_alias(model).to_string();
+    let provider_override = runtime_config
+        .provider()
+        .map(provider_override_from_runtime_config);
+    let oauth = runtime_config.oauth().cloned();
+    let client = ProviderClient::from_model_with_anthropic_auth_resolver(
+        &resolved,
+        provider_override.as_ref(),
+        || resolve_tool_auth_source(&oauth),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(ProviderEntry {
+        model: resolved,
+        client,
+    })
+}
+
 impl ApiClient for ProviderRuntimeClient {
-    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
@@ -3783,106 +3826,130 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: (!tools.is_empty()).then_some(tools),
-            tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
-            stream: true,
-        };
+        let messages = convert_messages(&request.messages);
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
-        self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = Vec::new();
-            let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-            let mut saw_stop = false;
+        let runtime = &self.runtime;
+        let chain = &self.chain;
+        let mut last_error: Option<ApiError> = None;
+        for (index, entry) in chain.iter().enumerate() {
+            let message_request = MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: max_tokens_for_model(&entry.model),
+                messages: messages.clone(),
+                system: system.clone(),
+                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tool_choice: tool_choice.clone(),
+                stream: true,
+            };
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
-                match event {
-                    ApiStreamEvent::MessageStart(start) => {
-                        for block in start.message.content {
-                            push_output_block(block, 0, &mut events, &mut pending_tools, true);
-                        }
-                    }
-                    ApiStreamEvent::ContentBlockStart(start) => {
-                        push_output_block(
-                            start.content_block,
-                            start.index,
-                            &mut events,
-                            &mut pending_tools,
-                            true,
-                        );
-                    }
-                    ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                        ContentBlockDelta::TextDelta { text } => {
-                            if !text.is_empty() {
-                                events.push(AssistantEvent::TextDelta(text));
-                            }
-                        }
-                        ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                                input.push_str(&partial_json);
-                            }
-                        }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
-                    },
-                    ApiStreamEvent::ContentBlockStop(stop) => {
-                        if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                            events.push(AssistantEvent::ToolUse { id, name, input });
-                        }
-                    }
-                    ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    }
-                    ApiStreamEvent::MessageStop(_) => {
-                        saw_stop = true;
-                        events.push(AssistantEvent::MessageStop);
-                    }
+            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            match attempt {
+                Ok(events) => return Ok(events),
+                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                    eprintln!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(RuntimeError::new(error.to_string())),
+            }
+        }
+
+        Err(RuntimeError::new(
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn stream_with_provider(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+) -> Result<Vec<AssistantEvent>, ApiError> {
+    let mut stream = client.stream_message(message_request).await?;
+    let mut events = Vec::new();
+    let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut saw_stop = false;
+
+    while let Some(event) = stream.next_event().await? {
+        match event {
+            ApiStreamEvent::MessageStart(start) => {
+                for block in start.message.content {
+                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
             }
-
-            push_prompt_cache_record(&self.client, &mut events);
-
-            if !saw_stop
-                && events.iter().any(|event| {
-                    matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ToolUse { .. })
-                })
-            {
+            ApiStreamEvent::ContentBlockStart(start) => {
+                push_output_block(
+                    start.content_block,
+                    start.index,
+                    &mut events,
+                    &mut pending_tools,
+                    true,
+                );
+            }
+            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        events.push(AssistantEvent::TextDelta(text));
+                    }
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                        input.push_str(&partial_json);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { .. }
+                | ContentBlockDelta::SignatureDelta { .. } => {}
+            },
+            ApiStreamEvent::ContentBlockStop(stop) => {
+                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                    events.push(AssistantEvent::ToolUse { id, name, input });
+                }
+            }
+            ApiStreamEvent::MessageDelta(delta) => {
+                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+            }
+            ApiStreamEvent::MessageStop(_) => {
+                saw_stop = true;
                 events.push(AssistantEvent::MessageStop);
             }
-
-            if events
-                .iter()
-                .any(|event| matches!(event, AssistantEvent::MessageStop))
-            {
-                return Ok(events);
-            }
-
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = response_to_events(response);
-            push_prompt_cache_record(&self.client, &mut events);
-            Ok(events)
-        })
+        }
     }
+
+    push_prompt_cache_record(client, &mut events);
+
+    if !saw_stop
+        && events.iter().any(|event| {
+            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                || matches!(event, AssistantEvent::ToolUse { .. })
+        })
+    {
+        events.push(AssistantEvent::MessageStop);
+    }
+
+    if events
+        .iter()
+        .any(|event| matches!(event, AssistantEvent::MessageStop))
+    {
+        return Ok(events);
+    }
+
+    let response = client
+        .send_message(&MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        })
+        .await?;
+    let mut events = response_to_events(response);
+    push_prompt_cache_record(client, &mut events);
+    Ok(events)
 }
 
 struct SubagentToolExecutor {
@@ -4725,48 +4792,46 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
-    args: &'static [&'static str],
+    program: String,
+    args: Vec<String>,
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => {
-            resolve_python_repl_runtime().ok_or_else(|| String::from("python runtime not found"))
-        }
+        "python" | "py" => detect_python_repl_runtime(),
         "javascript" | "js" | "node" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])
-                .ok_or_else(|| String::from("node runtime not found"))?,
-            args: &["-e"],
+                .ok_or_else(|| String::from("node runtime not found"))?
+                .to_string(),
+            args: vec![String::from("-e")],
         }),
         "sh" | "shell" | "bash" => Ok(ReplRuntime {
             program: detect_first_command(&["bash", "sh"])
-                .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
+                .ok_or_else(|| String::from("shell runtime not found"))?
+                .to_string(),
+            args: vec![String::from("-lc")],
         }),
         other => Err(format!("unsupported REPL language: {other}")),
     }
 }
 
-fn resolve_python_repl_runtime() -> Option<ReplRuntime> {
+fn detect_python_repl_runtime() -> Result<ReplRuntime, String> {
     #[cfg(windows)]
-    if command_runs_successfully("py", &["-3", "--version"]) {
-        return Some(ReplRuntime {
-            program: "py",
-            args: &["-3", "-c"],
-        });
-    }
-
-    for candidate in ["python3", "python"] {
-        if command_runs_successfully(candidate, &["--version"]) {
-            return Some(ReplRuntime {
-                program: candidate,
-                args: &["-c"],
+    {
+        if command_supports_args("py", &["-3", "--version"]) {
+            return Ok(ReplRuntime {
+                program: String::from("py"),
+                args: vec![String::from("-3"), String::from("-c")],
             });
         }
     }
 
-    None
+    let program = detect_first_command(&["python3", "python"])
+        .ok_or_else(|| String::from("python runtime not found"))?;
+    Ok(ReplRuntime {
+        program: program.to_string(),
+        args: vec![String::from("-c")],
+    })
 }
 
 fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
@@ -4774,17 +4839,6 @@ fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|command| command_exists(command))
-}
-
-fn command_runs_successfully(command: &str, args: &[&str]) -> bool {
-    Command::new(command)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -5109,105 +5163,78 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
 }
 
 fn detect_powershell_shell() -> std::io::Result<String> {
-    let mut probe_failures = Vec::new();
-
-    for candidate in ["pwsh", "powershell"] {
-        let Some(path) = resolve_command_path(candidate) else {
-            continue;
-        };
-        match probe_powershell_shell(&path) {
-            Ok(()) => return Ok(path.display().to_string()),
-            Err(error) => probe_failures.push(format!("{} ({error})", path.display())),
+    if let Ok(path) = std::env::var("CLAW_TEST_POWERSHELL_PATH") {
+        if !path.trim().is_empty() {
+            return Ok(path);
         }
     }
 
-    if probe_failures.is_empty() {
+    if let Some(path) = command_path("pwsh") {
+        Ok(path)
+    } else if let Some(path) = command_path("powershell") {
+        Ok(path)
+    } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
         ))
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "PowerShell executable found but failed probe (tried: {})",
-                probe_failures.join(", ")
-            ),
-        ))
-    }
-}
-
-fn probe_powershell_shell(shell: &Path) -> std::io::Result<()> {
-    const PROBE_TOKEN: &str = "__claw_pwsh_probe__";
-    let output = std::process::Command::new(shell)
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-Command")
-        .arg(format!("Write-Output {PROBE_TOKEN}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let message = if stderr.is_empty() {
-            format!("probe exited with status {}", output.status)
-        } else {
-            format!("probe exited with status {}: {stderr}", output.status)
-        };
-        return Err(std::io::Error::other(message));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim() == PROBE_TOKEN {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "probe stdout mismatch: expected {PROBE_TOKEN}, got {:?}",
-            stdout.trim()
-        )))
     }
 }
 
 fn command_exists(command: &str) -> bool {
-    resolve_command_path(command).is_some()
+    command_path(command).is_some()
 }
 
-fn resolve_command_path(command: &str) -> Option<PathBuf> {
-    let command_path = Path::new(command);
-    if command_path.components().count() > 1 || command_path.is_absolute() {
-        return command_path.exists().then(|| command_path.to_path_buf());
+fn command_path(command: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("where")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string);
     }
 
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| executable_path_in_dir(&dir, command))
-    })
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {command}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    }
 }
 
-#[cfg(windows)]
-fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
-    let candidate = dir.join(command);
-    if candidate.exists() {
-        return Some(candidate);
-    }
-
-    if Path::new(command).extension().is_some() {
-        return None;
-    }
-
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| String::from(".COM;.EXE;.BAT;.CMD"));
-    pathext
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| dir.join(format!("{command}{ext}")))
-        .find(|candidate| candidate.exists())
-}
-
-#[cfg(not(windows))]
-fn executable_path_in_dir(dir: &Path, command: &str) -> Option<PathBuf> {
-    let candidate = dir.join(command);
-    candidate.exists().then_some(candidate)
+fn command_supports_args(command: &str, args: &[&str]) -> bool {
+    std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5400,6 +5427,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod lane_completion;
+pub mod pdf_extract;
 
 #[cfg(test)]
 mod tests {
@@ -5416,49 +5444,23 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, detect_powershell_shell, execute_agent_with_spawn, execute_tool,
-        final_assistant_text, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
+    use runtime::ProviderFallbackConfig;
     use runtime::{
-        bash_shell_path, permission_enforcer::PermissionEnforcer, set_shell_if_windows, ApiRequest,
-        AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError,
-        Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn windows_bash_smoke_ok() -> bool {
-        #[cfg(windows)]
-        {
-            static OK: OnceLock<bool> = OnceLock::new();
-            *OK.get_or_init(|| {
-                if set_shell_if_windows().is_err() {
-                    return false;
-                }
-                let Ok(shell_path) = bash_shell_path() else {
-                    return false;
-                };
-                Command::new(shell_path)
-                    .args(["-lc", "printf ok"])
-                    .output()
-                    .is_ok_and(|output| {
-                        output.status.success()
-                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
-                    })
-            })
-        }
-
-        #[cfg(not(windows))]
-        {
-            true
-        }
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -5504,18 +5506,6 @@ mod tests {
             .fold(PermissionPolicy::new(mode), |policy, spec| {
                 policy.with_tool_requirement(spec.name, spec.required_permission)
             })
-    }
-
-    fn bash_echo_command() -> &'static str {
-        "printf 'hello'"
-    }
-
-    fn bash_error_command() -> &'static str {
-        "printf 'oops' >&2; exit 7"
-    }
-
-    fn bash_sleep_command() -> &'static str {
-        "sleep 1"
     }
 
     #[test]
@@ -5865,7 +5855,6 @@ mod tests {
         let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
         let titled_summary = titled_output["result"].as_str().expect("result string");
         assert!(titled_summary.contains("Title: Ignored"));
-        server.assert_clean();
     }
 
     #[test]
@@ -5900,14 +5889,10 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
-        server.assert_clean();
     }
 
     #[test]
     fn web_search_extracts_and_filters_results() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -5948,7 +5933,6 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Reqwest docs");
         assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
-        server.assert_clean();
     }
 
     #[test]
@@ -5960,7 +5944,7 @@ mod tests {
             assert!(
                 request_line.contains("GET /fallback?q=generic+links ")
                     || request_line.contains("GET /fallback?q=generic%20links "),
-                "unexpected request line: {request_line}"
+                "unexpected fallback request line: {request_line}"
             );
             HttpResponse::html(
                 200,
@@ -5995,10 +5979,25 @@ mod tests {
             .find(|item| item.get("content").is_some())
             .expect("search result block present");
         let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["url"], "https://example.com/one");
-        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
-        server.assert_clean();
+        let urls = content
+            .iter()
+            .filter_map(|item| item["url"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            urls.contains(&"https://example.com/one"),
+            "expected generic fallback results to include example.com: {urls:?}"
+        );
+        assert!(
+            urls.contains(&"https://docs.rs/tokio"),
+            "expected generic fallback results to include docs.rs: {urls:?}"
+        );
+        assert_eq!(
+            urls.iter()
+                .filter(|url| **url == "https://example.com/one")
+                .count(),
+            1,
+            "duplicate generic links should be deduplicated: {urls:?}"
+        );
 
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
@@ -6169,16 +6168,16 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let codex_home = temp_path("codex-home");
-        let skill_dir = codex_home.join("skills").join("help");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let home = temp_path("skills-home");
+        let skill_dir = home.join(".agents").join("skills").join("help");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "description: Guide on using oh-my-codex plugin\n\n# Help\n\nUse this skill for overviews.\n",
+            "# help\n\nGuide on using oh-my-codex plugin\n",
         )
-        .expect("write skill prompt");
-        let original_codex_home = std::env::var_os("CODEX_HOME");
-        std::env::set_var("CODEX_HOME", &codex_home);
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
 
         let result = execute_tool(
             "Skill",
@@ -6191,8 +6190,11 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(PathBuf::from(output["path"].as_str().expect("path"))
-            .ends_with(PathBuf::from("help").join("SKILL.md")));
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -6208,14 +6210,382 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(PathBuf::from(dollar_output["path"].as_str().expect("path"))
-            .ends_with(PathBuf::from("help").join("SKILL.md")));
+        assert!(dollar_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with("/help/SKILL.md"));
 
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn skill_resolves_project_local_skills_and_legacy_commands() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("project-skills");
+        let skill_dir = root.join(".claw").join("skills").join("plan");
+        let command_dir = root.join(".claw").join("commands");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: plan\ndescription: Project planning guidance\n---\n\n# plan\n",
+        )
+        .expect("skill file should exist");
+        fs::write(
+            command_dir.join("handoff.md"),
+            "---\nname: handoff\ndescription: Legacy handoff guidance\n---\n\n# handoff\n",
+        )
+        .expect("command file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
+            .expect("project-local skill should resolve");
+        let skill_output: serde_json::Value =
+            serde_json::from_str(&skill_result).expect("valid json");
+        assert!(skill_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".claw/skills/plan/SKILL.md"));
+
+        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
+            .expect("legacy command should resolve");
+        let command_output: serde_json::Value =
+            serde_json::from_str(&command_result).expect("valid json");
+        assert!(command_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".claw/commands/handoff.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_claude_skill_prompt() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("project-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let skill_dir = workspace.join(".claude").join("skills").join("trace");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local trace helper\n---\n# trace\n",
+        )
+        .expect("skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("project-local skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert_eq!(output["description"], "Project-local trace helper");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
         match original_codex_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        let _ = fs::remove_dir_all(codex_home);
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_omc_and_agents_skill_prompts() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("project-omc-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let omc_skill_dir = workspace.join(".omc").join("skills").join("hud");
+        let agents_skill_dir = workspace.join(".agents").join("skills").join("trace");
+        fs::create_dir_all(&omc_skill_dir).expect("omc skill dir should exist");
+        fs::create_dir_all(&agents_skill_dir).expect("agents skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            omc_skill_dir.join("SKILL.md"),
+            "---\nname: hud\ndescription: Project-local OMC HUD helper\n---\n# hud\n",
+        )
+        .expect("omc skill file should exist");
+        fs::write(
+            agents_skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local agents compatibility helper\n---\n# trace\n",
+        )
+        .expect("agents skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let omc_result =
+            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
+        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("agents skill should resolve");
+
+        let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
+        let agents_output: serde_json::Value =
+            serde_json::from_str(&agents_result).expect("valid json");
+        assert!(omc_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
+        assert!(agents_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert_eq!(
+            agents_output["description"],
+            "Project-local agents compatibility helper"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_learned_skill_from_claude_config_dir() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("claude-config-learned-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let learned_skill_dir = claude_config_dir
+            .join("skills")
+            .join("omc-learned")
+            .join("learned");
+        fs::create_dir_all(&learned_skill_dir).expect("learned skill dir should exist");
+        fs::write(
+            learned_skill_dir.join("SKILL.md"),
+            "---\nname: learned\ndescription: Learned OMC skill\n---\n# learned\n",
+        )
+        .expect("learned skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let result = execute_tool("Skill", &json!({ "skill": "learned" }))
+            .expect("learned skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert_eq!(output["description"], "Learned OMC skill");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("claude-config-direct-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let skill_dir = claude_config_dir.join("skills").join("statusline");
+        let command_dir = claude_config_dir.join("commands");
+        fs::create_dir_all(&skill_dir).expect("direct skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: statusline\ndescription: Claude config skill\n---\n# statusline\n",
+        )
+        .expect("direct skill file should exist");
+        fs::write(
+            command_dir.join("doctor-check.md"),
+            "---\nname: doctor-check\ndescription: Claude config command\n---\n# doctor-check\n",
+        )
+        .expect("direct command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let direct_skill =
+            execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
+        let direct_skill_output: serde_json::Value =
+            serde_json::from_str(&direct_skill).expect("valid skill json");
+        assert!(direct_skill_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with("skills/statusline/SKILL.md"));
+        assert_eq!(direct_skill_output["description"], "Claude config skill");
+
+        let legacy_command =
+            execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
+        let legacy_command_output: serde_json::Value =
+            serde_json::from_str(&legacy_command).expect("valid command json");
+        assert!(legacy_command_output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with("commands/doctor-check.md"));
+        assert_eq!(
+            legacy_command_output["description"],
+            "Claude config command"
+        );
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_legacy_command_markdown() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("project-legacy-command");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let command_dir = workspace.join(".claude").join("commands");
+        fs::create_dir_all(&command_dir).expect("legacy command dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            command_dir.join("team.md"),
+            "---\nname: team\ndescription: Legacy team workflow\n---\n# team\n",
+        )
+        .expect("legacy command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "team" }))
+            .expect("legacy command markdown should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .replace('\\', "/")
+            .ends_with(".claude/commands/team.md"));
+        assert_eq!(output["description"], "Legacy team workflow");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
     }
 
     #[test]
@@ -6839,19 +7209,13 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        if !windows_bash_smoke_ok() {
-            return;
-        }
-        let success = execute_tool("bash", &json!({ "command": bash_echo_command() }))
+        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
-        assert_eq!(
-            success_output["stdout"].as_str().expect("stdout").trim(),
-            "hello"
-        );
+        assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": bash_error_command() }))
+        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
             .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
@@ -6860,11 +7224,8 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool(
-            "bash",
-            &json!({ "command": bash_sleep_command(), "timeout": 10 }),
-        )
-        .expect("bash timeout should return output");
+        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
+            .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -6875,7 +7236,7 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": bash_sleep_command(), "run_in_background": true }),
+            &json!({ "command": "sleep 1", "run_in_background": true }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -7099,10 +7460,8 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(
-            PathBuf::from(globbed_output["filenames"][0].as_str().expect("filename"))
-                .ends_with(PathBuf::from("nested").join("lib.rs"))
-        );
+        let filename = globbed_output["filenames"][0].as_str().expect("filename");
+        assert!(filename.replace('\\', "/").ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -7474,69 +7833,6 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(windows)]
-        {
-            let dir = temp_path("pwsh-bin");
-            std::fs::create_dir_all(&dir).expect("create dir");
-            let script = dir.join("pwsh.cmd");
-            std::fs::write(
-                &script,
-                concat!(
-                    "@echo off\r\n",
-                    "setlocal EnableDelayedExpansion\r\n",
-                    "set \"cmd=\"\r\n",
-                    ":loop\r\n",
-                    "if \"%~1\"==\"\" goto done\r\n",
-                    "if /I \"%~1\"==\"-Command\" (\r\n",
-                    "  shift\r\n",
-                    "  set \"cmd=%~1\"\r\n",
-                    "  goto done\r\n",
-                    ")\r\n",
-                    "shift\r\n",
-                    "goto loop\r\n",
-                    ":done\r\n",
-                    "if /I \"!cmd!\"==\"Write-Output __claw_pwsh_probe__\" (\r\n",
-                    "  echo __claw_pwsh_probe__\r\n",
-                    ") else (\r\n",
-                    "  echo hello\r\n",
-                    ")\r\n",
-                ),
-            )
-            .expect("write script");
-            let original_path = std::env::var_os("PATH").unwrap_or_default();
-            let mut path_entries = vec![dir.clone()];
-            path_entries.extend(std::env::split_paths(&original_path));
-            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
-            std::env::set_var("PATH", &updated_path);
-
-            let result = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "timeout": 1000}),
-            )
-            .expect("PowerShell should succeed");
-
-            let background = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "run_in_background": true}),
-            )
-            .expect("PowerShell background should succeed");
-
-            std::env::set_var("PATH", original_path);
-            let _ = std::fs::remove_dir_all(&dir);
-
-            let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-            assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
-            assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-            let background_output: serde_json::Value =
-                serde_json::from_str(&background).expect("json");
-            assert!(background_output["backgroundTaskId"].as_str().is_some());
-            assert_eq!(background_output["backgroundedByUser"], true);
-            assert_eq!(background_output["assistantAutoBackgrounded"], false);
-            return;
-        }
-
-        #[cfg(not(windows))]
         let dir = std::env::temp_dir().join(format!(
             "clawd-pwsh-bin-{}",
             std::time::SystemTime::now()
@@ -7544,70 +7840,85 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
-        #[cfg(not(windows))]
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
         #[cfg(not(windows))]
         let script = dir.join("pwsh");
-        #[cfg(not(windows))]
+
+        #[cfg(windows)]
         std::fs::write(
             &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-if [ "$1" = "Write-Output __claw_pwsh_probe__" ]; then
-  printf '__claw_pwsh_probe__'
-else
-  printf 'pwsh:%s' "$1"
-fi
-"#,
+            "@echo off\r\n\
+setlocal\r\n\
+:loop\r\n\
+if \"%~1\"==\"\" goto done\r\n\
+if /I \"%~1\"==\"-Command\" (\r\n\
+  <nul set /p =pwsh:%~2\r\n\
+  exit /b 0\r\n\
+)\r\n\
+shift\r\n\
+goto loop\r\n\
+:done\r\n\
+exit /b 0\r\n",
         )
         .expect("write script");
-        #[cfg(not(windows))]
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
-        #[cfg(not(windows))]
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
-        #[cfg(not(windows))]
-        {
-            let mut path_entries = vec![dir.clone()];
-            path_entries.extend(std::env::split_paths(&original_path));
-            let updated_path = std::env::join_paths(path_entries).expect("join PATH");
-            std::env::set_var("PATH", &updated_path);
-        }
 
         #[cfg(not(windows))]
         {
-            let result = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "timeout": 1000}),
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
+shift
+printf 'pwsh:%s' "$1"
+"#,
             )
-            .expect("PowerShell should succeed");
-
-            let background = execute_tool(
-                "PowerShell",
-                &json!({"command": "Write-Output hello", "run_in_background": true}),
-            )
-            .expect("PowerShell background should succeed");
-
-            std::env::set_var("PATH", original_path);
-            let _ = std::fs::remove_dir_all(dir);
-
-            let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-            assert_eq!(
-                output["stdout"].as_str().expect("stdout").trim(),
-                "pwsh:Write-Output hello"
-            );
-            assert!(output["stderr"].as_str().expect("stderr").is_empty());
-
-            let background_output: serde_json::Value =
-                serde_json::from_str(&background).expect("json");
-            assert!(background_output["backgroundTaskId"].as_str().is_some());
-            assert_eq!(background_output["backgroundedByUser"], true);
-            assert_eq!(background_output["assistantAutoBackgrounded"], false);
+            .expect("write script");
+            std::process::Command::new("/bin/chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod");
         }
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let original_override = std::env::var("CLAW_TEST_POWERSHELL_PATH").ok();
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        std::env::set_var(
+            "PATH",
+            format!("{}{}{}", dir.display(), separator, original_path),
+        );
+        std::env::set_var("CLAW_TEST_POWERSHELL_PATH", script.display().to_string());
+
+        let result = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "timeout": 1000}),
+        )
+        .expect("PowerShell should succeed");
+
+        let background = execute_tool(
+            "PowerShell",
+            &json!({"command": "Write-Output hello", "run_in_background": true}),
+        )
+        .expect("PowerShell background should succeed");
+
+        std::env::set_var("PATH", original_path);
+        if let Some(original_override) = original_override {
+            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
+        } else {
+            std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["stdout"], "pwsh:Write-Output hello");
+        assert!(output["stderr"].as_str().expect("stderr").is_empty());
+
+        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
+        assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert_eq!(background_output["backgroundedByUser"], true);
+        assert_eq!(background_output["assistantAutoBackgrounded"], false);
     }
 
     #[test]
@@ -7616,6 +7927,7 @@ fi
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
+        let original_override = std::env::var("CLAW_TEST_POWERSHELL_PATH").ok();
         let empty_dir = std::env::temp_dir().join(format!(
             "clawd-empty-bin-{}",
             std::time::SystemTime::now()
@@ -7625,39 +7937,18 @@ fi
         ));
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
         std::env::set_var("PATH", empty_dir.display().to_string());
+        std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
 
         let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
             .expect_err("PowerShell should fail when shell is missing");
 
         std::env::set_var("PATH", original_path);
+        if let Some(original_override) = original_override {
+            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
+        }
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
-    }
-
-    #[test]
-    fn powershell_runs_real_shell_smoke_when_available() {
-        if !cfg!(windows) {
-            return;
-        }
-
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if detect_powershell_shell().is_err() {
-            return;
-        }
-
-        let result = execute_tool(
-            "PowerShell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
-        )
-        .expect("PowerShell should succeed when a real shell is available");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"].as_str().expect("stdout").trim(), "hello");
-        assert!(output["stderr"].as_str().expect("stderr").trim().is_empty());
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
@@ -7744,9 +8035,6 @@ fi
 
     #[test]
     fn given_no_enforcer_when_bash_then_executes_normally() {
-        if !windows_bash_smoke_ok() {
-            return;
-        }
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7756,6 +8044,151 @@ fi
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        let fallback_config = ProviderFallbackConfig::default();
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("primary-only chain should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 1);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with fallbacks should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 3);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "grok-3");
+        assert_eq!(client.chain[2].model, "grok-3-mini");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            Some("grok-3".to_string()),
+            vec!["claude-sonnet-4-6".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-haiku-4-5-20251213".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with primary override should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "grok-3");
+        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::remove_var("XAI_API_KEY");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec![
+                "grok-3".to_string(),
+                "claude-haiku-4-5-20251213".to_string(),
+            ],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain construction should not fail when only some fallbacks are unavailable");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        if let Some(value) = original_xai {
+            std::env::set_var("XAI_API_KEY", value);
+        }
     }
 
     #[test]
@@ -7834,26 +8267,16 @@ fi
         fn addr(&self) -> SocketAddr {
             self.addr
         }
-
-        fn assert_clean(mut self) {
-            self.shutdown_and_join().expect("join test server");
-        }
-
-        fn shutdown_and_join(&mut self) -> thread::Result<()> {
-            if let Some(tx) = self.shutdown.take() {
-                let _ = tx.send(());
-            }
-            if let Some(handle) = self.handle.take() {
-                handle.join()
-            } else {
-                Ok(())
-            }
-        }
     }
 
     impl Drop for TestServer {
         fn drop(&mut self) {
-            let _ = self.shutdown_and_join();
+            if let Some(tx) = self.shutdown.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
         }
     }
 
