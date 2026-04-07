@@ -1,6 +1,6 @@
 # AppFS Joint Startup / Launcher Contract v0.1
 
-**Status:** Draft for next implementation phase
+**Status:** Prototype implemented in `appfs-platform`; current focus is stabilizing `IC-3`
 **Scope:** Explicit startup path for `appfs` + `appfs-agent` after attach contract v1.1
 **Updated:** 2026-04-07
 
@@ -216,7 +216,7 @@ Proposed `IC-3` goals:
 
 ## 13. Open Decisions
 
-These choices still need to be made before implementation:
+These choices still need to be made before broader rollout:
 
 1. which launcher command surface becomes the first supported UX;
 2. whether the first launcher version should live in standalone `appfs` CLI or as a small wrapper first;
@@ -228,6 +228,6 @@ These choices still need to be made before implementation:
 The next implementation step should be:
 
 1. keep `IC-0`, `IC-1`, and `IC-2` green;
-2. prototype one explicit launcher-driven startup path;
-3. automate it as `IC-3`;
+2. keep one explicit launcher-driven startup path working and automate it as `IC-3`;
+3. validate it on the self-hosted Windows runner;
 4. only then continue to overlay-backed existing-directory entry and richer AppFS-aware UX.

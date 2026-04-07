@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 1 implemented in the integration workspace. Phase 2 launcher work is reserved.
+Phase 1 implemented in the integration workspace. Phase 2 now has a first launcher prototype plus `IC-3` baseline coverage.
 
 ## Purpose
 
@@ -130,6 +130,22 @@ Phase 1 multi-agent rules are:
 
 This avoids cross-agent write contention while keeping runtime identity explicit.
 
+### C6. Launcher-Driven Startup
+
+The first explicit startup path must:
+
+1. start AppFS bring-up before launching the child agent;
+2. wait until the runtime manifest is ready;
+3. inject `APPFS_ATTACH_*` environment variables explicitly into the child agent process;
+4. choose a child `cwd` inside the mounted AppFS workspace;
+5. avoid requiring the operator to inject attach env by hand.
+
+The current prototype surface is:
+
+1. `agentfs appfs launch <id-or-path> <mountpoint> --agent-bin <path> -- <agent-args...>`
+
+This is still a launcher phase, not a principal-aware visibility phase.
+
 ## Acceptance Checkpoints
 
 ### IC-0. Mounted Workspace Attach Baseline
@@ -225,13 +241,48 @@ Explicit non-assertions:
 3. no requirement yet for `principal_id`, `profile_id`, or `visibility`;
 4. no requirement yet for launcher-managed child process trees.
 
+### IC-3. Explicit Launcher Startup Baseline
+
+Goal:
+
+1. prove one supported command can start AppFS and one `appfs-agent` child process together;
+2. prove the launcher injects attach env explicitly without manual operator setup;
+3. prove the launched child runs inside an AppFS-backed workspace.
+
+Current gate:
+
+1. `integration/scripts/test-windows-appfs-agent-launcher.ps1`
+
+Required clauses:
+
+1. `C0. Mount Bring-Up`
+2. `C1. Runtime Manifest`
+3. `C2. Attach Input Precedence`
+4. `C3. Status Surface`
+5. `C6. Launcher-Driven Startup`
+
+Required assertions:
+
+1. the launched child reports `appfs.detected = true`;
+2. the launched child reports `appfs.attach_source = env`;
+3. the launched child reports a non-empty `appfs.runtime_session_id`;
+4. the launched child reports the expected `appfs.attach_id`;
+5. the launched child `cwd` is inside the mounted AppFS workspace;
+6. the launched child reports no AppFS attach warnings.
+
+Explicit non-assertions:
+
+1. no requirement yet for multi-child launcher orchestration;
+2. no requirement yet for shared/private app visibility;
+3. no requirement yet for overlay-backed existing-directory startup.
+
 ## Non-Goals For v1.1
 
 Phase 1 does not yet require:
 
 1. named pipes, local sockets, or heartbeat RPC;
 2. AppFS-side attached-agent registry files;
-3. launcher-driven child agent orchestration;
+3. multi-child launcher-driven orchestration;
 4. replacing OS-level sandboxing with AppFS;
 5. removing heuristic detection entirely.
 
@@ -262,8 +313,8 @@ For `IC-2`, use these additional buckets:
 The next planned step after this contract is:
 
 1. keep `IC-0` and `IC-1` green as mandatory baselines;
-2. add `IC-2` multi-agent automation;
-3. implement Phase 2 launcher-driven startup that injects attach env explicitly;
+2. keep `IC-2` green as the shared-runtime multi-agent baseline;
+3. implement and stabilize Phase 2 launcher-driven startup that injects attach env explicitly and keep `IC-3` green;
 4. keep directory heuristic detection only as a compatibility fallback.
 
 Launcher design note:

@@ -10,6 +10,7 @@ This directory is reserved for scenarios that span both `appfs` and `appfs-agent
 4. `integration/scripts/test-windows-appfs-agent-smoke.ps1`
 5. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
 6. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
+7. `integration/scripts/test-windows-appfs-agent-launcher.ps1`
 
 ## Intended Contents
 
@@ -34,6 +35,7 @@ Current contract mapping:
 | `integration/scripts/test-windows-appfs-agent-smoke.ps1` | `IC-0` | `C0`, `C1`, `C2`, `C3` |
 | `integration/scripts/test-windows-appfs-agent-http-demo.ps1` | `IC-1` | `C0`, `C1`, `C4` |
 | `integration/scripts/test-windows-appfs-agent-multi-attach.ps1` | `IC-2` | `C0`, `C1`, `C2`, `C3`, `C5` |
+| `integration/scripts/test-windows-appfs-agent-launcher.ps1` | `IC-3` | `C0`, `C1`, `C2`, `C3`, `C6` |
 
 For the first Windows integration checkpoint, use:
 
@@ -132,22 +134,33 @@ Example:
 The corresponding manual workflow is `.github/workflows/integration-multi-attach-windows.yml`.
 It is `workflow_dispatch` only for now so we can validate the scenario on the self-hosted WinFsp runner before promoting it into required PR CI.
 
-## Next Design Focus
+## Launcher Integration
 
-With `IC-2` in place, the next design step is explicit launcher-driven startup.
+The next launcher checkpoint is `IC-3`.
 
-The current direction is:
+What it validates:
 
-1. AppFS startup should wait for mount and runtime manifest readiness;
-2. a launcher should start `appfs-agent` inside an AppFS-backed workspace;
-3. the launcher should inject `APPFS_ATTACH_*` explicitly instead of relying on heuristic discovery;
-4. future overlay-backed "start from existing directory" flows should reuse the same launch contract.
+1. one supported command starts AppFS and one `appfs-agent` child together
+2. the launcher waits for `/.well-known/appfs/runtime.json` before child launch
+3. the launcher injects `APPFS_ATTACH_*` explicitly
+4. the child `cwd` lands inside `<mount_root>/workspace`
+5. the child reports `appfs.attach_source = env`
+6. the child reports no AppFS attach warnings
 
-Current prototype command:
+Example:
 
 ```powershell
-agentfs appfs launch <id-or-path> <mountpoint> --agent-bin <path-to-appfs-agent> -- status --output-format json
+./integration/scripts/test-windows-appfs-agent-launcher.ps1
 ```
+
+Optional local reuse of already-built binaries:
+
+```powershell
+./integration/scripts/test-windows-appfs-agent-launcher.ps1 -SkipBuild
+```
+
+The corresponding manual workflow is `.github/workflows/integration-launcher-windows.yml`.
+It stays `workflow_dispatch` only for now because it depends on a self-hosted Windows runner with WinFsp and a working Windows SDK / libclang environment for fresh builds.
 
 Tracked in:
 
