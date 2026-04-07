@@ -368,12 +368,12 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
             .stderr(Stdio::piped())
             .spawn()
             .expect("claw should launch");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin should be piped")
+        let mut child_stdin = child.stdin.take().expect("stdin should be piped");
+        child_stdin
             .write_all(stdin.as_bytes())
             .expect("stdin should write");
+        child_stdin.flush().expect("stdin should flush");
+        drop(child_stdin);
         child.wait_with_output().expect("claw should finish")
     } else {
         command.output().expect("claw should launch")

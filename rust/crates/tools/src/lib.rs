@@ -5163,6 +5163,12 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
 }
 
 fn detect_powershell_shell() -> std::io::Result<String> {
+    if let Ok(path) = std::env::var("CLAW_TEST_POWERSHELL_PATH") {
+        if !path.trim().is_empty() {
+            return Ok(path);
+        }
+    }
+
     if let Some(path) = command_path("pwsh") {
         Ok(path)
     } else if let Some(path) = command_path("powershell") {
@@ -7873,11 +7879,13 @@ printf 'pwsh:%s' "$1"
         }
 
         let original_path = std::env::var("PATH").unwrap_or_default();
+        let original_override = std::env::var("CLAW_TEST_POWERSHELL_PATH").ok();
         let separator = if cfg!(windows) { ';' } else { ':' };
         std::env::set_var(
             "PATH",
             format!("{}{}{}", dir.display(), separator, original_path),
         );
+        std::env::set_var("CLAW_TEST_POWERSHELL_PATH", script.display().to_string());
 
         let result = execute_tool(
             "PowerShell",
@@ -7892,6 +7900,11 @@ printf 'pwsh:%s' "$1"
         .expect("PowerShell background should succeed");
 
         std::env::set_var("PATH", original_path);
+        if let Some(original_override) = original_override {
+            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
+        } else {
+            std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
+        }
         let _ = std::fs::remove_dir_all(dir);
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
@@ -7910,6 +7923,7 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
+        let original_override = std::env::var("CLAW_TEST_POWERSHELL_PATH").ok();
         let empty_dir = std::env::temp_dir().join(format!(
             "clawd-empty-bin-{}",
             std::time::SystemTime::now()
@@ -7919,11 +7933,15 @@ printf 'pwsh:%s' "$1"
         ));
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
         std::env::set_var("PATH", empty_dir.display().to_string());
+        std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
 
         let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
             .expect_err("PowerShell should fail when shell is missing");
 
         std::env::set_var("PATH", original_path);
+        if let Some(original_override) = original_override {
+            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
+        }
         let _ = std::fs::remove_dir_all(empty_dir);
 
         assert!(err.contains("PowerShell executable not found"));
