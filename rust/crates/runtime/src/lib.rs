@@ -6,6 +6,7 @@ pub mod branch_lock;
 mod compact;
 mod config;
 mod context;
+pub mod config_validate;
 mod conversation;
 mod file_ops;
 pub mod green_contract;
@@ -55,6 +56,10 @@ pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, Branch
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+};
+pub use config_validate::{
+    check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
+    DiagnosticKind, ValidationResult,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,

@@ -286,16 +286,31 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp_servers = BTreeMap::new();
+        let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
-            let Some((value, source)) = read_optional_json_object(&entry.path)? else {
+            crate::config_validate::check_unsupported_format(&entry.path)?;
+            let Some(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
-            validate_known_top_level_keys(&value, source.as_deref(), &entry.path)?;
-            validate_optional_hooks_config(&value, &entry.path)?;
-            merge_mcp_servers(&mut mcp_servers, entry.source, &value, &entry.path)?;
-            deep_merge_objects(&mut merged, &value);
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let first_error = &validation.errors[0];
+                return Err(ConfigError::Parse(first_error.to_string()));
+            }
+            all_warnings.extend(validation.warnings);
+            validate_optional_hooks_config(&parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp_servers, entry.source, &parsed.object, &entry.path)?;
+            deep_merge_objects(&mut merged, &parsed.object);
             loaded_entries.push(entry);
+        }
+
+        for warning in &all_warnings {
+            eprintln!("warning: {warning}");
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -676,9 +691,13 @@ impl McpServerConfig {
     }
 }
 
-fn read_optional_json_object(
-    path: &Path,
-) -> Result<Option<(BTreeMap<String, JsonValue>, Option<String>)>, ConfigError> {
+/// Parsed JSON object paired with its raw source text for validation.
+struct ParsedConfigFile {
+    object: BTreeMap<String, JsonValue>,
+    source: String,
+}
+
+fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -687,7 +706,10 @@ fn read_optional_json_object(
     };
 
     if contents.trim().is_empty() {
-        return Ok(Some((BTreeMap::new(), None)));
+        return Ok(Some(ParsedConfigFile {
+            object: BTreeMap::new(),
+            source: contents,
+        }));
     }
 
     let parsed = match JsonValue::parse(&contents) {
@@ -704,168 +726,10 @@ fn read_optional_json_object(
             path.display()
         )));
     };
-    Ok(Some((object.clone(), Some(contents))))
-}
-
-fn validate_known_top_level_keys(
-    root: &BTreeMap<String, JsonValue>,
-    source: Option<&str>,
-    path: &Path,
-) -> Result<(), ConfigError> {
-    for key in root.keys() {
-        if let Some((_, replacement)) = DEPRECATED_TOP_LEVEL_KEYS
-            .iter()
-            .find(|(name, _)| *name == key.as_str())
-        {
-            return Err(ConfigError::Parse(format_field_error(
-                path,
-                source,
-                key,
-                &format!("deprecated field {key}; use {replacement} instead"),
-            )));
-        }
-
-        if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-            let mut message = format!("unknown field {key}");
-            if let Some(suggestion) = closest_known_top_level_key(key) {
-                message.push_str(&format!("; did you mean {suggestion}?"));
-            }
-            return Err(ConfigError::Parse(format_field_error(
-                path, source, key, &message,
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn format_field_error(path: &Path, source: Option<&str>, key: &str, message: &str) -> String {
-    let location = source
-        .and_then(|text| find_top_level_key_line(text, key))
-        .map_or_else(
-            || format!("{}", path.display()),
-            |line| format!("{}:{line}", path.display()),
-        );
-    format!("{location}: {message}")
-}
-
-fn find_top_level_key_line(source: &str, key: &str) -> Option<usize> {
-    let chars: Vec<char> = source.chars().collect();
-    let mut index = 0;
-    let mut line = 1_usize;
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-
-    while index < chars.len() {
-        let ch = chars[index];
-        if in_string {
-            if escape {
-                escape = false;
-                if ch == '\n' {
-                    line += 1;
-                }
-                index += 1;
-                continue;
-            }
-            match ch {
-                '\\' => {
-                    escape = true;
-                    index += 1;
-                    continue;
-                }
-                '"' => {
-                    in_string = false;
-                    index += 1;
-                    continue;
-                }
-                '\n' => {
-                    line += 1;
-                    index += 1;
-                    continue;
-                }
-                _ => {
-                    index += 1;
-                    continue;
-                }
-            }
-        }
-
-        match ch {
-            '"' => {
-                if depth == 1 {
-                    let start_line = line;
-                    let mut cursor = index + 1;
-                    let mut matched = true;
-                    for expected in key.chars() {
-                        if cursor >= chars.len() || chars[cursor] != expected {
-                            matched = false;
-                            break;
-                        }
-                        cursor += 1;
-                    }
-                    if matched && cursor < chars.len() && chars[cursor] == '"' {
-                        return Some(start_line);
-                    }
-                }
-                in_string = true;
-                index += 1;
-            }
-            '{' | '[' => {
-                depth += 1;
-                index += 1;
-            }
-            '}' | ']' => {
-                depth -= 1;
-                index += 1;
-            }
-            '\n' => {
-                line += 1;
-                index += 1;
-            }
-            _ => {
-                index += 1;
-            }
-        }
-    }
-
-    None
-}
-
-fn closest_known_top_level_key(input: &str) -> Option<&'static str> {
-    let lowered = input.to_ascii_lowercase();
-    KNOWN_TOP_LEVEL_KEYS
-        .iter()
-        .filter_map(|candidate| {
-            let distance = ascii_lowercase_edit_distance(&lowered, candidate);
-            (distance <= 3).then_some((distance, *candidate))
-        })
-        .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)))
-        .map(|(_, candidate)| candidate)
-}
-
-fn ascii_lowercase_edit_distance(left: &str, right: &str) -> usize {
-    let right_lower: String = right.to_ascii_lowercase();
-    let left_chars: Vec<char> = left.chars().collect();
-    let right_chars: Vec<char> = right_lower.chars().collect();
-    if left_chars.is_empty() {
-        return right_chars.len();
-    }
-    if right_chars.is_empty() {
-        return left_chars.len();
-    }
-    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
-    let mut current = vec![0_usize; right_chars.len() + 1];
-    for (i, left_char) in left_chars.iter().enumerate() {
-        current[0] = i + 1;
-        for (j, right_char) in right_chars.iter().enumerate() {
-            let cost = usize::from(left_char != right_char);
-            current[j + 1] = (previous[j + 1] + 1)
-                .min(current[j] + 1)
-                .min(previous[j] + cost);
-        }
-        previous.clone_from(&current);
-    }
-    previous[right_chars.len()]
+    Ok(Some(ParsedConfigFile {
+        object: object.clone(),
+        source: contents,
+    }))
 }
 
 fn merge_mcp_servers(
@@ -2085,12 +1949,13 @@ mod tests {
             .load()
             .expect_err("config should fail");
 
-        // then
+        // then — config validation now catches the mixed array before the hooks parser
         let rendered = error.to_string();
-        assert!(rendered.contains(&format!(
-            "{}: hooks: field PreToolUse must contain only strings",
-            project_settings.display()
-        )));
+        assert!(
+            rendered.contains("hooks.PreToolUse")
+                && rendered.contains("must be an array of strings"),
+            "expected validation error for hooks.PreToolUse, got: {rendered}"
+        );
         assert!(!rendered.contains("merged settings.hooks"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
