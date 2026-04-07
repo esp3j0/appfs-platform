@@ -169,6 +169,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::BranchDelete => print_branch_delete_report()?,
+        CliAction::Export {
+            session_reference,
+            output_path,
+            output_format,
+        } => run_export(&session_reference, output_path.as_deref(), output_format)?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -244,6 +249,11 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     BranchDelete,
+    Export {
+        session_reference: String,
+        output_path: Option<PathBuf>,
+        output_format: CliOutputFormat,
+    },
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -470,6 +480,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "doctor" => Ok(CliAction::Doctor { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
         "branch" => parse_branch_args(&rest[1..]),
+        "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -559,6 +570,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "logout"
             | "init"
             | "prompt"
+            | "export"
     ) {
         return None;
     }
@@ -958,6 +970,57 @@ fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
             "unknown branch action: {action}. Usage: claw branch delete"
         )),
     }
+}
+fn parse_export_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
+    let mut output_path: Option<PathBuf> = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_reference = value.clone();
+                index += 2;
+            }
+            flag if flag.starts_with("--session=") => {
+                session_reference = flag[10..].to_string();
+                index += 1;
+            }
+            "--output" | "-o" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for {}", args[index]))?;
+                output_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--output=") => {
+                output_path = Some(PathBuf::from(&flag[9..]));
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown export option: {other}"));
+            }
+            other if output_path.is_none() => {
+                output_path = Some(PathBuf::from(other));
+                index += 1;
+            }
+            other => {
+                return Err(format!("unexpected export argument: {other}"));
+            }
+        }
+    }
+
+    Ok(CliAction::Export {
+        session_reference,
+        output_path,
+        output_format,
+    })
 }
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
@@ -5894,6 +5957,172 @@ fn resolve_export_path(
     Ok(cwd.join(final_name))
 }
 
+const SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT: usize = 280;
+
+fn summarize_tool_payload_for_markdown(payload: &str) -> String {
+    let compact = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => value.to_string(),
+        Err(_) => payload.split_whitespace().collect::<Vec<_>>().join(" "),
+    };
+    if compact.is_empty() {
+        return String::new();
+    }
+    truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
+}
+
+fn run_export(
+    session_reference: &str,
+    output_path: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = resolve_session_reference(session_reference)?;
+    let session = Session::load_from_path(&handle.path)?;
+    let markdown = render_session_markdown(&session, &handle.id, &handle.path);
+
+    if let Some(path) = output_path {
+        fs::write(path, &markdown)?;
+        let report = format!(
+            "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
+            path.display(),
+            handle.id,
+            session.messages.len(),
+        );
+        match output_format {
+            CliOutputFormat::Text => println!("{report}"),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "export",
+                    "message": report,
+                    "session_id": handle.id,
+                    "file": path.display().to_string(),
+                    "messages": session.messages.len(),
+                }))?
+            ),
+        }
+        return Ok(());
+    }
+
+    match output_format {
+        CliOutputFormat::Text => {
+            print!("{markdown}");
+            if !markdown.ends_with('\n') {
+                println!();
+            }
+        }
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "export",
+                "session_id": handle.id,
+                "file": handle.path.display().to_string(),
+                "messages": session.messages.len(),
+                "markdown": markdown,
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+fn render_session_markdown(session: &Session, session_id: &str, session_path: &Path) -> String {
+    let mut lines = vec![
+        "# Conversation Export".to_string(),
+        String::new(),
+        format!("- **Session**: `{session_id}`"),
+        format!("- **File**: `{}`", session_path.display()),
+        format!("- **Messages**: {}", session.messages.len()),
+    ];
+    if let Some(workspace_root) = session.workspace_root() {
+        lines.push(format!("- **Workspace**: `{}`", workspace_root.display()));
+    }
+    if let Some(fork) = &session.fork {
+        let branch = fork.branch_name.as_deref().unwrap_or("(unnamed)");
+        lines.push(format!(
+            "- **Forked from**: `{}` (branch `{branch}`)",
+            fork.parent_session_id
+        ));
+    }
+    if let Some(compaction) = &session.compaction {
+        lines.push(format!(
+            "- **Compactions**: {} (last removed {} messages)",
+            compaction.count, compaction.removed_message_count
+        ));
+    }
+    lines.push(String::new());
+    lines.push("---".to_string());
+    lines.push(String::new());
+
+    for (index, message) in session.messages.iter().enumerate() {
+        let role = match message.role {
+            MessageRole::System => "System",
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Assistant",
+            MessageRole::Tool => "Tool",
+        };
+        lines.push(format!("## {}. {role}", index + 1));
+        lines.push(String::new());
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    let trimmed = text.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    lines.push(format!(
+                        "**Tool call** `{name}` _(id `{}`)_",
+                        short_tool_id(id)
+                    ));
+                    let summary = summarize_tool_payload_for_markdown(input);
+                    if !summary.is_empty() {
+                        lines.push(format!("> {summary}"));
+                    }
+                    lines.push(String::new());
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => {
+                    let status = if *is_error { "error" } else { "ok" };
+                    lines.push(format!(
+                        "**Tool result** `{tool_name}` _(id `{}`, {status})_",
+                        short_tool_id(tool_use_id)
+                    ));
+                    let summary = summarize_tool_payload_for_markdown(output);
+                    if !summary.is_empty() {
+                        lines.push(format!("> {summary}"));
+                    }
+                    lines.push(String::new());
+                }
+            }
+        }
+        if let Some(usage) = message.usage {
+            lines.push(format!(
+                "_tokens: in={} out={} cache_create={} cache_read={}_",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+            ));
+            lines.push(String::new());
+        }
+    }
+    lines.join("\n")
+}
+
+fn short_tool_id(id: &str) -> String {
+    let char_count = id.chars().count();
+    if char_count <= 12 {
+        return id.to_string();
+    }
+    let prefix: String = id.chars().take(12).collect();
+    format!("{prefix}…")
+}
+
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
@@ -7751,6 +7980,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Delete merged local git branches except the current/default worktree branches"
     )?;
+    writeln!(out, "  claw export [PATH] [--session SESSION] [--output PATH]")?;
+    writeln!(
+        out,
+        "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
+    )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -7832,6 +8066,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw export")?;
+    writeln!(out, "  claw export conversation.md")?;
     Ok(())
 }
 
@@ -7866,6 +8102,7 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
+        format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
         parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
@@ -7878,8 +8115,10 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
         GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
+        parse_export_args, print_help_to, render_session_markdown, short_tool_id,
+        summarize_tool_payload_for_markdown,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8809,6 +9048,277 @@ mod tests {
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
         );
+    }
+
+    #[test]
+    fn parses_bare_export_subcommand_targeting_latest_session() {
+        // given
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["export".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("bare export should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_positional_output_path() {
+        // given
+        let args = vec!["export".to_string(), "conversation.md".to_string()];
+
+        // when
+        let parsed = parse_args(&args).expect("export with path should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: Some(PathBuf::from("conversation.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_session_and_output_flags() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "--session".to_string(),
+            "session-alpha".to_string(),
+            "--output".to_string(),
+            "/tmp/share.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("export flags should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: "session-alpha".to_string(),
+                output_path: Some(PathBuf::from("/tmp/share.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_inline_flag_values() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "--session=session-beta".to_string(),
+            "--output=/tmp/beta.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("export inline flags should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: "session-beta".to_string(),
+                output_path: Some(PathBuf::from("/tmp/beta.md")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_export_subcommand_with_json_output_format() {
+        // given
+        let args = vec![
+            "--output-format=json".to_string(),
+            "export".to_string(),
+            "/tmp/notes.md".to_string(),
+        ];
+
+        // when
+        let parsed = parse_args(&args).expect("json export should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: Some(PathBuf::from("/tmp/notes.md")),
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_export_options_with_helpful_message() {
+        // given
+        let args = vec!["export".to_string(), "--bogus".to_string()];
+
+        // when
+        let error = parse_args(&args).expect_err("unknown export option should fail");
+
+        // then
+        assert!(error.contains("unknown export option: --bogus"));
+    }
+
+    #[test]
+    fn rejects_export_with_extra_positional_after_path() {
+        // given
+        let args = vec![
+            "export".to_string(),
+            "first.md".to_string(),
+            "second.md".to_string(),
+        ];
+
+        // when
+        let error = parse_args(&args).expect_err("multiple positionals should fail");
+
+        // then
+        assert!(error.contains("unexpected export argument: second.md"));
+    }
+
+    #[test]
+    fn parse_export_args_helper_defaults_to_latest_reference_and_no_output() {
+        // given
+        let args: Vec<String> = vec![];
+
+        // when
+        let parsed = parse_export_args(&args, CliOutputFormat::Text)
+            .expect("empty export args should parse");
+
+        // then
+        assert_eq!(
+            parsed,
+            CliAction::Export {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                output_path: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn render_session_markdown_includes_header_and_summarized_tool_calls() {
+        // given
+        let mut session = Session::new();
+        session.session_id = "session-export-test".to_string();
+        session.messages = vec![
+            ConversationMessage::user_text("How do I list files?"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Text {
+                    text: "I'll run a tool.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_abcdefghijklmnop".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"ls -la"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        // when
+        let markdown = render_session_markdown(
+            &session,
+            "session-export-test",
+            std::path::Path::new("/tmp/sessions/session-export-test.jsonl"),
+        );
+
+        // then
+        assert!(markdown.starts_with("# Conversation Export"));
+        assert!(markdown.contains("- **Session**: `session-export-test`"));
+        assert!(markdown.contains("- **Messages**: 3"));
+        assert!(markdown.contains("## 1. User"));
+        assert!(markdown.contains("How do I list files?"));
+        assert!(markdown.contains("## 2. Assistant"));
+        assert!(markdown.contains("**Tool call** `bash`"));
+        assert!(markdown.contains("toolu_abcdef…"));
+        assert!(markdown.contains("ls -la"));
+        assert!(markdown.contains("## 3. Tool"));
+        assert!(markdown.contains("**Tool result** `bash`"));
+        assert!(markdown.contains("ok"));
+        assert!(markdown.contains("total 8"));
+    }
+
+    #[test]
+    fn render_session_markdown_marks_tool_errors_and_skips_empty_summaries() {
+        // given
+        let mut session = Session::new();
+        session.session_id = "errs".to_string();
+        session.messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "short".to_string(),
+                tool_name: "read_file".to_string(),
+                output: "   ".to_string(),
+                is_error: true,
+            }],
+            usage: None,
+        }];
+
+        // when
+        let markdown =
+            render_session_markdown(&session, "errs", std::path::Path::new("errs.jsonl"));
+
+        // then
+        assert!(markdown.contains("**Tool result** `read_file` _(id `short`, error)_"));
+        // an empty summary should not produce a stray blockquote line
+        assert!(!markdown.contains("> \n"));
+    }
+
+    #[test]
+    fn summarize_tool_payload_for_markdown_compacts_json_and_truncates_overflow() {
+        // given
+        let json_payload = r#"{
+            "command":   "ls -la",
+            "cwd": "/tmp"
+        }"#;
+        let long_payload = "a".repeat(600);
+
+        // when
+        let compacted = summarize_tool_payload_for_markdown(json_payload);
+        let truncated = summarize_tool_payload_for_markdown(&long_payload);
+
+        // then
+        assert_eq!(compacted, r#"{"command":"ls -la","cwd":"/tmp"}"#);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 281);
+    }
+
+    #[test]
+    fn short_tool_id_truncates_long_identifiers_with_ellipsis() {
+        // given
+        let long = "toolu_01ABCDEFGHIJKLMN";
+        let short = "tool_1";
+
+        // when
+        let trimmed_long = short_tool_id(long);
+        let trimmed_short = short_tool_id(short);
+
+        // then
+        assert_eq!(trimmed_long, "toolu_01ABCD…");
+        assert_eq!(trimmed_short, "tool_1");
     }
 
     #[test]
