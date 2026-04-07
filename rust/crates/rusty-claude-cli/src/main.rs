@@ -362,11 +362,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias(value).to_string();
+                model = resolve_model_alias_with_config(value);
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias(&flag[8..]).to_string();
+                model = resolve_model_alias_with_config(&flag[8..]);
                 index += 1;
             }
             "--output-format" => {
@@ -407,7 +407,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias(&model).to_string(),
+                    model: resolve_model_alias_with_config(&model),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -817,6 +817,27 @@ fn resolve_model_alias(model: &str) -> &str {
     }
 }
 
+/// Resolve a model name through user-defined config aliases first, then fall
+/// back to the built-in alias table. This is the entry point used wherever a
+/// user-supplied model string is about to be dispatched to a provider.
+fn resolve_model_alias_with_config(model: &str) -> String {
+    let trimmed = model.trim();
+    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
+        return resolve_model_alias(&resolved).to_string();
+    }
+    resolve_model_alias(trimmed).to_string()
+}
+
+fn config_alias_for_current_dir(alias: &str) -> Option<String> {
+    if alias.is_empty() {
+        return None;
+    }
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load().ok()?;
+    config.aliases().get(alias).cloned()
+}
+
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -921,10 +942,10 @@ fn resolve_repl_model(cli_model: String) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        return resolve_model_alias(&env_model).to_string();
+        return resolve_model_alias_with_config(&env_model);
     }
     if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias(&config_model).to_string();
+        return resolve_model_alias_with_config(&config_model);
     }
     cli_model
 }
@@ -3924,7 +3945,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let model = resolve_model_alias(&model).to_string();
+        let model = resolve_model_alias_with_config(&model);
 
         if model == self.model {
             println!(
@@ -8158,6 +8179,7 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
         CliAction, CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
         GitWorkspaceSummary, GitWorktreeEntry,
+        resolve_model_alias_with_config,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
@@ -8896,6 +8918,45 @@ mod tests {
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
         assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
         assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn user_defined_aliases_resolve_before_provider_dispatch() {
+        // given
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(cwd.join(".claw")).expect("project config dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"opus","cheap":"grok-3-mini"}}"#,
+        )
+        .expect("project config should write");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        // when
+        let direct = with_current_dir(&cwd, || resolve_model_alias_with_config("fast"));
+        let chained = with_current_dir(&cwd, || resolve_model_alias_with_config("smart"));
+        let cross_provider = with_current_dir(&cwd, || resolve_model_alias_with_config("cheap"));
+        let unknown = with_current_dir(&cwd, || resolve_model_alias_with_config("unknown-model"));
+        let builtin = with_current_dir(&cwd, || resolve_model_alias_with_config("haiku"));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        // then
+        assert_eq!(direct, "claude-haiku-4-5-20251213");
+        assert_eq!(chained, "claude-opus-4-6");
+        assert_eq!(cross_provider, "grok-3-mini");
+        assert_eq!(unknown, "unknown-model");
+        assert_eq!(builtin, "claude-haiku-4-5-20251213");
     }
 
     #[test]
