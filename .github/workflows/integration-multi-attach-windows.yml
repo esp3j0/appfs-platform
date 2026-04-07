@@ -1,0 +1,66 @@
+name: Integration Multi-Attach (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  appfs-agent-windows-multi-attach:
+    name: appfs + appfs-agent multi-attach
+    runs-on:
+      - self-hosted
+      - windows
+      - winfsp
+    env:
+      CHECKOUT_PATH: repo-selfhosted-multi-attach
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          path: ${{ env.CHECKOUT_PATH }}
+
+      - name: Clean stale self-hosted state
+        shell: powershell
+        run: |
+          cmd /c "taskkill /IM agentfs.exe /F /T >nul 2>nul || exit /b 0"
+          cmd /c "taskkill /IM claw.exe /F /T >nul 2>nul || exit /b 0"
+
+          Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.Name -eq 'python.exe' -and
+              $_.CommandLine -like '*bridge_server.py*'
+            } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+          Start-Sleep -Seconds 1
+          foreach ($path in @(
+            'C:\mnt\appfs-agent-smoke',
+            'C:\mnt\appfs-agent-http-demo',
+            'C:\mnt\appfs-agent-multi-attach'
+          )) {
+            if (Test-Path $path) {
+              cmd /c "rmdir /s /q `"$path`"" 2>$null | Out-Null
+            }
+          }
+
+      - name: Prepare VM tool paths
+        shell: powershell
+        run: |
+          @(
+            'C:\Users\esp3j\.cargo\bin'
+            'C:\Users\esp3j\AppData\Local\Programs\Python\Python312'
+            'C:\Users\esp3j\AppData\Local\Programs\Python\Python312\Scripts'
+            'C:\Program Files\Git\cmd'
+            'C:\Program Files\Git\bin'
+            'C:\actions-runner\tools\libclang\clang\native'
+          ) | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value 'CARGO_HOME=C:\Users\esp3j\.cargo'
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTUP_HOME=C:\Users\esp3j\.rustup'
+          Add-Content -Path $env:GITHUB_ENV -Value 'LIBCLANG_PATH=C:\actions-runner\tools\libclang\clang\native'
+
+      - name: Run Windows multi-attach test
+        shell: powershell
+        run: |
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE $env:CHECKOUT_PATH)
+          ./integration/scripts/test-windows-appfs-agent-multi-attach.ps1

@@ -4,9 +4,11 @@ This directory is reserved for scenarios that span both `appfs` and `appfs-agent
 
 ## Start Here
 
-1. [AppFS x appfs-agent Attach Contract v1.1](./APPFS-appfs-agent-attach-contract-v1.1.md)
-2. `integration/scripts/test-windows-appfs-agent-smoke.ps1`
-3. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
+1. [AppFS Platform Unified Roadmap v0.1](./APPFS-platform-roadmap-v0.1.md)
+2. [AppFS x appfs-agent Attach Contract v1.1](./APPFS-appfs-agent-attach-contract-v1.1.md)
+3. `integration/scripts/test-windows-appfs-agent-smoke.ps1`
+4. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
+5. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
 
 ## Intended Contents
 
@@ -30,6 +32,7 @@ Current contract mapping:
 |---|---|---|
 | `integration/scripts/test-windows-appfs-agent-smoke.ps1` | `IC-0` | `C0`, `C1`, `C2`, `C3` |
 | `integration/scripts/test-windows-appfs-agent-http-demo.ps1` | `IC-1` | `C0`, `C1`, `C4` |
+| `integration/scripts/test-windows-appfs-agent-multi-attach.ps1` | `IC-2` | `C0`, `C1`, `C2`, `C3`, `C5` |
 
 For the first Windows integration checkpoint, use:
 
@@ -95,3 +98,35 @@ It stays `workflow_dispatch` only on purpose:
 - it incurs external model cost and network variability
 
 If we later want broader automation, the next sensible step is a scheduled or label-triggered version of the same workflow, still backed by repository secrets rather than hard-coded credentials.
+
+## Planned IC-2 Automation
+
+The next integration checkpoint is `IC-2`.
+
+What it should validate:
+
+1. start one AppFS mount
+2. start at least two `appfs-agent` processes against that same mount
+3. inject the same runtime manifest and mount metadata into both agents
+4. inject distinct `APPFS_ATTACH_ID` values
+5. verify both agents report the same `runtime_session_id`
+6. verify both agents report different `attach_id` values
+7. verify both agents resolve AppFS attach from `env`
+
+What it should not validate yet:
+
+1. shared/private app visibility
+2. per-agent app-side account separation
+3. principal-aware path routing
+4. launcher-managed joint startup
+
+That keeps `IC-2` focused on Phase 1 attach semantics rather than future identity policy.
+
+Example:
+
+```powershell
+./integration/scripts/test-windows-appfs-agent-multi-attach.ps1
+```
+
+The corresponding manual workflow is `.github/workflows/integration-multi-attach-windows.yml`.
+It is `workflow_dispatch` only for now so we can validate the scenario on the self-hosted WinFsp runner before promoting it into required PR CI.
