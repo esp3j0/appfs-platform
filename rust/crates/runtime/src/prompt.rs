@@ -51,6 +51,7 @@ pub struct ProjectContext {
     pub current_date: String,
     pub git_status: Option<String>,
     pub git_diff: Option<String>,
+    pub git_recent_commits: Option<String>,
     pub instruction_files: Vec<ContextFile>,
 }
 
@@ -66,6 +67,7 @@ impl ProjectContext {
             current_date: current_date.into(),
             git_status: None,
             git_diff: None,
+            git_recent_commits: None,
             instruction_files,
         })
     }
@@ -77,6 +79,7 @@ impl ProjectContext {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
         context.git_diff = read_git_diff(&context.cwd);
+        context.git_recent_commits = read_git_recent_commits(&context.cwd);
         Ok(context)
     }
 }
@@ -242,6 +245,31 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
+fn read_git_recent_commits(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "log",
+            "--oneline",
+            "--no-decorate",
+            "-n",
+            "5",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -291,6 +319,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
+    }
+    if let Some(commits) = &project_context.git_recent_commits {
+        lines.push(String::new());
+        lines.push("Recent commits (last 5):".to_string());
+        lines.push(commits.clone());
     }
     if let Some(diff) = &project_context.git_diff {
         lines.push(String::new());
@@ -642,6 +675,82 @@ mod tests {
         assert!(context.git_diff.is_none());
 
         remove_dir_all_with_retry(&root);
+    }
+
+    #[test]
+    fn discover_with_git_includes_recent_commits_and_renders_them() {
+        // given: a git repo with three commits and a current branch
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "tests@example.com"])
+            .current_dir(&root)
+            .status()
+            .expect("git config email should run");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Runtime Prompt Tests"])
+            .current_dir(&root)
+            .status()
+            .expect("git config name should run");
+        for (file, message) in [
+            ("a.txt", "first commit"),
+            ("b.txt", "second commit"),
+            ("c.txt", "third commit"),
+        ] {
+            fs::write(root.join(file), "x\n").expect("write commit file");
+            std::process::Command::new("git")
+                .args(["add", file])
+                .current_dir(&root)
+                .status()
+                .expect("git add should run");
+            std::process::Command::new("git")
+                .args(["commit", "-m", message, "--quiet"])
+                .current_dir(&root)
+                .status()
+                .expect("git commit should run");
+        }
+        fs::write(root.join("d.txt"), "staged\n").expect("write staged file");
+        std::process::Command::new("git")
+            .args(["add", "d.txt"])
+            .current_dir(&root)
+            .status()
+            .expect("git add staged should run");
+
+        // when: discovering project context with git auto-include
+        let context =
+            ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+        let rendered = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(context.clone())
+            .render();
+
+        // then: branch, recent commits and staged files are present in context
+        let commits = context
+            .git_recent_commits
+            .as_deref()
+            .expect("recent commits should be present");
+        assert!(commits.contains("first commit"));
+        assert!(commits.contains("second commit"));
+        assert!(commits.contains("third commit"));
+        assert_eq!(commits.lines().count(), 3);
+
+        let status = context.git_status.as_deref().expect("status snapshot");
+        assert!(status.contains("## main"));
+        assert!(status.contains("A  d.txt"));
+
+        assert!(rendered.contains("Recent commits (last 5):"));
+        assert!(rendered.contains("first commit"));
+        assert!(rendered.contains("Git status snapshot:"));
+        assert!(rendered.contains("## main"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
