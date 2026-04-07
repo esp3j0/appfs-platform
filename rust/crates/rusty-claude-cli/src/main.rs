@@ -4290,9 +4290,55 @@ impl LiveCli {
                 );
                 Ok(true)
             }
+            Some("delete") => {
+                let Some(target) = target else {
+                    println!("Usage: /session delete <session-id> [--force]");
+                    return Ok(false);
+                };
+                let handle = resolve_session_reference(target)?;
+                if handle.id == self.session.id {
+                    println!(
+                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                        handle.id
+                    );
+                    return Ok(false);
+                }
+                if !confirm_session_deletion(&handle.id) {
+                    println!("delete: cancelled.");
+                    return Ok(false);
+                }
+                delete_managed_session(&handle.path)?;
+                println!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                );
+                Ok(false)
+            }
+            Some("delete-force") => {
+                let Some(target) = target else {
+                    println!("Usage: /session delete <session-id> [--force]");
+                    return Ok(false);
+                };
+                let handle = resolve_session_reference(target)?;
+                if handle.id == self.session.id {
+                    println!(
+                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                        handle.id
+                    );
+                    return Ok(false);
+                }
+                delete_managed_session(&handle.path)?;
+                println!(
+                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    handle.id,
+                    handle.path.display(),
+                );
+                Ok(false)
+            }
             Some(other) => {
                 println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, or /session fork [branch-name]."
+                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
                 );
                 Ok(false)
             }
@@ -4576,6 +4622,24 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
         .into_iter()
         .next()
         .ok_or_else(|| format_no_managed_sessions().into())
+}
+
+fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err(format!("session file does not exist: {}", path.display()).into());
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn confirm_session_deletion(session_id: &str) -> bool {
+    print!("Delete session '{session_id}'? This cannot be undone. [y/N]: ");
+    io::stdout().flush().unwrap_or(());
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
 fn format_missing_session_reference(reference: &str) -> String {

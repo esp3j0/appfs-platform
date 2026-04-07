@@ -221,8 +221,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "session",
         aliases: &[],
-        summary: "List, switch, or fork managed local sessions",
-        argument_hint: Some("[list|switch <session-id>|fork [branch-name]]"),
+        summary: "List, switch, fork, or delete managed local sessions",
+        argument_hint: Some(
+            "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        ),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1526,7 +1528,7 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]]")),
+        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
         ["switch"] => Err(usage_error("session switch", "<session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
@@ -1550,12 +1552,33 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             "session",
             "/session fork [branch-name]",
         )),
-        [action, ..] => Err(command_error(
+        ["delete"] => Err(usage_error("session delete", "<session-id> [--force]")),
+        ["delete", target] => Ok(SlashCommand::Session {
+            action: Some("delete".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["delete", target, "--force"] => Ok(SlashCommand::Session {
+            action: Some("delete-force".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["delete", _target, unexpected] => Err(command_error(
             &format!(
-                "Unknown /session action '{action}'. Use list, switch <session-id>, or fork [branch-name]."
+                "Unsupported /session delete flag '{unexpected}'. Use --force to skip confirmation."
             ),
             "session",
-            "/session [list|switch <session-id>|fork [branch-name]]",
+            "/session delete <session-id> [--force]",
+        )),
+        ["delete", ..] => Err(command_error(
+            "Unexpected arguments for /session delete.",
+            "session",
+            "/session delete <session-id> [--force]",
+        )),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /session action '{action}'. Use list, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
+            ),
+            "session",
+            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         )),
     }
 }
