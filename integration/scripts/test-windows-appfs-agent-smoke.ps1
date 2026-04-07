@@ -156,7 +156,7 @@ function Read-AppfsRuntimeManifest {
     Assert-True (Test-Path $manifestPath) "AppFS runtime manifest exists at $manifestPath"
 
     $raw = Get-Content $manifestPath -Raw -ErrorAction Stop
-    $manifest = $raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop
+    $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
 
     Assert-True ($manifest.schema_version -eq 1) "AppFS runtime manifest schema_version is 1"
     Assert-True ($manifest.runtime_kind -eq "appfs") "AppFS runtime manifest runtime_kind is appfs"
