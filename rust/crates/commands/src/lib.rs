@@ -3664,9 +3664,15 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectCodex | DefinitionSource::ProjectClaude => "project_claw",
-        DefinitionSource::UserCodexHome => "user_claw_config_home",
-        DefinitionSource::UserCodex | DefinitionSource::UserClaude => "user_claw",
+        DefinitionSource::ProjectClaw
+        | DefinitionSource::ProjectCodex
+        | DefinitionSource::ProjectClaude => "project_claw",
+        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
+            "user_claw_config_home"
+        }
+        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
+            "user_claw"
+        }
     }
 }
 
