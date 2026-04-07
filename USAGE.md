@@ -259,7 +259,6 @@ let client = build_http_client_with(&config).expect("proxy client");
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
 - If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
-
 ## Common operational commands
 
 ```bash
