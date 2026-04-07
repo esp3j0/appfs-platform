@@ -470,7 +470,8 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request_body = self.request_profile.render_json_body(request)?;
+        let mut request_body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -516,11 +517,10 @@ impl AnthropicClient {
             input_tokens: u32,
         }
 
-        let request_url = format!(
-            "{}/v1/messages/count_tokens",
-            self.base_url.trim_end_matches('/')
-        );
-        let request_body = self.request_profile.render_json_body(request)?;
+<<<<<<< HEAD
+        let request_url = format!("{}/v1/messages/count_tokens", self.base_url.trim_end_matches('/'));
+        let mut request_body = self.request_profile.render_json_body(request)?;
+        strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -885,6 +885,16 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Remove beta-only body fields that the standard `/v1/messages` and
+/// `/v1/messages/count_tokens` endpoints reject as `Extra inputs are not
+/// permitted`. The `betas` opt-in is communicated via the `anthropic-beta`
+/// HTTP header on these endpoints, never as a JSON body field.
+fn strip_unsupported_beta_body_fields(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("betas");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1317,6 +1327,75 @@ mod tests {
         assert_eq!(
             headers.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer proxy-token")
+        );
+    }
+
+    #[test]
+    fn strip_unsupported_beta_body_fields_removes_betas_array() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "betas": ["claude-code-20250219", "prompt-caching-scope-2026-01-05"],
+            "metadata": {"source": "test"},
+        });
+
+        super::strip_unsupported_beta_body_fields(&mut body);
+
+        assert!(
+            body.get("betas").is_none(),
+            "betas body field must be stripped before sending to /v1/messages"
+        );
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(body["max_tokens"], serde_json::json!(1024));
+        assert_eq!(body["metadata"]["source"], serde_json::json!("test"));
+    }
+
+    #[test]
+    fn strip_unsupported_beta_body_fields_is_a_noop_when_betas_absent() {
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+        });
+        let original = body.clone();
+
+        super::strip_unsupported_beta_body_fields(&mut body);
+
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn rendered_request_body_strips_betas_for_standard_messages_endpoint() {
+        let client = AnthropicClient::new("test-key").with_beta("tools-2026-04-01");
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+        };
+
+        let mut rendered = client
+            .request_profile()
+            .render_json_body(&request)
+            .expect("body should render");
+        assert!(
+            rendered.get("betas").is_some(),
+            "render_json_body still emits betas; the strip helper guards the wire format",
+        );
+        super::strip_unsupported_beta_body_fields(&mut rendered);
+
+        assert!(
+            rendered.get("betas").is_none(),
+            "betas must not appear in /v1/messages request bodies"
+        );
+        assert_eq!(
+            rendered.get("model").and_then(serde_json::Value::as_str),
+            Some("claude-sonnet-4-6")
         );
     }
 }
