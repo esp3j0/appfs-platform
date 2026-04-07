@@ -1,5 +1,6 @@
 # AppFS + appfs-agent Windows HTTP demo integration smoke test
 # Covers: http bridge + app registration + snapshot read + action submit via appfs-agent
+# Contract checkpoint: IC-1 in integration/APPFS-appfs-agent-attach-contract-v1.1.md
 
 param(
     [string]$AgentId = "appfs-agent-http-demo",
@@ -150,6 +151,33 @@ function Assert-True {
         Fail-WithContext $Message
     }
     Write-Success $Message
+}
+
+function Read-AppfsRuntimeManifest {
+    param([string]$MountRoot)
+
+    $manifestPath = Join-Path $MountRoot ".well-known\appfs\runtime.json"
+    Assert-True (Test-Path $manifestPath) "AppFS runtime manifest exists at $manifestPath"
+
+    $raw = Get-Content $manifestPath -Raw -ErrorAction Stop
+    $manifest = $raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop
+
+    Assert-True ($manifest.schema_version -eq 1) "AppFS runtime manifest schema_version is 1"
+    Assert-True ($manifest.runtime_kind -eq "appfs") "AppFS runtime manifest runtime_kind is appfs"
+    Assert-True (
+        $manifest.multi_agent_mode -eq "shared_mount_distinct_attach"
+    ) "AppFS runtime manifest multi_agent_mode is shared_mount_distinct_attach"
+    Assert-True (
+        -not [string]::IsNullOrWhiteSpace([string]$manifest.runtime_session_id)
+    ) "AppFS runtime manifest runtime_session_id is populated"
+    Assert-True (
+        $manifest.capabilities.multi_agent_attach -eq $true
+    ) "AppFS runtime manifest advertises multi_agent_attach capability"
+
+    return [pscustomobject]@{
+        Path = $manifestPath
+        Document = $manifest
+    }
 }
 
 function Ensure-ProcessRunning {
@@ -356,6 +384,10 @@ function Main {
             (Test-Path (Join-Path $controlDir "list_apps.act"))
     }
     Write-Success "AppFS mount is ready"
+    $runtimeManifest = Read-AppfsRuntimeManifest -MountRoot $MountPoint
+    Assert-True (
+        $runtimeManifest.Document.control_plane.register_action -eq "/_appfs/register_app.act"
+    ) "AppFS runtime manifest exposes the register action path"
 
     Write-Section "Register Demo App"
     $registerAction = Join-Path $controlDir "register_app.act"
