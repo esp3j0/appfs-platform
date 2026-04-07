@@ -5109,15 +5109,64 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
 }
 
 fn detect_powershell_shell() -> std::io::Result<String> {
-    if let Some(path) = resolve_command_path("pwsh") {
-        Ok(path.display().to_string())
-    } else if let Some(path) = resolve_command_path("powershell") {
-        Ok(path.display().to_string())
-    } else {
+    let mut probe_failures = Vec::new();
+
+    for candidate in ["pwsh", "powershell"] {
+        let Some(path) = resolve_command_path(candidate) else {
+            continue;
+        };
+        match probe_powershell_shell(&path) {
+            Ok(()) => return Ok(path.display().to_string()),
+            Err(error) => probe_failures.push(format!("{} ({error})", path.display())),
+        }
+    }
+
+    if probe_failures.is_empty() {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
         ))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "PowerShell executable found but failed probe (tried: {})",
+                probe_failures.join(", ")
+            ),
+        ))
+    }
+}
+
+fn probe_powershell_shell(shell: &Path) -> std::io::Result<()> {
+    const PROBE_TOKEN: &str = "__claw_pwsh_probe__";
+    let output = std::process::Command::new(shell)
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(format!("Write-Output {PROBE_TOKEN}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("probe exited with status {}", output.status)
+        } else {
+            format!("probe exited with status {}: {stderr}", output.status)
+        };
+        return Err(std::io::Error::other(message));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim() == PROBE_TOKEN {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "probe stdout mismatch: expected {PROBE_TOKEN}, got {:?}",
+            stdout.trim()
+        )))
     }
 }
 
@@ -7430,7 +7479,30 @@ mod tests {
             let dir = temp_path("pwsh-bin");
             std::fs::create_dir_all(&dir).expect("create dir");
             let script = dir.join("pwsh.cmd");
-            std::fs::write(&script, "@echo off\r\necho hello\r\n").expect("write script");
+            std::fs::write(
+                &script,
+                concat!(
+                    "@echo off\r\n",
+                    "setlocal EnableDelayedExpansion\r\n",
+                    "set \"cmd=\"\r\n",
+                    ":loop\r\n",
+                    "if \"%~1\"==\"\" goto done\r\n",
+                    "if /I \"%~1\"==\"-Command\" (\r\n",
+                    "  shift\r\n",
+                    "  set \"cmd=%~1\"\r\n",
+                    "  goto done\r\n",
+                    ")\r\n",
+                    "shift\r\n",
+                    "goto loop\r\n",
+                    ":done\r\n",
+                    "if /I \"!cmd!\"==\"Write-Output __claw_pwsh_probe__\" (\r\n",
+                    "  echo __claw_pwsh_probe__\r\n",
+                    ") else (\r\n",
+                    "  echo hello\r\n",
+                    ")\r\n",
+                ),
+            )
+            .expect("write script");
             let original_path = std::env::var_os("PATH").unwrap_or_default();
             let mut path_entries = vec![dir.clone()];
             path_entries.extend(std::env::split_paths(&original_path));
@@ -7482,7 +7554,11 @@ mod tests {
             r#"#!/bin/sh
 while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
 shift
-printf 'pwsh:%s' "$1"
+if [ "$1" = "Write-Output __claw_pwsh_probe__" ]; then
+  printf '__claw_pwsh_probe__'
+else
+  printf 'pwsh:%s' "$1"
+fi
 "#,
         )
         .expect("write script");
