@@ -1630,6 +1630,17 @@ fn default_oauth_config() -> OAuthConfig {
 }
 
 fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(base_url) = read_openai_base_url_override() {
+        emit_openai_base_url_login_conflict(
+            output_format,
+            &base_url,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        )?;
+        return Err(
+            io::Error::other("claw login is unavailable when OPENAI_BASE_URL is set").into(),
+        );
+    }
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let default_oauth = default_oauth_config();
@@ -1719,6 +1730,42 @@ fn emit_login_browser_open_failure(
         CliOutputFormat::Text => writeln!(stdout, "Open this URL manually:\n{authorize_url}"),
         CliOutputFormat::Json => writeln!(stderr, "Open this URL manually:\n{authorize_url}"),
     }
+}
+fn read_openai_base_url_override() -> Option<String> {
+    env::var("OPENAI_BASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn emit_openai_base_url_login_conflict(
+    output_format: CliOutputFormat,
+    base_url: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> io::Result<()> {
+    let summary = format!(
+        "claw login uses Anthropic OAuth, which cannot authenticate against the custom base URL set in OPENAI_BASE_URL ({base_url})."
+    );
+    let suggestion =
+        "Unset OPENAI_BASE_URL before running claw login, or skip OAuth entirely and export ANTHROPIC_API_KEY to authenticate with your Anthropic API key.";
+    writeln!(stderr, "error: {summary}")?;
+    writeln!(stderr, "{suggestion}")?;
+    if output_format == CliOutputFormat::Json {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "login_error",
+                "reason": "openai_base_url_set",
+                "openai_base_url": base_url,
+                "message": summary,
+                "suggestion": suggestion,
+            }))
+            .map_err(io::Error::other)?
+        )?;
+    }
+    Ok(())
 }
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
@@ -10195,6 +10242,87 @@ UU conflicted.rs",
         assert!(stderr.contains("failed to open browser automatically"));
         assert!(stderr.contains("Open this URL manually:"));
         assert!(stderr.contains("https://example.test/oauth/authorize"));
+    }
+
+    #[test]
+    fn login_with_openai_base_url_emits_actionable_text_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        super::emit_openai_base_url_login_conflict(
+            CliOutputFormat::Text,
+            "https://proxy.example.test/v1",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("conflict message should render");
+
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("error: claw login uses Anthropic OAuth"));
+        assert!(stderr.contains("OPENAI_BASE_URL"));
+        assert!(stderr.contains("https://proxy.example.test/v1"));
+        assert!(stderr.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn login_with_openai_base_url_json_output_emits_machine_readable_error() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        super::emit_openai_base_url_login_conflict(
+            CliOutputFormat::Json,
+            "https://proxy.example.test/v1",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("conflict message should render");
+
+        let stdout = String::from_utf8(stdout).expect("utf8");
+        let payload: serde_json::Value =
+            serde_json::from_str(&stdout).expect("stdout should be valid json");
+        assert_eq!(payload["kind"], serde_json::json!("login_error"));
+        assert_eq!(payload["reason"], serde_json::json!("openai_base_url_set"));
+        assert_eq!(
+            payload["openai_base_url"],
+            serde_json::json!("https://proxy.example.test/v1")
+        );
+        assert!(payload["message"]
+            .as_str()
+            .expect("message string")
+            .contains("OPENAI_BASE_URL"));
+        assert!(payload["suggestion"]
+            .as_str()
+            .expect("suggestion string")
+            .contains("ANTHROPIC_API_KEY"));
+
+        let stderr = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr.contains("error: claw login uses Anthropic OAuth"));
+        assert!(stderr.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn read_openai_base_url_override_reports_set_value_and_ignores_blank() {
+        let _guard = env_lock();
+        let original = std::env::var("OPENAI_BASE_URL").ok();
+
+        std::env::remove_var("OPENAI_BASE_URL");
+        let absent = super::read_openai_base_url_override();
+
+        std::env::set_var("OPENAI_BASE_URL", "   ");
+        let blank = super::read_openai_base_url_override();
+
+        std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.test/v1");
+        let present = super::read_openai_base_url_override();
+
+        match original {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+
+        assert!(absent.is_none());
+        assert!(blank.is_none());
+        assert_eq!(present.as_deref(), Some("https://proxy.example.test/v1"));
     }
 
     #[test]
