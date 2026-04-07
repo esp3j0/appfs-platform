@@ -170,8 +170,60 @@ Current gate:
 Goal:
 
 1. run at least two `appfs-agent` processes against the same mount and confirm they share `runtime_session_id` while keeping distinct `attach_id` values.
+2. prove the Phase 1 attach contract supports multiple agent instances on one shared AppFS runtime.
 
-Not yet automated in Phase 1.
+Current gate:
+
+1. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
+
+Scope clarification:
+
+1. `IC-2` validates shared-runtime multi-agent attach semantics only.
+2. `IC-2` does **not** validate principal-aware app routing.
+3. `IC-2` does **not** validate shared/private app visibility policy.
+4. `IC-2` does **not** require any AppFS-side attached-agent registry file.
+
+Operational model:
+
+1. one AppFS mount corresponds to one shared runtime instance;
+2. that runtime instance is identified by one `runtime_session_id`;
+3. multiple attached agents may share that `runtime_session_id`;
+4. each attached agent must keep a distinct `attach_id`;
+5. `attach_id` identifies a process instance, not an app-side user identity.
+
+Recommended Phase 1 inputs:
+
+1. one mounted AppFS root with a published runtime manifest;
+2. at least two `appfs-agent` processes started with:
+3. the same `APPFS_RUNTIME_MANIFEST`;
+4. the same `APPFS_MOUNT_ROOT`;
+5. the same `APPFS_RUNTIME_SESSION_ID`;
+6. distinct `APPFS_ATTACH_ID` values;
+7. optional `APPFS_AGENT_ROLE` values.
+
+Required assertions:
+
+1. both agents report `appfs.detected = true`;
+2. both agents report `appfs.attach_source = env`;
+3. both agents report the same `appfs.runtime_session_id`;
+4. both agents report the same `appfs.mount_root`;
+5. each agent reports a different `appfs.attach_id`;
+6. neither agent reports attach warnings under the normal success path.
+
+Recommended evidence:
+
+1. JSON `/status` output from agent A;
+2. JSON `/status` output from agent B;
+3. comparison of `runtime_session_id`;
+4. comparison of `attach_id`;
+5. optional text `/status` output for human-readable diagnostics.
+
+Explicit non-assertions:
+
+1. no requirement yet that agents see different app trees;
+2. no requirement yet that chat or account-backed apps isolate per agent;
+3. no requirement yet for `principal_id`, `profile_id`, or `visibility`;
+4. no requirement yet for launcher-managed child process trees.
 
 ## Non-Goals For v1.1
 
@@ -197,6 +249,13 @@ When the integration run fails, classify it into one of these buckets first:
 6. snapshot read failure;
 7. action append failure;
 8. event observation failure.
+
+For `IC-2`, use these additional buckets:
+
+1. shared runtime identity mismatch;
+2. duplicate or missing attach identity;
+3. attach source precedence regression;
+4. multi-agent process startup regression.
 
 ## Next Work
 
