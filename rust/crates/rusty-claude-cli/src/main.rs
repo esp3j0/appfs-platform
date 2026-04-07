@@ -2677,6 +2677,15 @@ fn run_resume_command(
             message: Some(render_doctor_report()?.render()),
             json: None,
         }),
+        SlashCommand::History { count } => {
+            let limit = parse_history_count(count.as_deref()).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let entries = collect_session_prompt_history(session);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_prompt_history_report(&entries, limit)),
+                json: None,
+            })
+        }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -2770,6 +2779,7 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
+                cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
@@ -2806,6 +2816,13 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    prompt_history: Vec<PromptHistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptHistoryEntry {
+    timestamp_ms: u64,
+    text: String,
 }
 
 struct RuntimePluginState {
@@ -3307,6 +3324,7 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            prompt_history: Vec::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3597,8 +3615,15 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Doctor
-            | SlashCommand::Login
+            SlashCommand::Doctor => {
+                println!("{}", render_doctor_report()?.render());
+                false
+            }
+            SlashCommand::History { count } => {
+                self.print_prompt_history(count.as_deref());
+                false
+            }
+            SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Upgrade
@@ -3670,6 +3695,35 @@ impl LiveCli {
                 &status_context(Some(&self.session.path)).expect("status context should load"),
             )
         );
+    }
+
+    fn record_prompt_history(&mut self, prompt: &str) {
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map_or(self.runtime.session().updated_at_ms, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.prompt_history.push(PromptHistoryEntry {
+            timestamp_ms,
+            text: prompt.to_string(),
+        });
+    }
+
+    fn print_prompt_history(&self, count: Option<&str>) {
+        let limit = match parse_history_count(count) {
+            Ok(limit) => limit,
+            Err(message) => {
+                eprintln!("{message}");
+                return;
+            }
+        };
+        let entries = if self.prompt_history.is_empty() {
+            collect_session_prompt_history(self.runtime.session())
+        } else {
+            self.prompt_history.clone()
+        };
+        println!("{}", render_prompt_history_report(&entries, limit));
     }
 
     fn print_sandbox_status() {
@@ -4397,9 +4451,15 @@ fn render_repl_help() -> String {
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
+        "  Up/Down              Navigate prompt history".to_string(),
+        "  Ctrl-R               Reverse-search prompt history".to_string(),
+        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
+        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
+        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
+        "  Show prompt history  /history [count]".to_string(),
         String::new(),
         render_slash_command_help(),
     ]
@@ -5518,6 +5578,100 @@ fn write_temp_text_file(
     let path = env::temp_dir().join(filename);
     fs::write(&path, contents)?;
     Ok(path)
+}
+
+const DEFAULT_HISTORY_LIMIT: usize = 10;
+
+fn parse_history_count(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_HISTORY_LIMIT);
+    };
+    let parsed: usize = raw
+        .parse()
+        .map_err(|_| format!("history: invalid count '{raw}'. Expected a positive integer."))?;
+    if parsed == 0 {
+        return Err("history: count must be greater than 0.".to_string());
+    }
+    Ok(parsed)
+}
+
+fn format_history_timestamp(timestamp_ms: u64) -> String {
+    let secs = timestamp_ms / 1_000;
+    let subsec_ms = timestamp_ms % 1_000;
+    let days_since_epoch = secs / 86_400;
+    let seconds_of_day = secs % 86_400;
+    let hours = seconds_of_day / 3_600;
+    let minutes = (seconds_of_day % 3_600) / 60;
+    let seconds = seconds_of_day % 60;
+
+    let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z"
+    )
+}
+
+// Computes civil (Gregorian) year/month/day from days since the Unix epoch
+// (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = y + i64::from(m <= 2);
+    (y as i32, m as u32, d as u32)
+}
+
+fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
+    if entries.is_empty() {
+        return "Prompt history\n  Result           no prompts recorded yet".to_string();
+    }
+
+    let total = entries.len();
+    let start = total.saturating_sub(limit);
+    let shown = &entries[start..];
+    let mut lines = vec![
+        "Prompt history".to_string(),
+        format!("  Total            {total}"),
+        format!("  Showing          {} most recent", shown.len()),
+        format!("  Reverse search   Ctrl-R in the REPL"),
+        String::new(),
+    ];
+    for (offset, entry) in shown.iter().enumerate() {
+        let absolute_index = start + offset + 1;
+        let timestamp = format_history_timestamp(entry.timestamp_ms);
+        let first_line = entry.text.lines().next().unwrap_or("").trim();
+        let display = if first_line.chars().count() > 80 {
+            let truncated: String = first_line.chars().take(77).collect();
+            format!("{truncated}...")
+        } else {
+            first_line.to_string()
+        };
+        lines.push(format!("  {absolute_index:>3}. [{timestamp}] {display}"));
+    }
+    lines.join("\n")
+}
+
+fn collect_session_prompt_history(session: &Session) -> Vec<PromptHistoryEntry> {
+    let timestamp_ms = session.updated_at_ms;
+    session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .filter_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(PromptHistoryEntry {
+                    timestamp_ms,
+                    text: text.clone(),
+                }),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 fn recent_user_context(session: &Session, limit: usize) -> String {
@@ -7620,29 +7774,30 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
+        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
+        delete_merged_local_branches_in,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_cost_report,
-        format_connected_line, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_cost_report,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
-        parse_hook_args, parse_recent_commits, permission_policy, print_help_to, push_output_block,
-        regroup_omc_agent_sections, render_config_report, render_diff_report,
-        render_diff_report_for, render_hook_list_report_for, render_memory_report,
-        render_merged_runtime_config_json, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_repl_model, resolve_session_reference, response_to_events,
+        parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
+        print_help_to, push_output_block, regroup_omc_agent_sections, render_config_report,
+        render_diff_report, render_diff_report_for, render_hook_list_report_for,
+        render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
+        render_repl_help, render_resume_usage, resolve_model_alias, resolve_repl_model,
+        resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
         GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9987,6 +10142,168 @@ UU conflicted.rs",
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
+        assert!(help.contains("Ctrl-R"));
+        assert!(help.contains("Reverse-search prompt history"));
+        assert!(help.contains("/history [count]"));
+    }
+
+    #[test]
+    fn parse_history_count_defaults_to_ten_when_missing() {
+        // given
+        let raw: Option<&str> = None;
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert_eq!(parsed, Ok(10));
+    }
+
+    #[test]
+    fn parse_history_count_accepts_positive_integers() {
+        // given
+        let raw = Some("25");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert_eq!(parsed, Ok(25));
+    }
+
+    #[test]
+    fn parse_history_count_rejects_zero() {
+        // given
+        let raw = Some("0");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().contains("greater than 0"));
+    }
+
+    #[test]
+    fn parse_history_count_rejects_non_numeric() {
+        // given
+        let raw = Some("abc");
+
+        // when
+        let parsed = parse_history_count(raw);
+
+        // then
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().contains("invalid count 'abc'"));
+    }
+
+    #[test]
+    fn format_history_timestamp_renders_iso8601_utc() {
+        // given
+        // 2023-01-15T12:34:56.789Z -> 1673786096789 ms
+        let timestamp_ms: u64 = 1_673_786_096_789;
+
+        // when
+        let formatted = format_history_timestamp(timestamp_ms);
+
+        // then
+        assert_eq!(formatted, "2023-01-15T12:34:56.789Z");
+    }
+
+    #[test]
+    fn format_history_timestamp_renders_unix_epoch_origin() {
+        // given
+        let timestamp_ms: u64 = 0;
+
+        // when
+        let formatted = format_history_timestamp(timestamp_ms);
+
+        // then
+        assert_eq!(formatted, "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn render_prompt_history_report_lists_entries_with_timestamps() {
+        // given
+        let entries = vec![
+            PromptHistoryEntry {
+                timestamp_ms: 1_673_786_096_000,
+                text: "first prompt".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 1_673_786_100_000,
+                text: "second prompt".to_string(),
+            },
+        ];
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 10);
+
+        // then
+        assert!(rendered.contains("Prompt history"));
+        assert!(rendered.contains("Total            2"));
+        assert!(rendered.contains("Showing          2 most recent"));
+        assert!(rendered.contains("Reverse search   Ctrl-R in the REPL"));
+        assert!(rendered.contains("2023-01-15T12:34:56.000Z"));
+        assert!(rendered.contains("first prompt"));
+        assert!(rendered.contains("second prompt"));
+    }
+
+    #[test]
+    fn render_prompt_history_report_truncates_to_limit_from_the_tail() {
+        // given
+        let entries = vec![
+            PromptHistoryEntry {
+                timestamp_ms: 1_000,
+                text: "older".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 2_000,
+                text: "middle".to_string(),
+            },
+            PromptHistoryEntry {
+                timestamp_ms: 3_000,
+                text: "latest".to_string(),
+            },
+        ];
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 2);
+
+        // then
+        assert!(rendered.contains("Total            3"));
+        assert!(rendered.contains("Showing          2 most recent"));
+        assert!(!rendered.contains("older"));
+        assert!(rendered.contains("middle"));
+        assert!(rendered.contains("latest"));
+    }
+
+    #[test]
+    fn render_prompt_history_report_handles_empty_history() {
+        // given
+        let entries: Vec<PromptHistoryEntry> = Vec::new();
+
+        // when
+        let rendered = render_prompt_history_report(&entries, 10);
+
+        // then
+        assert!(rendered.contains("no prompts recorded yet"));
+    }
+
+    #[test]
+    fn collect_session_prompt_history_extracts_user_text_blocks() {
+        // given
+        let mut session = Session::new();
+        session.push_user_text("hello").unwrap();
+        session.push_user_text("world").unwrap();
+
+        // when
+        let entries = collect_session_prompt_history(&session);
+
+        // then
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, "hello");
+        assert_eq!(entries[1].text, "world");
     }
 
     #[test]
