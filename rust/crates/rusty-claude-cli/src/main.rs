@@ -48,15 +48,18 @@ use runtime::{
     parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
     save_oauth_credentials, set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent,
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker,
+    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
+    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage,
+    ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{strip_tool_call_prefix, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    execute_tool, mvp_tool_specs, strip_tool_call_prefix, GlobalToolRegistry,
+    RuntimeToolDefinition, ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -1208,6 +1211,41 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     if report.has_failures() {
         return Err("doctor found failing checks".into());
     }
+    Ok(())
+}
+
+/// Starts a minimal Model Context Protocol server that exposes claw's
+/// built-in tools over stdio.
+///
+/// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
+/// dispatched through [`tools::execute_tool`], so this server exposes exactly
+/// the same surface the in-process agent loop uses.
+fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    let tools = mvp_tool_specs()
+        .into_iter()
+        .map(|spec| McpTool {
+            name: spec.name.to_string(),
+            description: Some(spec.description.to_string()),
+            input_schema: Some(spec.input_schema),
+            annotations: None,
+            meta: None,
+        })
+        .collect();
+
+    let spec = McpServerSpec {
+        server_name: "claw".to_string(),
+        server_version: VERSION.to_string(),
+        tools,
+        tool_handler: Box::new(execute_tool),
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut server = McpServer::new(spec);
+        server.run().await
+    })?;
     Ok(())
 }
 
@@ -3972,6 +4010,12 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
+        // tools. All other `mcp` subcommands fall through to the existing
+        // configured-server reporter (`list`, `status`, ...).
+        if matches!(args.map(str::trim), Some("serve")) {
+            return run_mcp_serve();
+        }
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
