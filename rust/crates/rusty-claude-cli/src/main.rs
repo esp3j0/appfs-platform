@@ -89,6 +89,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowed-tools",
     "--resume",
     "--print",
+    "--compact",
     "-p",
 ];
 
@@ -157,8 +158,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
+            compact,
         } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+            .run_turn_with_output(&prompt, output_format, compact)?,
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -224,6 +226,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        compact: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -286,6 +289,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut compact = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -336,6 +340,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
+            "--compact" => {
+                compact = true;
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -349,6 +357,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
+                    compact,
                 });
             }
             "--print" => {
@@ -443,6 +452,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    compact,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -468,6 +478,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                compact,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -476,6 +487,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            compact,
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
@@ -483,6 +495,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            compact,
         }),
     }
 }
@@ -573,6 +586,7 @@ fn parse_direct_slash_cli_action(
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    compact: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -598,6 +612,7 @@ fn parse_direct_slash_cli_action(
                     output_format,
                     allowed_tools,
                     permission_mode,
+                    compact,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -3459,11 +3474,26 @@ impl LiveCli {
         &mut self,
         input: &str,
         output_format: CliOutputFormat,
+        compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
+            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
+    }
+
+    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        let final_text = final_assistant_text(&summary);
+        println!("{final_text}");
+        Ok(())
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -7689,6 +7719,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --compact                  Strip tool call details; print only the final assistant text (text mode only; useful for piping)"
+    )?;
+    writeln!(
+        out,
         "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
     )?;
     writeln!(
@@ -7732,6 +7766,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
+    )?;
+    writeln!(
+        out,
+        "  claw --compact \"summarize Cargo.toml\" | wc -l"
     )?;
     writeln!(
         out,
@@ -8367,6 +8405,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
     }
@@ -8390,8 +8429,54 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_compact_flag_for_prompt_mode() {
+        // given a bare prompt invocation that includes the --compact flag
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--compact".to_string(),
+            "summarize".to_string(),
+            "this".to_string(),
+        ];
+
+        // when parse_args interprets the flag
+        let parsed = parse_args(&args).expect("args should parse");
+
+        // then compact mode is propagated and other defaults stay unchanged
+        assert_eq!(
+            parsed,
+            CliAction::Prompt {
+                prompt: "summarize this".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                compact: true,
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_subcommand_defaults_compact_to_false() {
+        // given a `prompt` subcommand invocation without --compact
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["prompt".to_string(), "hello".to_string()];
+
+        // when parse_args runs
+        let parsed = parse_args(&args).expect("args should parse");
+
+        // then compact stays false (opt-in flag)
+        match parsed {
+            CliAction::Prompt { compact, .. } => assert!(!compact),
+            other => panic!("expected Prompt action, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8412,6 +8497,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
     }
@@ -8563,6 +8649,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         assert_eq!(
@@ -8724,6 +8811,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
             }
         );
     }
@@ -8773,6 +8861,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         assert_eq!(
@@ -8796,6 +8885,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
+                compact: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
