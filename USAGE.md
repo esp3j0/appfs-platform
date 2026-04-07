@@ -221,6 +221,8 @@ The name "codex" appears in the Claw Code ecosystem but it does **not** refer to
 
 `claw` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
 
+### Environment variables
+
 ```bash
 export HTTPS_PROXY="http://proxy.corp.example:3128"
 export HTTP_PROXY="http://proxy.corp.example:3128"
@@ -230,9 +232,30 @@ cd rust
 ./target/debug/claw prompt "hello via the corporate proxy"
 ```
 
-Notes:
+### Programmatic `proxy_url` config option
+
+As an alternative to per-scheme environment variables, the `ProxyConfig` type exposes a `proxy_url` field that acts as a single catch-all proxy for both HTTP and HTTPS traffic. When `proxy_url` is set it takes precedence over the separate `http_proxy` and `https_proxy` fields.
+
+```rust
+use api::{build_http_client_with, ProxyConfig};
+
+// From a single unified URL (config file, CLI flag, etc.)
+let config = ProxyConfig::from_proxy_url("http://proxy.corp.example:3128");
+let client = build_http_client_with(&config).expect("proxy client");
+
+// Or set the field directly alongside NO_PROXY
+let config = ProxyConfig {
+    proxy_url: Some("http://proxy.corp.example:3128".to_string()),
+    no_proxy: Some("localhost,127.0.0.1".to_string()),
+    ..ProxyConfig::default()
+};
+let client = build_http_client_with(&config).expect("proxy client");
+```
+
+### Notes
 
 - When both `HTTPS_PROXY` and `HTTP_PROXY` are set, the secure proxy applies to `https://` URLs and the plain proxy applies to `http://` URLs.
+- `proxy_url` is a unified alternative: when set, it applies to both `http://` and `https://` destinations, overriding the per-scheme fields.
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
 - If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
