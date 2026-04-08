@@ -114,27 +114,89 @@ function Invoke-WindowsIntegrationStreamingCommand {
         [System.Text.Encoding]$Encoding
     )
 
-    $exitCode = 0
+    function ConvertTo-WindowsCommandLineArgument {
+        param([string]$Argument)
+
+        if ($null -eq $Argument) {
+            return '""'
+        }
+        if ($Argument.Length -eq 0) {
+            return '""'
+        }
+        if ($Argument -notmatch '[\s"]') {
+            return $Argument
+        }
+
+        $escaped = $Argument -replace '(\\*)"', '$1$1\"'
+        $escaped = $escaped -replace '(\\+)$', '$1$1'
+        return '"' + $escaped + '"'
+    }
+
     $command = Get-Command $FilePath -ErrorAction SilentlyContinue
     $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $commandOutput = @()
+    $stdoutLines = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $stderrLines = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $resolvedFilePath
+    $startInfo.Arguments = (@($ArgumentList) | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Argument ([string]$_) }) -join " "
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+
+    $stdoutHandler = [System.Diagnostics.DataReceivedEventHandler]{
+        param($Sender, $EventArgs)
+
+        if ($null -ne $EventArgs.Data) {
+            $stdoutLines.Enqueue($EventArgs.Data)
+            [Console]::Out.WriteLine($EventArgs.Data)
+        }
+    }
+    $stderrHandler = [System.Diagnostics.DataReceivedEventHandler]{
+        param($Sender, $EventArgs)
+
+        if ($null -ne $EventArgs.Data) {
+            $stderrLines.Enqueue($EventArgs.Data)
+            [Console]::Out.WriteLine($EventArgs.Data)
+        }
+    }
+    $process.add_OutputDataReceived($stdoutHandler)
+    $process.add_ErrorDataReceived($stderrHandler)
 
     Write-Host (
         "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
     ) -ForegroundColor DarkGray
 
-    Push-Location $WorkingDirectory
     try {
-        & $resolvedFilePath @ArgumentList 2>&1 | Tee-Object -Variable commandOutput | Out-Host
-        $exitCode = $LASTEXITCODE
+        [void]$process.Start()
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
     } finally {
         $stopwatch.Stop()
-        Pop-Location
+        try {
+            $process.CancelOutputRead()
+        } catch {
+        }
+        try {
+            $process.CancelErrorRead()
+        } catch {
+        }
+        $process.remove_OutputDataReceived($stdoutHandler)
+        $process.remove_ErrorDataReceived($stderrHandler)
+        $process.Dispose()
     }
 
-    $text = (@($commandOutput) | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-    $text = $text.TrimEnd()
+    $stdout = (@($stdoutLines.ToArray())) -join [Environment]::NewLine
+    $stderr = (@($stderrLines.ToArray())) -join [Environment]::NewLine
+    $textParts = @($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $text = ($textParts -join [Environment]::NewLine).TrimEnd()
 
     if ($null -eq $Encoding) {
         $Encoding = New-Object System.Text.UTF8Encoding($false)
