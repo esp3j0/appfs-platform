@@ -55,12 +55,12 @@ function Remove-TestPath {
     } catch {
         if (Test-Path $Path -PathType Container) {
             if ($Recurse) {
-                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
+                cmd /c "rmdir /s /q `"$Path`"" 2>$null | Out-Null
             } else {
-                cmd /c "rmdir `"$Path`"" | Out-Null
+                cmd /c "rmdir `"$Path`"" 2>$null | Out-Null
             }
         } elseif (Test-Path $Path -PathType Leaf) {
-            cmd /c "del /f /q `"$Path`"" | Out-Null
+            cmd /c "del /f /q `"$Path`"" 2>$null | Out-Null
         }
     }
 }
