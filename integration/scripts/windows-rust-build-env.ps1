@@ -185,6 +185,15 @@ function Clear-WindowsIntegrationExecutableTargets {
                     }
             )
         } while ($remaining.Count -gt 0 -and (Get-Date) -lt $deadline)
+
+        foreach ($process in $remaining) {
+            try {
+                & taskkill.exe /F /T /PID $process.ProcessId | Out-Null
+                Write-Host "[warn] taskkill forced stale process $($process.Name) (PID $($process.ProcessId))" -ForegroundColor Yellow
+            } catch {
+                Write-Host "[warn] taskkill failed for stale process $($process.Name) (PID $($process.ProcessId)): $_" -ForegroundColor Yellow
+            }
+        }
     }
 
     foreach ($path in $normalizedPaths) {
@@ -198,4 +207,21 @@ function Clear-WindowsIntegrationExecutableTargets {
             Write-Host "[warn] Failed to delete stale executable $path before rebuild: $_" -ForegroundColor Yellow
         }
     }
+}
+
+function Copy-WindowsIntegrationExecutableForRun {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationDirectory
+    )
+
+    $resolvedSourcePath = Resolve-NormalizedWindowsPath $SourcePath
+    if ([string]::IsNullOrWhiteSpace($resolvedSourcePath) -or -not (Test-Path $resolvedSourcePath -PathType Leaf)) {
+        throw "Executable not found for staging: $SourcePath"
+    }
+
+    [void][System.IO.Directory]::CreateDirectory($DestinationDirectory)
+    $destinationPath = Join-Path $DestinationDirectory (Split-Path $resolvedSourcePath -Leaf)
+    Copy-Item -Path $resolvedSourcePath -Destination $destinationPath -Force
+    return (Resolve-NormalizedWindowsPath $destinationPath)
 }

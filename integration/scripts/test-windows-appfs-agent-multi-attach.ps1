@@ -25,6 +25,7 @@ $script:DbPath = Join-Path $script:AppfsCliDir ".agentfs\$AgentId.db"
 $script:AppfsHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-multi-attach-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
+$script:RuntimeBinDir = Join-Path $script:LogDir "bin"
 $script:HadFailure = $false
 $script:CargoCacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "appfs-platform-cargo-targets"
 $script:AppfsCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-cli"
@@ -327,6 +328,11 @@ function Build-TestBinaries {
     }
 }
 
+function Stage-TestBinaries {
+    $script:AppfsExe = Copy-WindowsIntegrationExecutableForRun -SourcePath $script:AppfsExe -DestinationDirectory $script:RuntimeBinDir
+    $script:ClawExe = Copy-WindowsIntegrationExecutableForRun -SourcePath $script:ClawExe -DestinationDirectory $script:RuntimeBinDir
+}
+
 function New-AttachEnvironment {
     param(
         [pscustomobject]$RuntimeManifest,
@@ -417,6 +423,7 @@ function Main {
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
     [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
     Build-TestBinaries
+    Stage-TestBinaries
 
     $mountParent = Split-Path -Parent $MountPoint
     if ($mountParent -and !(Test-Path $mountParent)) {
