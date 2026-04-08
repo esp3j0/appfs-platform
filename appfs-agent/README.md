@@ -27,7 +27,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Rust port is now in progress** on the [`dev/rust`](https://github.com/instructkr/claw-code/tree/dev/rust) branch and is expected to be merged into main today. The Rust implementation aims to deliver a faster, memory-safe harness runtime. Stay tuned — this will be the definitive version of the project.
+> The active Rust workspace now lives in [`rust/`](./rust). Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows, make the doctor health check your first run, use [`rust/README.md`](./rust/README.md) for crate-level details, and see [`docs/container.md`](./docs/container.md) for Docker/Podman container-first usage.
 
 > If you find this work useful, consider [sponsoring @instructkr on GitHub](https://github.com/sponsors/instructkr) to support continued open-source harness engineering research.
 
@@ -62,6 +62,22 @@ I've been deeply interested in **harness engineering** — studying how agent sy
 ![WSJ Feature](assets/wsj-feature.png)
 
 ---
+
+## New user onboarding
+
+If you are here to try the Rust CLI, make the doctor check the first thing you run after building:
+
+```bash
+cd rust
+cargo build --workspace
+./target/debug/claw
+# first command inside the REPL
+/doctor
+```
+
+`/doctor` is the built-in setup and preflight diagnostic. After your first session, you can rerun the same health check with `./target/debug/claw --resume latest /doctor`.
+
+For the rest of the install, auth, session, and parity-harness workflow, continue in [`USAGE.md`](./USAGE.md).
 
 ## Porting Status
 
@@ -109,7 +125,7 @@ The new Python `src/` tree currently provides:
 - **`query_engine.py`** — renders a Python porting summary from the active workspace
 - **`main.py`** — a CLI entrypoint for manifest and summary output
 
-## Quickstart
+## Python workspace quickstart
 
 Render the Python porting summary:
 
