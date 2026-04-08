@@ -253,7 +253,7 @@ fn config_validation_rejects_invalid_hook_shapes_before_runtime_use() {
     let rendered = error.to_string();
 
     assert!(rendered.contains(&format!(
-        "{}: hooks: field PreToolUse must contain only strings",
+        "{}: field \"hooks.PreToolUse\" must be an array of strings, got an array (line 1)",
         bad_settings.display()
     )));
     assert!(!rendered.contains("merged settings.hooks"));

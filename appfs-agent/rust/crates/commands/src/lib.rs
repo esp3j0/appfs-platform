@@ -221,8 +221,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "session",
         aliases: &[],
-        summary: "List, switch, or fork managed local sessions",
-        argument_hint: Some("[list|switch <session-id>|fork [branch-name]]"),
+        summary: "List, switch, fork, or delete managed local sessions",
+        argument_hint: Some(
+            "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        ),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1188,6 +1190,9 @@ pub enum SlashCommand {
     AddDir {
         path: Option<String>,
     },
+    History {
+        count: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1421,6 +1426,9 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "history" => SlashCommand::History {
+            count: optional_single_arg(command, &args, "[count]")?,
+        },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -1520,7 +1528,7 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             action: Some("list".to_string()),
             target: None,
         }),
-        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]]")),
+        ["list", ..] => Err(usage_error("session", "[list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]")),
         ["switch"] => Err(usage_error("session switch", "<session-id>")),
         ["switch", target] => Ok(SlashCommand::Session {
             action: Some("switch".to_string()),
@@ -1544,12 +1552,33 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             "session",
             "/session fork [branch-name]",
         )),
-        [action, ..] => Err(command_error(
+        ["delete"] => Err(usage_error("session delete", "<session-id> [--force]")),
+        ["delete", target] => Ok(SlashCommand::Session {
+            action: Some("delete".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["delete", target, "--force"] => Ok(SlashCommand::Session {
+            action: Some("delete-force".to_string()),
+            target: Some((*target).to_string()),
+        }),
+        ["delete", _target, unexpected] => Err(command_error(
             &format!(
-                "Unknown /session action '{action}'. Use list, switch <session-id>, or fork [branch-name]."
+                "Unsupported /session delete flag '{unexpected}'. Use --force to skip confirmation."
             ),
             "session",
-            "/session [list|switch <session-id>|fork [branch-name]]",
+            "/session delete <session-id> [--force]",
+        )),
+        ["delete", ..] => Err(command_error(
+            "Unexpected arguments for /session delete.",
+            "session",
+            "/session delete <session-id> [--force]",
+        )),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /session action '{action}'. Use list, switch <session-id>, fork [branch-name], or delete <session-id> [--force]."
+            ),
+            "session",
+            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
         )),
     }
 }
@@ -1786,24 +1815,29 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "sandbox" | "model" | "permissions" | "cost" | "resume" | "session"
-        | "version" | "login" | "logout" | "usage" | "stats" | "rename" | "privacy-settings" => {
-            "Session & visibility"
-        }
-        "compact" | "clear" | "config" | "memory" | "init" | "diff" | "commit" | "pr" | "issue"
-        | "export" | "plugin" | "branch" | "add-dir" | "files" | "hooks" | "release-notes" => {
-            "Workspace & git"
-        }
-        "agents" | "skills" | "teleport" | "debug-tool-call" | "mcp" | "context" | "tasks"
-        | "doctor" | "ide" | "desktop" => "Discovery & debugging",
-        "bughunter" | "ultraplan" | "review" | "security-review" | "advisor" | "insights" => {
-            "Analysis & automation"
-        }
-        "theme" | "vim" | "voice" | "color" | "effort" | "fast" | "brief" | "output-style"
-        | "keybindings" | "stickers" => "Appearance & input",
-        "copy" | "share" | "feedback" | "summary" | "tag" | "thinkback" | "plan" | "exit"
-        | "upgrade" | "rewind" => "Communication & control",
-        _ => "Other",
+        "help" | "status" | "cost" | "resume" | "session" | "version" | "login" | "logout"
+        | "usage" | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache"
+        | "exit" | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind"
+        | "pin" | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry"
+        | "stop" | "undo" => "Session",
+        "diff" | "commit" | "pr" | "issue" | "branch" | "blame" | "log" | "git" | "stash"
+        | "init" | "export" | "plan" | "review" | "security-review" | "bughunter" | "ultraplan"
+        | "teleport" | "refactor" | "fix" | "autofix" | "explain" | "docs" | "perf" | "search"
+        | "references" | "definition" | "hover" | "symbols" | "map" | "web" | "image"
+        | "screenshot" | "paste" | "listen" | "speak" | "test" | "lint" | "build" | "run"
+        | "format" | "parallel" | "multi" | "macro" | "alias" | "templates" | "migrate"
+        | "benchmark" | "cron" | "agent" | "subagent" | "agents" | "skills" | "team" | "plugin"
+        | "mcp" | "hooks" | "tasks" | "advisor" | "insights" | "release-notes" | "chat"
+        | "approve" | "deny" | "allowed-tools" | "add-dir" => "Tools",
+        "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
+        | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
+        | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
+        | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
+        | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
+        | "desktop" | "upgrade" => "Config",
+        "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
+        | "metrics" => "Debug",
+        _ => "Tools",
     }
 }
 
@@ -1912,12 +1946,7 @@ pub fn render_slash_command_help() -> String {
         String::new(),
     ];
 
-    let categories = [
-        "Session & visibility",
-        "Workspace & git",
-        "Discovery & debugging",
-        "Analysis & automation",
-    ];
+    let categories = ["Session", "Tools", "Config", "Debug"];
 
     for category in categories {
         lines.push(category.to_string());
@@ -1929,6 +1958,12 @@ pub fn render_slash_command_help() -> String {
         }
         lines.push(String::new());
     }
+
+    lines.push("Keyboard shortcuts".to_string());
+    lines.push("  Up/Down              Navigate prompt history".to_string());
+    lines.push("  Tab                  Complete commands, modes, and recent sessions".to_string());
+    lines.push("  Ctrl-C               Clear input (or exit on empty prompt)".to_string());
+    lines.push("  Shift+Enter/Ctrl+J   Insert a newline".to_string());
 
     lines
         .into_iter()
@@ -1955,22 +1990,46 @@ pub struct PluginsCommandResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionSource {
+    ProjectClaw,
     ProjectCodex,
     ProjectClaude,
+    UserClawConfigHome,
     UserCodexHome,
+    UserClaw,
     UserCodex,
     UserClaude,
 }
 
-impl DefinitionSource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DefinitionScope {
+    Project,
+    UserConfigHome,
+    UserHome,
+}
+
+impl DefinitionScope {
     fn label(self) -> &'static str {
         match self {
-            Self::ProjectCodex => "Project (.codex)",
-            Self::ProjectClaude => "Project (.claude)",
-            Self::UserCodexHome => "User ($CODEX_HOME)",
-            Self::UserCodex => "User (~/.codex)",
-            Self::UserClaude => "User (~/.claude)",
+            Self::Project => "Project (.claw)",
+            Self::UserConfigHome => "User ($CLAW_CONFIG_HOME)",
+            Self::UserHome => "User (~/.claw)",
         }
+    }
+}
+
+impl DefinitionSource {
+    fn report_scope(self) -> DefinitionScope {
+        match self {
+            Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
+                DefinitionScope::Project
+            }
+            Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
+            Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.report_scope().label()
     }
 }
 
@@ -2521,6 +2580,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     for ancestor in cwd.ancestors() {
         push_unique_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join(leaf),
+        );
+        push_unique_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join(leaf),
         );
@@ -2528,6 +2592,14 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
             &mut roots,
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join(leaf),
+        );
+    }
+
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            PathBuf::from(claw_config_home).join(leaf),
         );
     }
 
@@ -2541,6 +2613,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
+        push_unique_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join(leaf),
+        );
         push_unique_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -2563,6 +2640,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     for ancestor in cwd.ancestors() {
         push_unique_skill_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("skills"),
             SkillOrigin::SkillsDir,
@@ -2575,6 +2658,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
         push_unique_skill_root(
             &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
             DefinitionSource::ProjectCodex,
             ancestor.join(".codex").join("commands"),
             SkillOrigin::LegacyCommandsDir,
@@ -2583,6 +2672,22 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             &mut roots,
             DefinitionSource::ProjectClaude,
             ancestor.join(".claude").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
+    }
+
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        let claw_config_home = PathBuf::from(claw_config_home);
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            claw_config_home.join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
+            claw_config_home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }
@@ -2605,6 +2710,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
 
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join("commands"),
+            SkillOrigin::LegacyCommandsDir,
+        );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -2685,15 +2802,18 @@ fn install_skill_into(
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
+    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+        return Ok(PathBuf::from(claw_config_home).join("skills"));
+    }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
     if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".codex").join("skills"));
+        return Ok(PathBuf::from(home).join(".claw").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CODEX_HOME or HOME",
+        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
     ))
 }
 
@@ -3059,22 +3179,20 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
         String::new(),
     ];
 
-    for source in [
-        DefinitionSource::ProjectCodex,
-        DefinitionSource::ProjectClaude,
-        DefinitionSource::UserCodexHome,
-        DefinitionSource::UserCodex,
-        DefinitionSource::UserClaude,
+    for scope in [
+        DefinitionScope::Project,
+        DefinitionScope::UserConfigHome,
+        DefinitionScope::UserHome,
     ] {
         let group = agents
             .iter()
-            .filter(|agent| agent.source == source)
+            .filter(|agent| agent.source.report_scope() == scope)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
 
-        lines.push(format!("{}:", source.label()));
+        lines.push(format!("{}:", scope.label()));
         for agent in group {
             let detail = agent_detail(agent);
             match agent.shadowed_by {
@@ -3136,22 +3254,20 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         String::new(),
     ];
 
-    for source in [
-        DefinitionSource::ProjectCodex,
-        DefinitionSource::ProjectClaude,
-        DefinitionSource::UserCodexHome,
-        DefinitionSource::UserCodex,
-        DefinitionSource::UserClaude,
+    for scope in [
+        DefinitionScope::Project,
+        DefinitionScope::UserConfigHome,
+        DefinitionScope::UserHome,
     ] {
         let group = skills
             .iter()
-            .filter(|skill| skill.source == source)
+            .filter(|skill| skill.source.report_scope() == scope)
             .collect::<Vec<_>>();
         if group.is_empty() {
             continue;
         }
 
-        lines.push(format!("{}:", source.label()));
+        lines.push(format!("{}:", scope.label()));
         for skill in group {
             let mut parts = vec![skill.name.clone()];
             if let Some(description) = &skill.description {
@@ -3388,7 +3504,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
         "  Direct CLI       claw agents".to_string(),
-        "  Sources          .codex/agents, .claude/agents, $CODEX_HOME/agents".to_string(),
+        "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3415,8 +3531,8 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $CODEX_HOME/skills or ~/.codex/skills".to_string(),
-        "  Sources          .codex/skills, .claude/skills, legacy /commands".to_string(),
+        "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
+        "  Sources          .claw/skills, ~/.claw/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3432,10 +3548,10 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
-            "install_root": "$CODEX_HOME/skills or ~/.codex/skills",
+            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
-                ".codex/skills",
-                ".claude/skills",
+                ".claw/skills",
+                "~/.claw/skills",
                 "legacy /commands",
                 "legacy fallback dirs still load automatically",
             ],
@@ -3548,9 +3664,15 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
-        DefinitionSource::ProjectCodex | DefinitionSource::ProjectClaude => "project_claw",
-        DefinitionSource::UserCodexHome => "user_claw_config_home",
-        DefinitionSource::UserCodex | DefinitionSource::UserClaude => "user_claw",
+        DefinitionSource::ProjectClaw
+        | DefinitionSource::ProjectCodex
+        | DefinitionSource::ProjectClaude => "project_claw",
+        DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
+            "user_claw_config_home"
+        }
+        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
+            "user_claw"
+        }
     }
 }
 
@@ -3773,6 +3895,7 @@ pub fn handle_slash_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::History { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -4074,6 +4197,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_history_command_without_count() {
+        // given
+        let input = "/history";
+
+        // when
+        let parsed = SlashCommand::parse(input);
+
+        // then
+        assert_eq!(parsed, Ok(Some(SlashCommand::History { count: None })));
+    }
+
+    #[test]
+    fn parses_history_command_with_numeric_count() {
+        // given
+        let input = "/history 25";
+
+        // when
+        let parsed = SlashCommand::parse(input);
+
+        // then
+        assert_eq!(
+            parsed,
+            Ok(Some(SlashCommand::History {
+                count: Some("25".to_string())
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_history_with_extra_arguments() {
+        // given
+        let input = "/history 25 extra";
+
+        // when
+        let error = parse_error_message(input);
+
+        // then
+        assert!(error.contains("Usage: /history [count]"));
+    }
+
+    #[test]
     fn rejects_unexpected_arguments_for_no_arg_commands() {
         // given
         let input = "/compact now";
@@ -4114,7 +4278,7 @@ mod tests {
 
         // then
         assert!(error.contains("Usage: /teleport <symbol-or-path>"));
-        assert!(error.contains("  Category         Discovery & debugging"));
+        assert!(error.contains("  Category         Tools"));
     }
 
     #[test]
@@ -4348,10 +4512,10 @@ mod tests {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
         assert!(help.contains("[resume]          also works with --resume SESSION.jsonl"));
-        assert!(help.contains("Session & visibility"));
-        assert!(help.contains("Workspace & git"));
-        assert!(help.contains("Discovery & debugging"));
-        assert!(help.contains("Analysis & automation"));
+        assert!(help.contains("Session"));
+        assert!(help.contains("Tools"));
+        assert!(help.contains("Config"));
+        assert!(help.contains("Debug"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
@@ -4375,7 +4539,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]]"));
+        assert!(help.contains(
+            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]"
+        ));
         assert!(help.contains("/sandbox"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
@@ -4385,6 +4551,53 @@ mod tests {
         assert!(help.contains("/skills [list|install <path>|help]"));
         assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
+    }
+
+    #[test]
+    fn renders_help_with_grouped_categories_and_keyboard_shortcuts() {
+        // given
+        let categories = ["Session", "Tools", "Config", "Debug"];
+
+        // when
+        let help = render_slash_command_help();
+
+        // then
+        for category in categories {
+            assert!(
+                help.contains(category),
+                "expected help to contain category {category}"
+            );
+        }
+        let session_index = help.find("Session").expect("Session header should exist");
+        let tools_index = help.find("Tools").expect("Tools header should exist");
+        let config_index = help.find("Config").expect("Config header should exist");
+        let debug_index = help.find("Debug").expect("Debug header should exist");
+        assert!(session_index < tools_index);
+        assert!(tools_index < config_index);
+        assert!(config_index < debug_index);
+
+        assert!(help.contains("Keyboard shortcuts"));
+        assert!(help.contains("Up/Down              Navigate prompt history"));
+        assert!(help.contains("Tab                  Complete commands, modes, and recent sessions"));
+        assert!(help.contains("Ctrl-C               Clear input (or exit on empty prompt)"));
+        assert!(help.contains("Shift+Enter/Ctrl+J   Insert a newline"));
+
+        // every command should still render with a summary line
+        for spec in slash_command_specs() {
+            let usage = match spec.argument_hint {
+                Some(hint) => format!("/{} {hint}", spec.name),
+                None => format!("/{}", spec.name),
+            };
+            assert!(
+                help.contains(&usage),
+                "expected help to contain command {usage}"
+            );
+            assert!(
+                help.contains(spec.summary),
+                "expected help to contain summary for /{}",
+                spec.name
+            );
+        }
     }
 
     #[test]
@@ -4399,7 +4612,7 @@ mod tests {
         assert!(help.contains("/plugin"));
         assert!(help.contains("Summary          Manage Claw Code plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
-        assert!(help.contains("Category         Workspace & git"));
+        assert!(help.contains("Category         Tools"));
     }
 
     #[test]
@@ -4407,7 +4620,7 @@ mod tests {
         let help = render_slash_command_help_detail("mcp").expect("detail help should exist");
         assert!(help.contains("/mcp"));
         assert!(help.contains("Summary          Inspect configured MCP servers"));
-        assert!(help.contains("Category         Discovery & debugging"));
+        assert!(help.contains("Category         Tools"));
         assert!(help.contains("Resume           Supported with --resume SESSION.jsonl"));
     }
 
@@ -4602,7 +4815,7 @@ mod tests {
         let workspace = temp_dir("agents-workspace");
         let project_agents = workspace.join(".codex").join("agents");
         let user_home = temp_dir("agents-home");
-        let user_agents = user_home.join(".codex").join("agents");
+        let user_agents = user_home.join(".claude").join("agents");
 
         write_agent(
             &project_agents,
@@ -4635,10 +4848,10 @@ mod tests {
 
         assert!(report.contains("Agents"));
         assert!(report.contains("2 active agents"));
-        assert!(report.contains("Project (.codex):"));
+        assert!(report.contains("Project (.claw):"));
         assert!(report.contains("planner · Project planner · gpt-5.4 · medium"));
-        assert!(report.contains("User (~/.codex):"));
-        assert!(report.contains("(shadowed by Project (.codex)) planner · User planner"));
+        assert!(report.contains("User (~/.claw):"));
+        assert!(report.contains("(shadowed by Project (.claw)) planner · User planner"));
         assert!(report.contains("verifier · Verification agent · gpt-5.4-mini · high"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4746,12 +4959,11 @@ mod tests {
 
         assert!(report.contains("Skills"));
         assert!(report.contains("3 available skills"));
-        assert!(report.contains("Project (.codex):"));
+        assert!(report.contains("Project (.claw):"));
         assert!(report.contains("plan · Project planning guidance"));
-        assert!(report.contains("Project (.claude):"));
         assert!(report.contains("deploy · Legacy deployment guidance · legacy /commands"));
-        assert!(report.contains("User (~/.codex):"));
-        assert!(report.contains("(shadowed by Project (.codex)) plan · User planning guidance"));
+        assert!(report.contains("User (~/.claw):"));
+        assert!(report.contains("(shadowed by Project (.claw)) plan · User planning guidance"));
         assert!(report.contains("help · Help guidance"));
 
         let _ = fs::remove_dir_all(workspace);
@@ -4766,6 +4978,8 @@ mod tests {
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
         assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help
+            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -4776,7 +4990,7 @@ mod tests {
         assert!(skills_help
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CODEX_HOME/skills or ~/.codex/skills"));
+        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
@@ -4942,7 +5156,7 @@ mod tests {
         let listed = render_skills_report(
             &load_skills_from_roots(&roots).expect("installed skills should load"),
         );
-        assert!(listed.contains("User ($CODEX_HOME):"));
+        assert!(listed.contains("User ($CLAW_CONFIG_HOME):"));
         assert!(listed.contains("help · Helpful skill"));
 
         let _ = fs::remove_dir_all(workspace);

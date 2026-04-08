@@ -25,9 +25,11 @@ $script:BridgeHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-http-demo-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
 $script:HadFailure = $false
-$script:CargoTargetDir = Join-Path $script:LogDir "cargo-target"
-$script:AppfsExe = Join-Path $script:CargoTargetDir "debug\agentfs.exe"
-$script:ClawExe = Join-Path $script:CargoTargetDir "debug\claw.exe"
+$script:CargoCacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "appfs-platform-cargo-targets"
+$script:AppfsCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-cli"
+$script:ClawCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-agent-rust"
+$script:AppfsExe = Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe"
+$script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
 
 function Write-Success { Write-Host "[ok] $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "[fail] $args" -ForegroundColor Red }
@@ -56,6 +58,20 @@ function Remove-TestPath {
         } elseif (Test-Path $Path -PathType Leaf) {
             cmd /c "del /f /q `"$Path`"" | Out-Null
         }
+    }
+}
+
+function Cleanup-StaleTempArtifacts {
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    foreach ($pattern in @(
+        "appfs-agent-smoke-*",
+        "appfs-agent-http-demo-*",
+        "appfs-agent-multi-attach-*",
+        "appfs-agent-launcher-*"
+    )) {
+        Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $script:LogDir } |
+            ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
     }
 }
 
@@ -100,6 +116,8 @@ function Fail-WithContext {
     if (Test-Path $script:LogDir) {
         Write-Host "`nLogs preserved at $script:LogDir" -ForegroundColor Gray
         foreach ($path in @(
+            (Join-Path $script:LogDir "appfs-build.log"),
+            (Join-Path $script:LogDir "claw-build.log"),
             (Join-Path $script:LogDir "bridge.stdout.log"),
             (Join-Path $script:LogDir "bridge.stderr.log"),
             (Join-Path $script:LogDir "appfs-up.stdout.log"),
@@ -271,14 +289,14 @@ function Build-TestBinaries {
 
     Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:AppfsCargoTargetDir,
         "--bin", "agentfs"
     ) -WorkingDirectory $script:AppfsCliDir | Out-Null
     Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
     Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:ClawCargoTargetDir,
         "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
         "-p", "rusty-claude-cli"
     ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
@@ -333,7 +351,9 @@ function Main {
         throw "ANTHROPIC_API_KEY is required for the HTTP demo integration smoke test"
     }
 
+    Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
+    [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
     Build-TestBinaries
 
     $mountParent = Split-Path -Parent $MountPoint
