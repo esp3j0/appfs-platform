@@ -29,6 +29,8 @@ $script:ClawCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-agent-rust"
 $script:AppfsExe = Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe"
 $script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
 
+. (Join-Path $PSScriptRoot "windows-rust-build-env.ps1")
+
 function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
 function Write-WarningLine { Write-Host "⚠ $args" -ForegroundColor Yellow }
@@ -282,6 +284,7 @@ function Require-Command {
 
 function Build-TestBinaries {
     Write-Section "Build Test Binaries"
+    Initialize-WindowsRustBuildEnv
 
     Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
         "build",
