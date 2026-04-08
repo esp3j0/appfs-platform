@@ -114,6 +114,24 @@ function Invoke-WindowsIntegrationStreamingCommand {
         [System.Text.Encoding]$Encoding
     )
 
+    function ConvertTo-WindowsCommandLineArgument {
+        param([string]$Argument)
+
+        if ($null -eq $Argument) {
+            return '""'
+        }
+        if ($Argument.Length -eq 0) {
+            return '""'
+        }
+        if ($Argument -notmatch '[\s"]') {
+            return $Argument
+        }
+
+        $escaped = $Argument -replace '(\\*)"', '$1$1\"'
+        $escaped = $escaped -replace '(\\+)$', '$1$1'
+        return '"' + $escaped + '"'
+    }
+
     $exitCode = 0
     $command = Get-Command $FilePath -ErrorAction SilentlyContinue
     $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
@@ -122,6 +140,14 @@ function Invoke-WindowsIntegrationStreamingCommand {
         (Split-Path $LogPath -Parent),
         ("{0}.stdout{1}" -f [System.IO.Path]::GetFileNameWithoutExtension($LogPath), [System.IO.Path]::GetExtension($LogPath))
     )
+    $commandLine = @(
+        ConvertTo-WindowsCommandLineArgument -Argument $resolvedFilePath
+        @($ArgumentList | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Argument ([string]$_) })
+    ) -join " "
+    $cmdCommandLine = "{0} 1>{1} 2>{2}" -f
+        $commandLine,
+        (ConvertTo-WindowsCommandLineArgument -Argument $stdoutLogPath),
+        (ConvertTo-WindowsCommandLineArgument -Argument $LogPath)
 
     Write-Host (
         "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
@@ -129,15 +155,15 @@ function Invoke-WindowsIntegrationStreamingCommand {
 
     Push-Location $WorkingDirectory
     try {
-        $process = Start-Process -FilePath $resolvedFilePath `
-            -ArgumentList $ArgumentList `
-            -WorkingDirectory $WorkingDirectory `
-            -PassThru `
-            -WindowStyle Hidden `
-            -Wait `
-            -RedirectStandardOutput $stdoutLogPath `
-            -RedirectStandardError $LogPath
-        $exitCode = $process.ExitCode
+        if (Test-Path $stdoutLogPath -PathType Leaf) {
+            Remove-Item -Path $stdoutLogPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $LogPath -PathType Leaf) {
+            Remove-Item -Path $LogPath -Force -ErrorAction SilentlyContinue
+        }
+
+        & cmd.exe /d /c $cmdCommandLine
+        $exitCode = $LASTEXITCODE
     } finally {
         $stopwatch.Stop()
         Pop-Location
