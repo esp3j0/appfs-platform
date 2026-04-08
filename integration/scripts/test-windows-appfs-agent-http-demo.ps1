@@ -111,6 +111,57 @@ function Wait-ProcessExitById {
     return $null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
 
+function Stop-ProcessTreeById {
+    param(
+        [int]$ProcessId,
+        [string]$ProcessLabel,
+        [int]$TimeoutMs = 2000
+    )
+
+    if ($ProcessId -le 0) {
+        return
+    }
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+    } catch {
+    }
+
+    if (-not (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs)) {
+        try {
+            & taskkill.exe /F /T /PID $ProcessId | Out-Null
+        } catch {
+        } finally {
+            $global:LASTEXITCODE = 0
+        }
+
+        if (-not (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs)) {
+            Write-WarningLine "Cleanup could not fully stop $ProcessLabel (PID $ProcessId)."
+        }
+    }
+}
+
+function Wait-For-PathToDisappear {
+    param(
+        [string]$Path,
+        [int]$TimeoutSec = 15
+    )
+
+    if (!(Test-Path $Path)) {
+        return $true
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        if (!(Test-Path $Path)) {
+            return $true
+        }
+    }
+
+    return !(Test-Path $Path)
+}
+
 function Stop-AgentfsProcessesForAgentId {
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
@@ -119,10 +170,7 @@ function Stop-AgentfsProcessesForAgentId {
             $_.CommandLine -like "*$AgentId*"
         } |
         ForEach-Object {
-            try {
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-            } catch {
-            }
+            Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessLabel $_.Name
         }
 }
 
@@ -134,10 +182,7 @@ function Stop-BridgeProcesses {
             $_.CommandLine -like "*bridge_server.py*"
         } |
         ForEach-Object {
-            try {
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-            } catch {
-            }
+            Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessLabel $_.Name
         }
 }
 
@@ -199,6 +244,14 @@ function Cleanup-TestArtifacts {
 
     if (!$SkipCleanup) {
         Invoke-CleanupStep "remove mount and database artifacts" {
+            if (Test-Path $MountPoint) {
+                if (Wait-For-PathToDisappear -Path $MountPoint -TimeoutSec 15) {
+                    Write-Host "[info] AppFS mountpoint auto-unmounted before filesystem cleanup"
+                } else {
+                    Write-WarningLine "AppFS mountpoint still exists 15s after shutdown; forcing lingering process sweep before removal."
+                    Stop-AgentfsProcessesForAgentId
+                }
+            }
             Remove-TestPath -Path $MountPoint -Recurse
             Remove-TestPath -Path $script:DbPath
             Remove-TestPath -Path "$($script:DbPath)-shm"
@@ -341,7 +394,7 @@ function Wait-Until {
     }
 }
 
-function Invoke-LoggedCommand {
+function Invoke-LoggedCommandResult {
     param(
         [string]$Name,
         [string]$FilePath,
@@ -392,13 +445,65 @@ function Invoke-LoggedCommand {
     Remove-TestPath -Path $stdoutPath
     Remove-TestPath -Path $stderrPath
 
-    if ($exitCode -ne 0) {
-        Fail-WithContext "$Name failed with exit code $exitCode"
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Text = $text
+        LogPath = $logPath
     }
-    if ($text) {
-        Write-Host $text
+}
+
+function Invoke-LoggedCommand {
+    param(
+        [string]$Name,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory
+    )
+
+    $result = Invoke-LoggedCommandResult -Name $Name -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory
+    if ($result.ExitCode -ne 0) {
+        Fail-WithContext "$Name failed with exit code $($result.ExitCode)"
     }
-    return $text
+    if ($result.Text) {
+        Write-Host $result.Text
+    }
+    return $result.Text
+}
+
+function Test-IsTransientClawDemoFailure {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    $normalized = $Text.ToLowerInvariant()
+    return (
+        $normalized.Contains("failed to parse anthropic response") -or
+        (
+            (
+                $normalized.Contains('"type":"error"') -or
+                $normalized.Contains("unknown variant 'error'")
+            ) -and (
+                $normalized.Contains('"code":"429"') -or
+                $normalized.Contains('"code":"500"') -or
+                $normalized.Contains('"code":"502"') -or
+                $normalized.Contains('"code":"503"') -or
+                $normalized.Contains('"code":"504"') -or
+                $normalized.Contains('"code":"529"')
+            )
+        ) -or
+        $normalized.Contains('"code":"429"') -or
+        $normalized.Contains('"code":"500"') -or
+        $normalized.Contains('"code":"502"') -or
+        $normalized.Contains('"code":"503"') -or
+        $normalized.Contains('"code":"504"') -or
+        $normalized.Contains('"code":"529"') -or
+        $normalized.Contains("overloaded_error") -or
+        $normalized.Contains("rate limit") -or
+        $normalized.Contains("timed out") -or
+        $normalized.Contains("timeout")
+    )
 }
 
 function Require-Command {
@@ -496,6 +601,88 @@ function Read-RecentTextFile {
     return (@(Get-Content $Path -Tail $Tail -ErrorAction Stop) -join "`n")
 }
 
+function Write-DemoScript {
+    param(
+        [string]$Path,
+        [string]$ClientToken
+    )
+
+    $demoScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+echo "__PWD__"
+pwd
+echo "__SNAPSHOT__"
+head -n 3 chats/chat-001/messages.res.jsonl
+echo "__ACTION_WRITTEN__"
+printf '%s\n' '{"version":2,"client_token":"$ClientToken","payload":{"text":"hello-from-agent-http-demo"}}' >> contacts/zhangsan/send_message.act
+echo "__EVENT_TAIL__"
+tail -n 20 _stream/events.evt.jsonl | grep "$ClientToken" || true
+"@
+    Write-Utf8TextFile -Path $Path -Content $demoScript
+}
+
+function Invoke-ClawDemoPrompt {
+    param(
+        [string]$AppRoot,
+        [string]$Prompt,
+        [int]$MaxAttempts = 2,
+        [int]$RetryDelaySec = 5
+    )
+
+    $demoScriptPath = Join-Path $AppRoot ".ci-http-demo.sh"
+    $lastResult = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $clientToken = "agent-http-demo-$attempt" # @I-am-sure-its-safe
+        Write-DemoScript -Path $demoScriptPath -ClientToken $clientToken
+
+        Push-Location $AppRoot
+        try {
+            $lastResult = Invoke-LoggedCommandResult -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
+                "--dangerously-skip-permissions",
+                "--output-format", "json",
+                "--allowedTools", "bash",
+                "prompt",
+                $Prompt
+            ) -WorkingDirectory $AppRoot
+        } finally {
+            Pop-Location
+        }
+
+        if ($lastResult.ExitCode -eq 0) {
+            if ($lastResult.Text) {
+                Write-Host $lastResult.Text
+            }
+
+            return [pscustomobject]@{
+                ClientToken = $clientToken
+                ResponseText = $lastResult.Text
+                Attempts = $attempt
+            }
+        }
+
+        $failureText = if (Test-Path $lastResult.LogPath) {
+            Get-Content $lastResult.LogPath -Raw -ErrorAction SilentlyContinue
+        } else {
+            $lastResult.Text
+        }
+
+        if ($attempt -lt $MaxAttempts -and (Test-IsTransientClawDemoFailure -Text $failureText)) {
+            $attemptLogPath = Join-Path $script:LogDir ("claw-demo.attempt-{0}.log" -f $attempt)
+            if (Test-Path $lastResult.LogPath) {
+                Copy-Item -Path $lastResult.LogPath -Destination $attemptLogPath -Force
+            }
+            Write-WarningLine "claw-demo hit a transient Anthropic/API failure on attempt $attempt/$MaxAttempts; retrying in ${RetryDelaySec}s."
+            Start-Sleep -Seconds $RetryDelaySec
+            continue
+        }
+
+        Fail-WithContext "claw-demo failed with exit code $($lastResult.ExitCode)"
+    }
+
+    Fail-WithContext "claw-demo exhausted $MaxAttempts attempts after transient Anthropic/API failures"
+}
+
 function Main {
     Require-Command cargo
     Require-Command python
@@ -552,7 +739,8 @@ function Main {
     Write-Section "Start AppFS"
     $script:AppfsHandle = New-LogHandle -Name "appfs-up" -FilePath $script:AppfsExe -ArgumentList @(
         "appfs", "up", $script:DbPath, $MountPoint,
-        "--backend", "winfsp"
+        "--backend", "winfsp",
+        "--auto-unmount"
     ) -WorkingDirectory $script:AppfsCliDir
 
     $controlDir = Join-Path $MountPoint "_appfs"
@@ -615,35 +803,10 @@ function Main {
     Write-Success "Initial snapshot is readable from the mount"
 
     Write-Section "Run appfs-agent Demo Prompt"
-    $clientToken = "agent-http-demo-001" # @I-am-sure-its-safe
-    $demoScriptPath = Join-Path $appRoot ".ci-http-demo.sh"
-    $demoScript = @"
-#!/usr/bin/env bash
-set -euo pipefail
-echo "__PWD__"
-pwd
-echo "__SNAPSHOT__"
-head -n 3 chats/chat-001/messages.res.jsonl
-echo "__ACTION_WRITTEN__"
-printf '%s\n' '{"version":2,"client_token":"$clientToken","payload":{"text":"hello-from-agent-http-demo"}}' >> contacts/zhangsan/send_message.act
-echo "__EVENT_TAIL__"
-tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
-"@
-    Write-Utf8TextFile -Path $demoScriptPath -Content $demoScript
-
     $prompt = 'Use bash only. Run `bash ./.ci-http-demo.sh` exactly once. Do not rewrite the script. Return the exact command output.'
-    Push-Location $appRoot
-    try {
-        $promptResponse = Invoke-LoggedCommand -Name "claw-demo" -FilePath $script:ClawExe -ArgumentList @(
-            "--dangerously-skip-permissions",
-            "--output-format", "json",
-            "--allowedTools", "bash",
-            "prompt",
-            $prompt
-        ) -WorkingDirectory $appRoot
-    } finally {
-        Pop-Location
-    }
+    $clawDemoResult = Invoke-ClawDemoPrompt -AppRoot $appRoot -Prompt $prompt
+    $clientToken = $clawDemoResult.ClientToken
+    $promptResponse = $clawDemoResult.ResponseText
 
     $promptPayload = ConvertFrom-JsonSafe $promptResponse
     $promptMessage = if ($promptPayload -and $promptPayload.PSObject.Properties.Name -contains "message") {
