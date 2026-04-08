@@ -32,9 +32,9 @@ $script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
 
 . (Join-Path $PSScriptRoot "windows-rust-build-env.ps1")
 
-function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
-function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
-function Write-WarningLine { Write-Host "⚠ $args" -ForegroundColor Yellow }
+function Write-Success { Write-Host "[ok] $args" -ForegroundColor Green }
+function Write-Fail { Write-Host "[fail] $args" -ForegroundColor Red }
+function Write-WarningLine { Write-Host "[warn] $args" -ForegroundColor Yellow }
 function Write-Section { Write-Host "`n==== $args ====" -ForegroundColor Magenta }
 
 function Remove-TestPath {
