@@ -65,12 +65,7 @@ function Remove-TestPath {
 
 function Cleanup-StaleTempArtifacts {
     $tempRoot = [System.IO.Path]::GetTempPath()
-    foreach ($pattern in @(
-        "appfs-agent-smoke-*",
-        "appfs-agent-http-demo-*",
-        "appfs-agent-multi-attach-*",
-        "appfs-agent-launcher-*"
-    )) {
+    foreach ($pattern in @("appfs-agent-http-demo-*")) {
         Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -ne $script:LogDir } |
             ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
@@ -290,20 +285,22 @@ function Build-TestBinaries {
     Write-Section "Build Test Binaries"
     Initialize-WindowsRustBuildEnv
 
-    Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
-        "build",
-        "--target-dir", $script:AppfsCargoTargetDir,
-        "--bin", "agentfs"
-    ) -WorkingDirectory $script:AppfsCliDir | Out-Null
-    Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
+    Invoke-WithWindowsIntegrationBuildLock {
+        Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+            "build",
+            "--target-dir", $script:AppfsCargoTargetDir,
+            "--bin", "agentfs"
+        ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+        Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
-    Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
-        "build",
-        "--target-dir", $script:ClawCargoTargetDir,
-        "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
-        "-p", "rusty-claude-cli"
-    ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
-    Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
+        Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+            "build",
+            "--target-dir", $script:ClawCargoTargetDir,
+            "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
+            "-p", "rusty-claude-cli"
+        ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+        Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
+    }
 }
 
 function Append-Utf8JsonLine {
