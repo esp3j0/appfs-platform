@@ -4764,7 +4764,11 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
                     .map_err(|error| error.to_string())?;
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
+                if let Err(error) = child.kill() {
+                    if error.kind() != std::io::ErrorKind::InvalidInput {
+                        return Err(error.to_string());
+                    }
+                }
                 child
                     .wait_with_output()
                     .map_err(|error| error.to_string())?;
