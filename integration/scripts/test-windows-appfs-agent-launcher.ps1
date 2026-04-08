@@ -134,6 +134,11 @@ function Invoke-LoggedCommand {
     $exitCode = 0
     $command = Get-Command $FilePath -ErrorAction SilentlyContinue
     $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    Write-Host (
+        "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
+    ) -ForegroundColor DarkGray
 
     Push-Location $WorkingDirectory
     try {
@@ -147,8 +152,16 @@ function Invoke-LoggedCommand {
             -RedirectStandardError $stderrPath
         $exitCode = $proc.ExitCode
     } finally {
+        $stopwatch.Stop()
         Pop-Location
     }
+
+    Write-Host (
+        "[info] Completed {0} in {1} with exit code {2}" -f
+            $Name,
+            (Format-WindowsIntegrationElapsed -Elapsed $stopwatch.Elapsed),
+            $exitCode
+    ) -ForegroundColor DarkGray
 
     $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
