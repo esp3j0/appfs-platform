@@ -122,3 +122,80 @@ function Invoke-WithWindowsIntegrationBuildLock {
         }
     }
 }
+
+function Resolve-NormalizedWindowsPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd("\/")
+}
+
+function Clear-WindowsIntegrationExecutableTargets {
+    param(
+        [string[]]$ExecutablePaths,
+        [int]$WaitTimeoutMs = 5000
+    )
+
+    $normalizedPaths = @(
+        $ExecutablePaths |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { Resolve-NormalizedWindowsPath $_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+
+    if ($normalizedPaths.Count -eq 0) {
+        return
+    }
+
+    $targetPathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $normalizedPaths) {
+        [void]$targetPathSet.Add($path)
+    }
+
+    $processes = @(Get-CimInstance Win32_Process -Filter "name = 'agentfs.exe' OR name = 'claw.exe'" -ErrorAction SilentlyContinue)
+    $stopped = $false
+    foreach ($process in $processes) {
+        $executablePath = Resolve-NormalizedWindowsPath $process.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($executablePath) -or -not $targetPathSet.Contains($executablePath)) {
+            continue
+        }
+
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            $stopped = $true
+            Write-Host "[warn] Stopped stale process $($process.Name) (PID $($process.ProcessId)) using $executablePath" -ForegroundColor Yellow
+        } catch {
+            Write-Host "[warn] Failed to stop stale process $($process.Name) (PID $($process.ProcessId)): $_" -ForegroundColor Yellow
+        }
+    }
+
+    if ($stopped) {
+        $deadline = (Get-Date).AddMilliseconds($WaitTimeoutMs)
+        do {
+            Start-Sleep -Milliseconds 200
+            $remaining = @(
+                Get-CimInstance Win32_Process -Filter "name = 'agentfs.exe' OR name = 'claw.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $executablePath = Resolve-NormalizedWindowsPath $_.ExecutablePath
+                        -not [string]::IsNullOrWhiteSpace($executablePath) -and $targetPathSet.Contains($executablePath)
+                    }
+            )
+        } while ($remaining.Count -gt 0 -and (Get-Date) -lt $deadline)
+    }
+
+    foreach ($path in $normalizedPaths) {
+        if (-not (Test-Path $path -PathType Leaf)) {
+            continue
+        }
+
+        try {
+            Remove-Item -Path $path -Force -ErrorAction Stop
+        } catch {
+            Write-Host "[warn] Failed to delete stale executable $path before rebuild: $_" -ForegroundColor Yellow
+        }
+    }
+}

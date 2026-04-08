@@ -290,6 +290,11 @@ function Build-TestBinaries {
     Initialize-WindowsRustBuildEnv
 
     Invoke-WithWindowsIntegrationBuildLock {
+        Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+            $script:AppfsExe,
+            $script:ClawExe
+        )
+
         Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
@@ -355,6 +360,10 @@ function Main {
         throw "ANTHROPIC_API_KEY is required for the HTTP demo integration smoke test"
     }
 
+    Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+        $script:AppfsExe,
+        $script:ClawExe
+    )
     Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
     [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
