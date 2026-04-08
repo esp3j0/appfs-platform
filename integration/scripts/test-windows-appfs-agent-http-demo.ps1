@@ -24,12 +24,15 @@ $script:AppfsHandle = $null
 $script:BridgeHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-http-demo-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
+$script:RuntimeBinDir = Join-Path $script:LogDir "bin"
 $script:HadFailure = $false
 $script:CargoCacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "appfs-platform-cargo-targets"
 $script:AppfsCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-cli"
 $script:ClawCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-agent-rust"
 $script:AppfsExe = Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe"
 $script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
+
+. (Join-Path $PSScriptRoot "windows-rust-build-env.ps1")
 
 function Write-Success { Write-Host "[ok] $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "[fail] $args" -ForegroundColor Red }
@@ -63,12 +66,7 @@ function Remove-TestPath {
 
 function Cleanup-StaleTempArtifacts {
     $tempRoot = [System.IO.Path]::GetTempPath()
-    foreach ($pattern in @(
-        "appfs-agent-smoke-*",
-        "appfs-agent-http-demo-*",
-        "appfs-agent-multi-attach-*",
-        "appfs-agent-launcher-*"
-    )) {
+    foreach ($pattern in @("appfs-agent-http-demo-*")) {
         Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -ne $script:LogDir } |
             ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
@@ -245,17 +243,21 @@ function Invoke-LoggedCommand {
     $stdoutPath = Join-Path $script:LogDir "$Name.stdout.tmp.log"
     $stderrPath = Join-Path $script:LogDir "$Name.stderr.tmp.log"
     $exitCode = 0
+    $command = Get-Command $FilePath -ErrorAction SilentlyContinue
+    $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
 
     Push-Location $WorkingDirectory
     try {
-        $previousErrorActionPreference = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
-        if ($LASTEXITCODE -is [int]) {
-            $exitCode = $LASTEXITCODE
-        }
+        $proc = Start-Process -FilePath $resolvedFilePath `
+            -ArgumentList $ArgumentList `
+            -WorkingDirectory $WorkingDirectory `
+            -PassThru `
+            -WindowStyle Hidden `
+            -Wait `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        $exitCode = $proc.ExitCode
     } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
         Pop-Location
     }
 
@@ -286,21 +288,34 @@ function Require-Command {
 
 function Build-TestBinaries {
     Write-Section "Build Test Binaries"
+    Initialize-WindowsRustBuildEnv
 
-    Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
-        "build",
-        "--target-dir", $script:AppfsCargoTargetDir,
-        "--bin", "agentfs"
-    ) -WorkingDirectory $script:AppfsCliDir | Out-Null
-    Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
+    Invoke-WithWindowsIntegrationBuildLock {
+        Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+            $script:AppfsExe,
+            $script:ClawExe
+        )
 
-    Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
-        "build",
-        "--target-dir", $script:ClawCargoTargetDir,
-        "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
-        "-p", "rusty-claude-cli"
-    ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
-    Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
+        Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+            "build",
+            "--target-dir", $script:AppfsCargoTargetDir,
+            "--bin", "agentfs"
+        ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+        Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
+
+        Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+            "build",
+            "--target-dir", $script:ClawCargoTargetDir,
+            "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
+            "-p", "rusty-claude-cli"
+        ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+        Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
+    }
+}
+
+function Stage-TestBinaries {
+    $script:AppfsExe = Copy-WindowsIntegrationExecutableForRun -SourcePath $script:AppfsExe -DestinationDirectory $script:RuntimeBinDir
+    $script:ClawExe = Copy-WindowsIntegrationExecutableForRun -SourcePath $script:ClawExe -DestinationDirectory $script:RuntimeBinDir
 }
 
 function Append-Utf8JsonLine {
@@ -351,10 +366,15 @@ function Main {
         throw "ANTHROPIC_API_KEY is required for the HTTP demo integration smoke test"
     }
 
+    Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+        $script:AppfsExe,
+        $script:ClawExe
+    )
     Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
     [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
     Build-TestBinaries
+    Stage-TestBinaries
 
     $mountParent = Split-Path -Parent $MountPoint
     if ($mountParent -and !(Test-Path $mountParent)) {
