@@ -94,6 +94,95 @@ function Initialize-WindowsRustBuildEnv {
     }
 }
 
+function Format-WindowsIntegrationElapsed {
+    param([TimeSpan]$Elapsed)
+
+    return [string]::Format(
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        "{0:0.0}s",
+        $Elapsed.TotalSeconds
+    )
+}
+
+function Invoke-WindowsIntegrationStreamingCommand {
+    param(
+        [string]$Name,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [string]$LogPath,
+        [System.Text.Encoding]$Encoding
+    )
+
+    function ConvertTo-WindowsCommandLineArgument {
+        param([string]$Argument)
+
+        if ($null -eq $Argument) {
+            return '""'
+        }
+        if ($Argument.Length -eq 0) {
+            return '""'
+        }
+        if ($Argument -notmatch '[\s"]') {
+            return $Argument
+        }
+
+        $escaped = $Argument -replace '(\\*)"', '$1$1\"'
+        $escaped = $escaped -replace '(\\+)$', '$1$1'
+        return '"' + $escaped + '"'
+    }
+
+    $exitCode = 0
+    $command = Get-Command $FilePath -ErrorAction SilentlyContinue
+    $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $stdoutLogPath = [System.IO.Path]::Combine(
+        (Split-Path $LogPath -Parent),
+        ("{0}.stdout{1}" -f [System.IO.Path]::GetFileNameWithoutExtension($LogPath), [System.IO.Path]::GetExtension($LogPath))
+    )
+    $commandLine = @(
+        ConvertTo-WindowsCommandLineArgument -Argument $resolvedFilePath
+        @($ArgumentList | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Argument ([string]$_) })
+    ) -join " "
+    $cmdCommandLine = "{0} 1>{1} 2>{2}" -f
+        $commandLine,
+        (ConvertTo-WindowsCommandLineArgument -Argument $stdoutLogPath),
+        (ConvertTo-WindowsCommandLineArgument -Argument $LogPath)
+
+    Write-Host (
+        "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
+    ) -ForegroundColor DarkGray
+
+    Push-Location $WorkingDirectory
+    try {
+        if (Test-Path $stdoutLogPath -PathType Leaf) {
+            Remove-Item -Path $stdoutLogPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $LogPath -PathType Leaf) {
+            Remove-Item -Path $LogPath -Force -ErrorAction SilentlyContinue
+        }
+
+        & cmd.exe /d /c $cmdCommandLine
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $stopwatch.Stop()
+        Pop-Location
+    }
+
+    Write-Host (
+        "[info] Completed {0} in {1} with exit code {2}" -f
+            $Name,
+            (Format-WindowsIntegrationElapsed -Elapsed $stopwatch.Elapsed),
+            $exitCode
+    ) -ForegroundColor DarkGray
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        LogPath = $LogPath
+        StdoutLogPath = $stdoutLogPath
+    }
+}
+
 function Invoke-WithWindowsIntegrationBuildLock {
     param(
         [scriptblock]$ScriptBlock,
@@ -102,18 +191,36 @@ function Invoke-WithWindowsIntegrationBuildLock {
 
     $mutex = $null
     $acquired = $false
+    $waitStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $holdStopwatch = $null
     try {
         $mutex = New-Object System.Threading.Mutex($false, "Global\appfs-platform-windows-build-cache")
+        Write-Host "[info] Waiting for Windows integration build cache lock (timeout ${TimeoutSec}s)" -ForegroundColor DarkGray
         $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))
+        $waitStopwatch.Stop()
         if (-not $acquired) {
             throw "Timed out waiting for the Windows integration build cache lock after ${TimeoutSec}s"
         }
 
+        Write-Host (
+            "[info] Acquired Windows integration build cache lock after {0}" -f (
+                Format-WindowsIntegrationElapsed -Elapsed $waitStopwatch.Elapsed
+            )
+        ) -ForegroundColor DarkGray
+        $holdStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         & $ScriptBlock
     } finally {
         if ($null -ne $mutex) {
             if ($acquired) {
                 try {
+                    if ($null -ne $holdStopwatch) {
+                        $holdStopwatch.Stop()
+                        Write-Host (
+                            "[info] Releasing Windows integration build cache lock after holding it for {0}" -f (
+                                Format-WindowsIntegrationElapsed -Elapsed $holdStopwatch.Elapsed
+                            )
+                        ) -ForegroundColor DarkGray
+                    }
                     [void]$mutex.ReleaseMutex()
                 } catch {
                 }

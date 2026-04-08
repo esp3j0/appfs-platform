@@ -55,12 +55,12 @@ function Remove-TestPath {
     } catch {
         if (Test-Path $Path -PathType Container) {
             if ($Recurse) {
-                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
+                cmd /c "rmdir /s /q `"$Path`" 2>nul || exit /b 0" | Out-Null
             } else {
-                cmd /c "rmdir `"$Path`"" | Out-Null
+                cmd /c "rmdir `"$Path`" 2>nul || exit /b 0" | Out-Null
             }
         } elseif (Test-Path $Path -PathType Leaf) {
-            cmd /c "del /f /q `"$Path`"" | Out-Null
+            cmd /c "del /f /q `"$Path`" 2>nul || exit /b 0" | Out-Null
         }
     }
 }
@@ -81,12 +81,30 @@ function Stop-LoggedProcess {
         return
     }
 
-    if ($Handle.Process -and !$Handle.Process.HasExited) {
+    if ($Handle.Process) {
         try {
-            Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
-            $null = $Handle.Process.WaitForExit(5000)
-        } catch {
-            Write-WarningLine "Failed to stop $($Handle.Name): $_"
+            if (!$Handle.Process.HasExited) {
+                try {
+                    Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
+                } catch {
+                    Write-WarningLine "Failed to stop $($Handle.Name): $_"
+                }
+
+                if (-not $Handle.Process.WaitForExit(5000)) {
+                    try {
+                        & taskkill.exe /F /T /PID $Handle.Process.Id | Out-Null
+                    } catch {
+                    } finally {
+                        $global:LASTEXITCODE = 0
+                    }
+                    $null = $Handle.Process.WaitForExit(5000)
+                }
+            }
+        } finally {
+            try {
+                $Handle.Process.Dispose()
+            } catch {
+            }
         }
     }
 }
@@ -246,6 +264,11 @@ function Invoke-LoggedCommand {
     $savedEnvironment = @{}
     $command = Get-Command $FilePath -ErrorAction SilentlyContinue
     $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    Write-Host (
+        "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
+    ) -ForegroundColor DarkGray
 
     foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
         $key = [string]$entry.Key
@@ -265,11 +288,19 @@ function Invoke-LoggedCommand {
             -RedirectStandardError $stderrPath
         $exitCode = $proc.ExitCode
     } finally {
+        $stopwatch.Stop()
         Pop-Location
         foreach ($key in $savedEnvironment.Keys) {
             [System.Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key], "Process")
         }
     }
+
+    Write-Host (
+        "[info] Completed {0} in {1} with exit code {2}" -f
+            $Name,
+            (Format-WindowsIntegrationElapsed -Elapsed $stopwatch.Elapsed),
+            $exitCode
+    ) -ForegroundColor DarkGray
 
     $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
@@ -311,19 +342,25 @@ function Build-TestBinaries {
             $script:ClawExe
         )
 
-        Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+        $appfsBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
             "--bin", "agentfs"
-        ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+        ) -WorkingDirectory $script:AppfsCliDir -LogPath (Join-Path $script:LogDir "appfs-build.log") -Encoding $script:Utf8NoBom
+        if ($appfsBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "appfs-build failed with exit code $($appfsBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
-        Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+        $clawBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:ClawCargoTargetDir,
             "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
             "-p", "rusty-claude-cli"
-        ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+        ) -WorkingDirectory $script:AppfsAgentRustDir -LogPath (Join-Path $script:LogDir "claw-build.log") -Encoding $script:Utf8NoBom
+        if ($clawBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "claw-build failed with exit code $($clawBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
     }
 }

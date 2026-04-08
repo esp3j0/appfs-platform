@@ -42,35 +42,103 @@ function Write-Section { Write-Host "`n==== $args ====" -ForegroundColor Magenta
 function Remove-TestPath {
     param(
         [string]$Path,
-        [switch]$Recurse
+        [switch]$Recurse,
+        [int]$RetryCount = 8,
+        [int]$RetryDelayMs = 250
     )
 
     if (!(Test-Path $Path)) {
         return
     }
 
-    try {
-        Remove-Item -Path $Path -Force -Recurse:$Recurse -ErrorAction Stop
-    } catch {
-        if (Test-Path $Path -PathType Container) {
-            if ($Recurse) {
-                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
-            } else {
-                cmd /c "rmdir `"$Path`"" | Out-Null
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            Remove-Item -Path $Path -Force -Recurse:$Recurse -ErrorAction Stop
+        } catch {
+            if (Test-Path $Path -PathType Container) {
+                if ($Recurse) {
+                    cmd /c "rmdir /s /q `"$Path`" 2>nul || exit /b 0" | Out-Null
+                } else {
+                    cmd /c "rmdir `"$Path`" 2>nul || exit /b 0" | Out-Null
+                }
+            } elseif (Test-Path $Path -PathType Leaf) {
+                cmd /c "del /f /q `"$Path`" 2>nul || exit /b 0" | Out-Null
             }
-        } elseif (Test-Path $Path -PathType Leaf) {
-            cmd /c "del /f /q `"$Path`"" | Out-Null
         }
+
+        if (!(Test-Path $Path)) {
+            return
+        }
+
+        if ($attempt -lt $RetryCount) {
+            Start-Sleep -Milliseconds $RetryDelayMs
+        }
+    }
+
+    if (Test-Path $Path) {
+        Write-WarningLine "Cleanup could not remove $Path after $RetryCount attempts."
     }
 }
 
 function Cleanup-StaleTempArtifacts {
+    Stop-AgentfsProcessesForAgentId
+    Stop-BridgeProcesses
+
     $tempRoot = [System.IO.Path]::GetTempPath()
     foreach ($pattern in @("appfs-agent-http-demo-*")) {
         Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -ne $script:LogDir } |
             ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
     }
+}
+
+function Wait-ProcessExitById {
+    param(
+        [int]$ProcessId,
+        [int]$TimeoutMs = 2000
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    do {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+
+    return $null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Stop-AgentfsProcessesForAgentId {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq "agentfs.exe" -and
+            $_.CommandLine -and
+            $_.CommandLine -like "*$AgentId*"
+        } |
+        ForEach-Object {
+            try {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+            } catch {
+            }
+        }
+}
+
+function Stop-BridgeProcesses {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq "python.exe" -and
+            $_.CommandLine -and
+            $_.CommandLine -like "*bridge_server.py*"
+        } |
+        ForEach-Object {
+            try {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+            } catch {
+            }
+        }
 }
 
 function Stop-LoggedProcess {
@@ -80,30 +148,72 @@ function Stop-LoggedProcess {
         return
     }
 
-    if ($Handle.Process -and !$Handle.Process.HasExited) {
+    if ($Handle.Process) {
+        $processId = $Handle.Process.Id
         try {
-            Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
-            $null = $Handle.Process.WaitForExit(5000)
-        } catch {
-            Write-WarningLine "Failed to stop $($Handle.Name): $_"
+            if (!$Handle.Process.HasExited) {
+                try {
+                    Stop-Process -Id $processId -Force -ErrorAction Stop
+                } catch {
+                    Write-WarningLine "Failed to stop $($Handle.Name): $_"
+                }
+
+                if (-not (Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000)) {
+                    cmd /c "taskkill /F /T /PID $processId >nul 2>nul || exit /b 0" | Out-Null
+                    $null = Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000
+                }
+            }
+        } finally {
+            try {
+                $Handle.Process.Dispose()
+            } catch {
+            }
         }
     }
 }
 
+function Invoke-CleanupStep {
+    param(
+        [string]$Name,
+        [scriptblock]$Action
+    )
+
+    $stepStarted = Get-Date
+    Write-Host "[info] Cleanup: $Name"
+    & $Action
+    $elapsed = ((Get-Date) - $stepStarted).TotalSeconds
+    Write-Host ("[info] Cleanup: {0} finished in {1:N1}s" -f $Name, $elapsed)
+}
+
 function Cleanup-TestArtifacts {
-    Stop-LoggedProcess $script:AppfsHandle
-    Stop-LoggedProcess $script:BridgeHandle
+    $cleanupStarted = Get-Date
+    Write-Host "[info] Starting HTTP demo cleanup"
+
+    Invoke-CleanupStep "sweep lingering appfs/bridge processes" {
+        Stop-AgentfsProcessesForAgentId
+        Stop-BridgeProcesses
+        Start-Sleep -Milliseconds 500
+    }
+    Invoke-CleanupStep "stop appfs" { Stop-LoggedProcess $script:AppfsHandle }
+    Invoke-CleanupStep "stop bridge" { Stop-LoggedProcess $script:BridgeHandle }
 
     if (!$SkipCleanup) {
-        Remove-TestPath -Path $MountPoint -Recurse
-        Remove-TestPath -Path $script:DbPath
-        Remove-TestPath -Path "$($script:DbPath)-shm"
-        Remove-TestPath -Path "$($script:DbPath)-wal"
+        Invoke-CleanupStep "remove mount and database artifacts" {
+            Remove-TestPath -Path $MountPoint -Recurse
+            Remove-TestPath -Path $script:DbPath
+            Remove-TestPath -Path "$($script:DbPath)-shm"
+            Remove-TestPath -Path "$($script:DbPath)-wal"
+        }
     }
 
     if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
-        Remove-TestPath -Path $script:LogDir -Recurse
+        Invoke-CleanupStep "remove temporary log directory" {
+            Remove-TestPath -Path $script:LogDir -Recurse
+        }
     }
+
+    $cleanupElapsed = ((Get-Date) - $cleanupStarted).TotalSeconds
+    Write-Host ("[info] HTTP demo cleanup finished in {0:N1}s" -f $cleanupElapsed)
 }
 
 function Fail-WithContext {
@@ -245,6 +355,11 @@ function Invoke-LoggedCommand {
     $exitCode = 0
     $command = Get-Command $FilePath -ErrorAction SilentlyContinue
     $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    Write-Host (
+        "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
+    ) -ForegroundColor DarkGray
 
     Push-Location $WorkingDirectory
     try {
@@ -258,8 +373,16 @@ function Invoke-LoggedCommand {
             -RedirectStandardError $stderrPath
         $exitCode = $proc.ExitCode
     } finally {
+        $stopwatch.Stop()
         Pop-Location
     }
+
+    Write-Host (
+        "[info] Completed {0} in {1} with exit code {2}" -f
+            $Name,
+            (Format-WindowsIntegrationElapsed -Elapsed $stopwatch.Elapsed),
+            $exitCode
+    ) -ForegroundColor DarkGray
 
     $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
@@ -296,19 +419,25 @@ function Build-TestBinaries {
             $script:ClawExe
         )
 
-        Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+        $appfsBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
             "--bin", "agentfs"
-        ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+        ) -WorkingDirectory $script:AppfsCliDir -LogPath (Join-Path $script:LogDir "appfs-build.log") -Encoding $script:Utf8NoBom
+        if ($appfsBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "appfs-build failed with exit code $($appfsBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
-        Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+        $clawBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:ClawCargoTargetDir,
             "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
             "-p", "rusty-claude-cli"
-        ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+        ) -WorkingDirectory $script:AppfsAgentRustDir -LogPath (Join-Path $script:LogDir "claw-build.log") -Encoding $script:Utf8NoBom
+        if ($clawBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "claw-build failed with exit code $($clawBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
     }
 }
@@ -356,6 +485,15 @@ function ConvertFrom-JsonSafe {
     } catch {
         return $null
     }
+}
+
+function Read-RecentTextFile {
+    param(
+        [string]$Path,
+        [int]$Tail = 200
+    )
+
+    return (@(Get-Content $Path -Tail $Tail -ErrorAction Stop) -join "`n")
 }
 
 function Main {
@@ -546,7 +684,7 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
             return $false
         }
         try {
-            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains($clientToken)
+            return (Read-RecentTextFile -Path $eventsPath).Contains($clientToken)
         } catch {
             return $false
         }
@@ -559,7 +697,7 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
             return $false
         }
         try {
-            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains('"type":"action.completed"')
+            return (Read-RecentTextFile -Path $eventsPath).Contains('"type":"action.completed"')
         } catch {
             return $false
         }
