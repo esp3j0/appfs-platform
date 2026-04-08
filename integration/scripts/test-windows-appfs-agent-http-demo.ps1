@@ -377,6 +377,15 @@ function ConvertFrom-JsonSafe {
     }
 }
 
+function Read-RecentTextFile {
+    param(
+        [string]$Path,
+        [int]$Tail = 200
+    )
+
+    return (@(Get-Content $Path -Tail $Tail -ErrorAction Stop) -join "`n")
+}
+
 function Main {
     Require-Command cargo
     Require-Command python
@@ -565,7 +574,7 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
             return $false
         }
         try {
-            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains($clientToken)
+            return (Read-RecentTextFile -Path $eventsPath).Contains($clientToken)
         } catch {
             return $false
         }
@@ -578,7 +587,7 @@ tail -n 20 _stream/events.evt.jsonl | grep "$clientToken" || true
             return $false
         }
         try {
-            return (Get-Content $eventsPath -Raw -ErrorAction Stop).Contains('"type":"action.completed"')
+            return (Read-RecentTextFile -Path $eventsPath).Contains('"type":"action.completed"')
         } catch {
             return $false
         }
