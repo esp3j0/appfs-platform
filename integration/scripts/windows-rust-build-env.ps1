@@ -104,6 +104,57 @@ function Format-WindowsIntegrationElapsed {
     )
 }
 
+function Invoke-WindowsIntegrationStreamingCommand {
+    param(
+        [string]$Name,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [string]$LogPath,
+        [System.Text.Encoding]$Encoding
+    )
+
+    $exitCode = 0
+    $command = Get-Command $FilePath -ErrorAction SilentlyContinue
+    $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $commandOutput = @()
+
+    Write-Host (
+        "[info] Starting {0} from {1}" -f $Name, $WorkingDirectory
+    ) -ForegroundColor DarkGray
+
+    Push-Location $WorkingDirectory
+    try {
+        & $resolvedFilePath @ArgumentList 2>&1 | Tee-Object -Variable commandOutput | Out-Host
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $stopwatch.Stop()
+        Pop-Location
+    }
+
+    $text = (@($commandOutput) | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    $text = $text.TrimEnd()
+
+    if ($null -eq $Encoding) {
+        $Encoding = New-Object System.Text.UTF8Encoding($false)
+    }
+    [System.IO.File]::WriteAllText($LogPath, $text + [Environment]::NewLine, $Encoding)
+
+    Write-Host (
+        "[info] Completed {0} in {1} with exit code {2}" -f
+            $Name,
+            (Format-WindowsIntegrationElapsed -Elapsed $stopwatch.Elapsed),
+            $exitCode
+    ) -ForegroundColor DarkGray
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        LogPath = $LogPath
+        Text = $text
+    }
+}
+
 function Invoke-WithWindowsIntegrationBuildLock {
     param(
         [scriptblock]$ScriptBlock,

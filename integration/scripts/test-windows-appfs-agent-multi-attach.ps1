@@ -324,19 +324,25 @@ function Build-TestBinaries {
             $script:ClawExe
         )
 
-        Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
+        $appfsBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
             "--bin", "agentfs"
-        ) -WorkingDirectory $script:AppfsCliDir | Out-Null
+        ) -WorkingDirectory $script:AppfsCliDir -LogPath (Join-Path $script:LogDir "appfs-build.log") -Encoding $script:Utf8NoBom
+        if ($appfsBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "appfs-build failed with exit code $($appfsBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
-        Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
+        $clawBuildResult = Invoke-WindowsIntegrationStreamingCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:ClawCargoTargetDir,
             "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
             "-p", "rusty-claude-cli"
-        ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
+        ) -WorkingDirectory $script:AppfsAgentRustDir -LogPath (Join-Path $script:LogDir "claw-build.log") -Encoding $script:Utf8NoBom
+        if ($clawBuildResult.ExitCode -ne 0) {
+            Fail-WithContext "claw-build failed with exit code $($clawBuildResult.ExitCode)"
+        }
         Assert-True (Test-Path $script:ClawExe) "Built appfs-agent CLI binary $script:ClawExe"
     }
 }
