@@ -189,9 +189,15 @@ function Clear-WindowsIntegrationExecutableTargets {
         foreach ($process in $remaining) {
             try {
                 & taskkill.exe /F /T /PID $process.ProcessId | Out-Null
-                Write-Host "[warn] taskkill forced stale process $($process.Name) (PID $($process.ProcessId))" -ForegroundColor Yellow
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "[warn] taskkill forced stale process $($process.Name) (PID $($process.ProcessId))" -ForegroundColor Yellow
+                } else {
+                    Write-Host "[warn] taskkill reported exit code $LASTEXITCODE for stale process $($process.Name) (PID $($process.ProcessId))" -ForegroundColor Yellow
+                }
             } catch {
                 Write-Host "[warn] taskkill failed for stale process $($process.Name) (PID $($process.ProcessId)): $_" -ForegroundColor Yellow
+            } finally {
+                $global:LASTEXITCODE = 0
             }
         }
     }
