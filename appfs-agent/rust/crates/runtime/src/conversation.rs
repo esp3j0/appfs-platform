@@ -504,11 +504,6 @@ where
     }
 
     #[must_use]
-    pub fn fork_session(&self, branch_name: Option<String>) -> Session {
-        self.session.fork(branch_name)
-    }
-
-    #[must_use]
     pub fn into_session(self) -> Session {
         self.session
     }

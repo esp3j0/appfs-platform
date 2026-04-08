@@ -100,6 +100,8 @@ function Fail-WithContext {
     if (Test-Path $script:LogDir) {
         Write-Host "`nLogs preserved at $script:LogDir" -ForegroundColor Gray
         foreach ($path in @(
+            (Join-Path $script:LogDir "appfs-build.log"),
+            (Join-Path $script:LogDir "claw-build.log"),
             (Join-Path $script:LogDir "bridge.stdout.log"),
             (Join-Path $script:LogDir "bridge.stderr.log"),
             (Join-Path $script:LogDir "appfs-up.stdout.log"),
