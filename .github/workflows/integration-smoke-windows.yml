@@ -1,9 +1,6 @@
 name: Integration Smoke (Windows)
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main

@@ -1,9 +1,6 @@
 name: Integration HTTP Demo (Windows)
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
