@@ -26,7 +26,9 @@ $script:DbPath = Join-Path $script:AppfsCliDir ".agentfs\$AgentId.db"
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-launcher-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
 $script:HadFailure = $false
-$script:CargoTargetDir = Join-Path $script:LogDir "cargo-target"
+$script:CargoCacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "appfs-platform-cargo-targets"
+$script:AppfsCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-cli"
+$script:ClawCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-agent-rust"
 $script:AppfsExe = ""
 $script:ClawExe = ""
 
@@ -81,8 +83,6 @@ function Cleanup-TestArtifacts {
         Remove-TestPath -Path "$($script:DbPath)-shm"
         Remove-TestPath -Path "$($script:DbPath)-wal"
     }
-
-    Remove-TestPath -Path $script:CargoTargetDir -Recurse
 
     if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
         Remove-TestPath -Path $script:LogDir -Recurse
@@ -202,11 +202,11 @@ function Initialize-BinaryPaths {
     if ($SkipBuild) {
         $script:AppfsExe = Resolve-ExecutablePath `
             -ExplicitPath $AppfsExePath `
-            -FallbackPath (Join-Path $script:AppfsCliDir "target\debug\agentfs.exe") `
+            -FallbackPath (Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe") `
             -Description "Existing AppFS CLI binary"
         $script:ClawExe = Resolve-ExecutablePath `
             -ExplicitPath $ClawExePath `
-            -FallbackPath (Join-Path $script:AppfsAgentRustDir "target\debug\claw.exe") `
+            -FallbackPath (Join-Path $script:ClawCargoTargetDir "debug\claw.exe") `
             -Description "Existing appfs-agent CLI binary"
         Write-Success "Reusing existing binaries for launcher validation"
         return
@@ -217,8 +217,8 @@ function Initialize-BinaryPaths {
     }
 
     Require-Command cargo
-    $script:AppfsExe = Join-Path $script:CargoTargetDir "debug\agentfs.exe"
-    $script:ClawExe = Join-Path $script:CargoTargetDir "debug\claw.exe"
+    $script:AppfsExe = Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe"
+    $script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
     Build-TestBinaries
 }
 
@@ -227,14 +227,14 @@ function Build-TestBinaries {
 
     Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:AppfsCargoTargetDir,
         "--bin", "agentfs"
     ) -WorkingDirectory $script:AppfsCliDir | Out-Null
     Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
     Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:ClawCargoTargetDir,
         "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
         "-p", "rusty-claude-cli"
     ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
@@ -294,6 +294,7 @@ function Get-JsonWarnings {
 function Main {
     Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
+    [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
     Initialize-BinaryPaths
 
     $mountParent = Split-Path -Parent $MountPoint

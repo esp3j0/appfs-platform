@@ -23,9 +23,11 @@ $script:AppfsHandle = $null
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ("appfs-agent-smoke-{0}-{1}" -f $AgentId, ([guid]::NewGuid().ToString("N")))
 $script:HadFailure = $false
-$script:CargoTargetDir = Join-Path $script:LogDir "cargo-target"
-$script:AppfsExe = Join-Path $script:CargoTargetDir "debug\agentfs.exe"
-$script:ClawExe = Join-Path $script:CargoTargetDir "debug\claw.exe"
+$script:CargoCacheRoot = Join-Path ([System.IO.Path]::GetTempPath()) "appfs-platform-cargo-targets"
+$script:AppfsCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-cli"
+$script:ClawCargoTargetDir = Join-Path $script:CargoCacheRoot "appfs-agent-rust"
+$script:AppfsExe = Join-Path $script:AppfsCargoTargetDir "debug\agentfs.exe"
+$script:ClawExe = Join-Path $script:ClawCargoTargetDir "debug\claw.exe"
 
 function Write-Success { Write-Host "✓ $args" -ForegroundColor Green }
 function Write-Fail { Write-Host "✗ $args" -ForegroundColor Red }
@@ -97,8 +99,6 @@ function Cleanup-TestArtifacts {
         Remove-TestPath -Path "$($script:DbPath)-shm"
         Remove-TestPath -Path "$($script:DbPath)-wal"
     }
-
-    Remove-TestPath -Path $script:CargoTargetDir -Recurse
 
     if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
         Remove-TestPath -Path $script:LogDir -Recurse
@@ -285,14 +285,14 @@ function Build-TestBinaries {
 
     Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:AppfsCargoTargetDir,
         "--bin", "agentfs"
     ) -WorkingDirectory $script:AppfsCliDir | Out-Null
     Assert-True (Test-Path $script:AppfsExe) "Built AppFS CLI binary $script:AppfsExe"
 
     Invoke-LoggedCommand -Name "claw-build" -FilePath "cargo" -ArgumentList @(
         "build",
-        "--target-dir", $script:CargoTargetDir,
+        "--target-dir", $script:ClawCargoTargetDir,
         "--manifest-path", (Join-Path $script:AppfsAgentRustDir "Cargo.toml"),
         "-p", "rusty-claude-cli"
     ) -WorkingDirectory $script:AppfsAgentRustDir | Out-Null
@@ -304,6 +304,7 @@ function Main {
 
     Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
+    [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)
     Build-TestBinaries
 
     $mountParent = Split-Path -Parent $MountPoint
