@@ -94,6 +94,16 @@ function Initialize-WindowsRustBuildEnv {
     }
 }
 
+function Format-WindowsIntegrationElapsed {
+    param([TimeSpan]$Elapsed)
+
+    return [string]::Format(
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        "{0:0.0}s",
+        $Elapsed.TotalSeconds
+    )
+}
+
 function Invoke-WithWindowsIntegrationBuildLock {
     param(
         [scriptblock]$ScriptBlock,
@@ -102,18 +112,36 @@ function Invoke-WithWindowsIntegrationBuildLock {
 
     $mutex = $null
     $acquired = $false
+    $waitStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $holdStopwatch = $null
     try {
         $mutex = New-Object System.Threading.Mutex($false, "Global\appfs-platform-windows-build-cache")
+        Write-Host "[info] Waiting for Windows integration build cache lock (timeout ${TimeoutSec}s)" -ForegroundColor DarkGray
         $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))
+        $waitStopwatch.Stop()
         if (-not $acquired) {
             throw "Timed out waiting for the Windows integration build cache lock after ${TimeoutSec}s"
         }
 
+        Write-Host (
+            "[info] Acquired Windows integration build cache lock after {0}" -f (
+                Format-WindowsIntegrationElapsed -Elapsed $waitStopwatch.Elapsed
+            )
+        ) -ForegroundColor DarkGray
+        $holdStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         & $ScriptBlock
     } finally {
         if ($null -ne $mutex) {
             if ($acquired) {
                 try {
+                    if ($null -ne $holdStopwatch) {
+                        $holdStopwatch.Stop()
+                        Write-Host (
+                            "[info] Releasing Windows integration build cache lock after holding it for {0}" -f (
+                                Format-WindowsIntegrationElapsed -Elapsed $holdStopwatch.Elapsed
+                            )
+                        ) -ForegroundColor DarkGray
+                    }
                     [void]$mutex.ReleaseMutex()
                 } catch {
                 }
