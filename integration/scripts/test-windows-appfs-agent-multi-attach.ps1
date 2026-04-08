@@ -60,6 +60,20 @@ function Remove-TestPath {
     }
 }
 
+function Cleanup-StaleTempArtifacts {
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    foreach ($pattern in @(
+        "appfs-agent-smoke-*",
+        "appfs-agent-http-demo-*",
+        "appfs-agent-multi-attach-*",
+        "appfs-agent-launcher-*"
+    )) {
+        Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $script:LogDir } |
+            ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
+    }
+}
+
 function Stop-LoggedProcess {
     param($Handle)
 
@@ -87,6 +101,8 @@ function Cleanup-TestArtifacts {
         Remove-TestPath -Path "$($script:DbPath)-wal"
     }
 
+    Remove-TestPath -Path $script:CargoTargetDir -Recurse
+
     if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
         Remove-TestPath -Path $script:LogDir -Recurse
     }
@@ -100,6 +116,8 @@ function Fail-WithContext {
     if (Test-Path $script:LogDir) {
         Write-Host "`nLogs preserved at $script:LogDir" -ForegroundColor Gray
         foreach ($path in @(
+            (Join-Path $script:LogDir "appfs-build.log"),
+            (Join-Path $script:LogDir "claw-build.log"),
             (Join-Path $script:LogDir "appfs-up.stdout.log"),
             (Join-Path $script:LogDir "appfs-up.stderr.log"),
             (Join-Path $script:LogDir "claw-status-agent-a.log"),
@@ -382,6 +400,7 @@ function Assert-AttachStatusMatches {
 function Main {
     Require-Command cargo
 
+    Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
     Build-TestBinaries
 
