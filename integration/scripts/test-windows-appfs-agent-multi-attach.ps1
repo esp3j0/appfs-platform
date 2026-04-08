@@ -55,12 +55,12 @@ function Remove-TestPath {
     } catch {
         if (Test-Path $Path -PathType Container) {
             if ($Recurse) {
-                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
+                cmd /c "rmdir /s /q `"$Path`"" 2>$null | Out-Null
             } else {
-                cmd /c "rmdir `"$Path`"" | Out-Null
+                cmd /c "rmdir `"$Path`"" 2>$null | Out-Null
             }
         } elseif (Test-Path $Path -PathType Leaf) {
-            cmd /c "del /f /q `"$Path`"" | Out-Null
+            cmd /c "del /f /q `"$Path`"" 2>$null | Out-Null
         }
     }
 }
@@ -81,12 +81,30 @@ function Stop-LoggedProcess {
         return
     }
 
-    if ($Handle.Process -and !$Handle.Process.HasExited) {
+    if ($Handle.Process) {
         try {
-            Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
-            $null = $Handle.Process.WaitForExit(5000)
-        } catch {
-            Write-WarningLine "Failed to stop $($Handle.Name): $_"
+            if (!$Handle.Process.HasExited) {
+                try {
+                    Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
+                } catch {
+                    Write-WarningLine "Failed to stop $($Handle.Name): $_"
+                }
+
+                if (-not $Handle.Process.WaitForExit(5000)) {
+                    try {
+                        & taskkill.exe /F /T /PID $Handle.Process.Id | Out-Null
+                    } catch {
+                    } finally {
+                        $global:LASTEXITCODE = 0
+                    }
+                    $null = $Handle.Process.WaitForExit(5000)
+                }
+            }
+        } finally {
+            try {
+                $Handle.Process.Dispose()
+            } catch {
+            }
         }
     }
 }

@@ -42,25 +42,41 @@ function Write-Section { Write-Host "`n==== $args ====" -ForegroundColor Magenta
 function Remove-TestPath {
     param(
         [string]$Path,
-        [switch]$Recurse
+        [switch]$Recurse,
+        [int]$RetryCount = 8,
+        [int]$RetryDelayMs = 250
     )
 
     if (!(Test-Path $Path)) {
         return
     }
 
-    try {
-        Remove-Item -Path $Path -Force -Recurse:$Recurse -ErrorAction Stop
-    } catch {
-        if (Test-Path $Path -PathType Container) {
-            if ($Recurse) {
-                cmd /c "rmdir /s /q `"$Path`"" | Out-Null
-            } else {
-                cmd /c "rmdir `"$Path`"" | Out-Null
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            Remove-Item -Path $Path -Force -Recurse:$Recurse -ErrorAction Stop
+        } catch {
+            if (Test-Path $Path -PathType Container) {
+                if ($Recurse) {
+                    cmd /c "rmdir /s /q `"$Path`"" 2>$null | Out-Null
+                } else {
+                    cmd /c "rmdir `"$Path`"" 2>$null | Out-Null
+                }
+            } elseif (Test-Path $Path -PathType Leaf) {
+                cmd /c "del /f /q `"$Path`"" 2>$null | Out-Null
             }
-        } elseif (Test-Path $Path -PathType Leaf) {
-            cmd /c "del /f /q `"$Path`"" | Out-Null
         }
+
+        if (!(Test-Path $Path)) {
+            return
+        }
+
+        if ($attempt -lt $RetryCount) {
+            Start-Sleep -Milliseconds $RetryDelayMs
+        }
+    }
+
+    if (Test-Path $Path) {
+        Write-WarningLine "Cleanup could not remove $Path after $RetryCount attempts."
     }
 }
 
@@ -80,30 +96,71 @@ function Stop-LoggedProcess {
         return
     }
 
-    if ($Handle.Process -and !$Handle.Process.HasExited) {
+    if ($Handle.Process) {
         try {
-            Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
-            $null = $Handle.Process.WaitForExit(5000)
-        } catch {
-            Write-WarningLine "Failed to stop $($Handle.Name): $_"
+            if (!$Handle.Process.HasExited) {
+                try {
+                    Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
+                } catch {
+                    Write-WarningLine "Failed to stop $($Handle.Name): $_"
+                }
+
+                if (-not $Handle.Process.WaitForExit(5000)) {
+                    try {
+                        & taskkill.exe /F /T /PID $Handle.Process.Id | Out-Null
+                    } catch {
+                    } finally {
+                        $global:LASTEXITCODE = 0
+                    }
+                    $null = $Handle.Process.WaitForExit(5000)
+                }
+            }
+        } finally {
+            try {
+                $Handle.Process.Dispose()
+            } catch {
+            }
         }
     }
 }
 
+function Invoke-CleanupStep {
+    param(
+        [string]$Name,
+        [scriptblock]$Action
+    )
+
+    $stepStarted = Get-Date
+    Write-Host "[info] Cleanup: $Name"
+    & $Action
+    $elapsed = ((Get-Date) - $stepStarted).TotalSeconds
+    Write-Host ("[info] Cleanup: {0} finished in {1:N1}s" -f $Name, $elapsed)
+}
+
 function Cleanup-TestArtifacts {
-    Stop-LoggedProcess $script:AppfsHandle
-    Stop-LoggedProcess $script:BridgeHandle
+    $cleanupStarted = Get-Date
+    Write-Host "[info] Starting HTTP demo cleanup"
+
+    Invoke-CleanupStep "stop appfs" { Stop-LoggedProcess $script:AppfsHandle }
+    Invoke-CleanupStep "stop bridge" { Stop-LoggedProcess $script:BridgeHandle }
 
     if (!$SkipCleanup) {
-        Remove-TestPath -Path $MountPoint -Recurse
-        Remove-TestPath -Path $script:DbPath
-        Remove-TestPath -Path "$($script:DbPath)-shm"
-        Remove-TestPath -Path "$($script:DbPath)-wal"
+        Invoke-CleanupStep "remove mount and database artifacts" {
+            Remove-TestPath -Path $MountPoint -Recurse
+            Remove-TestPath -Path $script:DbPath
+            Remove-TestPath -Path "$($script:DbPath)-shm"
+            Remove-TestPath -Path "$($script:DbPath)-wal"
+        }
     }
 
     if (!$KeepLogs -and !$script:HadFailure -and (Test-Path $script:LogDir)) {
-        Remove-TestPath -Path $script:LogDir -Recurse
+        Invoke-CleanupStep "remove temporary log directory" {
+            Remove-TestPath -Path $script:LogDir -Recurse
+        }
     }
+
+    $cleanupElapsed = ((Get-Date) - $cleanupStarted).TotalSeconds
+    Write-Host ("[info] HTTP demo cleanup finished in {0:N1}s" -f $cleanupElapsed)
 }
 
 function Fail-WithContext {
