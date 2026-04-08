@@ -286,6 +286,11 @@ function Build-TestBinaries {
     Initialize-WindowsRustBuildEnv
 
     Invoke-WithWindowsIntegrationBuildLock {
+        Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+            $script:AppfsExe,
+            $script:ClawExe
+        )
+
         Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
@@ -306,6 +311,10 @@ function Build-TestBinaries {
 function Main {
     Require-Command cargo
 
+    Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+        $script:AppfsExe,
+        $script:ClawExe
+    )
     Cleanup-StaleTempArtifacts
     [void][System.IO.Directory]::CreateDirectory($script:LogDir)
     [void][System.IO.Directory]::CreateDirectory($script:CargoCacheRoot)

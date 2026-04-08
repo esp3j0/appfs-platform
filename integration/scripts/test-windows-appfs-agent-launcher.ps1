@@ -228,6 +228,11 @@ function Build-TestBinaries {
     Initialize-WindowsRustBuildEnv
 
     Invoke-WithWindowsIntegrationBuildLock {
+        Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
+            $script:AppfsExe,
+            $script:ClawExe
+        )
+
         Invoke-LoggedCommand -Name "appfs-build" -FilePath "cargo" -ArgumentList @(
             "build",
             "--target-dir", $script:AppfsCargoTargetDir,
