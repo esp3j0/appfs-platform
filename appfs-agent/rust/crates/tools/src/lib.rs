@@ -4764,7 +4764,11 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
                     .map_err(|error| error.to_string())?;
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                child.kill().map_err(|error| error.to_string())?;
+                if let Err(error) = child.kill() {
+                    if error.kind() != std::io::ErrorKind::InvalidInput {
+                        return Err(error.to_string());
+                    }
+                }
                 child
                     .wait_with_output()
                     .map_err(|error| error.to_string())?;
@@ -5893,6 +5897,9 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(

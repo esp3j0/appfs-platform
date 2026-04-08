@@ -1,6 +1,9 @@
 name: Integration Multi-Attach (Windows)
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
