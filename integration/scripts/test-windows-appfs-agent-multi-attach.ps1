@@ -243,6 +243,8 @@ function Invoke-LoggedCommand {
     $stderrPath = Join-Path $script:LogDir "$Name.stderr.tmp.log"
     $exitCode = 0
     $savedEnvironment = @{}
+    $command = Get-Command $FilePath -ErrorAction SilentlyContinue
+    $resolvedFilePath = if ($null -ne $command) { $command.Source } else { $FilePath }
 
     foreach ($entry in $EnvironmentOverrides.GetEnumerator()) {
         $key = [string]$entry.Key
@@ -252,14 +254,16 @@ function Invoke-LoggedCommand {
 
     Push-Location $WorkingDirectory
     try {
-        $previousErrorActionPreference = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
-        if ($LASTEXITCODE -is [int]) {
-            $exitCode = $LASTEXITCODE
-        }
+        $proc = Start-Process -FilePath $resolvedFilePath `
+            -ArgumentList $ArgumentList `
+            -WorkingDirectory $WorkingDirectory `
+            -PassThru `
+            -WindowStyle Hidden `
+            -Wait `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        $exitCode = $proc.ExitCode
     } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
         Pop-Location
         foreach ($key in $savedEnvironment.Keys) {
             [System.Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key], "Process")
