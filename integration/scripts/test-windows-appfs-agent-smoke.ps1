@@ -385,7 +385,8 @@ function Main {
     Write-Section "Start AppFS"
     $script:AppfsHandle = New-LogHandle -Name "appfs-up" -FilePath $script:AppfsExe -ArgumentList @(
         "appfs", "up", $script:DbPath, $MountPoint,
-        "--backend", "winfsp"
+        "--backend", "winfsp",
+        "--auto-unmount"
     ) -WorkingDirectory $script:AppfsCliDir
 
     $controlDir = Join-Path $MountPoint "_appfs"
