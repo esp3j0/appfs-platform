@@ -114,31 +114,64 @@ function Wait-ProcessExitById {
 function Stop-ProcessTreeById {
     param(
         [int]$ProcessId,
-        [string]$ProcessLabel,
-        [int]$TimeoutMs = 2000
+        [string]$ProcessName = "process",
+        [int]$TimeoutMs = 5000
     )
 
-    if ($ProcessId -le 0) {
-        return
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return $true
     }
 
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
     } catch {
-    }
-
-    if (-not (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs)) {
-        try {
-            & taskkill.exe /F /T /PID $ProcessId | Out-Null
-        } catch {
-        } finally {
-            $global:LASTEXITCODE = 0
+        $remaining = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $remaining) {
+            return $true
         }
 
-        if (-not (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs)) {
-            Write-WarningLine "Cleanup could not fully stop $ProcessLabel (PID $ProcessId)."
-        }
+        Write-WarningLine "Failed to stop $ProcessName (PID $ProcessId) with Stop-Process: $_"
     }
+
+    if (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs) {
+        return $true
+    }
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $taskkill = Start-Process -FilePath "taskkill.exe" `
+            -ArgumentList @("/F", "/T", "/PID", [string]$ProcessId) `
+            -NoNewWindow `
+            -PassThru `
+            -Wait `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        $global:LASTEXITCODE = 0
+
+        if ($taskkill.ExitCode -ne 0) {
+            $remaining = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($null -ne $remaining) {
+                Write-WarningLine "taskkill reported exit code $($taskkill.ExitCode) for $ProcessName (PID $ProcessId)."
+            }
+        }
+    } catch {
+        $remaining = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -ne $remaining) {
+            Write-WarningLine "taskkill failed for $ProcessName (PID $ProcessId): $_"
+        }
+    } finally {
+        Remove-TestPath -Path $stdoutPath
+        Remove-TestPath -Path $stderrPath
+    }
+
+    if (Wait-ProcessExitById -ProcessId $ProcessId -TimeoutMs $TimeoutMs) {
+        return $true
+    }
+
+    Write-WarningLine "Cleanup could not fully stop $ProcessName (PID $ProcessId)."
+    return $false
 }
 
 function Wait-For-PathToDisappear {
@@ -170,7 +203,7 @@ function Stop-AgentfsProcessesForAgentId {
             $_.CommandLine -like "*$AgentId*"
         } |
         ForEach-Object {
-            Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessLabel $_.Name
+            [void](Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessName $_.Name)
         }
 }
 
@@ -182,7 +215,7 @@ function Stop-BridgeProcesses {
             $_.CommandLine -like "*bridge_server.py*"
         } |
         ForEach-Object {
-            Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessLabel $_.Name
+            [void](Stop-ProcessTreeById -ProcessId $_.ProcessId -ProcessName $_.Name)
         }
 }
 
@@ -197,16 +230,7 @@ function Stop-LoggedProcess {
         $processId = $Handle.Process.Id
         try {
             if (!$Handle.Process.HasExited) {
-                try {
-                    Stop-Process -Id $processId -Force -ErrorAction Stop
-                } catch {
-                    Write-WarningLine "Failed to stop $($Handle.Name): $_"
-                }
-
-                if (-not (Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000)) {
-                    cmd /c "taskkill /F /T /PID $processId >nul 2>nul || exit /b 0" | Out-Null
-                    $null = Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000
-                }
+                [void](Stop-ProcessTreeById -ProcessId $processId -ProcessName $Handle.Name)
             }
         } finally {
             try {
@@ -230,6 +254,47 @@ function Invoke-CleanupStep {
     Write-Host ("[info] Cleanup: {0} finished in {1:N1}s" -f $Name, $elapsed)
 }
 
+function Wait-PathGone {
+    param(
+        [string]$Path,
+        [int]$TimeoutSec = 20
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (!(Test-Path $Path)) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    return !(Test-Path $Path)
+}
+
+function Remove-AppfsArtifacts {
+    Stop-AgentfsProcessesForAgentId
+    Stop-BridgeProcesses
+
+    if (Test-Path $MountPoint) {
+        if (-not (Wait-PathGone -Path $MountPoint -TimeoutSec 15)) {
+            Write-WarningLine "AppFS mountpoint still exists 15s after shutdown; forcing one more lingering process sweep before removal."
+            Stop-AgentfsProcessesForAgentId
+            Stop-BridgeProcesses
+            Start-Sleep -Seconds 1
+        }
+
+        Remove-TestPath -Path $MountPoint -Recurse -RetryCount 40 -RetryDelayMs 500
+        if (Test-Path $MountPoint) {
+            Write-WarningLine "Cleanup left mountpoint in place: $MountPoint"
+        }
+    }
+
+    Remove-TestPath -Path $script:DbPath
+    Remove-TestPath -Path "$($script:DbPath)-shm"
+    Remove-TestPath -Path "$($script:DbPath)-wal"
+}
+
 function Cleanup-TestArtifacts {
     $cleanupStarted = Get-Date
     Write-Host "[info] Starting HTTP demo cleanup"
@@ -250,12 +315,11 @@ function Cleanup-TestArtifacts {
                 } else {
                     Write-WarningLine "AppFS mountpoint still exists 15s after shutdown; forcing lingering process sweep before removal."
                     Stop-AgentfsProcessesForAgentId
+                    Stop-BridgeProcesses
+                    Start-Sleep -Seconds 1
                 }
             }
-            Remove-TestPath -Path $MountPoint -Recurse
-            Remove-TestPath -Path $script:DbPath
-            Remove-TestPath -Path "$($script:DbPath)-shm"
-            Remove-TestPath -Path "$($script:DbPath)-wal"
+            Remove-AppfsArtifacts
         }
     }
 
