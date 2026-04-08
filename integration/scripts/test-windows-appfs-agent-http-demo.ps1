@@ -81,12 +81,64 @@ function Remove-TestPath {
 }
 
 function Cleanup-StaleTempArtifacts {
+    Stop-AgentfsProcessesForAgentId
+    Stop-BridgeProcesses
+
     $tempRoot = [System.IO.Path]::GetTempPath()
     foreach ($pattern in @("appfs-agent-http-demo-*")) {
         Get-ChildItem -Path $tempRoot -Directory -Filter $pattern -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -ne $script:LogDir } |
             ForEach-Object { Remove-TestPath -Path $_.FullName -Recurse }
     }
+}
+
+function Wait-ProcessExitById {
+    param(
+        [int]$ProcessId,
+        [int]$TimeoutMs = 2000
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    do {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+
+    return $null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Stop-AgentfsProcessesForAgentId {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq "agentfs.exe" -and
+            $_.CommandLine -and
+            $_.CommandLine -like "*$AgentId*"
+        } |
+        ForEach-Object {
+            try {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+            } catch {
+            }
+        }
+}
+
+function Stop-BridgeProcesses {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -eq "python.exe" -and
+            $_.CommandLine -and
+            $_.CommandLine -like "*bridge_server.py*"
+        } |
+        ForEach-Object {
+            try {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+            } catch {
+            }
+        }
 }
 
 function Stop-LoggedProcess {
@@ -97,22 +149,18 @@ function Stop-LoggedProcess {
     }
 
     if ($Handle.Process) {
+        $processId = $Handle.Process.Id
         try {
             if (!$Handle.Process.HasExited) {
                 try {
-                    Stop-Process -Id $Handle.Process.Id -Force -ErrorAction Stop
+                    Stop-Process -Id $processId -Force -ErrorAction Stop
                 } catch {
                     Write-WarningLine "Failed to stop $($Handle.Name): $_"
                 }
 
-                if (-not $Handle.Process.WaitForExit(5000)) {
-                    try {
-                        & taskkill.exe /F /T /PID $Handle.Process.Id | Out-Null
-                    } catch {
-                    } finally {
-                        $global:LASTEXITCODE = 0
-                    }
-                    $null = $Handle.Process.WaitForExit(5000)
+                if (-not (Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000)) {
+                    cmd /c "taskkill /F /T /PID $processId >nul 2>nul || exit /b 0" | Out-Null
+                    $null = Wait-ProcessExitById -ProcessId $processId -TimeoutMs 2000
                 }
             }
         } finally {
@@ -141,6 +189,11 @@ function Cleanup-TestArtifacts {
     $cleanupStarted = Get-Date
     Write-Host "[info] Starting HTTP demo cleanup"
 
+    Invoke-CleanupStep "sweep lingering appfs/bridge processes" {
+        Stop-AgentfsProcessesForAgentId
+        Stop-BridgeProcesses
+        Start-Sleep -Milliseconds 500
+    }
     Invoke-CleanupStep "stop appfs" { Stop-LoggedProcess $script:AppfsHandle }
     Invoke-CleanupStep "stop bridge" { Stop-LoggedProcess $script:BridgeHandle }
 
