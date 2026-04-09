@@ -612,6 +612,7 @@ fn push_event(
     let timestamp = now_secs();
     let seq = worker.events.len() as u64 + 1;
     worker.updated_at = timestamp;
+    worker.status = status;
     worker.events.push(WorkerEvent {
         seq,
         kind,
@@ -620,6 +621,50 @@ fn push_event(
         payload,
         timestamp,
     });
+    emit_state_file(worker);
+}
+
+#[derive(Serialize)]
+struct WorkerStateSnapshot<'a> {
+    worker_id: &'a str,
+    status: WorkerStatus,
+    is_ready: bool,
+    trust_gate_cleared: bool,
+    prompt_in_flight: bool,
+    last_event: Option<&'a WorkerEvent>,
+    updated_at: u64,
+    seconds_since_update: u64,
+}
+
+/// Write current worker state to `.claw/worker-state.json` under the worker's cwd.
+/// External observers can poll this file without needing an HTTP surface.
+fn emit_state_file(worker: &Worker) {
+    let state_dir = Path::new(&worker.cwd).join(".claw");
+    if std::fs::create_dir_all(&state_dir).is_err() {
+        return;
+    }
+
+    let state_path = state_dir.join("worker-state.json");
+    let tmp_path = state_dir.join("worker-state.json.tmp");
+
+    let snapshot = WorkerStateSnapshot {
+        worker_id: &worker.worker_id,
+        status: worker.status,
+        is_ready: worker.status == WorkerStatus::ReadyForPrompt,
+        trust_gate_cleared: worker.trust_gate_cleared,
+        prompt_in_flight: worker.prompt_in_flight,
+        last_event: worker.events.last(),
+        updated_at: worker.updated_at,
+        seconds_since_update: now_secs().saturating_sub(worker.updated_at),
+    };
+
+    let Ok(body) = serde_json::to_vec_pretty(&snapshot) else {
+        return;
+    };
+    if std::fs::write(&tmp_path, body).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&tmp_path, &state_path);
 }
 
 fn reset_worker_boot_clock(worker: &mut Worker) {

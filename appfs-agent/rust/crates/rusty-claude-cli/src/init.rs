@@ -356,7 +356,7 @@ mod tests {
             let candidate = temp_root.join(format!("rusty-claude-init-{pid}-{nanos}-{counter}"));
             match fs::create_dir(&candidate) {
                 Ok(()) => return candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("create temp dir: {error}"),
             }
         }

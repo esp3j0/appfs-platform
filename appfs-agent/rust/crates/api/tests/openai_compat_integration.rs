@@ -88,6 +88,7 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
             tools: None,
             tool_choice: None,
             stream: false,
+            ..Default::default()
         })
         .await
         .expect_err("oversized request should fail local context-window preflight");
@@ -347,6 +348,7 @@ async fn provider_client_dispatches_xai_requests_from_env() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn provider_client_dispatches_openai_requests_from_env() {
     let _lock = env_lock();
     let _api_key = ScopedEnvVar::set("OPENAI_API_KEY", "openai-test-key");
@@ -536,6 +538,7 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+        ..Default::default()
     }
 }
 
