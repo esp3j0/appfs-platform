@@ -473,9 +473,7 @@ pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
     match mount_thread.join() {
         Ok(Ok(())) => runtime_result,
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(anyhow::anyhow!(
-            "AppFS mount thread panicked during shutdown"
-        )),
+        Err(_) => Err(anyhow::anyhow!("AppFS mount thread panicked during shutdown")),
     }
 }
 
@@ -1016,6 +1014,40 @@ mod supervisor_tests {
         assert_eq!(
             manifest["multi_agent_mode"].as_str(),
             Some(super::runtime_manifest::APPFS_MULTI_AGENT_MODE_SHARED)
+        );
+    }
+
+    #[test]
+    fn supervisor_poll_does_not_rewrite_runtime_manifest_without_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime_args = build_runtime_cli_args(
+            Some("aiim".to_string()),
+            Vec::new(),
+            Some("sess-aiim".to_string()),
+            bridge_args(),
+            None,
+        )
+        .expect("build runtime args");
+        let mut supervisor = AppfsRuntimeSupervisor::new(
+            temp.path().to_path_buf(),
+            resolve_runtime_cli_args(runtime_args),
+            false,
+        )
+        .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+        supervisor
+            .sync_registry_to_disk(None)
+            .expect("persist registry and manifest");
+
+        let manifest_path = super::runtime_manifest::runtime_manifest_path(temp.path());
+        let before = fs::read(&manifest_path).expect("read manifest before poll");
+
+        supervisor.poll_once().expect("poll once");
+
+        let after = fs::read(&manifest_path).expect("read manifest after poll");
+        assert_eq!(
+            before, after,
+            "runtime manifest should remain byte-for-byte stable when poll_once() has no state changes"
         );
     }
 
