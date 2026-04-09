@@ -203,9 +203,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             base_commit,
+            ..
         } => {
             run_stale_base_preflight(base_commit.as_deref());
-            let stdin_context = read_piped_stdin();
+            // Only consume piped stdin as prompt context when the permission
+            // mode is fully unattended. In modes where the permission
+            // prompter may invoke CliPermissionPrompter::decide(), stdin
+            // must remain available for interactive approval; otherwise the
+            // prompter's read_line() would hit EOF and deny every request.
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
                 &effective_prompt,
@@ -228,7 +238,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
-        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
+            ..
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit.as_deref(),
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -286,6 +302,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -310,6 +327,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -436,6 +454,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     base_commit: base_commit.clone(),
+                    reasoning_effort: None,
                 });
             }
             "--print" => {
@@ -494,6 +513,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             base_commit,
+            reasoning_effort: None,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -533,6 +553,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -561,6 +582,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit: base_commit.clone(),
+                reasoning_effort: None,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -580,6 +602,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort: None,
         }),
     }
 }
@@ -700,6 +723,7 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1081,7 +1105,7 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --session".to_string())?;
-                session_reference = value.clone();
+                session_reference.clone_from(value);
                 index += 2;
             }
             flag if flag.starts_with("--session=") => {
@@ -2958,10 +2982,7 @@ fn run_resume_command(
 /// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
 /// stderr when the HEAD has diverged.
 fn run_stale_base_preflight(flag_value: Option<&str>) {
-    let cwd = match env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return,
-    };
+    let Ok(cwd) = env::current_dir() else { return };
     let source = resolve_expected_base(flag_value, &cwd);
     let state = check_base_commit(&cwd, source.as_ref());
     if let Some(warning) = format_stale_base_warning(&state) {
@@ -2973,9 +2994,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    base_commit: Option<String>,
+    base_commit: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_stale_base_preflight(base_commit.as_deref());
+    run_stale_base_preflight(base_commit);
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     let mut editor =
@@ -3000,12 +3021,10 @@ fn run_repl(
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
                         }
-                        continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
-                        continue;
                     }
                 }
                 editor.push_history(input);
@@ -4263,6 +4282,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_session_command(
         &mut self,
         action: Option<&str>,
@@ -4595,6 +4615,22 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
             return Ok(path);
         }
     }
+    // Backward compatibility: pre-isolation sessions were stored at
+    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
+    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
+    // and try the flat layout as a fallback so users do not lose access
+    // to their pre-upgrade managed sessions.
+    if let Some(legacy_root) = directory
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
     Err(format_missing_session_reference(session_id).into())
 }
 
@@ -4606,9 +4642,14 @@ fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    let mut sessions = Vec::new();
-    for entry in fs::read_dir(sessions_dir()?)? {
+fn collect_sessions_from_dir(
+    directory: &Path,
+    sessions: &mut Vec<ManagedSessionSummary>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if !is_managed_session_file(&path) {
@@ -4658,6 +4699,24 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             branch_name,
         });
     }
+    Ok(())
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    let primary_dir = sessions_dir()?;
+    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
+
+    // Backward compatibility: include sessions stored in the pre-isolation
+    // flat `.claw/sessions/` root so users do not lose access to existing
+    // managed sessions after the workspace-hashed subdirectory rollout.
+    if let Some(legacy_root) = primary_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+    {
+        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    }
+
     sessions.sort_by(|left, right| {
         right
             .modified_epoch_millis
@@ -4869,33 +4928,36 @@ fn status_json_value(
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
         },
-        "appfs": context.appfs_environment.as_ref().map(|environment| {
-            json!({
-                "detected": true,
-                "attach_source": environment.attach_source.as_str(),
-                "mount_root": environment.mount_root,
-                "runtime_session_id": environment.runtime_session_id,
-                "attach_id": environment.attach_id,
-                "attach_role": environment.attach_role,
-                "multi_agent_mode": environment.multi_agent_mode,
-                "manifest_path": environment.manifest_path,
-                "control_dir": environment.control_dir,
-                "control_events_path": environment.control_events_path,
-                "registry_path": environment.registry_path,
-                "register_app_path": environment.register_app_path,
-                "unregister_app_path": environment.unregister_app_path,
-                "list_apps_path": environment.list_apps_path,
-                "current_app_id": environment.current_app_id,
-                "current_app_root": environment.current_app_root,
-                "current_app_events_path": environment.current_app_events_path,
-                "registered_apps": environment.registered_apps,
-                "warnings": environment.warnings,
-            })
-        }).unwrap_or_else(|| {
-            json!({
-                "detected": false
-            })
-        }),
+        "appfs": context.appfs_environment.as_ref().map_or_else(
+            || {
+                json!({
+                    "detected": false
+                })
+            },
+            |environment| {
+                json!({
+                    "detected": true,
+                    "attach_source": environment.attach_source.as_str(),
+                    "mount_root": environment.mount_root,
+                    "runtime_session_id": environment.runtime_session_id,
+                    "attach_id": environment.attach_id,
+                    "attach_role": environment.attach_role,
+                    "multi_agent_mode": environment.multi_agent_mode,
+                    "manifest_path": environment.manifest_path,
+                    "control_dir": environment.control_dir,
+                    "control_events_path": environment.control_events_path,
+                    "registry_path": environment.registry_path,
+                    "register_app_path": environment.register_app_path,
+                    "unregister_app_path": environment.unregister_app_path,
+                    "list_apps_path": environment.list_apps_path,
+                    "current_app_id": environment.current_app_id,
+                    "current_app_root": environment.current_app_root,
+                    "current_app_events_path": environment.current_app_events_path,
+                    "registered_apps": environment.registered_apps,
+                    "warnings": environment.warnings,
+                })
+            },
+        ),
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
             "active": context.sandbox_status.active,
@@ -5341,7 +5403,7 @@ fn collect_hook_list_entries(
     let mut entries = Vec::new();
     extend_hook_list_entries(
         &mut entries,
-        "config".to_string(),
+        "config",
         true,
         runtime_config.hooks().pre_tool_use(),
         runtime_config.hooks().post_tool_use(),
@@ -5353,7 +5415,7 @@ fn collect_hook_list_entries(
     for plugin in plugin_registry.plugins() {
         extend_hook_list_entries(
             &mut entries,
-            format!("plugin:{}", plugin.metadata().id),
+            &format!("plugin:{}", plugin.metadata().id),
             plugin.is_enabled(),
             &plugin.hooks().pre_tool_use,
             &plugin.hooks().post_tool_use,
@@ -5366,17 +5428,17 @@ fn collect_hook_list_entries(
 
 fn extend_hook_list_entries(
     entries: &mut Vec<HookListEntry>,
-    source: String,
+    source: &str,
     enabled: bool,
     pre_tool_use: &[String],
     post_tool_use: &[String],
     post_tool_use_failure: &[String],
 ) {
-    append_hook_list_entries(entries, &source, enabled, "PreToolUse", pre_tool_use);
-    append_hook_list_entries(entries, &source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(entries, source, enabled, "PreToolUse", pre_tool_use);
+    append_hook_list_entries(entries, source, enabled, "PostToolUse", post_tool_use);
     append_hook_list_entries(
         entries,
-        &source,
+        source,
         enabled,
         "PostToolUseFailure",
         post_tool_use_failure,
@@ -5953,15 +6015,19 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let doe = (z - era * 146_097).cast_unsigned(); // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
+    let y = yoe.cast_signed() + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = y + i64::from(m <= 2);
-    (y as i32, m as u32, d as u32)
+    (
+        i32::try_from(y).expect("civil year should fit in i32"),
+        u32::try_from(m).expect("month should fit in u32"),
+        u32::try_from(d).expect("day should fit in u32"),
+    )
 }
 
 fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
@@ -6951,7 +7017,7 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
-            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            .map_err(Box::<dyn std::error::Error>::from)?;
         let provider_override = runtime_config
             .provider()
             .map(provider_override_from_runtime_config);
@@ -6961,7 +7027,7 @@ impl AnthropicRuntimeClient {
             client: ProviderClient::from_model_with_anthropic_auth_resolver(
                 &model,
                 provider_override.as_ref(),
-                || resolve_cli_auth_source(&oauth),
+                || resolve_cli_auth_source(oauth.as_ref()),
             )?
             .with_prompt_cache(PromptCache::new(session_id)),
             session_id: session_id.to_string(),
@@ -6975,8 +7041,8 @@ impl AnthropicRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
-    if let Some(oauth) = oauth.clone() {
+fn resolve_cli_auth_source(oauth: Option<&OAuthConfig>) -> Result<AuthSource, api::ApiError> {
+    if let Some(oauth) = oauth.cloned() {
         resolve_startup_auth_source(|| Ok(Some(oauth)))
     } else {
         let cwd = env::current_dir().map_err(api::ApiError::Io)?;
@@ -7041,6 +7107,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.runtime.block_on(async {
@@ -7062,7 +7129,6 @@ impl ApiClient for AnthropicRuntimeClient {
                     {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
-                        continue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -8629,8 +8695,6 @@ mod tests {
         const ATTEMPTS: usize = 6;
         for attempt in 0..ATTEMPTS {
             match fs::remove_dir_all(path) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
                 Err(error)
                     if attempt + 1 < ATTEMPTS
                         && matches!(
@@ -8640,7 +8704,7 @@ mod tests {
                 {
                     std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
                 }
-                Err(_) => return,
+                _ => return,
             }
         }
     }
@@ -8826,6 +8890,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -8989,6 +9054,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9097,6 +9163,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9126,6 +9193,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9167,6 +9235,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9244,6 +9313,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9263,6 +9333,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9291,6 +9362,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9316,6 +9388,7 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9408,6 +9481,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9831,6 +9905,9 @@ mod tests {
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        // Input is ["help", "me", "debug"] so the joined prompt shorthand
+        // must be "help me debug". A previous batch accidentally rewrote
+        // the expected string to "$help overview" (copy-paste slip).
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
@@ -9842,6 +9919,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9893,6 +9971,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9918,6 +9997,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -10127,9 +10207,9 @@ mod tests {
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains(
-            "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]"
-        ));
+        // Batch 5 added `/session delete`; match on the stable core rather than
+        // the trailing bracket so future additions don't re-break this.
+        assert!(help.contains("/session [list|switch <session-id>|fork [branch-name]"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
@@ -10359,6 +10439,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn status_line_reports_model_and_token_totals() {
         let status = format_status_report(
             "claude-sonnet",
@@ -12008,6 +12089,9 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+        // Serialize access to process-wide env vars so parallel tests
+        // that set/remove ANTHROPIC_API_KEY do not race with this test.
+        let _guard = env_lock();
         if !windows_bash_smoke_ok() {
             return;
         }

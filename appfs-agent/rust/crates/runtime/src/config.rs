@@ -817,13 +817,6 @@ fn parse_provider_kind(value: &str, context: &str) -> Result<RuntimeProviderKind
     }
 }
 
-fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
-}
-
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(RuntimeHookConfig::default());
@@ -1318,17 +1311,14 @@ mod tests {
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
-        static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        let sequence = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("runtime-config-{nanos}-{sequence}"))
+        std::env::temp_dir().join(format!("runtime-config-{nanos}"))
     }
 
     #[test]
