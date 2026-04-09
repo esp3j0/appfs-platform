@@ -1,12 +1,14 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
   workflow_dispatch:
 
 concurrency:
@@ -15,6 +17,7 @@ concurrency:
 
 jobs:
   appfs-agent-rust:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged == true
     name: appfs-agent rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -51,6 +54,7 @@ jobs:
         run: cargo build --workspace --release
 
   appfs-agent-python:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged == true
     name: appfs-agent python
     runs-on: ubuntu-latest
     defaults:
@@ -70,6 +74,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   appfs-contract-gate:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged == true
     name: appfs contract gate
     runs-on: ubuntu-latest
     defaults:
