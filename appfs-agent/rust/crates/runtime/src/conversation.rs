@@ -1141,9 +1141,6 @@ mod tests {
 
     #[test]
     fn appends_post_tool_hook_feedback_to_tool_result() {
-        if !windows_bash_smoke_ok() {
-            return;
-        }
         struct TwoCallApiClient {
             calls: usize,
         }
@@ -1173,6 +1170,10 @@ mod tests {
                     _ => unreachable!("extra API call"),
                 }
             }
+        }
+
+        if !windows_bash_smoke_ok() {
+            return;
         }
 
         let mut runtime = ConversationRuntime::new_with_features(
@@ -1455,16 +1456,8 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
     }
 
-    fn shell_echo(message: &str) -> String {
-        format!("printf '{message}'")
-    }
-
     fn shell_snippet(command: &str) -> String {
         command.to_string()
-    }
-
-    fn shell_echo_and_exit(message: &str, code: i32) -> String {
-        format!("printf '{message}'; exit {code}")
     }
 
     fn windows_bash_smoke_ok() -> bool {

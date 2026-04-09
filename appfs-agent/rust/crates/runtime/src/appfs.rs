@@ -64,6 +64,7 @@ pub struct AppfsRuntimeManifestControlPlane {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppfsRuntimeManifestCapabilities {
     pub app_registration: bool,
     pub event_stream: bool,
@@ -265,13 +266,14 @@ fn build_env_environment(
         .attach_id
         .clone()
         .unwrap_or_else(generate_ephemeral_attach_id);
-    let multi_agent_mode = manifest
-        .map(|doc| doc.multi_agent_mode.clone())
-        .unwrap_or_else(|| APPFS_MULTI_AGENT_MODE_SHARED.to_string());
+    let multi_agent_mode = manifest.map_or_else(
+        || APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+        |doc| doc.multi_agent_mode.clone(),
+    );
     let control_paths = manifest
         .map(|doc| resolve_control_plane_paths(&mount_root, &doc.control_plane))
         .or_else(|| heuristic.map(control_plane_from_heuristic))
-        .unwrap_or_else(ResolvedControlPlanePaths::default);
+        .unwrap_or_default();
     let current_detection = detect_current_app(&mount_root, cwd);
     let registered_apps = load_registered_apps_from_paths(
         control_paths
@@ -367,6 +369,7 @@ fn build_heuristic_environment(
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_field_names)]
 struct CurrentAppDetection {
     current_app_id: Option<String>,
     current_app_root: Option<PathBuf>,
@@ -419,24 +422,22 @@ fn resolve_control_plane_paths(
     let list_apps_path = absolute_mount_path(mount_root, &control_plane.list_action);
     let registry_path = absolute_mount_path(mount_root, &control_plane.registry);
     let control_events_path = absolute_mount_path(mount_root, &control_plane.events);
-    let control_dir = register_app_path
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let control_dir = register_app_path.parent().map(Path::to_path_buf);
 
     ResolvedControlPlanePaths {
         control_dir,
-        control_events_path,
-        registry_path,
-        register_app_path,
-        unregister_app_path,
-        list_apps_path,
+        control_events_path: Some(control_events_path),
+        registry_path: Some(registry_path),
+        register_app_path: Some(register_app_path),
+        unregister_app_path: Some(unregister_app_path),
+        list_apps_path: Some(list_apps_path),
     }
 }
 
-fn absolute_mount_path(mount_root: &Path, virtual_path: &str) -> Option<PathBuf> {
+fn absolute_mount_path(mount_root: &Path, virtual_path: &str) -> PathBuf {
     let trimmed = virtual_path.trim().trim_start_matches(['/', '\\']);
     if trimmed.is_empty() {
-        return Some(mount_root.to_path_buf());
+        return mount_root.to_path_buf();
     }
     let mut path = mount_root.to_path_buf();
     for segment in trimmed.split(['/', '\\']) {
@@ -445,7 +446,7 @@ fn absolute_mount_path(mount_root: &Path, virtual_path: &str) -> Option<PathBuf>
         }
         path.push(segment);
     }
-    Some(path)
+    path
 }
 
 fn load_attach_env() -> AppfsAttachEnv {

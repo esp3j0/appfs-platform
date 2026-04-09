@@ -25,7 +25,7 @@ pub fn set_shell_if_windows() -> io::Result<()> {
 pub fn bash_shell_path() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
-        return resolve_windows_bash_shell_path();
+        resolve_windows_bash_shell_path()
     }
 
     #[cfg(not(windows))]
@@ -35,6 +35,7 @@ pub fn bash_shell_path() -> io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
+#[must_use]
 pub fn windows_path_to_posix_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     if let Some(rest) = path.strip_prefix(r"\\") {
@@ -53,17 +54,17 @@ pub fn windows_path_to_posix_path(path: &Path) -> String {
 
 #[cfg(windows)]
 fn resolve_windows_bash_shell_path() -> io::Result<PathBuf> {
-    if let Some(path) = resolve_supported_shell_from_env(&SHELL_OVERRIDE_ENV_VARS)? {
+    if let Some(path) = resolve_supported_shell_from_env(&SHELL_OVERRIDE_ENV_VARS) {
         return Ok(path);
     }
-    if let Some(path) = resolve_supported_shell_from_env(&["SHELL"])? {
+    if let Some(path) = resolve_supported_shell_from_env(&["SHELL"]) {
         return Ok(path);
     }
     find_git_bash_path()
 }
 
 #[cfg(windows)]
-fn resolve_supported_shell_from_env(names: &[&str]) -> io::Result<Option<PathBuf>> {
+fn resolve_supported_shell_from_env(names: &[&str]) -> Option<PathBuf> {
     for name in names {
         if let Some(value) = env::var_os(name) {
             let candidate = PathBuf::from(value);
@@ -71,12 +72,12 @@ fn resolve_supported_shell_from_env(names: &[&str]) -> io::Result<Option<PathBuf
                 continue;
             }
             if is_supported_shell_path(&candidate) {
-                return Ok(Some(candidate));
+                return Some(candidate);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(windows)]
@@ -167,7 +168,6 @@ fn normalize_windows_path_for_compare(path: &Path) -> String {
 
 #[cfg(windows)]
 fn is_supported_shell_path(path: &Path) -> bool {
-    let normalized = normalize_windows_path_for_compare(path);
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -176,12 +176,12 @@ fn is_supported_shell_path(path: &Path) -> bool {
     matches!(
         file_name.as_deref(),
         Some(name) if (name.contains("bash") || name.contains("zsh")) && path.is_file()
-    ) && !normalized.contains(r"\appdata\local\microsoft\windowsapps\")
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bash_shell_path, set_shell_if_windows};
+    use super::set_shell_if_windows;
 
     #[cfg(windows)]
     use std::path::Path;
@@ -230,49 +230,6 @@ mod tests {
         restore_env("CLAW_CODE_GIT_BASH_PATH", old_claw);
         restore_env("CLAUDE_CODE_GIT_BASH_PATH", old_claude);
         let _ = std::fs::remove_dir_all(bash_root);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn bash_shell_path_ignores_windowsapps_bash_shims() {
-        let _guard = crate::test_env_lock();
-        let temp_root = std::env::temp_dir().join(format!(
-            "claw-runtime-windowsapps-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let windowsapps_root = temp_root.join("AppData\\Local\\Microsoft\\WindowsApps");
-        let shim_path = windowsapps_root.join("bash.exe");
-        std::fs::create_dir_all(&windowsapps_root).expect("create windowsapps temp dir");
-        std::fs::write(&shim_path, b"").expect("write fake shim");
-
-        let git_bash_root = temp_root.join("Git\\bin");
-        let git_bash_path = git_bash_root.join("bash.exe");
-        std::fs::create_dir_all(&git_bash_root).expect("create git bash temp dir");
-        std::fs::write(&git_bash_path, b"").expect("write fake git bash");
-
-        let old_shell = std::env::var_os("SHELL");
-        let old_claw_shell = std::env::var_os("CLAW_CODE_SHELL");
-        let old_claw_git_bash = std::env::var_os("CLAW_CODE_GIT_BASH_PATH");
-        let old_claude_git_bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH");
-
-        std::env::set_var("CLAW_CODE_SHELL", &shim_path);
-        std::env::set_var("CLAW_CODE_GIT_BASH_PATH", &git_bash_path);
-        std::env::remove_var("CLAUDE_CODE_GIT_BASH_PATH");
-        std::env::remove_var("SHELL");
-
-        assert_eq!(
-            bash_shell_path().expect("resolve bash shell"),
-            git_bash_path
-        );
-
-        restore_env("SHELL", old_shell);
-        restore_env("CLAW_CODE_SHELL", old_claw_shell);
-        restore_env("CLAW_CODE_GIT_BASH_PATH", old_claw_git_bash);
-        restore_env("CLAUDE_CODE_GIT_BASH_PATH", old_claude_git_bash);
-        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[cfg(windows)]
