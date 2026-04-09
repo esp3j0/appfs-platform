@@ -5,6 +5,10 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -43,6 +47,7 @@ use runtime_supervisor::AppfsRuntimeSupervisor;
 
 const DEFAULT_RETENTION_HINT_SEC: i64 = 86400;
 const MIN_POLL_MS: u64 = 50;
+const DEFAULT_ACTION_FALLBACK_POLL_MS: u64 = 500;
 const ACTION_CURSORS_FILENAME: &str = "action-cursors.res.json";
 const ACTION_CURSOR_PROBE_WINDOW: usize = 64;
 const MAX_RECOVERY_LINES: usize = 32;
@@ -69,6 +74,55 @@ const MAX_SEGMENT_BYTES: usize = 255;
 const ALLOWED_SEGMENT_CHARS: &str =
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~";
 
+#[derive(Clone)]
+pub struct ActionWakeHandle {
+    inner: Arc<ActionWakeState>,
+}
+
+struct ActionWakeState {
+    notify: tokio::sync::Notify,
+    pending: AtomicBool,
+}
+
+impl Default for ActionWakeHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ActionWakeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionWakeHandle").finish_non_exhaustive()
+    }
+}
+
+impl ActionWakeHandle {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(ActionWakeState {
+                notify: tokio::sync::Notify::new(),
+                pending: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub(crate) fn signal(&self) {
+        if !self.inner.pending.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_one();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.inner.pending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppfsServeArgs {
     pub root: PathBuf,
@@ -77,6 +131,7 @@ pub struct AppfsServeArgs {
     pub app_ids: Vec<String>,
     pub session_id: Option<String>,
     pub poll_ms: u64,
+    pub action_wake: Option<ActionWakeHandle>,
     pub adapter_http_endpoint: Option<String>,
     pub adapter_http_timeout_ms: u64,
     pub adapter_grpc_endpoint: Option<String>,
@@ -143,6 +198,7 @@ fn build_managed_mount_args(args: &AppfsUpArgs) -> crate::cmd::MountArgs {
         adapter_bridge_max_backoff_ms: 1_000,
         adapter_bridge_circuit_breaker_failures: 5,
         adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+        action_wake: None,
     }
 }
 
@@ -346,6 +402,7 @@ pub async fn handle_appfs_adapter_command(args: AppfsServeArgs) -> Result<()> {
         app_ids,
         session_id,
         poll_ms,
+        action_wake,
         adapter_http_endpoint,
         adapter_http_timeout_ms,
         adapter_grpc_endpoint,
@@ -398,16 +455,39 @@ pub async fn handle_appfs_adapter_command(args: AppfsServeArgs) -> Result<()> {
     supervisor.log_started();
     eprintln!("Press Ctrl+C to stop.");
 
-    let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(MIN_POLL_MS)));
+    let fallback_poll_ms = poll_ms
+        .max(DEFAULT_ACTION_FALLBACK_POLL_MS)
+        .max(MIN_POLL_MS);
+    let mut interval = tokio::time::interval(Duration::from_millis(fallback_poll_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("AppFS adapter stopping...");
-                return Ok(());
+        if let Some(wake) = action_wake.as_ref() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("AppFS adapter stopping...");
+                    return Ok(());
+                }
+                _ = wake.wait() => {
+                    if let Err(err) = supervisor.poll_once() {
+                        eprintln!("AppFS adapter poll error: {err:#}");
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(err) = supervisor.poll_once() {
+                        eprintln!("AppFS adapter poll error: {err:#}");
+                    }
+                }
             }
-            _ = interval.tick() => {
-                if let Err(err) = supervisor.poll_once() {
-                    eprintln!("AppFS adapter poll error: {err:#}");
+        } else {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("AppFS adapter stopping...");
+                    return Ok(());
+                }
+                _ = interval.tick() => {
+                    if let Err(err) = supervisor.poll_once() {
+                        eprintln!("AppFS adapter poll error: {err:#}");
+                    }
                 }
             }
         }
@@ -415,7 +495,9 @@ pub async fn handle_appfs_adapter_command(args: AppfsServeArgs) -> Result<()> {
 }
 
 pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
-    let mount_args = build_managed_mount_args(&args);
+    let action_wake = ActionWakeHandle::new();
+    let mut mount_args = build_managed_mount_args(&args);
+    mount_args.action_wake = Some(action_wake.clone());
     let mountpoint = mount_args.mountpoint.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let mount_thread = std::thread::spawn(move || {
@@ -454,6 +536,7 @@ pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
         app_ids: Vec::new(),
         session_id: None,
         poll_ms: args.poll_ms,
+        action_wake: Some(action_wake),
         adapter_http_endpoint: None,
         adapter_http_timeout_ms: 5_000,
         adapter_grpc_endpoint: None,
@@ -733,11 +816,12 @@ struct AppfsAdapter {
 mod supervisor_tests {
     use super::{
         build_runtime_cli_args, registry, resolve_runtime_cli_args, runtime_config,
-        AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
+        ActionWakeHandle, AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
     };
     use serde_json::{json, Value as JsonValue};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn bridge_args() -> AppfsBridgeCliArgs {
@@ -781,6 +865,18 @@ mod supervisor_tests {
         assert!(mount_args.appfs_app_ids.is_empty());
         assert!(mount_args.adapter_http_endpoint.is_none());
         assert!(mount_args.adapter_grpc_endpoint.is_none());
+    }
+
+    #[test]
+    fn action_wake_handle_does_not_drop_pending_signal() {
+        let wake = ActionWakeHandle::new();
+        wake.signal();
+
+        crate::get_runtime().block_on(async move {
+            tokio::time::timeout(Duration::from_millis(50), wake.wait())
+                .await
+                .expect("wake should resolve immediately when already pending");
+        });
     }
 
     #[test]
