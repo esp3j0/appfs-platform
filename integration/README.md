@@ -11,6 +11,7 @@ This directory is reserved for scenarios that span both `appfs` and `appfs-agent
 5. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
 6. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
 7. `integration/scripts/test-windows-appfs-agent-launcher.ps1`
+8. `integration/scripts/test-unix-appfs-agent-smoke.sh`
 
 ## Intended Contents
 
@@ -36,6 +37,47 @@ Current contract mapping:
 | `integration/scripts/test-windows-appfs-agent-http-demo.ps1` | `IC-1` | `C0`, `C1`, `C4` |
 | `integration/scripts/test-windows-appfs-agent-multi-attach.ps1` | `IC-2` | `C0`, `C1`, `C2`, `C3`, `C5` |
 | `integration/scripts/test-windows-appfs-agent-launcher.ps1` | `IC-3` | `C0`, `C1`, `C2`, `C3`, `C6` |
+
+## Unix Local Smoke
+
+For Linux and macOS, use:
+
+- `integration/scripts/test-unix-appfs-agent-smoke.sh`
+
+It validates the same attached-workspace baseline as the Windows `IC-0` smoke:
+
+1. initialize an AppFS database
+2. start `appfs up` in managed mode
+3. confirm AppFS publishes `/.well-known/appfs/runtime.json`
+4. create a mounted workspace and `hello.txt`
+5. run `appfs-agent` (`claw status`) with the mounted workspace as `cwd`
+6. verify `/status` shows manifest attach metadata
+7. optionally run one prompt against the mounted workspace when `--run-prompt` is supplied
+
+Backend mapping:
+
+- Linux: `--backend fuse`
+- macOS: `--backend nfs`
+
+Example:
+
+```bash
+bash ./integration/scripts/test-unix-appfs-agent-smoke.sh
+```
+
+Optional real-provider prompt:
+
+```bash
+export ANTHROPIC_BASE_URL="https://open.bigmodel.cn/api/anthropic"
+export ANTHROPIC_API_KEY="..."
+bash ./integration/scripts/test-unix-appfs-agent-smoke.sh --run-prompt
+```
+
+Notes:
+
+- Linux requires `/dev/fuse` plus `fusermount3` or `fusermount`.
+- macOS uses the existing localhost NFS backend and requires `mount_nfs`.
+- This helper is local-only for now; it is not wired into GitHub Actions yet because hosted runners do not reliably provide the required FUSE/NFS mount privileges.
 
 For the first Windows integration checkpoint, use:
 
