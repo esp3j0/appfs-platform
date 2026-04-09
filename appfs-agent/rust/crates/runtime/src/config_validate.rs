@@ -170,6 +170,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "trustedRoots",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
         name: "mcpServers",
         expected: FieldType::Object,
     },
