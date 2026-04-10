@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
 use std::sync::{
@@ -11,6 +13,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 mod action_dispatcher;
 mod bridge_resilience;
@@ -217,6 +223,13 @@ fn build_appfs_up_launcher_command(args: &AppfsLaunchArgs) -> Result<ProcessComm
         .arg(args.poll_ms.to_string())
         .arg("--auto-unmount");
 
+    #[cfg(target_os = "windows")]
+    {
+        // Use a dedicated process group so the launcher can request a graceful
+        // CTRL_BREAK shutdown on the nested `appfs up` child before escalating.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
     if args.allow_root {
         command.arg("--allow-root");
     }
@@ -398,6 +411,15 @@ fn terminate_launcher_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) => {
+            #[cfg(target_os = "windows")]
+            {
+                let sent_ctrl_break =
+                    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) != 0 };
+                if sent_ctrl_break && wait_for_child_exit(child, Duration::from_secs(10)) {
+                    return;
+                }
+            }
+
             let _ = child.kill();
             if !wait_for_child_exit(child, Duration::from_secs(5)) {
                 #[cfg(target_os = "windows")]
