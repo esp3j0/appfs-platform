@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
 use std::sync::{
@@ -11,6 +13,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 mod action_dispatcher;
 mod bridge_resilience;
@@ -217,6 +223,13 @@ fn build_appfs_up_launcher_command(args: &AppfsLaunchArgs) -> Result<ProcessComm
         .arg(args.poll_ms.to_string())
         .arg("--auto-unmount");
 
+    #[cfg(target_os = "windows")]
+    {
+        // Use a dedicated process group so the launcher can request a graceful
+        // CTRL_BREAK shutdown on the nested `appfs up` child before escalating.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
     if args.allow_root {
         command.arg("--allow-root");
     }
@@ -352,7 +365,28 @@ async fn wait_for_runtime_manifest_ready(
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                anyhow::bail!("AppFS launcher interrupted before runtime manifest became ready");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+}
+
+async fn wait_for_child_or_interrupt(child: &mut Child) -> Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed while waiting for child process status")?
+        {
+            return Ok(Some(status));
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(None),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
     }
 }
 
@@ -377,6 +411,15 @@ fn terminate_launcher_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         Ok(None) => {
+            #[cfg(target_os = "windows")]
+            {
+                let sent_ctrl_break =
+                    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) != 0 };
+                if sent_ctrl_break && wait_for_child_exit(child, Duration::from_secs(10)) {
+                    return;
+                }
+            }
+
             let _ = child.kill();
             if !wait_for_child_exit(child, Duration::from_secs(5)) {
                 #[cfg(target_os = "windows")]
@@ -569,7 +612,8 @@ pub async fn handle_appfs_launch_command(args: AppfsLaunchArgs) -> Result<()> {
     let launch_result = async {
         let timeout = Duration::from_millis(args.startup_timeout_ms.max(1));
         let (manifest_path, manifest) =
-            wait_for_runtime_manifest_ready(&args.mountpoint, timeout, &mut appfs_up_child).await?;
+            wait_for_runtime_manifest_ready(&args.mountpoint, timeout, &mut appfs_up_child)
+                .await?;
 
         let workspace_dir = resolve_launch_workspace_path(&manifest.mount_root, &args.workspace)?;
         std::fs::create_dir_all(&workspace_dir).with_context(|| {
@@ -603,12 +647,16 @@ pub async fn handle_appfs_launch_command(args: AppfsLaunchArgs) -> Result<()> {
                 args.agent_bin.display()
             )
         })?;
-        let status = agent_child
-            .wait()
-            .context("failed while waiting for appfs-agent child process")?;
-
-        if !status.success() {
-            anyhow::bail!("appfs-agent child exited with non-zero status: {status}");
+        match wait_for_child_or_interrupt(&mut agent_child).await? {
+            Some(status) => {
+                if !status.success() {
+                    anyhow::bail!("appfs-agent child exited with non-zero status: {status}");
+                }
+            }
+            None => {
+                eprintln!("AppFS launcher interrupted; stopping child processes...");
+                terminate_launcher_child(&mut agent_child);
+            }
         }
 
         Ok::<(), anyhow::Error>(())

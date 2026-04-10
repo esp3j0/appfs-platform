@@ -88,6 +88,7 @@ aegis = { version = "0.9.6", features = ["pure-rust"] }
 # do not need an additional clang-cl toolchain just to build turso's crypto deps.
 aegis = { version = "0.9.8", features = ["pure-rust"] }
 winfsp = { version = "0.12", default-features = false, features = ["delayload"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
 
 # Build dependencies for Windows (needed for winfsp_link_delayload in build.rs)
 [target.'cfg(target_os = "windows")'.build-dependencies]
