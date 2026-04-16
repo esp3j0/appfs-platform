@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -30,7 +31,29 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str,
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(encoded)))
     handler.end_headers()
-    handler.wfile.write(encoded)
+    try:
+        handler.wfile.write(encoded)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as err:
+        print(
+            f"[bridge] response write aborted path={handler.path} status={status} error={err.__class__.__name__}: {err}"
+        )
+
+
+def _should_log_route(route: str) -> bool:
+    verbose = os.getenv("APPFS_HTTP_BRIDGE_VERBOSE", "").strip().lower()
+    if verbose in ("1", "true", "yes", "on", "all"):
+        return True
+    return route in ("/connector/structure/refresh", "/connector/structure/get")
+
+
+def _log_route_result(route: str, status: int, body: dict[str, Any]) -> None:
+    if not _should_log_route(route):
+        return
+    try:
+        rendered = json.dumps(body, ensure_ascii=False)
+    except Exception:
+        rendered = repr(body)
+    print(f"[bridge] route={route} status={status} body={rendered}")
 
 
 class BridgeApplication:
@@ -141,7 +164,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             )
             return
 
-        status, body = self.application.dispatch(self.path, payload)
+        try:
+            status, body = self.application.dispatch(self.path, payload)
+        except Exception as err:
+            print(f"[bridge] unhandled dispatch exception path={self.path}: {err}")
+            traceback.print_exc()
+            status, body = (500, internal_error(f"unhandled bridge dispatch failure: {err}"))
+        _log_route_result(self.path, status, body)
         _json_response(self, status, body)
 
     def log_message(self, format: str, *args: object) -> None:

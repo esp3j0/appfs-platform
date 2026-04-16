@@ -10,7 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from appfs_http_bridge.huoyan_backend import HuoyanBackend, _json_request
+from appfs_http_bridge.huoyan_backend import HuoyanBackend, _json_request, _rewrite_loopback_storage_host
 
 
 class _FakeHuoyanClient:
@@ -18,6 +18,7 @@ class _FakeHuoyanClient:
         self.case_locations = case_locations
         self.opened_paths: list[str] = []
         self.exited_case_ids: list[int] = []
+        self.storage_host_cache_reset_count = 0
 
     def list_cases(
         self, *, limit: int, offset: int, desc: bool, column: str, keyword: str
@@ -57,7 +58,7 @@ class _FakeHuoyanClient:
 
     def open_case(self, *, path: str) -> dict[str, Any]:
         self.opened_paths.append(path)
-        return {"status": "success"}
+        return {"status": "success", "case": {"Id": 1}}
 
     def exit_case(self, *, cid: int) -> dict[str, Any]:
         self.exited_case_ids.append(cid)
@@ -136,6 +137,9 @@ class _FakeHuoyanClient:
             "table": "evidence_1_immsginfo",
         }
 
+    def reset_storage_host_cache(self) -> None:
+        self.storage_host_cache_reset_count += 1
+
 
 class HuoyanBackendTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -199,6 +203,7 @@ class HuoyanBackendTests(unittest.TestCase):
         paths = {node["path"] for node in snapshot["nodes"]}
         self.assertEqual(snapshot["active_scope"], "case:7")
         self.assertIn(str(self.case_dir_7 / "测试入库12.gec"), self.client.opened_paths)
+        self.assertEqual(self.client.storage_host_cache_reset_count, 1)
         target_path = "检材A/微信/mzs(wxid_ykx86h8vvs7v12)/好友消息_张三.res.jsonl"
         self.assertIn(target_path, paths)
 
@@ -212,6 +217,7 @@ class HuoyanBackendTests(unittest.TestCase):
         )
         self.assertEqual(len(fetched["records"]), 2)
         self.assertEqual(fetched["records"][0]["line"]["Content"], "文本")
+        self.assertEqual(self.client.last_case_id, 1)
         self.assertEqual(self.client.last_fetch_params["cid"], 1)
         self.assertEqual(self.client.last_fetch_params["pid"], 4000000302)
         self.assertEqual(self.client.last_fetch_params["datatype"], "immsginfo")
@@ -238,6 +244,7 @@ class HuoyanBackendTests(unittest.TestCase):
         snapshot = refreshed["result"]["snapshot"]
         self.assertEqual(snapshot["active_scope"], "home")
         self.assertEqual(self.client.exited_case_ids, [1])
+        self.assertEqual(self.client.storage_host_cache_reset_count, 2)
 
     def test_switching_case_exits_previous_case_before_opening_next(self) -> None:
         self.backend.refresh_app_structure(
@@ -292,6 +299,24 @@ class HuoyanBackendTests(unittest.TestCase):
                 }
             )
             self.assertEqual(resolved, str(gec_path))
+
+    def test_case_open_path_joins_remote_location_and_name_without_local_probe(self) -> None:
+        resolved = self.backend._case_open_path(
+            {
+                "Location": r"D:\火眼案件\案件6",
+                "Name": "案件6",
+                "DisplayName": "案件6",
+                "CaseNumber": "CASE-6",
+            }
+        )
+        self.assertEqual(resolved, r"D:\火眼案件\案件6\案件6.gec")
+
+    def test_rewrite_loopback_storage_host_for_remote_huoyan(self) -> None:
+        rewritten = _rewrite_loopback_storage_host(
+            "http://127.0.0.1:51494",
+            "http://10.0.1.4:8999",
+        )
+        self.assertEqual(rewritten, "http://10.0.1.4:51494")
 
 
 if __name__ == "__main__":
