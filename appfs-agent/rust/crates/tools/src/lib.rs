@@ -28,6 +28,7 @@ use runtime::{
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
     RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
+    claw_config_home, user_home_dir,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3078,8 +3079,8 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
+    if let Some(home) = user_home_dir() {
+        push_home_skill_lookup_roots(&mut roots, &home);
     }
     if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
@@ -5058,11 +5059,9 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".claw"))
+    claw_config_home().ok_or_else(|| {
+        String::from("unable to resolve a claw config home; set CLAW_CONFIG_HOME, HOME, or USERPROFILE")
+    })
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
