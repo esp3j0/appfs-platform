@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::OAuthConfig;
+use crate::user_paths::claw_config_home;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokenSet {
@@ -324,12 +325,12 @@ fn generate_random_token(bytes: usize) -> io::Result<String> {
 }
 
 fn credentials_home_dir() -> io::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CLAW_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".claw"))
+    claw_config_home().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "unable to resolve a claw config home; set CLAW_CONFIG_HOME, HOME, or USERPROFILE",
+        )
+    })
 }
 
 fn read_credentials_root(path: &PathBuf) -> io::Result<Map<String, Value>> {

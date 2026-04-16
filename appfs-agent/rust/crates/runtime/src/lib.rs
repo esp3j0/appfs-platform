@@ -43,6 +43,7 @@ pub mod team_cron_registry;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
+mod user_paths;
 mod windows_shell;
 pub mod worker_boot;
 
@@ -171,6 +172,7 @@ pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, Tr
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
+pub use user_paths::{claw_config_home, user_home_dir};
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
