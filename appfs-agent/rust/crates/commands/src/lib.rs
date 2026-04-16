@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    ScopedMcpServerConfig, Session, user_home_dir,
 };
 use serde_json::{json, Value};
 
@@ -2603,8 +2603,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = user_home_dir() {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserClaw,
@@ -2700,8 +2699,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = user_home_dir() {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
@@ -2800,12 +2798,12 @@ fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
+    if let Some(home) = user_home_dir() {
+        return Ok(home.join(".claw").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
+        "unable to resolve a skills install root; set CLAW_CONFIG_HOME, HOME, or USERPROFILE",
     ))
 }
 
