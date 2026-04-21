@@ -112,9 +112,11 @@ dependencies = [
 name = "commands"
 version = "0.1.0"
 dependencies = [
+ "api",
  "plugins",
  "runtime",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

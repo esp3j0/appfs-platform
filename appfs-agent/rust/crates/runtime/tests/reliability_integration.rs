@@ -252,7 +252,7 @@ fn prompt_misdelivery_arms_replay_and_maps_to_recovery_recipe() {
     assert_eq!(ready.status, WorkerStatus::ReadyForPrompt);
 
     let running = registry
-        .send_prompt(&worker.worker_id, Some("Investigate flaky boot"))
+        .send_prompt(&worker.worker_id, Some("Investigate flaky boot"), None)
         .expect("prompt send should succeed");
     assert_eq!(running.status, WorkerStatus::Running);
 

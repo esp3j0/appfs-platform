@@ -35,7 +35,8 @@ pub fn user_home_dir() -> Option<PathBuf> {
 
 #[must_use]
 pub fn claw_config_home() -> Option<PathBuf> {
-    non_empty_env_path("CLAW_CONFIG_HOME").or_else(|| user_home_dir().map(|home| home.join(".claw")))
+    non_empty_env_path("CLAW_CONFIG_HOME")
+        .or_else(|| user_home_dir().map(|home| home.join(".claw")))
 }
 
 #[cfg(test)]
@@ -55,7 +56,10 @@ mod tests {
         std::env::remove_var("HOMEDRIVE");
         std::env::remove_var("HOMEPATH");
 
-        assert_eq!(user_home_dir(), Some(std::path::PathBuf::from("/tmp/test-home")));
+        assert_eq!(
+            user_home_dir(),
+            Some(std::path::PathBuf::from("/tmp/test-home"))
+        );
 
         match original_home {
             Some(value) => std::env::set_var("HOME", value),

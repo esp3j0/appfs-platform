@@ -224,6 +224,18 @@ const HOOKS_FIELDS: &[FieldSpec] = &[
         name: "PostToolUseFailure",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "PreCompact",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "PostCompact",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "SessionStart",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const PERMISSIONS_FIELDS: &[FieldSpec] = &[

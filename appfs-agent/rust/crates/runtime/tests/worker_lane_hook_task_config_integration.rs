@@ -105,7 +105,11 @@ fn lane_event_emission_serializes_worker_prompt_delivery_failure() {
         .observe(&worker.worker_id, "Ready for input\n>")
         .expect("ready observe should succeed");
     registry
-        .send_prompt(&worker.worker_id, Some("Run lane event emission test"))
+        .send_prompt(
+            &worker.worker_id,
+            Some("Run lane event emission test"),
+            None,
+        )
         .expect("prompt send should succeed");
 
     let failed = registry

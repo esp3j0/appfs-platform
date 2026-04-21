@@ -91,6 +91,9 @@ pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
     post_tool_use_failure: Vec<String>,
+    pre_compact: Vec<String>,
+    post_compact: Vec<String>,
+    session_start: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -596,7 +599,28 @@ impl RuntimeHookConfig {
             pre_tool_use,
             post_tool_use,
             post_tool_use_failure,
+            pre_compact: Vec::new(),
+            post_compact: Vec::new(),
+            session_start: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_pre_compact(mut self, pre_compact: Vec<String>) -> Self {
+        self.pre_compact = pre_compact;
+        self
+    }
+
+    #[must_use]
+    pub fn with_post_compact(mut self, post_compact: Vec<String>) -> Self {
+        self.post_compact = post_compact;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_start(mut self, session_start: Vec<String>) -> Self {
+        self.session_start = session_start;
+        self
     }
 
     #[must_use]
@@ -607,6 +631,21 @@ impl RuntimeHookConfig {
     #[must_use]
     pub fn post_tool_use(&self) -> &[String] {
         &self.post_tool_use
+    }
+
+    #[must_use]
+    pub fn pre_compact(&self) -> &[String] {
+        &self.pre_compact
+    }
+
+    #[must_use]
+    pub fn post_compact(&self) -> &[String] {
+        &self.post_compact
+    }
+
+    #[must_use]
+    pub fn session_start(&self) -> &[String] {
+        &self.session_start
     }
 
     #[must_use]
@@ -623,6 +662,9 @@ impl RuntimeHookConfig {
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
+        extend_unique(&mut self.pre_compact, other.pre_compact());
+        extend_unique(&mut self.post_compact, other.post_compact());
+        extend_unique(&mut self.session_start, other.session_start());
     }
 
     #[must_use]
@@ -830,12 +872,14 @@ fn parse_optional_hooks_config_object(
         return Ok(RuntimeHookConfig::default());
     };
     let hooks = expect_object(hooks_value, context)?;
-    Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default(),
-    })
+    Ok(RuntimeHookConfig::new(
+        optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
+        optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
+        optional_string_array(hooks, "PostToolUseFailure", context)?.unwrap_or_default(),
+    )
+    .with_pre_compact(optional_string_array(hooks, "PreCompact", context)?.unwrap_or_default())
+    .with_post_compact(optional_string_array(hooks, "PostCompact", context)?.unwrap_or_default())
+    .with_session_start(optional_string_array(hooks, "SessionStart", context)?.unwrap_or_default()))
 }
 
 fn validate_optional_hooks_config(
@@ -1355,7 +1399,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"],"PreCompact":["compact-base"],"SessionStart":["session-base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -1365,7 +1409,7 @@ mod tests {
         .expect("write project compat config");
         fs::write(
             cwd.join(".claw").join("settings.json"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"],"PostCompact":["project-post-compact"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -1414,6 +1458,15 @@ mod tests {
         assert_eq!(
             loaded.hooks().post_tool_use_failure(),
             &["project-failure".to_string()]
+        );
+        assert_eq!(loaded.hooks().pre_compact(), &["compact-base".to_string()]);
+        assert_eq!(
+            loaded.hooks().post_compact(),
+            &["project-post-compact".to_string()]
+        );
+        assert_eq!(
+            loaded.hooks().session_start(),
+            &["session-base".to_string()]
         );
         assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
         assert_eq!(
@@ -2017,6 +2070,28 @@ mod tests {
         assert_eq!(
             merged.post_tool_use_failure(),
             &["failure-a".to_string(), "failure-b".to_string()]
+        );
+        assert_eq!(merged.pre_compact(), &[] as &[String]);
+        assert_eq!(merged.post_compact(), &[] as &[String]);
+        assert_eq!(merged.session_start(), &[] as &[String]);
+
+        let merged_with_compact_hooks = merged.merged(
+            &RuntimeHookConfig::default()
+                .with_pre_compact(vec!["pre-compact-a".to_string()])
+                .with_post_compact(vec!["post-compact-a".to_string()])
+                .with_session_start(vec!["session-a".to_string()]),
+        );
+        assert_eq!(
+            merged_with_compact_hooks.pre_compact(),
+            &["pre-compact-a".to_string()]
+        );
+        assert_eq!(
+            merged_with_compact_hooks.post_compact(),
+            &["post-compact-a".to_string()]
+        );
+        assert_eq!(
+            merged_with_compact_hooks.session_start(),
+            &["session-a".to_string()]
         );
     }
 

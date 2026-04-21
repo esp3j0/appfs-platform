@@ -472,10 +472,7 @@ fn base_cache_root() -> PathBuf {
             .join("prompt-cache");
     }
     if let Some(home) = user_home_dir() {
-        return home
-            .join(".claude")
-            .join("cache")
-            .join("prompt-cache");
+        return home.join(".claude").join("cache").join("prompt-cache");
     }
     std::env::temp_dir().join("claude-prompt-cache")
 }

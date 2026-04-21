@@ -5,14 +5,19 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
+    select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
+    CompactionLayout, CompactionResult, PreservedSegmentAnchor,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{
+    AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, Session,
+};
+use crate::tool_session::with_tool_session_context;
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -22,6 +27,28 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Full compact uses a text-only request and must not expose tool schemas.
+    pub allow_tools: bool,
+}
+
+impl ApiRequest {
+    #[must_use]
+    pub fn conversation(system_prompt: Vec<String>, messages: Vec<ConversationMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            allow_tools: true,
+        }
+    }
+
+    #[must_use]
+    pub fn text_only(system_prompt: Vec<String>, messages: Vec<ConversationMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            allow_tools: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +309,30 @@ where
         }
     }
 
+    fn run_session_start_hook_messages(
+        &mut self,
+        source: &str,
+        model: Option<&str>,
+    ) -> Vec<ConversationMessage> {
+        let result = if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+            self.hook_runner.run_session_start_with_context(
+                source,
+                model,
+                Some(&self.hook_abort_signal),
+                Some(reporter.as_mut()),
+            )
+        } else {
+            self.hook_runner.run_session_start_with_context(
+                source,
+                model,
+                Some(&self.hook_abort_signal),
+                None,
+            )
+        };
+
+        session_start_hook_messages(source, &result)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -309,11 +360,13 @@ where
                 return Err(error);
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
-            };
-            let events = match self.api_client.stream(request) {
+            let request =
+                ApiRequest::conversation(self.system_prompt.clone(), self.session.messages.clone());
+            let events = match with_tool_session_context(
+                &self.session.session_id,
+                self.session.persistence_path(),
+                || self.api_client.stream(request),
+            ) {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
@@ -407,11 +460,14 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
+                        let (mut output, mut is_error) = with_tool_session_context(
+                            &self.session.session_id,
+                            self.session.persistence_path(),
+                            || match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
-                            };
+                            },
+                        );
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
@@ -474,9 +530,81 @@ where
         Ok(summary)
     }
 
-    #[must_use]
-    pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&self.session, config)
+    pub fn compact(&mut self, config: CompactionConfig) -> Result<CompactionResult, RuntimeError> {
+        if !should_compact(&self.session, config) {
+            return Ok(compact_session(&self.session, config));
+        }
+
+        self.run_full_compact(
+            true,
+            CompactTrigger::Manual,
+            config.preserve_recent_messages,
+        )
+    }
+
+    /// Runs a TS-style full compact summary turn and rewrites the session to a
+    /// boundary + summary layout with post-compact context messages.
+    fn run_full_compact(
+        &mut self,
+        suppress_follow_up_questions: bool,
+        trigger: CompactTrigger,
+        preserve_recent_messages: usize,
+    ) -> Result<CompactionResult, RuntimeError> {
+        let selection = select_full_compact_messages(&self.session, preserve_recent_messages);
+        let removed_message_count = selection.messages_to_summarize.len();
+        let pre_compact = self.hook_runner.run_pre_compact(trigger, None);
+        let summary = self.execute_full_compact_summary_request(
+            &selection.messages_to_summarize,
+            pre_compact.new_custom_instructions(),
+        )?;
+        let hook_result_messages = self.run_session_start_hook_messages("compact", None);
+        let post_compact = self.hook_runner.run_post_compact(trigger, &summary);
+        Ok(build_compaction_result(
+            &self.session,
+            summary,
+            BuildCompactionResultOptions {
+                preserved_messages: selection.preserved_messages,
+                hook_result_messages,
+                preserved_segment_anchor: if preserve_recent_messages == 0 {
+                    None
+                } else {
+                    Some(PreservedSegmentAnchor::LastSummaryMessage)
+                },
+                removed_message_count,
+                suppress_follow_up_questions,
+                layout: CompactionLayout::TsBoundaryAndSummary,
+                boundary_trigger: Some(trigger),
+                user_display_message: combine_optional_display_messages(&[
+                    pre_compact.user_display_message(),
+                    post_compact.user_display_message(),
+                ]),
+            },
+        ))
+    }
+
+    fn execute_full_compact_summary_request(
+        &mut self,
+        source_messages: &[ConversationMessage],
+        custom_instructions: Option<&str>,
+    ) -> Result<String, RuntimeError> {
+        let mut messages = source_messages.to_vec();
+        messages.push(ConversationMessage::user_text(get_compact_prompt(
+            custom_instructions,
+        )));
+        let request = ApiRequest::text_only(self.system_prompt.clone(), messages);
+        let events = with_tool_session_context(
+            &self.session.session_id,
+            self.session.persistence_path(),
+            || self.api_client.stream(request),
+        )?;
+        let (assistant_message, usage, _) = build_assistant_message(events)?;
+        if let Some(usage) = usage {
+            self.usage_tracker.record(usage);
+        }
+
+        assistant_text(&assistant_message).ok_or_else(|| {
+            RuntimeError::new("full compaction failed to produce a text summary response")
+        })
     }
 
     #[must_use]
@@ -515,13 +643,7 @@ where
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        );
+        let result = self.run_full_compact(true, CompactTrigger::Auto, 0).ok()?;
 
         if result.removed_message_count == 0 {
             return None;
@@ -707,6 +829,21 @@ fn build_assistant_message(
     ))
 }
 
+fn assistant_text(message: &ConversationMessage) -> Option<String> {
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    (!text.is_empty()).then_some(text)
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -739,6 +876,32 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     };
     sections.push(format!("{label}:\n{}", messages.join("\n")));
     sections.join("\n\n")
+}
+
+fn combine_optional_display_messages(messages: &[Option<&str>]) -> Option<String> {
+    let combined = messages
+        .iter()
+        .flatten()
+        .map(|message| message.trim())
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!combined.is_empty()).then_some(combined)
+}
+
+fn session_start_hook_messages(source: &str, result: &HookRunResult) -> Vec<ConversationMessage> {
+    result
+        .messages()
+        .iter()
+        .map(|message| {
+            ConversationMessage::hook_result_user_text(
+                format!("SessionStart hook ({source}) output:\n{}", message.trim()),
+                Some(AttachmentKind::HookAdditionalContext),
+                HookResultEvent::SessionStart,
+                source,
+            )
+        })
+        .collect()
 }
 
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
@@ -787,15 +950,19 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{
+        AttachmentKind, CompactTrigger, ContentBlock, HookResultEvent, MessageRole, Session,
+    };
     use crate::usage::TokenUsage;
     use crate::ToolError;
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows};
+    use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
     #[cfg(windows)]
     use std::process::Command;
+    use std::rc::Rc;
     use std::sync::Arc;
     #[cfg(windows)]
     use std::sync::OnceLock;
@@ -1341,22 +1508,37 @@ mod tests {
 
     #[test]
     fn compacts_session_after_turns() {
-        struct SimpleApi;
+        #[derive(Clone)]
+        struct SimpleApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         }
 
+        let requests = Rc::new(RefCell::new(Vec::new()));
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            SimpleApi,
+            SimpleApi {
+                requests: requests.clone(),
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -1365,20 +1547,221 @@ mod tests {
         runtime.run_turn("b", None).expect("turn b");
         runtime.run_turn("c", None).expect("turn c");
 
-        let result = runtime.compact(CompactionConfig {
-            preserve_recent_messages: 2,
-            max_estimated_tokens: 1,
-        });
-        assert!(result.summary.contains("Conversation summary"));
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+        assert!(result.summary.contains("Compacted from model"));
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
         );
+        assert_eq!(result.compacted_session.messages.len(), 4);
+        assert_eq!(result.compacted_session.messages[1].role, MessageRole::User);
+        assert_eq!(result.compacted_session.messages[2].role, MessageRole::User);
+        assert_eq!(
+            result.compacted_session.messages[3].role,
+            MessageRole::Assistant
+        );
+        let summary_uuid = result.compacted_session.messages[1].uuid.clone();
+        assert!(matches!(
+            result.compacted_session.messages[0].compact_metadata.as_ref(),
+            Some(metadata)
+                if metadata.trigger == CompactTrigger::Manual
+                    && metadata
+                        .preserved_segment
+                        .as_ref()
+                        .is_some_and(|segment| segment.anchor == summary_uuid)
+        ));
         assert_eq!(
             result.compacted_session.session_id,
             runtime.session().session_id
         );
         assert!(result.compacted_session.compaction.is_some());
+
+        let requests = requests.borrow();
+        let compact_request = requests.last().expect("compact request should exist");
+        assert!(!compact_request.allow_tools);
+        let compact_prompt = compact_request
+            .messages
+            .last()
+            .and_then(|message| message.blocks.first())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .expect("compact request should end with a text prompt");
+        assert!(compact_prompt.contains("Your task is to create a detailed summary"));
+        assert_eq!(compact_request.messages.len(), 5);
+        assert!(matches!(
+            &compact_request.messages[0].blocks[0],
+            ContentBlock::Text { text } if text == "a"
+        ));
+        assert!(matches!(
+            &compact_request.messages[2].blocks[0],
+            ContentBlock::Text { text } if text == "b"
+        ));
+        assert!(
+            compact_request.messages.iter().all(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::Text { text } if text == "c"))
+            }),
+            "preserved tail should be excluded from the summary request"
+        );
+    }
+
+    #[test]
+    fn compact_appends_session_start_hook_messages_after_summary() {
+        #[derive(Clone)]
+        struct SimpleApi;
+
+        impl ApiClient for SimpleApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_hooks(
+            RuntimeHookConfig::default()
+                .with_session_start(vec!["printf 'hook says keep compact context'".to_string()]),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+        runtime.run_turn("a", None).expect("turn a");
+        runtime.run_turn("b", None).expect("turn b");
+
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+
+        assert_eq!(result.compacted_session.messages.len(), 4);
+        assert_eq!(
+            result.compacted_session.messages[2].role,
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            result.compacted_session.messages[3]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::HookAdditionalContext)
+        );
+        let hook_metadata = result.compacted_session.messages[3]
+            .hook_result_metadata
+            .as_ref()
+            .expect("hook result metadata");
+        assert_eq!(hook_metadata.event, HookResultEvent::SessionStart);
+        assert_eq!(hook_metadata.source, "compact");
+        assert!(matches!(
+            &result.compacted_session.messages[3].blocks[0],
+            ContentBlock::Text { text }
+                if text.contains("SessionStart hook (compact) output:")
+                    && text.contains("hook says keep compact context")
+        ));
+    }
+
+    #[test]
+    fn compact_applies_pre_and_post_compact_hooks() {
+        #[derive(Clone)]
+        struct RecordingApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let feature_config = RuntimeFeatureConfig::default().with_hooks(
+            RuntimeHookConfig::default()
+                .with_pre_compact(vec![shell_snippet("printf 'preserve failing test output'")])
+                .with_post_compact(vec![shell_snippet("printf 'post compact note'")]),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            RecordingApi {
+                requests: requests.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+        runtime.run_turn("a", None).expect("turn a");
+        runtime.run_turn("b", None).expect("turn b");
+
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 0,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+
+        let requests = requests.borrow();
+        let compact_request = requests.last().expect("compact request should exist");
+        let compact_prompt = compact_request
+            .messages
+            .last()
+            .and_then(|message| message.blocks.first())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .expect("compact request should end with a text prompt");
+        assert!(compact_prompt.contains("Additional Instructions:"));
+        assert!(compact_prompt.contains("preserve failing test output"));
+        assert_eq!(
+            result.user_display_message.as_deref(),
+            Some(
+                "PreCompact [printf 'preserve failing test output'] completed successfully: preserve failing test output\nPostCompact [printf 'post compact note'] completed successfully: post compact note"
+            )
+        );
     }
 
     #[test]
@@ -1489,25 +1872,38 @@ mod tests {
 
     #[test]
     fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
-        struct SimpleApi;
+        #[derive(Clone)]
+        struct SimpleApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 120_000,
-                        output_tokens: 4,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    }),
-                    AssistantEvent::MessageStop,
-                ])
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 120_000,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Auto compacted</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         }
 
+        let requests = Rc::new(RefCell::new(Vec::new()));
         let mut session = Session::new();
         session.messages = vec![
             crate::session::ConversationMessage::user_text("one"),
@@ -1522,7 +1918,9 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             session,
-            SimpleApi,
+            SimpleApi {
+                requests: requests.clone(),
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -1536,10 +1934,24 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
+                removed_message_count: 6,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.session().messages[1].role, MessageRole::User);
+        assert!(matches!(
+            runtime.session().messages[0].compact_metadata.as_ref(),
+            Some(metadata) if metadata.trigger == CompactTrigger::Auto
+        ));
+        let requests = requests.borrow();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected turn request and compact request"
+        );
+        assert!(requests[0].allow_tools);
+        assert!(!requests[1].allow_tools);
     }
 
     #[test]
