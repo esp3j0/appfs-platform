@@ -148,7 +148,7 @@ impl SessionStore {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
-            let (id, message_count, parent_session_id, branch_name) =
+            let (id, updated_at_ms, message_count, parent_session_id, branch_name) =
                 match Session::load_from_path(&path) {
                     Ok(session) => {
                         let parent_session_id = session
@@ -161,6 +161,7 @@ impl SessionStore {
                             .and_then(|fork| fork.branch_name.clone());
                         (
                             session.session_id,
+                            session.updated_at_ms,
                             session.messages.len(),
                             parent_session_id,
                             branch_name,
@@ -172,6 +173,7 @@ impl SessionStore {
                             .unwrap_or("unknown")
                             .to_string(),
                         0,
+                        0,
                         None,
                         None,
                     ),
@@ -179,18 +181,14 @@ impl SessionStore {
             sessions.push(ManagedSessionSummary {
                 id,
                 path,
+                updated_at_ms,
                 modified_epoch_millis,
                 message_count,
                 parent_session_id,
                 branch_name,
             });
         }
-        sessions.sort_by(|left, right| {
-            right
-                .modified_epoch_millis
-                .cmp(&left.modified_epoch_millis)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        sort_managed_sessions(&mut sessions);
         Ok(sessions)
     }
 
@@ -270,10 +268,21 @@ pub struct SessionHandle {
 pub struct ManagedSessionSummary {
     pub id: String,
     pub path: PathBuf,
+    pub updated_at_ms: u64,
     pub modified_epoch_millis: u128,
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub branch_name: Option<String>,
+}
+
+fn sort_managed_sessions(sessions: &mut [ManagedSessionSummary]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.modified_epoch_millis.cmp(&left.modified_epoch_millis))
+            .then_with(|| right.id.cmp(&left.id))
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,7 +448,7 @@ pub fn list_managed_sessions_for(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, updated_at_ms, message_count, parent_session_id, branch_name) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -452,6 +461,7 @@ pub fn list_managed_sessions_for(
                         .and_then(|fork| fork.branch_name.clone());
                     (
                         session.session_id,
+                        session.updated_at_ms,
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
@@ -463,6 +473,7 @@ pub fn list_managed_sessions_for(
                         .unwrap_or("unknown")
                         .to_string(),
                     0,
+                    0,
                     None,
                     None,
                 ),
@@ -470,18 +481,14 @@ pub fn list_managed_sessions_for(
         sessions.push(ManagedSessionSummary {
             id,
             path,
+            updated_at_ms,
             modified_epoch_millis,
             message_count,
             parent_session_id,
             branch_name,
         });
     }
-    sessions.sort_by(|left, right| {
-        right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+    sort_managed_sessions(&mut sessions);
     Ok(sessions)
 }
 
@@ -630,6 +637,35 @@ mod tests {
             .iter()
             .find(|summary| summary.id == id)
             .expect("session summary should exist")
+    }
+
+    #[test]
+    fn latest_session_prefers_semantic_updated_at_over_file_mtime() {
+        let mut sessions = vec![
+            ManagedSessionSummary {
+                id: "older-file-newer-session".to_string(),
+                path: PathBuf::from("/tmp/older"),
+                updated_at_ms: 200,
+                modified_epoch_millis: 100,
+                message_count: 2,
+                parent_session_id: None,
+                branch_name: None,
+            },
+            ManagedSessionSummary {
+                id: "newer-file-older-session".to_string(),
+                path: PathBuf::from("/tmp/newer"),
+                updated_at_ms: 100,
+                modified_epoch_millis: 200,
+                message_count: 1,
+                parent_session_id: None,
+                branch_name: None,
+            },
+        ];
+
+        crate::session_control::sort_managed_sessions(&mut sessions);
+
+        assert_eq!(sessions[0].id, "older-file-newer-session");
+        assert_eq!(sessions[1].id, "newer-file-older-session");
     }
 
     #[test]

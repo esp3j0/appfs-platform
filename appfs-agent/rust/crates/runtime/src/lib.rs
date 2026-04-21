@@ -40,6 +40,8 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+mod tool_output;
+mod tool_session;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
@@ -53,7 +55,11 @@ pub use appfs::{
     AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED,
     APPFS_RUNTIME_MANIFEST_REL_PATH,
 };
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, prepare_background_shell_output, prepare_shell_command_output,
+    shell_task_output_path, BackgroundShellOutputCapture, BashCommandInput, BashCommandOutput,
+    PreparedShellCommandOutput,
+};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
@@ -81,9 +87,9 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    edit_file, glob_search, grep_search, read_file, resolve_tool_path,
+    resolve_tool_path_allow_missing, write_file, EditFileOutput, GlobSearchOutput, GrepSearchInput,
+    GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -154,8 +160,10 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    AttachmentKind, AttachmentMetadata, CompactBoundaryMetadata, CompactPreservedSegment,
+    CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, HookResultMetadata,
+    MessageRole, Session, SessionCompaction, SessionError, SessionFork, SessionPromptEntry,
+    SystemMessageSubtype,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -167,6 +175,7 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
@@ -176,7 +185,8 @@ pub use user_paths::{claw_config_home, user_home_dir};
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTaskReceipt,
+    WorkerTrustResolution,
 };
 
 #[cfg(windows)]

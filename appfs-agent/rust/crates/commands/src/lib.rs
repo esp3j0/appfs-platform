@@ -5,10 +5,19 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use plugins::{PluginError, PluginManager, PluginSummary};
+use api::{
+    max_tokens_for_model, resolve_model_alias, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    ProviderOverride, ToolResultContentBlock,
+};
+use plugins::{
+    PluginError, PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry, PluginSummary,
+};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session, user_home_dir,
+    load_system_prompt, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ConversationMessage, ConversationRuntime, McpOAuthConfig, McpServerConfig, MessageRole,
+    PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig, Session, StaticToolExecutor,
 };
 use serde_json::{json, Value};
 
@@ -56,6 +65,9 @@ pub enum SkillSlashDispatch {
     Local,
     Invoke(String),
 }
+
+const DEFAULT_DATE: &str = "2026-03-31";
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
@@ -2603,7 +2615,8 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Some(home) = user_home_dir() {
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
         push_unique_root(
             &mut roots,
             DefinitionSource::UserClaw,
@@ -2699,7 +2712,8 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Some(home) = user_home_dir() {
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
@@ -2798,12 +2812,12 @@ fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
-    if let Some(home) = user_home_dir() {
-        return Ok(home.join(".claw").join("skills"));
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".claw").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME, HOME, or USERPROFILE",
+        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
     ))
 }
 
@@ -3783,12 +3797,295 @@ fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
         "details": mcp_server_details_json(&server.config),
     })
 }
-#[must_use]
-pub fn handle_slash_command(
+
+struct InitializedPluginRegistry {
+    registry: PluginRegistry,
+}
+
+impl InitializedPluginRegistry {
+    fn new(registry: PluginRegistry) -> Result<Self, String> {
+        registry.initialize().map_err(|error| error.to_string())?;
+        Ok(Self { registry })
+    }
+
+    fn aggregated_hooks(&self) -> Result<PluginHooks, String> {
+        self.registry
+            .aggregated_hooks()
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for InitializedPluginRegistry {
+    fn drop(&mut self) {
+        let _ = self.registry.shutdown();
+    }
+}
+
+struct CompactApiClient {
+    runtime: tokio::runtime::Runtime,
+    client: ProviderClient,
+    model: String,
+}
+
+impl CompactApiClient {
+    fn new(client: ProviderClient, model: String) -> Result<Self, String> {
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+            client,
+            model,
+        })
+    }
+}
+
+impl runtime::ApiClient for CompactApiClient {
+    fn stream(
+        &mut self,
+        request: runtime::ApiRequest,
+    ) -> Result<Vec<AssistantEvent>, runtime::RuntimeError> {
+        let message_request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: max_tokens_for_model(&self.model),
+            messages: convert_compact_messages(&request.messages),
+            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
+            stream: false,
+            ..Default::default()
+        };
+        let response = self
+            .runtime
+            .block_on(self.client.send_message(&message_request))
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        Ok(message_response_to_assistant_events(response))
+    }
+}
+
+fn message_response_to_assistant_events(response: MessageResponse) -> Vec<AssistantEvent> {
+    let mut events = Vec::new();
+    for block in response.content {
+        match block {
+            OutputContentBlock::Text { text } => events.push(AssistantEvent::TextDelta(text)),
+            OutputContentBlock::ToolUse { id, name, input } => {
+                events.push(AssistantEvent::ToolUse {
+                    id,
+                    name,
+                    input: serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
+                });
+            }
+            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+    let usage = response.usage.token_usage();
+    if usage.total_tokens() > 0 {
+        events.push(AssistantEvent::Usage(usage));
+    }
+    events.push(AssistantEvent::MessageStop);
+    events
+}
+
+fn convert_compact_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role {
+                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+                MessageRole::Assistant => "assistant",
+            };
+            let content = message
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    runtime::ContentBlock::Text { text } => {
+                        InputContentBlock::Text { text: text.clone() }
+                    }
+                    runtime::ContentBlock::ToolUse { id, name, input } => {
+                        InputContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: serde_json::from_str(input)
+                                .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                        }
+                    }
+                    runtime::ContentBlock::ToolResult {
+                        tool_use_id,
+                        output,
+                        is_error,
+                        ..
+                    } => InputContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: output.clone(),
+                        }],
+                        is_error: *is_error,
+                    },
+                })
+                .collect::<Vec<_>>();
+            (!content.is_empty()).then(|| InputMessage {
+                role: role.to_string(),
+                content,
+            })
+        })
+        .collect()
+}
+
+fn resolve_compact_model(config: &RuntimeConfig) -> String {
+    let configured_model = env::var("ANTHROPIC_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.model().map(ToOwned::to_owned))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let aliased = config
+        .aliases()
+        .get(configured_model.trim())
+        .cloned()
+        .unwrap_or(configured_model);
+    resolve_model_alias(&aliased).clone()
+}
+
+fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
+    ProviderOverride {
+        provider: match config.provider() {
+            RuntimeProviderKind::Anthropic => ProviderKind::Anthropic,
+            RuntimeProviderKind::OpenAi => ProviderKind::OpenAi,
+            RuntimeProviderKind::Xai => ProviderKind::Xai,
+        },
+        base_url: config.base_url().map(ToOwned::to_owned),
+        api_key_env: config.api_key_env().map(ToOwned::to_owned),
+        auth_token_env: config.auth_token_env().map(ToOwned::to_owned),
+    }
+}
+
+fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> RuntimeHookConfig {
+    RuntimeHookConfig::new(
+        hooks.pre_tool_use,
+        hooks.post_tool_use,
+        hooks.post_tool_use_failure,
+    )
+    .with_pre_compact(hooks.pre_compact)
+    .with_post_compact(hooks.post_compact)
+    .with_session_start(hooks.session_start)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
+}
+
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn build_full_compact_feature_config(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> Result<(RuntimeFeatureConfig, InitializedPluginRegistry), String> {
+    let plugin_registry = InitializedPluginRegistry::new(
+        build_plugin_manager(cwd, loader, runtime_config)
+            .plugin_registry()
+            .map_err(|error| error.to_string())?,
+    )?;
+    let plugin_hook_config =
+        runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
+    let feature_config = runtime_config
+        .feature_config()
+        .clone()
+        .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
+    Ok((feature_config, plugin_registry))
+}
+
+fn run_full_compact(
+    session: &Session,
+    compaction: CompactionConfig,
+) -> Result<runtime::CompactionResult, String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let system_prompt = load_system_prompt(cwd.clone(), DEFAULT_DATE, env::consts::OS, "unknown")
+        .map_err(|error| error.to_string())?;
+    let model = resolve_compact_model(&runtime_config);
+    let provider_override = runtime_config
+        .provider()
+        .map(provider_override_from_runtime_config);
+    let client =
+        ProviderClient::from_model_with_provider_override(&model, provider_override.as_ref())
+            .map_err(|error| error.to_string())?
+            .with_prompt_cache(PromptCache::new(&session.session_id));
+    let compact_client = CompactApiClient::new(client, model)?;
+    let (feature_config, _plugin_registry) =
+        build_full_compact_feature_config(&cwd, &loader, &runtime_config)?;
+    let mut runtime = ConversationRuntime::new_with_features(
+        session.clone(),
+        compact_client,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        system_prompt,
+        &feature_config,
+    );
+    runtime
+        .compact(compaction)
+        .map_err(|error| error.to_string())
+}
+
+fn format_compact_result_message(
+    result: &runtime::CompactionResult,
+    fallback_label: &str,
+) -> String {
+    let mut message = if result.removed_message_count == 0 {
+        "Compaction skipped: session is below the compaction threshold.".to_string()
+    } else {
+        format!(
+            "{fallback_label} {} messages.",
+            result.removed_message_count
+        )
+    };
+    if let Some(display) = result
+        .user_display_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|display| !display.is_empty())
+    {
+        message.push('\n');
+        message.push_str(display);
+    }
+    message
+}
+
+pub fn handle_slash_command_with_compactor<F>(
     input: &str,
     session: &Session,
     compaction: CompactionConfig,
-) -> Option<SlashCommandResult> {
+    compact_with_runtime: &mut F,
+) -> Option<SlashCommandResult>
+where
+    F: FnMut(&Session, CompactionConfig) -> Result<runtime::CompactionResult, String>,
+{
     let command = match SlashCommand::parse(input) {
         Ok(Some(command)) => command,
         Ok(None) => return None,
@@ -3801,21 +4098,19 @@ pub fn handle_slash_command(
     };
 
     match command {
-        SlashCommand::Compact => {
-            let result = compact_session(session, compaction);
-            let message = if result.removed_message_count == 0 {
-                "Compaction skipped: session is below the compaction threshold.".to_string()
-            } else {
-                format!(
-                    "Compacted {} messages into a resumable system summary.",
-                    result.removed_message_count
-                )
-            };
-            Some(SlashCommandResult {
-                message,
+        SlashCommand::Compact => match compact_with_runtime(session, compaction) {
+            Ok(result) => Some(SlashCommandResult {
+                message: format_compact_result_message(
+                    &result,
+                    "Compacted session with full compact summary for",
+                ),
                 session: result.compacted_session,
-            })
-        }
+            }),
+            Err(error) => Some(SlashCommandResult {
+                message: format!("Compaction failed: {error}"),
+                session: session.clone(),
+            }),
+        },
         SlashCommand::Help => Some(SlashCommandResult {
             message: render_slash_command_help(),
             session: session.clone(),
@@ -3890,21 +4185,31 @@ pub fn handle_slash_command(
     }
 }
 
+#[must_use]
+pub fn handle_slash_command(
+    input: &str,
+    session: &Session,
+    compaction: CompactionConfig,
+) -> Option<SlashCommandResult> {
+    handle_slash_command_with_compactor(input, session, compaction, &mut run_full_compact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
-        resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand,
+        handle_slash_command_with_compactor, load_agents_from_roots, load_skills_from_roots,
+        render_agents_report, render_agents_report_json, render_mcp_report_json_for,
+        render_plugins_report, render_skills_report, render_slash_command_help,
+        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
+        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
+        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
-        CompactionConfig, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, Session,
+        CompactBoundaryMetadata, CompactTrigger, CompactionConfig, CompactionResult, ConfigLoader,
+        ContentBlock, ConversationMessage, MessageRole, Session,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4668,17 +4973,47 @@ mod tests {
             }]),
         ];
 
-        let result = handle_slash_command(
+        let mut compacted_session = session.clone();
+        compacted_session.messages = vec![
+            ConversationMessage::compact_boundary(CompactBoundaryMetadata {
+                trigger: CompactTrigger::Manual,
+                pre_tokens: 321,
+                user_context: None,
+                messages_summarized: Some(2),
+                pre_compact_discovered_tools: vec!["bash".to_string()],
+                preserved_segment: None,
+            }),
+            ConversationMessage::compact_summary_user_text(
+                "This session is being continued from a previous conversation.\nSummary:\nCarry over context.",
+                true,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent".to_string(),
+            }]),
+        ];
+
+        let result = handle_slash_command_with_compactor(
             "/compact",
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
             },
+            &mut |input_session, _compaction| {
+                assert_eq!(input_session.messages.len(), 4);
+                Ok(CompactionResult {
+                    summary: "Carry over context.".to_string(),
+                    formatted_summary: "formatted".to_string(),
+                    compacted_session: compacted_session.clone(),
+                    removed_message_count: 2,
+                    user_display_message: Some("post compact note".to_string()),
+                })
+            },
         )
         .expect("slash command should be handled");
 
-        assert!(result.message.contains("Compacted 2 messages"));
+        assert!(result.message.contains("full compact summary"));
+        assert!(result.message.contains("post compact note"));
         assert_eq!(result.session.messages[0].role, MessageRole::System);
     }
 

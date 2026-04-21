@@ -1,7 +1,10 @@
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
@@ -12,9 +15,14 @@ use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
+use crate::tool_output::{task_outputs_dir, tool_results_dir};
 #[cfg(windows)]
 use crate::windows_path_to_posix_path;
 use crate::{bash_shell_path, ConfigLoader};
+
+static SHELL_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_PERSISTED_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const SHELL_TASK_ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
@@ -39,31 +47,109 @@ pub struct BashCommandInput {
 pub struct BashCommandOutput {
     pub stdout: String,
     pub stderr: String,
-    #[serde(rename = "rawOutputPath")]
+    #[serde(rename = "rawOutputPath", skip_serializing_if = "Option::is_none")]
     pub raw_output_path: Option<String>,
     pub interrupted: bool,
-    #[serde(rename = "isImage")]
+    #[serde(rename = "isImage", skip_serializing_if = "Option::is_none")]
     pub is_image: Option<bool>,
-    #[serde(rename = "backgroundTaskId")]
+    #[serde(rename = "backgroundTaskId", skip_serializing_if = "Option::is_none")]
     pub background_task_id: Option<String>,
-    #[serde(rename = "backgroundedByUser")]
+    #[serde(rename = "backgroundedByUser", skip_serializing_if = "Option::is_none")]
     pub backgrounded_by_user: Option<bool>,
-    #[serde(rename = "assistantAutoBackgrounded")]
+    #[serde(
+        rename = "assistantAutoBackgrounded",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub assistant_auto_backgrounded: Option<bool>,
-    #[serde(rename = "dangerouslyDisableSandbox")]
+    #[serde(
+        rename = "dangerouslyDisableSandbox",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub dangerously_disable_sandbox: Option<bool>,
-    #[serde(rename = "returnCodeInterpretation")]
+    #[serde(
+        rename = "returnCodeInterpretation",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub return_code_interpretation: Option<String>,
-    #[serde(rename = "noOutputExpected")]
+    #[serde(rename = "noOutputExpected", skip_serializing_if = "Option::is_none")]
     pub no_output_expected: Option<bool>,
-    #[serde(rename = "structuredContent")]
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Vec<serde_json::Value>>,
-    #[serde(rename = "persistedOutputPath")]
+    #[serde(
+        rename = "persistedOutputPath",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub persisted_output_path: Option<String>,
-    #[serde(rename = "persistedOutputSize")]
+    #[serde(
+        rename = "persistedOutputSize",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub persisted_output_size: Option<u64>,
-    #[serde(rename = "sandboxStatus")]
+    #[serde(rename = "sandboxStatus", skip_serializing_if = "Option::is_none")]
     pub sandbox_status: Option<SandboxStatus>,
+}
+
+#[derive(Debug)]
+pub struct BackgroundShellOutputCapture {
+    pub task_id: String,
+    pub output_path: String,
+    pub stdout: Stdio,
+    pub stderr: Stdio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedShellCommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub persisted_output_path: Option<String>,
+    pub persisted_output_size: Option<u64>,
+    pub no_output_expected: bool,
+}
+
+pub fn prepare_background_shell_output(
+    cwd: &Path,
+    _tool_name: &str,
+) -> io::Result<BackgroundShellOutputCapture> {
+    let task_id = next_shell_task_id();
+    let output_path = shell_task_output_path(cwd, &task_id);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&output_path)?;
+    let stderr = stdout.try_clone()?;
+    Ok(BackgroundShellOutputCapture {
+        task_id,
+        output_path: output_path.to_string_lossy().into_owned(),
+        stdout: Stdio::from(stdout),
+        stderr: Stdio::from(stderr),
+    })
+}
+
+#[must_use]
+pub fn prepare_shell_command_output(
+    cwd: &Path,
+    _tool_name: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> PreparedShellCommandOutput {
+    let raw_stdout = String::from_utf8_lossy(stdout).into_owned();
+    let raw_stderr = String::from_utf8_lossy(stderr).into_owned();
+    let persisted = if stdout.len() > MAX_OUTPUT_BYTES {
+        persist_stdout_for_model(cwd, stdout).ok()
+    } else {
+        None
+    };
+
+    PreparedShellCommandOutput {
+        stdout: preview_output(&raw_stdout, MAX_OUTPUT_BYTES),
+        stderr: truncate_output(&raw_stderr),
+        persisted_output_path: persisted.as_ref().map(|value| value.path.clone()),
+        persisted_output_size: persisted.map(|value| value.original_size),
+        no_output_expected: raw_stdout.trim().is_empty() && raw_stderr.trim().is_empty(),
+    }
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
@@ -71,22 +157,23 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
+        let background_output = prepare_background_shell_output(&cwd, "bash")?;
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
-        let child = child
+        child
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(background_output.stdout)
+            .stderr(background_output.stderr)
             .spawn()?;
 
         return Ok(BashCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
-            raw_output_path: None,
+            raw_output_path: Some(background_output.output_path),
             interrupted: false,
             is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(false),
-            assistant_auto_backgrounded: Some(false),
+            background_task_id: Some(background_output.task_id),
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
             dangerously_disable_sandbox: input.dangerously_disable_sandbox,
             return_code_interpretation: None,
             no_output_expected: Some(true),
@@ -123,7 +210,7 @@ async fn execute_bash_async(
                     assistant_auto_backgrounded: None,
                     dangerously_disable_sandbox: input.dangerously_disable_sandbox,
                     return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
+                    no_output_expected: Some(false),
                     structured_content: None,
                     persisted_output_path: None,
                     persisted_output_size: None,
@@ -136,9 +223,8 @@ async fn execute_bash_async(
     };
 
     let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
+    let prepared_output =
+        prepare_shell_command_output(&cwd, "bash", &output.stdout, &output.stderr);
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
             None
@@ -148,8 +234,8 @@ async fn execute_bash_async(
     });
 
     Ok(BashCommandOutput {
-        stdout,
-        stderr,
+        stdout: prepared_output.stdout,
+        stderr: prepared_output.stderr,
         raw_output_path: None,
         interrupted,
         is_image: None,
@@ -158,12 +244,70 @@ async fn execute_bash_async(
         assistant_auto_backgrounded: None,
         dangerously_disable_sandbox: input.dangerously_disable_sandbox,
         return_code_interpretation,
-        no_output_expected,
+        no_output_expected: Some(prepared_output.no_output_expected),
         structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
+        persisted_output_path: prepared_output.persisted_output_path,
+        persisted_output_size: prepared_output.persisted_output_size,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+fn persist_stdout_for_model(cwd: &Path, stdout: &[u8]) -> io::Result<PersistedShellOutput> {
+    let path = tool_results_dir(cwd).join(format!("{}.txt", next_shell_task_id()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes_to_write = stdout
+        .len()
+        .min(usize::try_from(MAX_PERSISTED_OUTPUT_BYTES).expect("persisted output cap fits usize"));
+    fs::write(&path, &stdout[..bytes_to_write])?;
+    Ok(PersistedShellOutput {
+        path: path.to_string_lossy().into_owned(),
+        original_size: u64::try_from(stdout.len()).expect("stdout length fits u64"),
+    })
+}
+
+#[must_use]
+pub fn shell_task_output_path(cwd: &Path, task_id: &str) -> PathBuf {
+    task_outputs_dir(cwd).join(format!("{task_id}.output"))
+}
+
+fn next_shell_task_id() -> String {
+    let counter = SHELL_OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let time_seed = duration.as_secs().rotate_left(32) ^ u64::from(duration.subsec_nanos());
+    let mut value = time_seed ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let alphabet_len =
+        u64::try_from(SHELL_TASK_ID_ALPHABET.len()).expect("alphabet length fits into u64");
+    let mut suffix = [b'0'; 8];
+
+    for ch in suffix.iter_mut().rev() {
+        let idx = usize::try_from(value % alphabet_len).expect("task id index fits into usize");
+        *ch = SHELL_TASK_ID_ALPHABET[idx];
+        value /= alphabet_len;
+    }
+
+    let suffix = std::str::from_utf8(&suffix).expect("task id alphabet is ASCII");
+    format!("b{suffix}")
+}
+
+struct PersistedShellOutput {
+    path: String,
+    original_size: u64,
+}
+
+fn preview_output(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -291,13 +435,20 @@ impl BashEnvCommand for TokioCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::{
+        execute_bash, prepare_background_shell_output, prepare_shell_command_output,
+        BashCommandInput, MAX_OUTPUT_BYTES,
+    };
+    use crate::tool_session::with_tool_session_context;
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows, test_env_lock};
+    use std::fs;
+    use std::path::PathBuf;
     #[cfg(windows)]
     use std::process::Command;
     #[cfg(windows)]
     use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(windows)]
     fn windows_bash_smoke_ok() -> bool {
@@ -325,6 +476,14 @@ mod tests {
     }
 
     const TEST_TIMEOUT_MS: u64 = 5_000;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawd-runtime-bash-{unique}-{name}"))
+    }
 
     #[test]
     fn executes_simple_command() {
@@ -396,6 +555,131 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn prepare_shell_command_output_persists_large_stdout() {
+        let cwd = temp_path("persisted-output");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        let stdout = vec![b'x'; MAX_OUTPUT_BYTES + 128];
+
+        let prepared = prepare_shell_command_output(&cwd, "bash", &stdout, b"");
+
+        let persisted_path = prepared
+            .persisted_output_path
+            .as_ref()
+            .expect("persisted output path");
+        let persisted_bytes = fs::read(persisted_path).expect("read persisted output");
+        assert_eq!(persisted_bytes, stdout);
+        assert_eq!(
+            prepared.persisted_output_size,
+            Some(u64::try_from(MAX_OUTPUT_BYTES + 128).expect("size fits u64"))
+        );
+        assert_eq!(prepared.stdout, "x".repeat(MAX_OUTPUT_BYTES));
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn prepare_background_shell_output_creates_output_file() {
+        let cwd = temp_path("background-output");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let prepared =
+            prepare_background_shell_output(&cwd, "bash").expect("prepare background output");
+        let output_path = PathBuf::from(&prepared.output_path);
+
+        assert!(output_path.exists(), "expected {output_path:?} to exist");
+        assert!(prepared.task_id.starts_with('b'));
+        assert_eq!(prepared.task_id.len(), 9);
+
+        drop(prepared);
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn prepare_background_shell_output_uses_session_isolated_directory_when_context_exists() {
+        let cwd = temp_path("session-background-output");
+        let session_path = cwd
+            .join(".claw")
+            .join("sessions")
+            .join("workspace-hash")
+            .join("session-123.jsonl");
+        fs::create_dir_all(
+            session_path
+                .parent()
+                .expect("session path should have a parent"),
+        )
+        .expect("create session dir");
+
+        let output_path = with_tool_session_context("session-123", Some(&session_path), || {
+            prepare_background_shell_output(&cwd, "bash")
+                .expect("prepare background output")
+                .output_path
+        });
+
+        let output_path = PathBuf::from(output_path);
+        assert!(
+            output_path.starts_with(
+                cwd.join(".claw")
+                    .join("sessions")
+                    .join("workspace-hash")
+                    .join("session-123")
+                    .join("tasks")
+            ),
+            "expected {output_path:?} to be under the session-specific tasks directory"
+        );
+        assert_eq!(
+            output_path
+                .parent()
+                .expect("output path should have a parent"),
+            cwd.join(".claw")
+                .join("sessions")
+                .join("workspace-hash")
+                .join("session-123")
+                .join("tasks")
+        );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn prepare_shell_command_output_uses_session_isolated_tool_results_directory() {
+        let cwd = temp_path("session-persisted-output");
+        let session_path = cwd
+            .join(".claw")
+            .join("sessions")
+            .join("workspace-hash")
+            .join("session-456.jsonl");
+        fs::create_dir_all(
+            session_path
+                .parent()
+                .expect("session path should have a parent"),
+        )
+        .expect("create session dir");
+        let stdout = vec![b'y'; MAX_OUTPUT_BYTES + 64];
+
+        let prepared = with_tool_session_context("session-456", Some(&session_path), || {
+            prepare_shell_command_output(&cwd, "bash", &stdout, b"")
+        });
+
+        let persisted_path = PathBuf::from(
+            prepared
+                .persisted_output_path
+                .expect("persisted output path should exist"),
+        );
+        assert_eq!(
+            persisted_path
+                .parent()
+                .expect("persisted path should have a parent"),
+            cwd.join(".claw")
+                .join("sessions")
+                .join("workspace-hash")
+                .join("session-456")
+                .join("tool-results")
+        );
+
+        let _ = fs::remove_dir_all(cwd);
     }
 }
 

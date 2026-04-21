@@ -71,6 +71,12 @@ pub struct PluginHooks {
     pub post_tool_use: Vec<String>,
     #[serde(rename = "PostToolUseFailure", default)]
     pub post_tool_use_failure: Vec<String>,
+    #[serde(rename = "PreCompact", default)]
+    pub pre_compact: Vec<String>,
+    #[serde(rename = "PostCompact", default)]
+    pub post_compact: Vec<String>,
+    #[serde(rename = "SessionStart", default)]
+    pub session_start: Vec<String>,
 }
 
 impl PluginHooks {
@@ -79,6 +85,9 @@ impl PluginHooks {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
             && self.post_tool_use_failure.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
+            && self.session_start.is_empty()
     }
 
     #[must_use]
@@ -93,6 +102,13 @@ impl PluginHooks {
         merged
             .post_tool_use_failure
             .extend(other.post_tool_use_failure.iter().cloned());
+        merged.pre_compact.extend(other.pre_compact.iter().cloned());
+        merged
+            .post_compact
+            .extend(other.post_compact.iter().cloned());
+        merged
+            .session_start
+            .extend(other.session_start.iter().cloned());
         merged
     }
 }
@@ -1897,6 +1913,21 @@ fn resolve_hooks(root: &Path, hooks: &PluginHooks) -> PluginHooks {
             .iter()
             .map(|entry| resolve_hook_entry(root, entry))
             .collect(),
+        pre_compact: hooks
+            .pre_compact
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
+        post_compact: hooks
+            .post_compact
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
+        session_start: hooks
+            .session_start
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
     }
 }
 
@@ -1950,6 +1981,9 @@ fn validate_hook_paths(root: Option<&Path>, hooks: &PluginHooks) -> Result<(), P
         .iter()
         .chain(hooks.post_tool_use.iter())
         .chain(hooks.post_tool_use_failure.iter())
+        .chain(hooks.pre_compact.iter())
+        .chain(hooks.post_compact.iter())
+        .chain(hooks.session_start.iter())
     {
         validate_command_path(root, entry, "hook")?;
     }
