@@ -1,25 +1,79 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use api::{
     max_tokens_for_model, resolve_model_alias, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
     ProviderOverride, ToolResultContentBlock,
 };
+use glob::Pattern;
 use plugins::{
     PluginError, PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry, PluginSummary,
 };
 use runtime::{
-    load_system_prompt, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ConversationMessage, ConversationRuntime, McpOAuthConfig, McpServerConfig, MessageRole,
-    PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig, Session, StaticToolExecutor,
+    load_system_prompt, tool_output_root, AssistantEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ConversationMessage, ConversationRuntime, McpOAuthConfig, McpServerConfig,
+    MessageRole, PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig, Session,
+    StaticToolExecutor,
 };
 use serde_json::{json, Value};
+
+mod bundled_skills;
+mod skill_docs;
+
+pub use bundled_skills::{
+    bundled_skill_reference_files, render_bundled_skill_prompt, resolve_bundled_skill,
+    BundledSkill, BundledSkillId,
+};
+pub use skill_docs::{
+    extract_skill_frontmatter_name, load_skill_document, parse_skill_document, SkillDocument,
+    SkillExecutionContext,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedSkill {
+    pub document: SkillDocument,
+    pub source: ResolvedSkillSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSkillSource {
+    Filesystem { path: PathBuf },
+    Bundled { id: BundledSkillId },
+}
+
+#[must_use]
+pub fn render_resolved_skill_prompt(skill: &ResolvedSkill, args: Option<&str>) -> String {
+    match &skill.source {
+        ResolvedSkillSource::Filesystem { .. } => {
+            skill.document.render_markdown_with_arguments(args)
+        }
+        ResolvedSkillSource::Bundled { id } => render_bundled_skill_prompt(
+            &BundledSkill {
+                id: *id,
+                document: skill.document.clone(),
+            },
+            args,
+        ),
+    }
+}
+
+#[must_use]
+pub fn resolved_skill_reference_files(skill: &ResolvedSkill) -> BTreeMap<String, String> {
+    match &skill.source {
+        ResolvedSkillSource::Filesystem { .. } => BTreeMap::new(),
+        ResolvedSkillSource::Bundled { id } => bundled_skill_reference_files(&BundledSkill {
+            id: *id,
+            document: skill.document.clone(),
+        }),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -1994,6 +2048,7 @@ pub struct PluginsCommandResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionSource {
+    Bundled,
     ProjectClaw,
     ProjectCodex,
     ProjectClaude,
@@ -2006,6 +2061,7 @@ enum DefinitionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionScope {
+    Bundled,
     Project,
     UserConfigHome,
     UserHome,
@@ -2014,6 +2070,7 @@ enum DefinitionScope {
 impl DefinitionScope {
     fn label(self) -> &'static str {
         match self {
+            Self::Bundled => "Bundled",
             Self::Project => "Project (.claw)",
             Self::UserConfigHome => "User ($CLAW_CONFIG_HOME)",
             Self::UserHome => "User (~/.claw)",
@@ -2024,6 +2081,7 @@ impl DefinitionScope {
 impl DefinitionSource {
     fn report_scope(self) -> DefinitionScope {
         match self {
+            Self::Bundled => DefinitionScope::Bundled,
             Self::ProjectClaw | Self::ProjectCodex | Self::ProjectClaude => {
                 DefinitionScope::Project
             }
@@ -2047,17 +2105,26 @@ struct AgentSummary {
     shadowed_by: Option<DefinitionSource>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SkillSummary {
     name: String,
     description: Option<String>,
+    location: SkillLocation,
+    document: SkillDocument,
     source: DefinitionSource,
     shadowed_by: Option<DefinitionSource>,
     origin: SkillOrigin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillLocation {
+    Filesystem(PathBuf),
+    Bundled(BundledSkillId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkillOrigin {
+    Bundled,
     SkillsDir,
     LegacyCommandsDir,
 }
@@ -2065,6 +2132,7 @@ enum SkillOrigin {
 impl SkillOrigin {
     fn detail_label(self) -> Option<&'static str> {
         match self {
+            Self::Bundled => Some("bundled"),
             Self::SkillsDir => None,
             Self::LegacyCommandsDir => Some("legacy /commands"),
         }
@@ -2268,7 +2336,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let skills = load_skills_from_roots_for_context(&roots, cwd)?;
             Ok(render_skills_report(&skills))
         }
         Some("install") => Ok(render_skills_usage(Some("install"))),
@@ -2299,7 +2367,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
     match normalize_optional_args(args) {
         None | Some("list") => {
             let roots = discover_skill_roots(cwd);
-            let skills = load_skills_from_roots(&roots)?;
+            let skills = load_skills_from_roots_for_context(&roots, cwd)?;
             Ok(render_skills_report_json(&skills))
         }
         Some("install") => Ok(render_skills_usage_json(Some("install"))),
@@ -2343,10 +2411,10 @@ pub fn resolve_skill_invocation(
             .next()
             .unwrap_or_default();
         if !skill_token.is_empty() {
-            if let Err(error) = resolve_skill_path(cwd, skill_token) {
+            if let Err(error) = resolve_skill(cwd, skill_token) {
                 let mut message = format!("Unknown skill: {skill_token} ({error})");
                 let roots = discover_skill_roots(cwd);
-                if let Ok(available) = load_skills_from_roots(&roots) {
+                if let Ok(available) = load_skills_from_roots_for_context(&roots, cwd) {
                     let names: Vec<String> = available
                         .iter()
                         .filter(|s| s.shadowed_by.is_none())
@@ -2364,69 +2432,67 @@ pub fn resolve_skill_invocation(
     Ok(dispatch)
 }
 
-pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
+fn requested_skill_name(skill: &str) -> std::io::Result<String> {
+    let requested = skill
+        .trim()
+        .trim_start_matches('/')
+        .trim_start_matches('$')
+        .to_string();
     if requested.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "skill must not be empty",
         ));
     }
+    Ok(requested)
+}
+
+pub fn resolve_skill(cwd: &Path, skill: &str) -> std::io::Result<ResolvedSkill> {
+    let requested = requested_skill_name(skill)?;
+    let roots = discover_skill_roots(cwd);
+
+    for skill in load_skills_from_roots_for_context(&roots, cwd)? {
+        if skill.name.eq_ignore_ascii_case(requested.as_str())
+            || skill
+                .document
+                .resolved_name
+                .eq_ignore_ascii_case(requested.as_str())
+        {
+            let source = match skill.location {
+                SkillLocation::Filesystem(path) => ResolvedSkillSource::Filesystem { path },
+                SkillLocation::Bundled(id) => ResolvedSkillSource::Bundled { id },
+            };
+            return Ok(ResolvedSkill {
+                document: skill.document,
+                source,
+            });
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("unknown skill: {requested}"),
+    ))
+}
+
+pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
+    let requested = requested_skill_name(skill)?;
 
     let roots = discover_skill_roots(cwd);
-    for root in &roots {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&root.path)? {
-            let entry = entry?;
-            match root.origin {
-                SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let skill_path = entry.path().join("SKILL.md");
-                    if !skill_path.is_file() {
-                        continue;
-                    }
-                    let contents = fs::read_to_string(&skill_path)?;
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((
-                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        skill_path,
-                    ));
-                }
-                SkillOrigin::LegacyCommandsDir => {
-                    let path = entry.path();
-                    let markdown_path = if path.is_dir() {
-                        let skill_path = path.join("SKILL.md");
-                        if !skill_path.is_file() {
-                            continue;
-                        }
-                        skill_path
-                    } else if path
-                        .extension()
-                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-                    {
-                        path
-                    } else {
-                        continue;
-                    };
-
-                    let contents = fs::read_to_string(&markdown_path)?;
-                    let fallback_name = markdown_path.file_stem().map_or_else(
-                        || entry.file_name().to_string_lossy().to_string(),
-                        |stem| stem.to_string_lossy().to_string(),
-                    );
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((name.unwrap_or(fallback_name), markdown_path));
-                }
-            }
-        }
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        if let Some((_, path)) = entries
-            .into_iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+    for skill in load_skills_from_roots_for_context(&roots, cwd)? {
+        if skill.name.eq_ignore_ascii_case(&requested)
+            || skill
+                .document
+                .resolved_name
+                .eq_ignore_ascii_case(&requested)
         {
-            return Ok(path);
+            return match skill.location {
+                SkillLocation::Filesystem(path) => Ok(path),
+                SkillLocation::Bundled(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("skill `{requested}` is bundled and has no filesystem path"),
+                )),
+            };
         }
     }
 
@@ -2755,6 +2821,142 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     roots
 }
 
+type ConditionalSkillActivationMap = BTreeMap<PathBuf, BTreeSet<String>>;
+
+fn conditional_skill_activations() -> &'static Mutex<ConditionalSkillActivationMap> {
+    static ACTIVATIONS: OnceLock<Mutex<ConditionalSkillActivationMap>> = OnceLock::new();
+    ACTIVATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn conditional_skill_context_root(cwd: &Path) -> PathBuf {
+    tool_output_root(cwd)
+}
+
+fn is_conditional_skill_activated(cwd: &Path, skill_name: &str) -> bool {
+    let activations = conditional_skill_activations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    activations
+        .get(&conditional_skill_context_root(cwd))
+        .is_some_and(|names| names.contains(skill_name))
+}
+
+fn record_conditional_skill_activation(cwd: &Path, skill_name: &str) {
+    let mut activations = conditional_skill_activations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    activations
+        .entry(conditional_skill_context_root(cwd))
+        .or_default()
+        .insert(skill_name.to_string());
+}
+
+pub fn activate_conditional_skills_for_paths(
+    file_paths: &[PathBuf],
+    cwd: &Path,
+) -> std::io::Result<Vec<String>> {
+    if file_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let roots = discover_skill_roots(cwd);
+    let skills = load_skills_from_roots(&roots)?;
+    let mut activated = Vec::new();
+
+    for skill in skills {
+        let Some(patterns) = skill.document.paths.as_deref() else {
+            continue;
+        };
+        if is_conditional_skill_activated(cwd, &skill.document.resolved_name) {
+            continue;
+        }
+
+        let matches_path = file_paths.iter().any(|path| {
+            normalize_relative_match_path(path, cwd)
+                .is_some_and(|relative_path| skill_paths_match(patterns, &relative_path))
+        });
+        if !matches_path {
+            continue;
+        }
+
+        record_conditional_skill_activation(cwd, &skill.document.resolved_name);
+        activated.push(skill.document.resolved_name);
+    }
+
+    Ok(activated)
+}
+
+fn normalize_relative_match_path(path: &Path, cwd: &Path) -> Option<String> {
+    let normalized_path = normalize_conditional_skill_match_path(path);
+    let normalized_cwd = normalize_conditional_skill_match_path(cwd);
+    let relative = normalized_path.strip_prefix(&normalized_cwd).ok()?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let relative = relative.trim_start_matches("./").trim_matches('/');
+    if relative.is_empty() || relative.starts_with("..") {
+        None
+    } else {
+        Some(relative.to_string())
+    }
+}
+
+fn normalize_conditional_skill_match_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return clean_conditional_skill_match_path(canonical);
+    }
+
+    if let Some(parent) = path.parent() {
+        let canonical_parent = parent.canonicalize().map_or_else(
+            |_| clean_conditional_skill_match_path(parent.to_path_buf()),
+            clean_conditional_skill_match_path,
+        );
+        if let Some(name) = path.file_name() {
+            return clean_conditional_skill_match_path(canonical_parent.join(name));
+        }
+    }
+
+    clean_conditional_skill_match_path(path.to_path_buf())
+}
+
+fn clean_conditional_skill_match_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path
+}
+
+fn skill_paths_match(patterns: &[String], relative_path: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| skill_path_pattern_matches(pattern, relative_path))
+}
+
+fn skill_path_pattern_matches(pattern: &str, relative_path: &str) -> bool {
+    let normalized_pattern = pattern.replace('\\', "/").trim_matches('/').to_string();
+    if normalized_pattern.is_empty() {
+        return false;
+    }
+
+    if !pattern_has_glob_metacharacters(&normalized_pattern) {
+        return relative_path == normalized_pattern
+            || relative_path.starts_with(&format!("{normalized_pattern}/"));
+    }
+
+    Pattern::new(&normalized_pattern)
+        .ok()
+        .is_some_and(|compiled| compiled.matches(relative_path))
+}
+
+fn pattern_has_glob_metacharacters(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '!'))
+}
+
 fn install_skill(source: &str, cwd: &Path) -> std::io::Result<InstalledSkill> {
     let registry_root = default_skill_install_root()?;
     install_skill_into(source, cwd, &registry_root)
@@ -2767,8 +2969,7 @@ fn install_skill_into(
 ) -> std::io::Result<InstalledSkill> {
     let source = resolve_skill_install_source(source, cwd)?;
     let prompt_path = source.prompt_path();
-    let contents = fs::read_to_string(prompt_path)?;
-    let display_name = parse_skill_frontmatter(&contents).0;
+    let display_name = load_skill_document(prompt_path, "Skill")?.display_name;
     let invocation_name = derive_skill_install_name(&source, display_name.as_deref())?;
     let installed_path = registry_root.join(&invocation_name);
 
@@ -3023,80 +3224,127 @@ fn load_agents_from_roots(
 }
 
 fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
+    load_skills_from_roots_impl(roots, None)
+}
+
+fn load_skills_from_roots_for_context(
+    roots: &[SkillRoot],
+    cwd: &Path,
+) -> std::io::Result<Vec<SkillSummary>> {
+    load_skills_from_roots_impl(roots, Some(cwd))
+}
+
+fn load_skills_from_roots_impl(
+    roots: &[SkillRoot],
+    activation_cwd: Option<&Path>,
+) -> std::io::Result<Vec<SkillSummary>> {
     let mut skills = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
+    merge_skill_summaries(&mut skills, &mut active_sources, bundled_skill_summaries());
+
     for root in roots {
-        let mut root_skills = Vec::new();
-        for entry in fs::read_dir(&root.path)? {
-            let entry = entry?;
-            match root.origin {
-                SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let skill_path = entry.path().join("SKILL.md");
-                    if !skill_path.is_file() {
-                        continue;
-                    }
-                    let contents = fs::read_to_string(skill_path)?;
-                    let (name, description) = parse_skill_frontmatter(&contents);
-                    root_skills.push(SkillSummary {
-                        name: name
-                            .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        description,
-                        source: root.source,
-                        shadowed_by: None,
-                        origin: root.origin,
-                    });
-                }
-                SkillOrigin::LegacyCommandsDir => {
-                    let path = entry.path();
-                    let markdown_path = if path.is_dir() {
-                        let skill_path = path.join("SKILL.md");
-                        if !skill_path.is_file() {
-                            continue;
-                        }
-                        skill_path
-                    } else if path
-                        .extension()
-                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-                    {
-                        path
-                    } else {
-                        continue;
-                    };
-
-                    let contents = fs::read_to_string(&markdown_path)?;
-                    let fallback_name = markdown_path.file_stem().map_or_else(
-                        || entry.file_name().to_string_lossy().to_string(),
-                        |stem| stem.to_string_lossy().to_string(),
-                    );
-                    let (name, description) = parse_skill_frontmatter(&contents);
-                    root_skills.push(SkillSummary {
-                        name: name.unwrap_or(fallback_name),
-                        description,
-                        source: root.source,
-                        shadowed_by: None,
-                        origin: root.origin,
-                    });
-                }
-            }
-        }
-        root_skills.sort_by(|left, right| left.name.cmp(&right.name));
-
-        for mut skill in root_skills {
-            let key = skill.name.to_ascii_lowercase();
-            if let Some(existing) = active_sources.get(&key) {
-                skill.shadowed_by = Some(*existing);
-            } else {
-                active_sources.insert(key, skill.source);
-            }
-            skills.push(skill);
-        }
+        merge_skill_summaries(
+            &mut skills,
+            &mut active_sources,
+            load_skills_from_root(root, activation_cwd)?,
+        );
     }
 
     Ok(skills)
+}
+
+fn bundled_skill_summaries() -> Vec<SkillSummary> {
+    let mut bundled_skills = bundled_skills::bundled_skill_inventory()
+        .into_iter()
+        .map(|skill| SkillSummary {
+            name: skill.document.user_facing_name().to_string(),
+            description: Some(skill.document.description.clone()),
+            location: SkillLocation::Bundled(skill.id),
+            document: skill.document,
+            source: DefinitionSource::Bundled,
+            shadowed_by: None,
+            origin: SkillOrigin::Bundled,
+        })
+        .collect::<Vec<_>>();
+    bundled_skills.sort_by(|left, right| left.name.cmp(&right.name));
+    bundled_skills
+}
+
+fn load_skills_from_root(
+    root: &SkillRoot,
+    activation_cwd: Option<&Path>,
+) -> std::io::Result<Vec<SkillSummary>> {
+    let mut root_skills = Vec::new();
+    for entry in fs::read_dir(&root.path)? {
+        let entry = entry?;
+        let Some((skill_path, description_fallback_label)) =
+            resolve_skill_entry_path(root.origin, entry.path())
+        else {
+            continue;
+        };
+        let document = load_skill_document(&skill_path, description_fallback_label)?;
+        if should_skip_conditional_skill(&document, activation_cwd) {
+            continue;
+        }
+        root_skills.push(SkillSummary {
+            name: document.user_facing_name().to_string(),
+            description: Some(document.description.clone()),
+            location: SkillLocation::Filesystem(skill_path),
+            document,
+            source: root.source,
+            shadowed_by: None,
+            origin: root.origin,
+        });
+    }
+    root_skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(root_skills)
+}
+
+fn resolve_skill_entry_path(origin: SkillOrigin, path: PathBuf) -> Option<(PathBuf, &'static str)> {
+    match origin {
+        SkillOrigin::Bundled => unreachable!("bundled skills are synthesized in-memory"),
+        SkillOrigin::SkillsDir => {
+            if !path.is_dir() {
+                return None;
+            }
+            let skill_path = path.join("SKILL.md");
+            skill_path.is_file().then_some((skill_path, "Skill"))
+        }
+        SkillOrigin::LegacyCommandsDir => {
+            if path.is_dir() {
+                let skill_path = path.join("SKILL.md");
+                return skill_path
+                    .is_file()
+                    .then_some((skill_path, "Custom command"));
+            }
+            path.extension()
+                .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+                .then_some((path, "Custom command"))
+        }
+    }
+}
+
+fn should_skip_conditional_skill(document: &SkillDocument, activation_cwd: Option<&Path>) -> bool {
+    activation_cwd.is_some_and(|cwd| {
+        document.paths.is_some() && !is_conditional_skill_activated(cwd, &document.resolved_name)
+    })
+}
+
+fn merge_skill_summaries(
+    destination: &mut Vec<SkillSummary>,
+    active_sources: &mut BTreeMap<String, DefinitionSource>,
+    skill_summaries: Vec<SkillSummary>,
+) {
+    for mut skill in skill_summaries {
+        let key = skill.name.to_ascii_lowercase();
+        if let Some(existing) = active_sources.get(&key) {
+            skill.shadowed_by = Some(*existing);
+        } else {
+            active_sources.insert(key, skill.source);
+        }
+        destination.push(skill);
+    }
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -3123,51 +3371,6 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return (None, None);
-    }
-
-    let mut name = None;
-    let mut description = None;
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("name:") {
-            let value = unquote_frontmatter_value(value.trim());
-            if !value.is_empty() {
-                name = Some(value);
-            }
-            continue;
-        }
-        if let Some(value) = trimmed.strip_prefix("description:") {
-            let value = unquote_frontmatter_value(value.trim());
-            if !value.is_empty() {
-                description = Some(value);
-            }
-        }
-    }
-
-    (name, description)
-}
-
-fn unquote_frontmatter_value(value: &str) -> String {
-    value
-        .strip_prefix('"')
-        .and_then(|trimmed| trimmed.strip_suffix('"'))
-        .or_else(|| {
-            value
-                .strip_prefix('\'')
-                .and_then(|trimmed| trimmed.strip_suffix('\''))
-        })
-        .unwrap_or(value)
-        .trim()
-        .to_string()
-}
-
 fn render_agents_report(agents: &[AgentSummary]) -> String {
     if agents.is_empty() {
         return "No agents found.".to_string();
@@ -3184,6 +3387,7 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
     ];
 
     for scope in [
+        DefinitionScope::Bundled,
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
@@ -3259,6 +3463,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     ];
 
     for scope in [
+        DefinitionScope::Bundled,
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
@@ -3536,7 +3741,8 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, ~/.claw/skills, legacy /commands".to_string(),
+        "  Sources          bundled built-ins, .claw/skills, ~/.claw/skills, legacy /commands"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3554,6 +3760,7 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
+                "bundled built-ins",
                 ".claw/skills",
                 "~/.claw/skills",
                 "legacy /commands",
@@ -3668,6 +3875,7 @@ fn format_mcp_oauth(oauth: Option<&McpOAuthConfig>) -> String {
 
 fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
+        DefinitionSource::Bundled => "bundled",
         DefinitionSource::ProjectClaw
         | DefinitionSource::ProjectCodex
         | DefinitionSource::ProjectClaude => "project_claw",
@@ -3701,6 +3909,7 @@ fn agent_summary_json(agent: &AgentSummary) -> Value {
 
 fn skill_origin_id(origin: SkillOrigin) -> &'static str {
     match origin {
+        SkillOrigin::Bundled => "bundled",
         SkillOrigin::SkillsDir => "skills_dir",
         SkillOrigin::LegacyCommandsDir => "legacy_commands_dir",
     }
@@ -3717,10 +3926,34 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
     json!({
         "name": &skill.name,
         "description": &skill.description,
+        "metadata": skill_document_json(&skill.document),
         "source": definition_source_json(skill.source),
         "origin": skill_origin_json(skill.origin),
         "active": skill.shadowed_by.is_none(),
         "shadowed_by": skill.shadowed_by.map(definition_source_json),
+    })
+}
+
+fn skill_document_json(document: &SkillDocument) -> Value {
+    json!({
+        "resolved_name": &document.resolved_name,
+        "display_name": &document.display_name,
+        "description": &document.description,
+        "has_user_specified_description": document.has_user_specified_description,
+        "allowed_tools": &document.allowed_tools,
+        "argument_hint": &document.argument_hint,
+        "argument_names": &document.argument_names,
+        "when_to_use": &document.when_to_use,
+        "version": &document.version,
+        "model": &document.model,
+        "disable_model_invocation": document.disable_model_invocation,
+        "user_invocable": document.user_invocable,
+        "hooks": &document.hooks,
+        "execution_context": document.execution_context.map(SkillExecutionContext::as_str),
+        "agent": &document.agent,
+        "effort": &document.effort,
+        "paths": &document.paths,
+        "shell": &document.shell,
     })
 }
 
@@ -4197,14 +4430,16 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
-        handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
+        activate_conditional_skills_for_paths, classify_skills_slash_command, discover_skill_roots,
+        handle_agents_slash_command_json, handle_plugins_slash_command,
+        handle_skills_slash_command_json, handle_slash_command,
         handle_slash_command_with_compactor, load_agents_from_roots, load_skills_from_roots,
-        render_agents_report, render_agents_report_json, render_mcp_report_json_for,
-        render_plugins_report, render_skills_report, render_slash_command_help,
-        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
+        load_skills_from_roots_for_context, normalize_relative_match_path, render_agents_report,
+        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
+        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
+        resolve_skill, resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
+        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
+        SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4651,6 +4886,12 @@ mod tests {
             resolve_skill_path(&workspace, "/handoff").expect("legacy command should resolve"),
             legacy_commands.join("handoff.md")
         );
+        let bundled = resolve_skill(&workspace, "verify").expect("bundled verify should resolve");
+        assert_eq!(bundled.document.resolved_name, "verify");
+        assert!(matches!(
+            bundled.source,
+            super::ResolvedSkillSource::Bundled { .. }
+        ));
     }
 
     #[test]
@@ -4688,13 +4929,39 @@ mod tests {
         );
         assert_eq!(report["kind"], "skills");
         assert_eq!(report["action"], "list");
-        assert_eq!(report["summary"]["active"], 3);
+        assert_eq!(report["summary"]["active"], 7);
         assert_eq!(report["summary"]["shadowed"], 1);
-        assert_eq!(report["skills"][0]["name"], "plan");
-        assert_eq!(report["skills"][0]["source"]["id"], "project_claw");
-        assert_eq!(report["skills"][1]["name"], "deploy");
-        assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
-        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_claw");
+        let skills = report["skills"].as_array().expect("skills array");
+        let verify = skills
+            .iter()
+            .find(|skill| skill["name"] == "verify")
+            .expect("verify bundled skill");
+        assert_eq!(verify["source"]["id"], "bundled");
+        assert_eq!(verify["origin"]["id"], "bundled");
+        let plan = skills
+            .iter()
+            .find(|skill| {
+                skill["name"] == "plan"
+                    && skill["source"]["id"] == "project_claw"
+                    && skill["active"] == true
+            })
+            .expect("project plan");
+        assert_eq!(plan["metadata"]["resolved_name"], "plan");
+        assert_eq!(plan["metadata"]["description"], "Project planning guidance");
+        let deploy = skills
+            .iter()
+            .find(|skill| skill["name"] == "deploy")
+            .expect("deploy skill");
+        assert_eq!(deploy["origin"]["id"], "legacy_commands_dir");
+        let shadowed_plan = skills
+            .iter()
+            .find(|skill| {
+                skill["name"] == "plan"
+                    && skill["source"]["id"] == "user_claw"
+                    && skill["active"] == false
+            })
+            .expect("shadowed user plan");
+        assert_eq!(shadowed_plan["shadowed_by"]["id"], "project_claw");
 
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         assert_eq!(help["kind"], "skills");
@@ -4706,6 +4973,78 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
+    fn conditional_skills_activate_only_after_matching_path_touch() {
+        let workspace = temp_dir("conditional-skills-workspace");
+        let project_skills = workspace.join(".codex").join("skills");
+        let source_file = workspace.join("src").join("lib.rs");
+        fs::create_dir_all(
+            source_file
+                .parent()
+                .expect("source file should have parent"),
+        )
+        .expect("create source dir");
+        fs::write(&source_file, "fn helper() {}\n").expect("write source file");
+        write_skill(&project_skills, "help", "Help guidance");
+
+        let conditional_root = project_skills.join("rustacean");
+        fs::create_dir_all(&conditional_root).expect("conditional skill root");
+        fs::write(
+            conditional_root.join("SKILL.md"),
+            "---\nname: rustacean\ndescription: Rust path guidance\npaths: src/**\n---\n\n# rustacean\n",
+        )
+        .expect("write conditional skill");
+
+        let roots = discover_skill_roots(&workspace);
+        let before = load_skills_from_roots_for_context(&roots, &workspace)
+            .expect("skills should load before activation");
+        assert_eq!(before.len(), 5);
+        assert!(before
+            .iter()
+            .any(|skill| skill.document.resolved_name == "help" && skill.shadowed_by.is_none()));
+        assert!(!before
+            .iter()
+            .any(|skill| skill.document.resolved_name == "rustacean"));
+        assert!(resolve_skill_path(&workspace, "rustacean").is_err());
+
+        let activated =
+            activate_conditional_skills_for_paths(std::slice::from_ref(&source_file), &workspace)
+                .expect("activation should succeed");
+        assert_eq!(activated, vec!["rustacean".to_string()]);
+
+        let after = load_skills_from_roots_for_context(&roots, &workspace)
+            .expect("skills should load after activation");
+        assert_eq!(after.len(), 6);
+        assert!(after.iter().any(|skill| {
+            skill.document.resolved_name == "rustacean" && skill.shadowed_by.is_none()
+        }));
+        assert_eq!(
+            resolve_skill_path(&workspace, "rustacean").expect("conditional skill should resolve"),
+            conditional_root.join("SKILL.md")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn conditional_skill_matching_normalizes_noncanonical_workspace_roots() {
+        let workspace = temp_dir("conditional-skills-noncanonical");
+        let source_dir = workspace.join("src");
+        let source_file = source_dir.join("lib.rs");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        fs::write(&source_file, "fn helper() {}\n").expect("write source file");
+
+        let canonical_file = source_file.canonicalize().expect("canonical source file");
+        let aliased_workspace = workspace.join("src").join("..");
+
+        assert_eq!(
+            normalize_relative_match_path(&canonical_file, &aliased_workspace),
+            Some("src/lib.rs".to_string())
+        );
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -5281,7 +5620,10 @@ mod tests {
             render_skills_report(&load_skills_from_roots(&roots).expect("skill roots should load"));
 
         assert!(report.contains("Skills"));
-        assert!(report.contains("3 available skills"));
+        assert!(report.contains("7 available skills"));
+        assert!(report.contains("Bundled:"));
+        assert!(report.contains("verify"));
+        assert!(report.contains("Verify a code change does what it should by running the app."));
         assert!(report.contains("Project (.claw):"));
         assert!(report.contains("plan · Project planning guidance"));
         assert!(report.contains("deploy · Legacy deployment guidance · legacy /commands"));
@@ -5314,6 +5656,7 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
         assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
+        assert!(skills_help.contains("bundled built-ins"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
@@ -5430,9 +5773,10 @@ mod tests {
     #[test]
     fn parses_quoted_skill_frontmatter_values() {
         let contents = "---\nname: \"hud\"\ndescription: 'Quoted description'\n---\n";
-        let (name, description) = super::parse_skill_frontmatter(contents);
-        assert_eq!(name.as_deref(), Some("hud"));
-        assert_eq!(description.as_deref(), Some("Quoted description"));
+        let document = super::parse_skill_document(contents, "hud".to_string(), "Skill");
+        assert_eq!(document.display_name.as_deref(), Some("hud"));
+        assert_eq!(document.description, "Quoted description");
+        assert!(document.has_user_specified_description);
     }
 
     #[test]

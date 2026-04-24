@@ -52,13 +52,14 @@ use runtime::{
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
     OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
     PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutionResult, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, model_visible_tool_result, mvp_tool_specs, GlobalToolRegistry,
-    RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
+    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -7246,6 +7247,26 @@ impl AnthropicRuntimeClient {
             progress_reporter,
         })
     }
+
+    fn provider_client_for_model(&self, model: &str) -> Result<ProviderClient, RuntimeError> {
+        let cwd = env::current_dir().map_err(|error| RuntimeError::new(error.to_string()))?;
+        let runtime_config = load_runtime_config_for_cwd(&cwd).map_err(|error| {
+            RuntimeError::new(format!(
+                "failed to load runtime config for model override: {error}"
+            ))
+        })?;
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
+        ProviderClient::from_model_with_anthropic_auth_resolver(
+            model,
+            provider_override.as_ref(),
+            || resolve_cli_auth_source(oauth.as_ref()),
+        )
+        .map(|client| client.with_prompt_cache(PromptCache::new(&self.session_id)))
+        .map_err(|error| RuntimeError::new(error.to_string()))
+    }
 }
 
 fn resolve_cli_auth_source(oauth: Option<&OAuthConfig>) -> Result<AuthSource, api::ApiError> {
@@ -7305,16 +7326,28 @@ impl ApiClient for AnthropicRuntimeClient {
         }
         let is_post_tool = request_ends_with_tool_result(&request);
         let allow_tools = self.enable_tools && request.allow_tools;
+        let effective_model = request
+            .model_override
+            .clone()
+            .unwrap_or_else(|| self.model.clone());
         let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            model: effective_model.clone(),
+            max_tokens: max_tokens_for_model(&effective_model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: allow_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: allow_tools.then_some(ToolChoice::Auto),
+            reasoning_effort: request.reasoning_effort.clone(),
             stream: true,
             ..Default::default()
+        };
+        let override_client;
+        let client = if request.model_override.is_some() {
+            override_client = self.provider_client_for_model(&effective_model)?;
+            &override_client
+        } else {
+            &self.client
         };
 
         self.runtime.block_on(async {
@@ -7326,7 +7359,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(client, &message_request, is_post_tool && attempt == 1)
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
@@ -7352,11 +7385,11 @@ impl AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
+        client: &ProviderClient,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
+        let mut stream = client
             .stream_message(message_request)
             .await
             .map_err(|error| {
@@ -7483,7 +7516,7 @@ impl AnthropicRuntimeClient {
             }
         }
 
-        push_prompt_cache_record(&self.client, &mut events);
+        push_prompt_cache_record(client, &mut events);
 
         if !saw_stop
             && events.iter().any(|event| {
@@ -7501,8 +7534,7 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
+        let response = client
             .send_message(&MessageRequest {
                 stream: false,
                 ..message_request.clone()
@@ -7512,7 +7544,7 @@ impl AnthropicRuntimeClient {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
         let mut events = response_to_events(response, out)?;
-        push_prompt_cache_record(&self.client, &mut events);
+        push_prompt_cache_record(client, &mut events);
         Ok(events)
     }
 }
@@ -8395,7 +8427,7 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<ToolExecutionResult, ToolError> {
         let resolved_tool_name = strip_tool_call_prefix(tool_name);
         if self
             .allowed_tools
@@ -8410,17 +8442,25 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let result = if resolved_tool_name == "ToolSearch" {
             self.execute_search_tool(value)
+                .map(ToolExecutionResult::text)
         } else if self.tool_registry.has_runtime_tool(resolved_tool_name) {
             self.execute_runtime_tool(resolved_tool_name, value)
+                .map(ToolExecutionResult::text)
+        } else if mvp_tool_specs()
+            .iter()
+            .any(|spec| spec.name == resolved_tool_name)
+        {
+            execute_tool_with_effects(resolved_tool_name, &value).map_err(ToolError::new)
         } else {
             self.tool_registry
                 .execute(resolved_tool_name, &value)
+                .map(ToolExecutionResult::text)
                 .map_err(ToolError::new)
         };
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(resolved_tool_name, &output, false);
+                    let markdown = format_tool_result(resolved_tool_name, &output.output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -12249,7 +12289,7 @@ UU conflicted.rs",
             .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
             .expect("discovered mcp tool should execute");
         let tool_json: serde_json::Value =
-            serde_json::from_str(&tool_output).expect("tool output should be json");
+            serde_json::from_str(&tool_output.output).expect("tool output should be json");
         assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
 
         let wrapped_output = executor
@@ -12259,14 +12299,14 @@ UU conflicted.rs",
             )
             .expect("generic mcp wrapper should execute");
         let wrapped_json: serde_json::Value =
-            serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
+            serde_json::from_str(&wrapped_output.output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
             .expect("tool search should execute");
         let search_json: serde_json::Value =
-            serde_json::from_str(&search_output).expect("search output should be json");
+            serde_json::from_str(&search_output.output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
         assert_eq!(search_json["pending_mcp_servers"][0], "broken");
         assert_eq!(
@@ -12286,7 +12326,7 @@ UU conflicted.rs",
             .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
             .expect("resources should list");
         let listed_json: serde_json::Value =
-            serde_json::from_str(&listed).expect("resource output should be json");
+            serde_json::from_str(&listed.output).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
 
         let read = executor
@@ -12296,7 +12336,7 @@ UU conflicted.rs",
             )
             .expect("resource should read");
         let read_json: serde_json::Value =
-            serde_json::from_str(&read).expect("resource read output should be json");
+            serde_json::from_str(&read.output).expect("resource read output should be json");
         assert_eq!(
             read_json["contents"][0]["text"],
             "contents for file://guide.txt"
@@ -12347,7 +12387,7 @@ UU conflicted.rs",
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
             .expect("tool search should execute");
         let search_json: serde_json::Value =
-            serde_json::from_str(&search_output).expect("search output should be json");
+            serde_json::from_str(&search_output.output).expect("search output should be json");
         assert_eq!(search_json["pending_mcp_servers"][0], "remote");
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
@@ -12382,7 +12422,7 @@ UU conflicted.rs",
             )
             .expect("prefixed tool call name should be allow-listed");
         let json: serde_json::Value =
-            serde_json::from_str(&output).expect("tool search output should be valid json");
+            serde_json::from_str(&output.output).expect("tool search output should be valid json");
         assert!(json["query"].is_string());
     }
 

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
-use crate::user_paths::claw_config_home;
 
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
@@ -585,7 +584,10 @@ impl RuntimeProviderConfig {
 
 #[must_use]
 pub fn default_config_home() -> PathBuf {
-    claw_config_home().unwrap_or_else(|| PathBuf::from(".claw"))
+    std::env::var_os("CLAW_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
 impl RuntimeHookConfig {

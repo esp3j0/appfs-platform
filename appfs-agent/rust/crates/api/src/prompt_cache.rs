@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runtime::user_home_dir;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{MessageRequest, MessageResponse, Usage};
@@ -471,8 +470,11 @@ fn base_cache_root() -> PathBuf {
             .join("cache")
             .join("prompt-cache");
     }
-    if let Some(home) = user_home_dir() {
-        return home.join(".claude").join("cache").join("prompt-cache");
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".claude")
+            .join("cache")
+            .join("prompt-cache");
     }
     std::env::temp_dir().join("claude-prompt-cache")
 }
