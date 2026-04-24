@@ -1103,7 +1103,40 @@ fn extract_num_matches(tool_output: &str) -> usize {
     serde_json::from_str::<Value>(tool_output)
         .ok()
         .and_then(|value| value.get("numMatches").and_then(Value::as_u64))
-        .unwrap_or(0) as usize
+        .map(|count| count as usize)
+        .or_else(|| {
+            tool_output.lines().find_map(|line| {
+                let trimmed = line.trim();
+                let remainder = trimmed.strip_prefix("Found ")?;
+                let digit_len = remainder.chars().take_while(char::is_ascii_digit).count();
+                if digit_len == 0 {
+                    return None;
+                }
+
+                let (digits, suffix) = remainder.split_at(digit_len);
+                suffix
+                    .starts_with(" total occurrence")
+                    .then(|| digits.parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            let total = tool_output
+                .lines()
+                .filter_map(|line| {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+
+                    trimmed
+                        .rsplit_once(':')
+                        .and_then(|(_, count)| count.parse::<usize>().ok())
+                })
+                .sum::<usize>();
+            (total > 0).then_some(total)
+        })
+        .unwrap_or(0)
 }
 
 fn extract_file_path(tool_output: &str) -> String {
@@ -1141,4 +1174,26 @@ fn extract_plugin_message(tool_output: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| tool_output.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_num_matches;
+
+    #[test]
+    fn extract_num_matches_reads_json_output() {
+        assert_eq!(extract_num_matches(r#"{"numMatches":2}"#), 2);
+    }
+
+    #[test]
+    fn extract_num_matches_reads_ts_count_wrapper_summary() {
+        let output = "fixture.txt:2\n\nFound 2 total occurrences across 1 file.";
+        assert_eq!(extract_num_matches(output), 2);
+    }
+
+    #[test]
+    fn extract_num_matches_falls_back_to_count_lines() {
+        let output = "fixture.txt:2\nnested/notes.txt:1";
+        assert_eq!(extract_num_matches(output), 3);
+    }
 }

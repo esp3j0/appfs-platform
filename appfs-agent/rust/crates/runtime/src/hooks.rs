@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::bash_shell_path;
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
+use crate::session::CompactTrigger;
 
 pub type HookPermissionDecision = PermissionOverride;
 
@@ -21,6 +22,9 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    PreCompact,
+    PostCompact,
+    SessionStart,
 }
 
 impl HookEvent {
@@ -30,6 +34,9 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::PreCompact => "PreCompact",
+            Self::PostCompact => "PostCompact",
+            Self::SessionStart => "SessionStart",
         }
     }
 }
@@ -147,6 +154,44 @@ impl HookRunResult {
     pub fn updated_input_json(&self) -> Option<&str> {
         self.updated_input()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreCompactHookResult {
+    new_custom_instructions: Option<String>,
+    user_display_message: Option<String>,
+}
+
+impl PreCompactHookResult {
+    #[must_use]
+    pub fn new_custom_instructions(&self) -> Option<&str> {
+        self.new_custom_instructions.as_deref()
+    }
+
+    #[must_use]
+    pub fn user_display_message(&self) -> Option<&str> {
+        self.user_display_message.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PostCompactHookResult {
+    user_display_message: Option<String>,
+}
+
+impl PostCompactHookResult {
+    #[must_use]
+    pub fn user_display_message(&self) -> Option<&str> {
+        self.user_display_message.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextHookCommandResult {
+    command: String,
+    succeeded: bool,
+    cancelled: bool,
+    output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -305,6 +350,232 @@ impl HookRunner {
             abort_signal,
             None,
         )
+    }
+
+    #[must_use]
+    pub fn run_pre_compact(
+        &self,
+        trigger: CompactTrigger,
+        custom_instructions: Option<&str>,
+    ) -> PreCompactHookResult {
+        self.run_pre_compact_with_context(trigger, custom_instructions, None, None)
+    }
+
+    #[must_use]
+    pub fn run_pre_compact_with_context(
+        &self,
+        trigger: CompactTrigger,
+        custom_instructions: Option<&str>,
+        abort_signal: Option<&HookAbortSignal>,
+        reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> PreCompactHookResult {
+        let payload = hook_pre_compact_payload(trigger, custom_instructions).to_string();
+        let command_results = Self::run_contextual_commands(
+            HookEvent::PreCompact,
+            self.config.pre_compact(),
+            "compact",
+            &payload,
+            abort_signal,
+            reporter,
+            |child| {
+                child.env("HOOK_TRIGGER", trigger.as_str());
+                if let Some(custom_instructions) = custom_instructions {
+                    child.env("HOOK_CUSTOM_INSTRUCTIONS", custom_instructions);
+                }
+            },
+        );
+
+        build_pre_compact_hook_result(&command_results)
+    }
+
+    #[must_use]
+    pub fn run_post_compact(
+        &self,
+        trigger: CompactTrigger,
+        compact_summary: &str,
+    ) -> PostCompactHookResult {
+        self.run_post_compact_with_context(trigger, compact_summary, None, None)
+    }
+
+    #[must_use]
+    pub fn run_post_compact_with_context(
+        &self,
+        trigger: CompactTrigger,
+        compact_summary: &str,
+        abort_signal: Option<&HookAbortSignal>,
+        reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> PostCompactHookResult {
+        let payload = hook_post_compact_payload(trigger, compact_summary).to_string();
+        let command_results = Self::run_contextual_commands(
+            HookEvent::PostCompact,
+            self.config.post_compact(),
+            "compact",
+            &payload,
+            abort_signal,
+            reporter,
+            |child| {
+                child.env("HOOK_TRIGGER", trigger.as_str());
+                child.env("HOOK_COMPACT_SUMMARY", compact_summary);
+            },
+        );
+
+        build_post_compact_hook_result(&command_results)
+    }
+
+    #[must_use]
+    pub fn run_session_start(&self, source: &str, model: Option<&str>) -> HookRunResult {
+        self.run_session_start_with_context(source, model, None, None)
+    }
+
+    #[must_use]
+    pub fn run_session_start_with_context(
+        &self,
+        source: &str,
+        model: Option<&str>,
+        abort_signal: Option<&HookAbortSignal>,
+        mut reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> HookRunResult {
+        let commands = self.config.session_start();
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+
+        if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+            return HookRunResult {
+                denied: false,
+                failed: false,
+                cancelled: true,
+                messages: vec![String::from("SessionStart hook cancelled before execution")],
+                permission_override: None,
+                permission_reason: None,
+                updated_input: None,
+            };
+        }
+
+        let payload = hook_session_start_payload(source, model).to_string();
+        let mut result = HookRunResult::allow(Vec::new());
+
+        for command in commands {
+            if let Some(reporter) = reporter.as_deref_mut() {
+                reporter.on_event(&HookProgressEvent::Started {
+                    event: HookEvent::SessionStart,
+                    tool_name: source.to_string(),
+                    command: command.clone(),
+                });
+            }
+
+            match Self::run_session_start_command(command, source, model, &payload, abort_signal) {
+                HookCommandOutcome::Allow { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event: HookEvent::SessionStart,
+                            tool_name: source.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_parsed_hook_output(&mut result, parsed);
+                }
+                HookCommandOutcome::Deny { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event: HookEvent::SessionStart,
+                            tool_name: source.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_parsed_hook_output(&mut result, parsed);
+                    result.denied = true;
+                    return result;
+                }
+                HookCommandOutcome::Failed { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event: HookEvent::SessionStart,
+                            tool_name: source.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_parsed_hook_output(&mut result, parsed);
+                    result.failed = true;
+                    return result;
+                }
+                HookCommandOutcome::Cancelled { message } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Cancelled {
+                            event: HookEvent::SessionStart,
+                            tool_name: source.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    result.cancelled = true;
+                    result.messages.push(message);
+                    return result;
+                }
+            }
+        }
+
+        result
+    }
+
+    fn run_contextual_commands<F>(
+        event: HookEvent,
+        commands: &[String],
+        context_name: &str,
+        payload: &str,
+        abort_signal: Option<&HookAbortSignal>,
+        mut reporter: Option<&mut dyn HookProgressReporter>,
+        mut configure_env: F,
+    ) -> Vec<ContextHookCommandResult>
+    where
+        F: FnMut(&mut CommandWithStdin),
+    {
+        let mut results = Vec::new();
+        for command in commands {
+            if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+                results.push(ContextHookCommandResult {
+                    command: command.clone(),
+                    succeeded: false,
+                    cancelled: true,
+                    output: format!("{} hook cancelled before execution", event.as_str()),
+                });
+                break;
+            }
+
+            if let Some(reporter) = reporter.as_deref_mut() {
+                reporter.on_event(&HookProgressEvent::Started {
+                    event,
+                    tool_name: context_name.to_string(),
+                    command: command.clone(),
+                });
+            }
+
+            let result = Self::run_contextual_command(
+                command,
+                event,
+                context_name,
+                payload,
+                abort_signal,
+                &mut configure_env,
+            );
+            if let Some(reporter) = reporter.as_deref_mut() {
+                let event = if result.cancelled {
+                    HookProgressEvent::Cancelled {
+                        event,
+                        tool_name: context_name.to_string(),
+                        command: command.clone(),
+                    }
+                } else {
+                    HookProgressEvent::Completed {
+                        event,
+                        tool_name: context_name.to_string(),
+                        command: command.clone(),
+                    }
+                };
+                reporter.on_event(&event);
+            }
+            results.push(result);
+        }
+        results
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -503,6 +774,175 @@ impl HookRunner {
             },
         }
     }
+
+    fn run_session_start_command(
+        command: &str,
+        source: &str,
+        model: Option<&str>,
+        payload: &str,
+        abort_signal: Option<&HookAbortSignal>,
+    ) -> HookCommandOutcome {
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return HookCommandOutcome::Failed {
+                    parsed: ParsedHookOutput {
+                        messages: vec![format!(
+                            "SessionStart hook `{command}` failed to start for `{source}`: {error}"
+                        )],
+                        ..ParsedHookOutput::default()
+                    },
+                };
+            }
+        };
+        child.stdin(Stdio::piped());
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        child.env("HOOK_EVENT", HookEvent::SessionStart.as_str());
+        child.env("HOOK_SESSION_SOURCE", source);
+        if let Some(model) = model {
+            child.env("HOOK_MODEL", model);
+        }
+
+        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+            Ok(CommandExecution::Finished(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let parsed = parse_hook_output(&stdout);
+                let primary_message = parsed.primary_message().map(ToOwned::to_owned);
+                match output.status.code() {
+                    Some(0) => {
+                        if parsed.deny {
+                            HookCommandOutcome::Deny { parsed }
+                        } else {
+                            HookCommandOutcome::Allow { parsed }
+                        }
+                    }
+                    Some(2) => HookCommandOutcome::Deny {
+                        parsed: parsed.with_fallback_message(format!(
+                            "SessionStart hook denied `{source}`"
+                        )),
+                    },
+                    Some(code) => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format_hook_failure(
+                            command,
+                            code,
+                            primary_message.as_deref(),
+                            stderr.as_str(),
+                        )),
+                    },
+                    None => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format!(
+                            "SessionStart hook `{command}` terminated by signal while handling `{source}`"
+                        )),
+                    },
+                }
+            }
+            Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
+                message: format!(
+                    "SessionStart hook `{command}` cancelled while handling `{source}`"
+                ),
+            },
+            Err(error) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "SessionStart hook `{command}` failed to start for `{source}`: {error}"
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
+        }
+    }
+
+    fn run_contextual_command<F>(
+        command: &str,
+        event: HookEvent,
+        context_name: &str,
+        payload: &str,
+        abort_signal: Option<&HookAbortSignal>,
+        configure_env: &mut F,
+    ) -> ContextHookCommandResult
+    where
+        F: FnMut(&mut CommandWithStdin),
+    {
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return ContextHookCommandResult {
+                    command: command.to_string(),
+                    succeeded: false,
+                    cancelled: false,
+                    output: format!(
+                        "{} hook `{command}` failed to start for `{context_name}`: {error}",
+                        event.as_str()
+                    ),
+                };
+            }
+        };
+        child.stdin(Stdio::piped());
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        child.env("HOOK_EVENT", event.as_str());
+        configure_env(&mut child);
+
+        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+            Ok(CommandExecution::Finished(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let rendered = if stdout.is_empty() {
+                    stderr.clone()
+                } else {
+                    stdout.clone()
+                };
+                match output.status.code() {
+                    Some(0) => ContextHookCommandResult {
+                        command: command.to_string(),
+                        succeeded: true,
+                        cancelled: false,
+                        output: rendered,
+                    },
+                    Some(code) => ContextHookCommandResult {
+                        command: command.to_string(),
+                        succeeded: false,
+                        cancelled: false,
+                        output: format_hook_failure(
+                            command,
+                            code,
+                            (!rendered.is_empty()).then_some(rendered.as_str()),
+                            stderr.as_str(),
+                        ),
+                    },
+                    None => ContextHookCommandResult {
+                        command: command.to_string(),
+                        succeeded: false,
+                        cancelled: false,
+                        output: format!(
+                            "{} hook `{command}` terminated by signal while handling `{context_name}`",
+                            event.as_str()
+                        ),
+                    },
+                }
+            }
+            Ok(CommandExecution::Cancelled) => ContextHookCommandResult {
+                command: command.to_string(),
+                succeeded: false,
+                cancelled: true,
+                output: format!(
+                    "{} hook `{command}` cancelled while handling `{context_name}`",
+                    event.as_str()
+                ),
+            },
+            Err(error) => ContextHookCommandResult {
+                command: command.to_string(),
+                succeeded: false,
+                cancelled: false,
+                output: format!(
+                    "{} hook `{command}` failed to start for `{context_name}`: {error}",
+                    event.as_str()
+                ),
+            },
+        }
+    }
 }
 
 enum HookCommandOutcome {
@@ -544,6 +984,92 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
     }
     if parsed.updated_input.is_some() {
         target.updated_input = parsed.updated_input;
+    }
+}
+
+fn build_pre_compact_hook_result(
+    command_results: &[ContextHookCommandResult],
+) -> PreCompactHookResult {
+    if command_results.is_empty() {
+        return PreCompactHookResult::default();
+    }
+
+    let new_custom_instructions = command_results
+        .iter()
+        .filter(|result| result.succeeded)
+        .map(|result| result.output.trim())
+        .filter(|output| !output.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let user_display_message = command_results
+        .iter()
+        .map(|result| {
+            if result.succeeded {
+                if result.output.trim().is_empty() {
+                    format!("PreCompact [{}] completed successfully", result.command)
+                } else {
+                    format!(
+                        "PreCompact [{}] completed successfully: {}",
+                        result.command,
+                        result.output.trim()
+                    )
+                }
+            } else if result.output.trim().is_empty() {
+                format!("PreCompact [{}] failed", result.command)
+            } else {
+                format!(
+                    "PreCompact [{}] failed: {}",
+                    result.command,
+                    result.output.trim()
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    PreCompactHookResult {
+        new_custom_instructions: (!new_custom_instructions.is_empty())
+            .then_some(new_custom_instructions),
+        user_display_message: (!user_display_message.is_empty()).then_some(user_display_message),
+    }
+}
+
+fn build_post_compact_hook_result(
+    command_results: &[ContextHookCommandResult],
+) -> PostCompactHookResult {
+    if command_results.is_empty() {
+        return PostCompactHookResult::default();
+    }
+
+    let user_display_message = command_results
+        .iter()
+        .map(|result| {
+            if result.succeeded {
+                if result.output.trim().is_empty() {
+                    format!("PostCompact [{}] completed successfully", result.command)
+                } else {
+                    format!(
+                        "PostCompact [{}] completed successfully: {}",
+                        result.command,
+                        result.output.trim()
+                    )
+                }
+            } else if result.output.trim().is_empty() {
+                format!("PostCompact [{}] failed", result.command)
+            } else {
+                format!(
+                    "PostCompact [{}] failed: {}",
+                    result.command,
+                    result.output.trim()
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    PostCompactHookResult {
+        user_display_message: (!user_display_message.is_empty()).then_some(user_display_message),
     }
 }
 
@@ -628,6 +1154,30 @@ fn hook_payload(
             "tool_result_is_error": is_error,
         }),
     }
+}
+
+fn hook_session_start_payload(source: &str, model: Option<&str>) -> Value {
+    json!({
+        "hook_event_name": HookEvent::SessionStart.as_str(),
+        "session_source": source,
+        "model": model,
+    })
+}
+
+fn hook_pre_compact_payload(trigger: CompactTrigger, custom_instructions: Option<&str>) -> Value {
+    json!({
+        "hook_event_name": HookEvent::PreCompact.as_str(),
+        "trigger": trigger.as_str(),
+        "custom_instructions": custom_instructions,
+    })
+}
+
+fn hook_post_compact_payload(trigger: CompactTrigger, compact_summary: &str) -> Value {
+    json!({
+        "hook_event_name": HookEvent::PostCompact.as_str(),
+        "trigger": trigger.as_str(),
+        "compact_summary": compact_summary,
+    })
 }
 
 fn parse_tool_input(tool_input: &str) -> Value {
@@ -730,6 +1280,7 @@ mod tests {
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
+    use crate::session::CompactTrigger;
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows};
 
@@ -868,6 +1419,60 @@ mod tests {
         // then
         assert!(!result.is_denied());
         assert_eq!(result.messages(), &["failure hook ran".to_string()]);
+    }
+
+    #[test]
+    fn runs_session_start_hooks_with_compact_source_context() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        let runner =
+            HookRunner::new(
+                RuntimeHookConfig::default().with_session_start(vec![shell_snippet(
+                    r#"printf '%s|%s' "$HOOK_SESSION_SOURCE" "$HOOK_MODEL""#,
+                )]),
+            );
+
+        let result = runner.run_session_start("compact", Some("claude-opus-4-6"));
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec!["compact|claude-opus-4-6".to_string()])
+        );
+    }
+
+    #[test]
+    fn runs_pre_and_post_compact_hooks_without_blocking_compaction() {
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        let runner = HookRunner::new(
+            RuntimeHookConfig::default()
+                .with_pre_compact(vec![
+                    shell_snippet(r#"printf '%s|%s' "$HOOK_TRIGGER" "$HOOK_CUSTOM_INSTRUCTIONS""#),
+                    shell_snippet("printf 'broken pre'; exit 1"),
+                ])
+                .with_post_compact(vec![shell_snippet(
+                    r#"printf '%s|%s' "$HOOK_TRIGGER" "$HOOK_COMPACT_SUMMARY""#,
+                )]),
+        );
+
+        let pre_result = runner.run_pre_compact(CompactTrigger::Manual, Some("keep latest logs"));
+        assert_eq!(
+            pre_result.new_custom_instructions(),
+            Some("manual|keep latest logs")
+        );
+        let pre_display = pre_result
+            .user_display_message()
+            .expect("pre-compact display message");
+        assert!(pre_display.contains("manual|keep latest logs"));
+        assert!(pre_display.contains("broken pre"));
+
+        let post_result = runner.run_post_compact(CompactTrigger::Auto, "summary body");
+        let post_display = post_result
+            .user_display_message()
+            .expect("post-compact display message");
+        assert!(post_display.contains("auto|summary body"));
     }
 
     #[test]

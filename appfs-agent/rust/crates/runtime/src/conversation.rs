@@ -5,14 +5,20 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
+    select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
+    CompactionLayout, CompactionResult, PreservedSegmentAnchor,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{
+    AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent,
+    InvokedSkill, Session,
+};
+use crate::tool_session::{with_tool_session_context, with_tool_session_snapshot};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -22,6 +28,34 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Full compact uses a text-only request and must not expose tool schemas.
+    pub allow_tools: bool,
+    pub model_override: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl ApiRequest {
+    #[must_use]
+    pub fn conversation(system_prompt: Vec<String>, messages: Vec<ConversationMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            allow_tools: true,
+            model_override: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[must_use]
+    pub fn text_only(system_prompt: Vec<String>, messages: Vec<ConversationMessage>) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            allow_tools: false,
+            model_override: None,
+            reasoning_effort: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +85,7 @@ pub trait ApiClient {
 }
 
 pub trait ToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<ToolExecutionResult, ToolError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +131,103 @@ impl Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolContextUpdate {
+    pub model_override: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub additional_allow_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionResult {
+    pub output: String,
+    pub additional_messages: Vec<ConversationMessage>,
+    pub context_update: Option<ToolContextUpdate>,
+    pub invoked_skills: Vec<InvokedSkill>,
+}
+
+impl ToolExecutionResult {
+    #[must_use]
+    pub fn text(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            additional_messages: Vec::new(),
+            context_update: None,
+            invoked_skills: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_additional_messages(
+        mut self,
+        additional_messages: Vec<ConversationMessage>,
+    ) -> Self {
+        self.additional_messages = additional_messages;
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_update(mut self, context_update: ToolContextUpdate) -> Self {
+        self.context_update = Some(context_update);
+        self
+    }
+
+    #[must_use]
+    pub fn with_invoked_skill(mut self, invoked_skill: InvokedSkill) -> Self {
+        self.invoked_skills.push(invoked_skill);
+        self
+    }
+}
+
+impl From<String> for ToolExecutionResult {
+    fn from(value: String) -> Self {
+        Self::text(value)
+    }
+}
+
+impl From<&str> for ToolExecutionResult {
+    fn from(value: &str) -> Self {
+        Self::text(value)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConversationToolContext {
+    model_override: Option<String>,
+    reasoning_effort: Option<String>,
+    additional_allow_rules: Vec<String>,
+}
+
+impl ConversationToolContext {
+    fn apply(&mut self, update: ToolContextUpdate) {
+        if let Some(model_override) = update.model_override {
+            self.model_override = Some(model_override);
+        }
+        if let Some(reasoning_effort) = update.reasoning_effort {
+            self.reasoning_effort = Some(reasoning_effort);
+        }
+        for rule in update.additional_allow_rules {
+            if !self.additional_allow_rules.contains(&rule) {
+                self.additional_allow_rules.push(rule);
+            }
+        }
+    }
+
+    fn apply_to_api_request(&self, request: &mut ApiRequest) {
+        request.model_override.clone_from(&self.model_override);
+        request.reasoning_effort.clone_from(&self.reasoning_effort);
+    }
+
+    fn permission_context(
+        &self,
+        override_decision: Option<crate::permissions::PermissionOverride>,
+        override_reason: Option<String>,
+    ) -> PermissionContext {
+        PermissionContext::new(override_decision, override_reason)
+            .with_additional_allow_rules(self.additional_allow_rules.clone())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
@@ -282,6 +413,30 @@ where
         }
     }
 
+    fn run_session_start_hook_messages(
+        &mut self,
+        source: &str,
+        model: Option<&str>,
+    ) -> Vec<ConversationMessage> {
+        let result = if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+            self.hook_runner.run_session_start_with_context(
+                source,
+                model,
+                Some(&self.hook_abort_signal),
+                Some(reporter.as_mut()),
+            )
+        } else {
+            self.hook_runner.run_session_start_with_context(
+                source,
+                model,
+                Some(&self.hook_abort_signal),
+                None,
+            )
+        };
+
+        session_start_hook_messages(source, &result)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -298,6 +453,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut tool_context = ConversationToolContext::default();
 
         loop {
             iterations += 1;
@@ -309,11 +465,14 @@ where
                 return Err(error);
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
-            };
-            let events = match self.api_client.stream(request) {
+            let mut request =
+                ApiRequest::conversation(self.system_prompt.clone(), self.session.messages.clone());
+            tool_context.apply_to_api_request(&mut request);
+            let events = match with_tool_session_context(
+                &self.session.session_id,
+                self.session.persistence_path(),
+                || self.api_client.stream(request),
+            ) {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
@@ -362,7 +521,7 @@ where
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
-                let permission_context = PermissionContext::new(
+                let permission_context = tool_context.permission_context(
                     pre_hook_result.permission_override(),
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
@@ -407,24 +566,48 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
-                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+                        let session_messages = self.session.messages.clone();
+                        let compaction_summary = self
+                            .session
+                            .compaction
+                            .as_ref()
+                            .map(|compaction| compaction.summary.clone());
+                        let (mut execution, mut is_error) = with_tool_session_context(
+                            &self.session.session_id,
+                            self.session.persistence_path(),
+                            || {
+                                with_tool_session_snapshot(
+                                    &session_messages,
+                                    compaction_summary.as_deref(),
+                                    || match self
+                                        .tool_executor
+                                        .execute(&tool_name, &effective_input)
+                                    {
+                                        Ok(output) => (output, false),
+                                        Err(error) => {
+                                            (ToolExecutionResult::text(error.to_string()), true)
+                                        }
+                                    },
+                                )
+                            },
+                        );
+                        execution.output = merge_hook_feedback(
+                            pre_hook_result.messages(),
+                            execution.output,
+                            false,
+                        );
 
                         let post_hook_result = if is_error {
                             self.run_post_tool_use_failure_hook(
                                 &tool_name,
                                 &effective_input,
-                                &output,
+                                &execution.output,
                             )
                         } else {
                             self.run_post_tool_use_hook(
                                 &tool_name,
                                 &effective_input,
-                                &output,
+                                &execution.output,
                                 false,
                             )
                         };
@@ -434,15 +617,40 @@ where
                         {
                             is_error = true;
                         }
-                        output = merge_hook_feedback(
+                        execution.output = merge_hook_feedback(
                             post_hook_result.messages(),
-                            output,
+                            execution.output,
                             post_hook_result.is_denied()
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
-
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
+                        let result_message = ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            execution.output,
+                            is_error,
+                        );
+                        self.session
+                            .push_message(result_message.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.record_tool_finished(iterations, &result_message);
+                        tool_results.push(result_message.clone());
+                        if !is_error {
+                            for invoked_skill in execution.invoked_skills {
+                                self.session
+                                    .upsert_invoked_skill(invoked_skill)
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
+                        }
+                        if let Some(context_update) = execution.context_update {
+                            tool_context.apply(context_update);
+                        }
+                        for message in execution.additional_messages {
+                            self.session
+                                .push_message(message)
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        continue;
                     }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                         tool_use_id,
@@ -474,9 +682,81 @@ where
         Ok(summary)
     }
 
-    #[must_use]
-    pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&self.session, config)
+    pub fn compact(&mut self, config: CompactionConfig) -> Result<CompactionResult, RuntimeError> {
+        if !should_compact(&self.session, config) {
+            return Ok(compact_session(&self.session, config));
+        }
+
+        self.run_full_compact(
+            true,
+            CompactTrigger::Manual,
+            config.preserve_recent_messages,
+        )
+    }
+
+    /// Runs a TS-style full compact summary turn and rewrites the session to a
+    /// boundary + summary layout with post-compact context messages.
+    fn run_full_compact(
+        &mut self,
+        suppress_follow_up_questions: bool,
+        trigger: CompactTrigger,
+        preserve_recent_messages: usize,
+    ) -> Result<CompactionResult, RuntimeError> {
+        let selection = select_full_compact_messages(&self.session, preserve_recent_messages);
+        let removed_message_count = selection.messages_to_summarize.len();
+        let pre_compact = self.hook_runner.run_pre_compact(trigger, None);
+        let summary = self.execute_full_compact_summary_request(
+            &selection.messages_to_summarize,
+            pre_compact.new_custom_instructions(),
+        )?;
+        let hook_result_messages = self.run_session_start_hook_messages("compact", None);
+        let post_compact = self.hook_runner.run_post_compact(trigger, &summary);
+        Ok(build_compaction_result(
+            &self.session,
+            summary,
+            BuildCompactionResultOptions {
+                preserved_messages: selection.preserved_messages,
+                hook_result_messages,
+                preserved_segment_anchor: if preserve_recent_messages == 0 {
+                    None
+                } else {
+                    Some(PreservedSegmentAnchor::LastSummaryMessage)
+                },
+                removed_message_count,
+                suppress_follow_up_questions,
+                layout: CompactionLayout::TsBoundaryAndSummary,
+                boundary_trigger: Some(trigger),
+                user_display_message: combine_optional_display_messages(&[
+                    pre_compact.user_display_message(),
+                    post_compact.user_display_message(),
+                ]),
+            },
+        ))
+    }
+
+    fn execute_full_compact_summary_request(
+        &mut self,
+        source_messages: &[ConversationMessage],
+        custom_instructions: Option<&str>,
+    ) -> Result<String, RuntimeError> {
+        let mut messages = source_messages.to_vec();
+        messages.push(ConversationMessage::user_text(get_compact_prompt(
+            custom_instructions,
+        )));
+        let request = ApiRequest::text_only(self.system_prompt.clone(), messages);
+        let events = with_tool_session_context(
+            &self.session.session_id,
+            self.session.persistence_path(),
+            || self.api_client.stream(request),
+        )?;
+        let (assistant_message, usage, _) = build_assistant_message(events)?;
+        if let Some(usage) = usage {
+            self.usage_tracker.record(usage);
+        }
+
+        assistant_text(&assistant_message).ok_or_else(|| {
+            RuntimeError::new("full compaction failed to produce a text summary response")
+        })
     }
 
     #[must_use]
@@ -515,13 +795,7 @@ where
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        );
+        let result = self.run_full_compact(true, CompactTrigger::Auto, 0).ok()?;
 
         if result.removed_message_count == 0 {
             return None;
@@ -707,6 +981,21 @@ fn build_assistant_message(
     ))
 }
 
+fn assistant_text(message: &ConversationMessage) -> Option<String> {
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    (!text.is_empty()).then_some(text)
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -741,7 +1030,33 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
-type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
+fn combine_optional_display_messages(messages: &[Option<&str>]) -> Option<String> {
+    let combined = messages
+        .iter()
+        .flatten()
+        .map(|message| message.trim())
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!combined.is_empty()).then_some(combined)
+}
+
+fn session_start_hook_messages(source: &str, result: &HookRunResult) -> Vec<ConversationMessage> {
+    result
+        .messages()
+        .iter()
+        .map(|message| {
+            ConversationMessage::hook_result_user_text(
+                format!("SessionStart hook ({source}) output:\n{}", message.trim()),
+                Some(AttachmentKind::HookAdditionalContext),
+                HookResultEvent::SessionStart,
+                source,
+            )
+        })
+        .collect()
+}
+
+type ToolHandler = Box<dyn FnMut(&str) -> Result<ToolExecutionResult, ToolError>>;
 
 #[derive(Default)]
 pub struct StaticToolExecutor {
@@ -755,18 +1070,24 @@ impl StaticToolExecutor {
     }
 
     #[must_use]
-    pub fn register(
+    pub fn register<R>(
         mut self,
         tool_name: impl Into<String>,
-        handler: impl FnMut(&str) -> Result<String, ToolError> + 'static,
-    ) -> Self {
-        self.handlers.insert(tool_name.into(), Box::new(handler));
+        mut handler: impl FnMut(&str) -> Result<R, ToolError> + 'static,
+    ) -> Self
+    where
+        R: Into<ToolExecutionResult> + 'static,
+    {
+        self.handlers.insert(
+            tool_name.into(),
+            Box::new(move |input| handler(input).map(Into::into)),
+        );
         self
     }
 }
 
 impl ToolExecutor for StaticToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<ToolExecutionResult, ToolError> {
         self.handlers
             .get_mut(tool_name)
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
@@ -778,7 +1099,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -787,15 +1109,23 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{
+        AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent,
+        InvokedSkill, MessageRole, Session, SessionCompaction,
+    };
+    use crate::tool_session::{
+        current_tool_session_compaction_summary, current_tool_session_messages,
+    };
     use crate::usage::TokenUsage;
     use crate::ToolError;
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows};
+    use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
     #[cfg(windows)]
     use std::process::Command;
+    use std::rc::Rc;
     use std::sync::Arc;
     #[cfg(windows)]
     use std::sync::OnceLock;
@@ -926,6 +1256,180 @@ mod tests {
     }
 
     #[test]
+    fn applies_tool_side_effects_to_follow_up_requests() {
+        struct RecordingApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "skill".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert_eq!(request.model_override.as_deref(), Some("claude-sonnet-4-6"),);
+                        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+                        let last_message = request.messages.last().expect("injected prompt");
+                        assert_eq!(last_message.role, MessageRole::User);
+                        assert_eq!(
+                            last_message.attachment_metadata.as_ref().map(|m| m.kind),
+                            Some(AttachmentKind::InvokedSkills),
+                        );
+                        assert!(matches!(
+                            last_message.blocks.first(),
+                            Some(ContentBlock::Text { text }) if text == "Injected skill prompt"
+                        ));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("continued".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let tool_executor = StaticToolExecutor::new().register("skill", |_input| {
+            Ok(ToolExecutionResult::text("launched")
+                .with_additional_messages(vec![ConversationMessage::attachment_user_text(
+                    "Injected skill prompt",
+                    AttachmentKind::InvokedSkills,
+                )])
+                .with_invoked_skill(InvokedSkill {
+                    skill: "trace".to_string(),
+                    resolved_name: Some("trace".to_string()),
+                    path: Some("C:\\repo\\.agents\\skills\\trace\\SKILL.md".to_string()),
+                    description: Some("Trace skill".to_string()),
+                    args: None,
+                    prompt: "Injected skill prompt".to_string(),
+                })
+                .with_context_update(ToolContextUpdate {
+                    model_override: Some("claude-sonnet-4-6".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    additional_allow_rules: Vec::new(),
+                }))
+        });
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RecordingApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("run skill", None)
+            .expect("conversation loop should succeed");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        assert_eq!(runtime.session().messages.len(), 5);
+        assert_eq!(
+            runtime.session().messages[3]
+                .attachment_metadata
+                .as_ref()
+                .map(|m| m.kind),
+            Some(AttachmentKind::InvokedSkills),
+        );
+        assert_eq!(runtime.session().invoked_skills.len(), 1);
+        assert_eq!(runtime.session().invoked_skills[0].skill, "trace");
+    }
+
+    #[test]
+    fn transient_allow_rules_enable_follow_up_tool_calls() {
+        struct RecordingApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "skill".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "bash".to_string(),
+                            input: r#"{"command":"git status"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    3 => Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let tool_executor = StaticToolExecutor::new()
+            .register("skill", |_input| {
+                Ok(ToolExecutionResult::text("launched")
+                    .with_additional_messages(vec![ConversationMessage::attachment_user_text(
+                        "Skill prompt",
+                        AttachmentKind::InvokedSkills,
+                    )])
+                    .with_invoked_skill(InvokedSkill {
+                        skill: "trace".to_string(),
+                        resolved_name: Some("trace".to_string()),
+                        path: Some("C:\\repo\\.agents\\skills\\trace\\SKILL.md".to_string()),
+                        description: Some("Trace skill".to_string()),
+                        args: None,
+                        prompt: "Skill prompt".to_string(),
+                    })
+                    .with_context_update(ToolContextUpdate {
+                        model_override: None,
+                        reasoning_effort: None,
+                        additional_allow_rules: vec!["bash(git:*)".to_string()],
+                    }))
+            })
+            .register("bash", |_input| Ok("git output".to_string()));
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RecordingApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("skill", PermissionMode::ReadOnly)
+                .with_tool_requirement("bash", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("run skill", None)
+            .expect("conversation loop should succeed");
+
+        assert_eq!(summary.tool_results.len(), 2);
+        assert!(matches!(
+            summary.tool_results[1].blocks.first(),
+            Some(ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error: false,
+                ..
+            }) if tool_name == "bash" && output == "git output"
+        ));
+    }
+
+    #[test]
     fn records_runtime_session_trace_events() {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-runtime", sink.clone());
@@ -956,6 +1460,92 @@ mod tests {
         assert!(trace_names.contains(&"tool_execution_started"));
         assert!(trace_names.contains(&"tool_execution_finished"));
         assert!(trace_names.contains(&"turn_completed"));
+    }
+
+    #[test]
+    fn exposes_session_snapshot_during_tool_execution() {
+        struct SnapshotApi {
+            call_count: usize,
+        }
+
+        impl ApiClient for SnapshotApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "snapshot".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        struct SnapshotTool;
+
+        impl ToolExecutor for SnapshotTool {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                _input: &str,
+            ) -> Result<ToolExecutionResult, ToolError> {
+                assert_eq!(tool_name, "snapshot");
+                let summary = current_tool_session_compaction_summary();
+                assert_eq!(summary.as_deref(), Some("Older compact summary"));
+
+                let messages = current_tool_session_messages().expect("session snapshot");
+                assert!(messages.iter().any(|message| {
+                    message.role == MessageRole::User
+                        && message.blocks.iter().any(|block| {
+                            matches!(block, ContentBlock::Text { text } if text == "check snapshot")
+                        })
+                }));
+                assert!(messages.iter().any(|message| {
+                    message.role == MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::ToolUse { name, .. } if name == "snapshot"
+                            )
+                        })
+                }));
+
+                Ok(ToolExecutionResult::text("ok"))
+            }
+        }
+
+        let mut session = Session::new();
+        session.compaction = Some(SessionCompaction {
+            count: 1,
+            removed_message_count: 3,
+            summary: "Older compact summary".to_string(),
+        });
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SnapshotApi { call_count: 0 },
+            SnapshotTool,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("check snapshot", None)
+            .expect("conversation loop should succeed");
     }
 
     #[test]
@@ -1041,7 +1631,7 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new().register("blocked", |_input| {
+            StaticToolExecutor::new().register("blocked", |_input| -> Result<String, ToolError> {
                 panic!("tool should not execute when hook denies")
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -1104,7 +1694,7 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new().register("blocked", |_input| {
+            StaticToolExecutor::new().register("blocked", |_input| -> Result<String, ToolError> {
                 panic!("tool should not execute when hook fails")
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -1255,8 +1845,9 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            StaticToolExecutor::new()
-                .register("fail", |_input| Err(ToolError::new("tool exploded"))),
+            StaticToolExecutor::new().register("fail", |_input| -> Result<String, ToolError> {
+                Err(ToolError::new("tool exploded"))
+            }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -1341,22 +1932,37 @@ mod tests {
 
     #[test]
     fn compacts_session_after_turns() {
-        struct SimpleApi;
+        #[derive(Clone)]
+        struct SimpleApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         }
 
+        let requests = Rc::new(RefCell::new(Vec::new()));
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            SimpleApi,
+            SimpleApi {
+                requests: requests.clone(),
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -1365,20 +1971,221 @@ mod tests {
         runtime.run_turn("b", None).expect("turn b");
         runtime.run_turn("c", None).expect("turn c");
 
-        let result = runtime.compact(CompactionConfig {
-            preserve_recent_messages: 2,
-            max_estimated_tokens: 1,
-        });
-        assert!(result.summary.contains("Conversation summary"));
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+        assert!(result.summary.contains("Compacted from model"));
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
         );
+        assert_eq!(result.compacted_session.messages.len(), 4);
+        assert_eq!(result.compacted_session.messages[1].role, MessageRole::User);
+        assert_eq!(result.compacted_session.messages[2].role, MessageRole::User);
+        assert_eq!(
+            result.compacted_session.messages[3].role,
+            MessageRole::Assistant
+        );
+        let summary_uuid = result.compacted_session.messages[1].uuid.clone();
+        assert!(matches!(
+            result.compacted_session.messages[0].compact_metadata.as_ref(),
+            Some(metadata)
+                if metadata.trigger == CompactTrigger::Manual
+                    && metadata
+                        .preserved_segment
+                        .as_ref()
+                        .is_some_and(|segment| segment.anchor == summary_uuid)
+        ));
         assert_eq!(
             result.compacted_session.session_id,
             runtime.session().session_id
         );
         assert!(result.compacted_session.compaction.is_some());
+
+        let requests = requests.borrow();
+        let compact_request = requests.last().expect("compact request should exist");
+        assert!(!compact_request.allow_tools);
+        let compact_prompt = compact_request
+            .messages
+            .last()
+            .and_then(|message| message.blocks.first())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .expect("compact request should end with a text prompt");
+        assert!(compact_prompt.contains("Your task is to create a detailed summary"));
+        assert_eq!(compact_request.messages.len(), 5);
+        assert!(matches!(
+            &compact_request.messages[0].blocks[0],
+            ContentBlock::Text { text } if text == "a"
+        ));
+        assert!(matches!(
+            &compact_request.messages[2].blocks[0],
+            ContentBlock::Text { text } if text == "b"
+        ));
+        assert!(
+            compact_request.messages.iter().all(|message| {
+                message
+                    .blocks
+                    .iter()
+                    .all(|block| !matches!(block, ContentBlock::Text { text } if text == "c"))
+            }),
+            "preserved tail should be excluded from the summary request"
+        );
+    }
+
+    #[test]
+    fn compact_appends_session_start_hook_messages_after_summary() {
+        #[derive(Clone)]
+        struct SimpleApi;
+
+        impl ApiClient for SimpleApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_hooks(
+            RuntimeHookConfig::default()
+                .with_session_start(vec!["printf 'hook says keep compact context'".to_string()]),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+        runtime.run_turn("a", None).expect("turn a");
+        runtime.run_turn("b", None).expect("turn b");
+
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+
+        assert_eq!(result.compacted_session.messages.len(), 4);
+        assert_eq!(
+            result.compacted_session.messages[2].role,
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            result.compacted_session.messages[3]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::HookAdditionalContext)
+        );
+        let hook_metadata = result.compacted_session.messages[3]
+            .hook_result_metadata
+            .as_ref()
+            .expect("hook result metadata");
+        assert_eq!(hook_metadata.event, HookResultEvent::SessionStart);
+        assert_eq!(hook_metadata.source, "compact");
+        assert!(matches!(
+            &result.compacted_session.messages[3].blocks[0],
+            ContentBlock::Text { text }
+                if text.contains("SessionStart hook (compact) output:")
+                    && text.contains("hook says keep compact context")
+        ));
+    }
+
+    #[test]
+    fn compact_applies_pre_and_post_compact_hooks() {
+        #[derive(Clone)]
+        struct RecordingApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted from model</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let feature_config = RuntimeFeatureConfig::default().with_hooks(
+            RuntimeHookConfig::default()
+                .with_pre_compact(vec![shell_snippet("printf 'preserve failing test output'")])
+                .with_post_compact(vec![shell_snippet("printf 'post compact note'")]),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            RecordingApi {
+                requests: requests.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+        runtime.run_turn("a", None).expect("turn a");
+        runtime.run_turn("b", None).expect("turn b");
+
+        let result = runtime
+            .compact(CompactionConfig {
+                preserve_recent_messages: 0,
+                max_estimated_tokens: 1,
+            })
+            .expect("compact should succeed");
+
+        let requests = requests.borrow();
+        let compact_request = requests.last().expect("compact request should exist");
+        let compact_prompt = compact_request
+            .messages
+            .last()
+            .and_then(|message| message.blocks.first())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            })
+            .expect("compact request should end with a text prompt");
+        assert!(compact_prompt.contains("Additional Instructions:"));
+        assert!(compact_prompt.contains("preserve failing test output"));
+        assert_eq!(
+            result.user_display_message.as_deref(),
+            Some(
+                "PreCompact [printf 'preserve failing test output'] completed successfully: preserve failing test output\nPostCompact [printf 'post compact note'] completed successfully: post compact note"
+            )
+        );
     }
 
     #[test]
@@ -1489,25 +2296,38 @@ mod tests {
 
     #[test]
     fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
-        struct SimpleApi;
+        #[derive(Clone)]
+        struct SimpleApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
         impl ApiClient for SimpleApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 120_000,
-                        output_tokens: 4,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                    }),
-                    AssistantEvent::MessageStop,
-                ])
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.requests.borrow_mut().push(request.clone());
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 120_000,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Auto compacted</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         }
 
+        let requests = Rc::new(RefCell::new(Vec::new()));
         let mut session = Session::new();
         session.messages = vec![
             crate::session::ConversationMessage::user_text("one"),
@@ -1522,7 +2342,9 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             session,
-            SimpleApi,
+            SimpleApi {
+                requests: requests.clone(),
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -1536,10 +2358,24 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
+                removed_message_count: 6,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.session().messages[1].role, MessageRole::User);
+        assert!(matches!(
+            runtime.session().messages[0].compact_metadata.as_ref(),
+            Some(metadata) if metadata.trigger == CompactTrigger::Auto
+        ));
+        let requests = requests.borrow();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected turn request and compact request"
+        );
+        assert!(requests[0].allow_tools);
+        assert!(!requests[1].allow_tools);
     }
 
     #[test]

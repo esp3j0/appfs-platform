@@ -1,6 +1,6 @@
 # AppFS
 
-Filesystem-native app protocol for shell-first AI agents.
+Filesystem-native app protocol for shell-first AI agents, powered by AgentFS.
 
 [中文 README](README.zh-CN.md)
 
@@ -10,7 +10,7 @@ AppFS turns different apps into one filesystem contract so agents can use the sa
 - `>> *.act` to trigger actions with JSONL
 - `tail -f` to watch async event streams
 
-This repository contains the AppFS protocol docs, runtime, reference fixtures, bridge adapters, and conformance tests, all built on top of AgentFS core storage and mount backends.
+This repository contains the AppFS protocol docs, runtime, reference fixtures, bridge adapters, and conformance tests. AppFS is the app-facing protocol and managed runtime; AgentFS is the storage, overlay, sync, and mount engine underneath.
 
 ## Overview
 
@@ -22,7 +22,23 @@ AppFS is designed for practical LLM + shell workflows:
 - managed runtime lifecycle with dynamic app registration
 - connector adapters for in-process, HTTP, and gRPC integrations
 
-The recommended runtime entrypoint is:
+## Powered by AgentFS
+
+AppFS is the primary product story in this repository, but it is currently shipped through the AgentFS engine and CLI:
+
+- `agentfs init ...` prepares the underlying AgentFS database and storage layer
+- `agentfs appfs up ...` starts the managed AppFS runtime on top of that AgentFS-backed filesystem
+- the `agentfs` binary remains the entrypoint because AppFS currently depends on AgentFS database lifecycle, overlay semantics, sync support, and platform mount backends
+
+In other words: AppFS is the app-facing protocol and UX; AgentFS is the engine that powers it.
+
+The recommended integration entrypoint for real app projects is:
+
+```bash
+agentfs appfs compose up -f appfs-compose.yaml
+```
+
+The lower-level managed runtime primitive remains:
 
 ```bash
 agentfs appfs up <id-or-path> <mountpoint>
@@ -41,13 +57,68 @@ Low-level debug commands still exist:
 
 ## Quick Start
 
-The normal AppFS flow is:
+The higher-level AppFS flow is now:
+
+1. declare runtime, connectors, and apps in `appfs-compose.yaml`
+2. run `agentfs appfs compose up`
+3. use the mounted tree directly
+
+The lower-level managed flow is still:
 
 1. start a bridge or in-process connector
-2. initialize an empty AgentFS database
+2. initialize an empty AgentFS database that AppFS will use as its storage and mount substrate
 3. start AppFS with `agentfs appfs up`
 4. register an app through `/_appfs/register_app.act`
 5. read files, switch scope, and trigger actions through the mounted tree
+
+Today the recommended integration path is compose-first. `agentfs appfs up` remains the lower-level runtime primitive when you want to debug mount/runtime behavior directly.
+
+A Huoyan attached-case compose example lives at [examples/appfs/appfs-compose.huoyan-attached-case.example.yaml](./examples/appfs/appfs-compose.huoyan-attached-case.example.yaml).
+
+Minimal compose shape for the reference HTTP bridge:
+
+```yaml
+version: 1
+
+runtime:
+  db: ./.agentfs/compose-aiim.db
+  mountpoint: C:/mnt/appfs-compose-aiim
+  backend: winfsp
+  init: if_missing
+  reset: false
+
+connectors:
+  aiim-http:
+    mode: command
+    transport: http
+    endpoint: http://127.0.0.1:8080
+    healthcheck:
+      kind: connector
+      interval_ms: 500
+      timeout_ms: 2000
+      max_attempts: 40
+    command:
+      cwd: ./examples/appfs/bridges/http-python
+      program: uv
+      args: ["run", "python", "bridge_server.py"]
+
+apps:
+  aiim:
+    connector: aiim-http
+```
+
+With that file in place:
+
+```bash
+agentfs appfs compose up -f appfs-compose.yaml
+```
+
+Compose is the recommended path when you want one command to:
+
+- prepare or reopen the AgentFS runtime database
+- supervise an external or command-launched connector
+- bootstrap the managed AppFS registry
+- mount the tree and start the runtime in one foreground process
 
 Prerequisites:
 
@@ -65,6 +136,16 @@ Install WinFsp first. AppFS uses WinFsp as the Windows mount backend for `--back
 - Download and install the latest WinFsp release from [winfsp.dev/rel](https://winfsp.dev/rel/)
 - After installation, open a new terminal before running `agentfs appfs up`
 - A reboot is usually not required, but if Windows reports the driver is busy or mounts still fail after install, reboot once and retry
+- For WinFsp, the mountpoint path itself should be absent before mount. Keep the parent directory, such as `C:\mnt`, but do not pre-create `C:\mnt\appfs-compose-aiim`. `appfs compose up` now preserves this WinFsp expectation and will clean up an empty stale placeholder directory if an older run left one behind.
+
+Compose-first startup on Windows:
+
+```powershell
+cd C:\Users\esp3j\rep\agentfs\cli
+cargo run -- appfs compose up -f ..\examples\appfs\appfs-compose.huoyan-attached-case.example.yaml
+```
+
+If the target software is already inside a case or other attached scope, prefer passing that bootstrap mode through connector env in the compose file, as shown in the Huoyan example. That avoids issuing an extra `enter_scope` just to land on the working tree.
 
 Start the reference HTTP bridge:
 
@@ -282,7 +363,7 @@ Key entry points:
 
 AppFS is organized into three layers:
 
-- AgentFS Core: SQLite filesystem, generic overlay behavior, and platform mount backends
+- AgentFS Core: the engine beneath AppFS, including SQLite filesystem, generic overlay behavior, sync, and platform mount backends
 - AppFS Engine: registry, structure sync, runtime lifecycle, snapshot read-through, and connector adapters
 - AppFS UX: `agentfs appfs up` plus the mounted control plane under `/_appfs/*`
 
@@ -306,11 +387,12 @@ Notes:
 - `AppConnector` is the canonical runtime-facing connector surface
 - `_meta/manifest.res.json` is a derived view, not the runtime source of truth
 - snapshot cold misses auto-expand on ordinary file reads through the mount path
+- the current CLI layering is intentional: AppFS is exposed as an `agentfs` subcommand because it still depends on AgentFS storage and mount infrastructure
 - `agentfs init --base` remains an AgentFS feature, but it is not part of the recommended AppFS path
 
 ## Repository Layout
 
-- `cli/`: CLI, runtime, and mount integration
+- `cli/`: the `agentfs` CLI, including AppFS subcommands, runtime, and mount integration
 - `sdk/rust/`: Rust SDK and filesystem implementations
 - `sdk/typescript/`: TypeScript SDK
 - `sdk/python/`: Python SDK

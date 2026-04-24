@@ -114,6 +114,7 @@ pub enum WorkerTrustResolution {
 pub enum WorkerPromptTarget {
     Shell,
     WrongTarget,
+    WrongTask,
     Unknown,
 }
 
@@ -130,8 +131,22 @@ pub enum WorkerEventPayload {
         observed_target: WorkerPromptTarget,
         #[serde(skip_serializing_if = "Option::is_none")]
         observed_cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observed_prompt_preview: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_receipt: Option<WorkerTaskReceipt>,
         recovery_armed: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerTaskReceipt {
+    pub repo: String,
+    pub task_kind: String,
+    pub source_surface: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_artifacts: Vec<String>,
+    pub objective_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +171,7 @@ pub struct Worker {
     pub prompt_delivery_attempts: u32,
     pub prompt_in_flight: bool,
     pub last_prompt: Option<String>,
+    pub expected_receipt: Option<WorkerTaskReceipt>,
     pub replay_prompt: Option<String>,
     pub last_error: Option<WorkerFailure>,
     pub created_at: u64,
@@ -218,6 +234,7 @@ impl WorkerRegistry {
             prompt_delivery_attempts: 0,
             prompt_in_flight: false,
             last_prompt: None,
+            expected_receipt: None,
             replay_prompt: None,
             last_error: None,
             created_at: ts,
@@ -297,6 +314,7 @@ impl WorkerRegistry {
                     &lowered,
                     worker.last_prompt.as_deref(),
                     &worker.cwd,
+                    worker.expected_receipt.as_ref(),
                 )
             })
             .flatten()
@@ -310,6 +328,10 @@ impl WorkerRegistry {
                 }
                 WorkerPromptTarget::WrongTarget => format!(
                     "worker prompt landed in the wrong target instead of {}: {}",
+                    worker.cwd, prompt_preview
+                ),
+                WorkerPromptTarget::WrongTask => format!(
+                    "worker prompt receipt mismatched the expected task context for {}: {}",
                     worker.cwd, prompt_preview
                 ),
                 WorkerPromptTarget::Unknown => format!(
@@ -331,6 +353,8 @@ impl WorkerRegistry {
                     prompt_preview: prompt_preview.clone(),
                     observed_target: observation.target,
                     observed_cwd: observation.observed_cwd.clone(),
+                    observed_prompt_preview: observation.observed_prompt_preview.clone(),
+                    task_receipt: worker.expected_receipt.clone(),
                     recovery_armed: false,
                 }),
             );
@@ -346,6 +370,8 @@ impl WorkerRegistry {
                         prompt_preview,
                         observed_target: observation.target,
                         observed_cwd: observation.observed_cwd,
+                        observed_prompt_preview: observation.observed_prompt_preview,
+                        task_receipt: worker.expected_receipt.clone(),
                         recovery_armed: true,
                     }),
                 );
@@ -416,7 +442,12 @@ impl WorkerRegistry {
         Ok(worker.clone())
     }
 
-    pub fn send_prompt(&self, worker_id: &str, prompt: Option<&str>) -> Result<Worker, String> {
+    pub fn send_prompt(
+        &self,
+        worker_id: &str,
+        prompt: Option<&str>,
+        task_receipt: Option<WorkerTaskReceipt>,
+    ) -> Result<Worker, String> {
         let mut inner = self.inner.lock().expect("worker registry lock poisoned");
         let worker = inner
             .workers
@@ -440,6 +471,7 @@ impl WorkerRegistry {
         worker.prompt_delivery_attempts += 1;
         worker.prompt_in_flight = true;
         worker.last_prompt = Some(next_prompt.clone());
+        worker.expected_receipt = task_receipt;
         worker.replay_prompt = None;
         worker.last_error = None;
         worker.status = WorkerStatus::Running;
@@ -600,6 +632,7 @@ fn prompt_misdelivery_is_relevant(worker: &Worker) -> bool {
 struct PromptDeliveryObservation {
     target: WorkerPromptTarget,
     observed_cwd: Option<String>,
+    observed_prompt_preview: Option<String>,
 }
 
 fn push_event(
@@ -833,6 +866,7 @@ fn detect_prompt_misdelivery(
     lowered: &str,
     prompt: Option<&str>,
     expected_cwd: &str,
+    expected_receipt: Option<&WorkerTaskReceipt>,
 ) -> Option<PromptDeliveryObservation> {
     let Some(prompt) = prompt else {
         return None;
@@ -847,12 +881,30 @@ fn detect_prompt_misdelivery(
         return None;
     }
     let prompt_visible = lowered.contains(&prompt_snippet);
+    let observed_prompt_preview = detect_prompt_echo(screen_text);
+
+    if let Some(receipt) = expected_receipt {
+        let receipt_visible = task_receipt_visible(lowered, receipt);
+        let mismatched_prompt_visible = observed_prompt_preview
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|preview| !preview.contains(&prompt_snippet));
+
+        if (prompt_visible || mismatched_prompt_visible) && !receipt_visible {
+            return Some(PromptDeliveryObservation {
+                target: WorkerPromptTarget::WrongTask,
+                observed_cwd: detect_observed_shell_cwd(screen_text),
+                observed_prompt_preview,
+            });
+        }
+    }
 
     if let Some(observed_cwd) = detect_observed_shell_cwd(screen_text) {
         if prompt_visible && !cwd_matches_observed_target(expected_cwd, &observed_cwd) {
             return Some(PromptDeliveryObservation {
                 target: WorkerPromptTarget::WrongTarget,
                 observed_cwd: Some(observed_cwd),
+                observed_prompt_preview,
             });
         }
     }
@@ -870,6 +922,7 @@ fn detect_prompt_misdelivery(
     (shell_error && prompt_visible).then_some(PromptDeliveryObservation {
         target: WorkerPromptTarget::Shell,
         observed_cwd: None,
+        observed_prompt_preview,
     })
 }
 
@@ -882,10 +935,39 @@ fn prompt_preview(prompt: &str) -> String {
     format!("{}…", preview.trim_end())
 }
 
+fn detect_prompt_echo(screen_text: &str) -> Option<String> {
+    screen_text.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix('›')
+            .or_else(|| line.trim_start().strip_prefix('?'))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn task_receipt_visible(lowered_screen_text: &str, receipt: &WorkerTaskReceipt) -> bool {
+    let expected_tokens = [
+        receipt.repo.to_ascii_lowercase(),
+        receipt.task_kind.to_ascii_lowercase(),
+        receipt.source_surface.to_ascii_lowercase(),
+        receipt.objective_preview.to_ascii_lowercase(),
+    ];
+
+    expected_tokens
+        .iter()
+        .all(|token| lowered_screen_text.contains(token))
+        && receipt
+            .expected_artifacts
+            .iter()
+            .all(|artifact| lowered_screen_text.contains(&artifact.to_ascii_lowercase()))
+}
+
 fn prompt_misdelivery_detail(observation: &PromptDeliveryObservation) -> &'static str {
     match observation.target {
         WorkerPromptTarget::Shell => "shell misdelivery detected",
         WorkerPromptTarget::WrongTarget => "prompt landed in wrong target",
+        WorkerPromptTarget::WrongTask => "prompt receipt mismatched expected task context",
         WorkerPromptTarget::Unknown => "prompt delivery failure detected",
     }
 }
@@ -1001,7 +1083,7 @@ mod tests {
             WorkerFailureKind::TrustGate
         );
 
-        let send_before_resolve = registry.send_prompt(&worker.worker_id, Some("ship it"));
+        let send_before_resolve = registry.send_prompt(&worker.worker_id, Some("ship it"), None);
         assert!(send_before_resolve
             .expect_err("prompt delivery should be gated")
             .contains("not ready for prompt delivery"));
@@ -1041,7 +1123,7 @@ mod tests {
             .expect("ready observe should succeed");
 
         let running = registry
-            .send_prompt(&worker.worker_id, Some("Implement worker handshake"))
+            .send_prompt(&worker.worker_id, Some("Implement worker handshake"), None)
             .expect("prompt send should succeed");
         assert_eq!(running.status, WorkerStatus::Running);
         assert_eq!(running.prompt_delivery_attempts, 1);
@@ -1077,6 +1159,8 @@ mod tests {
                 prompt_preview: "Implement worker handshake".to_string(),
                 observed_target: WorkerPromptTarget::Shell,
                 observed_cwd: None,
+                observed_prompt_preview: None,
+                task_receipt: None,
                 recovery_armed: false,
             })
         );
@@ -1092,12 +1176,14 @@ mod tests {
                 prompt_preview: "Implement worker handshake".to_string(),
                 observed_target: WorkerPromptTarget::Shell,
                 observed_cwd: None,
+                observed_prompt_preview: None,
+                task_receipt: None,
                 recovery_armed: true,
             })
         );
 
         let replayed = registry
-            .send_prompt(&worker.worker_id, None)
+            .send_prompt(&worker.worker_id, None, None)
             .expect("replay send should succeed");
         assert_eq!(replayed.status, WorkerStatus::Running);
         assert!(replayed.replay_prompt.is_none());
@@ -1112,7 +1198,11 @@ mod tests {
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
         registry
-            .send_prompt(&worker.worker_id, Some("Run the worker bootstrap tests"))
+            .send_prompt(
+                &worker.worker_id,
+                Some("Run the worker bootstrap tests"),
+                None,
+            )
             .expect("prompt send should succeed");
 
         let recovered = registry
@@ -1143,9 +1233,79 @@ mod tests {
                 prompt_preview: "Run the worker bootstrap tests".to_string(),
                 observed_target: WorkerPromptTarget::WrongTarget,
                 observed_cwd: Some("/tmp/repo-target-b".to_string()),
+                observed_prompt_preview: None,
+                task_receipt: None,
                 recovery_armed: false,
             })
         );
+    }
+
+    #[test]
+    fn wrong_task_receipt_mismatch_is_detected_before_execution_continues() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-task", &[], true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        registry
+            .send_prompt(
+                &worker.worker_id,
+                Some("Implement worker handshake"),
+                Some(WorkerTaskReceipt {
+                    repo: "claw-code".to_string(),
+                    task_kind: "repo_code".to_string(),
+                    source_surface: "omx_team".to_string(),
+                    expected_artifacts: vec!["patch".to_string(), "tests".to_string()],
+                    objective_preview: "Implement worker handshake".to_string(),
+                }),
+            )
+            .expect("prompt send should succeed");
+
+        let recovered = registry
+            .observe(
+                &worker.worker_id,
+                "› Explain this KakaoTalk screenshot for a friend\nI can help analyze the screenshot…",
+            )
+            .expect("mismatch observe should succeed");
+
+        assert_eq!(recovered.status, WorkerStatus::ReadyForPrompt);
+        assert_eq!(
+            recovered
+                .last_error
+                .expect("wrong-task error should exist")
+                .kind,
+            WorkerFailureKind::PromptDelivery
+        );
+        let misdelivery = recovered
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::PromptMisdelivery)
+            .expect("wrong-task event should exist");
+        assert_eq!(
+            misdelivery.payload,
+            Some(WorkerEventPayload::PromptDelivery {
+                prompt_preview: "Implement worker handshake".to_string(),
+                observed_target: WorkerPromptTarget::WrongTask,
+                observed_cwd: None,
+                observed_prompt_preview: Some(
+                    "Explain this KakaoTalk screenshot for a friend".to_string()
+                ),
+                task_receipt: Some(WorkerTaskReceipt {
+                    repo: "claw-code".to_string(),
+                    task_kind: "repo_code".to_string(),
+                    source_surface: "omx_team".to_string(),
+                    expected_artifacts: vec!["patch".to_string(), "tests".to_string()],
+                    objective_preview: "Implement worker handshake".to_string(),
+                }),
+                recovery_armed: false,
+            })
+        );
+        let replay = recovered
+            .events
+            .iter()
+            .find(|event| event.kind == WorkerEventKind::PromptReplayArmed)
+            .expect("replay event should exist");
+        assert_eq!(replay.status, WorkerStatus::ReadyForPrompt);
     }
 
     #[test]
@@ -1193,7 +1353,7 @@ mod tests {
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
         registry
-            .send_prompt(&worker.worker_id, Some("Run tests"))
+            .send_prompt(&worker.worker_id, Some("Run tests"), None)
             .expect("prompt send should succeed");
 
         let restarted = registry
@@ -1281,7 +1441,7 @@ mod tests {
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
         registry
-            .send_prompt(&worker.worker_id, Some("Run tests"))
+            .send_prompt(&worker.worker_id, Some("Run tests"), None)
             .expect("prompt send should succeed");
 
         let failed = registry
@@ -1306,7 +1466,7 @@ mod tests {
             .observe(&worker.worker_id, "Ready for input\n>")
             .expect("ready observe should succeed");
         registry
-            .send_prompt(&worker.worker_id, Some("Run tests"))
+            .send_prompt(&worker.worker_id, Some("Run tests"), None)
             .expect("prompt send should succeed");
 
         let finished = registry

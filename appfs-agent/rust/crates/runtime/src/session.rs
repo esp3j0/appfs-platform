@@ -8,11 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use getrandom::getrandom;
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -40,11 +43,71 @@ pub enum ContentBlock {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemMessageSubtype {
+    CompactBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    RunningAgents,
+    TodoList,
+    PlanMode,
+    InvokedSkills,
+    HookAdditionalContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactPreservedSegment {
+    pub head: String,
+    pub anchor: String,
+    pub tail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactBoundaryMetadata {
+    pub trigger: CompactTrigger,
+    pub pre_tokens: usize,
+    pub user_context: Option<String>,
+    pub messages_summarized: Option<usize>,
+    pub pre_compact_discovered_tools: Vec<String>,
+    pub preserved_segment: Option<CompactPreservedSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentMetadata {
+    pub kind: AttachmentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookResultEvent {
+    SessionStart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookResultMetadata {
+    pub event: HookResultEvent,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationMessage {
+    pub uuid: String,
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
+    pub subtype: Option<SystemMessageSubtype>,
+    pub compact_metadata: Option<CompactBoundaryMetadata>,
+    pub attachment_metadata: Option<AttachmentMetadata>,
+    pub hook_result_metadata: Option<HookResultMetadata>,
+    pub is_compact_summary: bool,
+    pub is_visible_in_transcript_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +128,16 @@ pub struct SessionFork {
 pub struct SessionPromptEntry {
     pub timestamp_ms: u64,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokedSkill {
+    pub skill: String,
+    pub resolved_name: Option<String>,
+    pub path: Option<String>,
+    pub description: Option<String>,
+    pub args: Option<String>,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +164,7 @@ pub struct Session {
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
+    pub invoked_skills: Vec<InvokedSkill>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -105,6 +179,7 @@ impl PartialEq for Session {
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
+            && self.invoked_skills == other.invoked_skills
     }
 }
 
@@ -155,6 +230,7 @@ impl Session {
             fork: None,
             workspace_root: None,
             prompt_history: Vec::new(),
+            invoked_skills: Vec::new(),
             persistence: None,
         }
     }
@@ -241,6 +317,27 @@ impl Session {
         });
     }
 
+    pub fn upsert_invoked_skill(
+        &mut self,
+        invoked_skill: InvokedSkill,
+    ) -> Result<(), SessionError> {
+        let previous_updated_at_ms = self.updated_at_ms;
+        let previous_invoked_skills = self.invoked_skills.clone();
+        self.touch();
+        upsert_invoked_skill_entry(&mut self.invoked_skills, invoked_skill);
+
+        let persistence_path = self.persistence_path().map(Path::to_path_buf);
+        if let Some(path) = persistence_path {
+            if let Err(error) = self.save_to_path(path) {
+                self.updated_at_ms = previous_updated_at_ms;
+                self.invoked_skills = previous_invoked_skills;
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
     #[must_use]
     pub fn fork(&self, branch_name: Option<String>) -> Self {
         let now = current_time_millis();
@@ -257,6 +354,7 @@ impl Session {
             }),
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
+            invoked_skills: self.invoked_skills.clone(),
             persistence: None,
         }
     }
@@ -307,6 +405,17 @@ impl Session {
                     self.prompt_history
                         .iter()
                         .map(SessionPromptEntry::to_jsonl_record)
+                        .collect(),
+                ),
+            );
+        }
+        if !self.invoked_skills.is_empty() {
+            object.insert(
+                "invoked_skills".to_string(),
+                JsonValue::Array(
+                    self.invoked_skills
+                        .iter()
+                        .map(InvokedSkill::to_json)
                         .collect(),
                 ),
             );
@@ -365,6 +474,11 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
+        let invoked_skills = object
+            .get("invoked_skills")
+            .map(invoked_skills_from_json)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -375,6 +489,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            invoked_skills,
             persistence: None,
         })
     }
@@ -389,6 +504,7 @@ impl Session {
         let mut fork = None;
         let mut workspace_root = None;
         let mut prompt_history = Vec::new();
+        let mut invoked_skills = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -427,6 +543,9 @@ impl Session {
                         .get("workspace_root")
                         .and_then(JsonValue::as_str)
                         .map(PathBuf::from);
+                    if let Some(value) = object.get("invoked_skills") {
+                        invoked_skills = invoked_skills_from_json(value)?;
+                    }
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -469,6 +588,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            invoked_skills,
             persistence: None,
         })
     }
@@ -574,6 +694,17 @@ impl Session {
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
             );
         }
+        if !self.invoked_skills.is_empty() {
+            object.insert(
+                "invoked_skills".to_string(),
+                JsonValue::Array(
+                    self.invoked_skills
+                        .iter()
+                        .map(InvokedSkill::to_json)
+                        .collect(),
+                ),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -589,31 +720,149 @@ impl Default for Session {
 }
 
 impl ConversationMessage {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        role: MessageRole,
+        blocks: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+        subtype: Option<SystemMessageSubtype>,
+        compact_metadata: Option<CompactBoundaryMetadata>,
+        attachment_metadata: Option<AttachmentMetadata>,
+        hook_result_metadata: Option<HookResultMetadata>,
+        is_compact_summary: bool,
+        is_visible_in_transcript_only: bool,
+    ) -> Self {
+        Self {
+            uuid: generate_message_uuid(),
+            role,
+            blocks,
+            usage,
+            subtype,
+            compact_metadata,
+            attachment_metadata,
+            hook_result_metadata,
+            is_compact_summary,
+            is_visible_in_transcript_only,
+        }
+    }
+
+    #[must_use]
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn compact_boundary(metadata: CompactBoundaryMetadata) -> Self {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::Text {
+                text: "Conversation compacted".to_string(),
+            }],
+            None,
+            Some(SystemMessageSubtype::CompactBoundary),
+            Some(metadata),
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
     #[must_use]
     pub fn user_text(text: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text { text: text.into() }],
-            usage: None,
-        }
+        Self::user_text_with_metadata(text, None, None, false, false)
+    }
+
+    #[must_use]
+    pub fn attachment_user_text(text: impl Into<String>, kind: AttachmentKind) -> Self {
+        Self::user_text_with_metadata(text, Some(AttachmentMetadata { kind }), None, false, false)
+    }
+
+    #[must_use]
+    pub fn hook_result_user_text(
+        text: impl Into<String>,
+        attachment_kind: Option<AttachmentKind>,
+        event: HookResultEvent,
+        source: impl Into<String>,
+    ) -> Self {
+        Self::user_text_with_metadata(
+            text,
+            attachment_kind.map(|kind| AttachmentMetadata { kind }),
+            Some(HookResultMetadata {
+                event,
+                source: source.into(),
+            }),
+            false,
+            false,
+        )
+    }
+
+    fn user_text_with_metadata(
+        text: impl Into<String>,
+        attachment_metadata: Option<AttachmentMetadata>,
+        hook_result_metadata: Option<HookResultMetadata>,
+        is_compact_summary: bool,
+        is_visible_in_transcript_only: bool,
+    ) -> Self {
+        Self::new(
+            MessageRole::User,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+            None,
+            attachment_metadata,
+            hook_result_metadata,
+            is_compact_summary,
+            is_visible_in_transcript_only,
+        )
+    }
+
+    #[must_use]
+    pub fn compact_summary_user_text(
+        text: impl Into<String>,
+        is_visible_in_transcript_only: bool,
+    ) -> Self {
+        Self::user_text_with_metadata(text, None, None, true, is_visible_in_transcript_only)
     }
 
     #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
+        Self::new(
+            MessageRole::Assistant,
             blocks,
-            usage: None,
-        }
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
     pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
+        Self::new(
+            MessageRole::Assistant,
             blocks,
             usage,
-        }
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
@@ -623,21 +872,28 @@ impl ConversationMessage {
         output: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
+        Self::new(
+            MessageRole::Tool,
+            vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
                 output: output.into(),
                 is_error,
             }],
-            usage: None,
-        }
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
+        object.insert("uuid".to_string(), JsonValue::String(self.uuid.clone()));
         object.insert(
             "role".to_string(),
             JsonValue::String(
@@ -657,13 +913,63 @@ impl ConversationMessage {
         if let Some(usage) = self.usage {
             object.insert("usage".to_string(), usage_to_json(usage));
         }
+        if let Some(subtype) = &self.subtype {
+            object.insert(
+                "subtype".to_string(),
+                JsonValue::String(subtype.as_str().to_string()),
+            );
+        }
+        if let Some(compact_metadata) = &self.compact_metadata {
+            object.insert(
+                "compact_metadata".to_string(),
+                compact_metadata
+                    .to_json()
+                    .expect("compact metadata to serialize"),
+            );
+        }
+        if let Some(attachment_metadata) = &self.attachment_metadata {
+            object.insert(
+                "attachment_metadata".to_string(),
+                attachment_metadata.to_json(),
+            );
+        }
+        if let Some(hook_result_metadata) = &self.hook_result_metadata {
+            object.insert(
+                "hook_result_metadata".to_string(),
+                hook_result_metadata.to_json(),
+            );
+        }
+        if self.is_compact_summary {
+            object.insert("is_compact_summary".to_string(), JsonValue::Bool(true));
+        }
+        if self.is_visible_in_transcript_only {
+            object.insert(
+                "is_visible_in_transcript_only".to_string(),
+                JsonValue::Bool(true),
+            );
+        }
         JsonValue::Object(object)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("message must be an object".to_string()))?;
+        let uuid = match object.get("uuid") {
+            Some(value) => {
+                let uuid = value.as_str().ok_or_else(|| {
+                    SessionError::Format("message uuid must be a string".to_string())
+                })?;
+                if uuid.trim().is_empty() {
+                    return Err(SessionError::Format(
+                        "message uuid cannot be empty".to_string(),
+                    ));
+                }
+                uuid.to_string()
+            }
+            None => generate_message_uuid(),
+        };
         let role = match object
             .get("role")
             .and_then(JsonValue::as_str)
@@ -687,10 +993,71 @@ impl ConversationMessage {
             .map(ContentBlock::from_json)
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
+        let subtype = object
+            .get("subtype")
+            .map(SystemMessageSubtype::from_json)
+            .transpose()?;
+        let compact_metadata = object
+            .get("compact_metadata")
+            .map(CompactBoundaryMetadata::from_json)
+            .transpose()?;
+        let attachment_metadata = object
+            .get("attachment_metadata")
+            .map(AttachmentMetadata::from_json)
+            .transpose()?;
+        let hook_result_metadata = object
+            .get("hook_result_metadata")
+            .map(HookResultMetadata::from_json)
+            .transpose()?;
+        let is_compact_summary = object
+            .get("is_compact_summary")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let is_visible_in_transcript_only = object
+            .get("is_visible_in_transcript_only")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        if subtype.is_some() && role != MessageRole::System {
+            return Err(SessionError::Format(
+                "message subtype is only supported on system messages".to_string(),
+            ));
+        }
+        if compact_metadata.is_some() && subtype != Some(SystemMessageSubtype::CompactBoundary) {
+            return Err(SessionError::Format(
+                "compact_metadata requires subtype=compact_boundary".to_string(),
+            ));
+        }
+        if attachment_metadata.is_some() && role != MessageRole::User {
+            return Err(SessionError::Format(
+                "attachment_metadata is only supported on user messages".to_string(),
+            ));
+        }
+        if hook_result_metadata.is_some() && role != MessageRole::User {
+            return Err(SessionError::Format(
+                "hook_result_metadata is only supported on user messages".to_string(),
+            ));
+        }
+        if is_compact_summary && role != MessageRole::User {
+            return Err(SessionError::Format(
+                "is_compact_summary is only supported on user messages".to_string(),
+            ));
+        }
+        if is_compact_summary && (attachment_metadata.is_some() || hook_result_metadata.is_some()) {
+            return Err(SessionError::Format(
+                "compact summary messages cannot also be attachments or hook results".to_string(),
+            ));
+        }
         Ok(Self {
+            uuid,
             role,
             blocks,
             usage,
+            subtype,
+            compact_metadata,
+            attachment_metadata,
+            hook_result_metadata,
+            is_compact_summary,
+            is_visible_in_transcript_only,
         })
     }
 }
@@ -768,6 +1135,266 @@ impl ContentBlock {
                 "unsupported block type: {other}"
             ))),
         }
+    }
+}
+
+impl SystemMessageSubtype {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CompactBoundary => "compact_boundary",
+        }
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        match value
+            .as_str()
+            .ok_or_else(|| SessionError::Format("subtype must be a string".to_string()))?
+        {
+            "compact_boundary" => Ok(Self::CompactBoundary),
+            other => Err(SessionError::Format(format!(
+                "unsupported message subtype: {other}"
+            ))),
+        }
+    }
+}
+
+impl AttachmentKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunningAgents => "running_agents",
+            Self::TodoList => "todo_list",
+            Self::PlanMode => "plan_mode",
+            Self::InvokedSkills => "invoked_skills",
+            Self::HookAdditionalContext => "hook_additional_context",
+        }
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        match value
+            .as_str()
+            .ok_or_else(|| SessionError::Format("attachment kind must be a string".to_string()))?
+        {
+            "running_agents" => Ok(Self::RunningAgents),
+            "todo_list" => Ok(Self::TodoList),
+            "plan_mode" => Ok(Self::PlanMode),
+            "invoked_skills" => Ok(Self::InvokedSkills),
+            "hook_additional_context" => Ok(Self::HookAdditionalContext),
+            other => Err(SessionError::Format(format!(
+                "unsupported attachment kind: {other}"
+            ))),
+        }
+    }
+}
+
+impl CompactTrigger {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        match value
+            .as_str()
+            .ok_or_else(|| SessionError::Format("compact trigger must be a string".to_string()))?
+        {
+            "manual" => Ok(Self::Manual),
+            "auto" => Ok(Self::Auto),
+            other => Err(SessionError::Format(format!(
+                "unsupported compact trigger: {other}"
+            ))),
+        }
+    }
+}
+
+impl AttachmentMetadata {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "kind".to_string(),
+            JsonValue::String(self.kind.as_str().to_string()),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("attachment_metadata must be an object".to_string())
+        })?;
+        Ok(Self {
+            kind: AttachmentKind::from_json(
+                object
+                    .get("kind")
+                    .ok_or_else(|| SessionError::Format("missing kind".to_string()))?,
+            )?,
+        })
+    }
+}
+
+impl HookResultEvent {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+        }
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        match value
+            .as_str()
+            .ok_or_else(|| SessionError::Format("hook event must be a string".to_string()))?
+        {
+            "session_start" => Ok(Self::SessionStart),
+            other => Err(SessionError::Format(format!(
+                "unsupported hook event: {other}"
+            ))),
+        }
+    }
+}
+
+impl HookResultMetadata {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "event".to_string(),
+            JsonValue::String(self.event.as_str().to_string()),
+        );
+        object.insert("source".to_string(), JsonValue::String(self.source.clone()));
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("hook_result_metadata must be an object".to_string())
+        })?;
+        Ok(Self {
+            event: HookResultEvent::from_json(
+                object
+                    .get("event")
+                    .ok_or_else(|| SessionError::Format("missing event".to_string()))?,
+            )?,
+            source: required_string(object, "source")?,
+        })
+    }
+}
+
+impl CompactPreservedSegment {
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "head_uuid".to_string(),
+            JsonValue::String(self.head.clone()),
+        );
+        object.insert(
+            "anchor_uuid".to_string(),
+            JsonValue::String(self.anchor.clone()),
+        );
+        object.insert(
+            "tail_uuid".to_string(),
+            JsonValue::String(self.tail.clone()),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("preserved_segment must be an object".to_string())
+        })?;
+        Ok(Self {
+            head: required_string(object, "head_uuid")?,
+            anchor: required_string(object, "anchor_uuid")?,
+            tail: required_string(object, "tail_uuid")?,
+        })
+    }
+}
+
+impl CompactBoundaryMetadata {
+    fn to_json(&self) -> Result<JsonValue, SessionError> {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "trigger".to_string(),
+            JsonValue::String(self.trigger.as_str().to_string()),
+        );
+        object.insert(
+            "pre_tokens".to_string(),
+            JsonValue::Number(i64_from_usize(self.pre_tokens, "pre_tokens")?),
+        );
+        if let Some(user_context) = &self.user_context {
+            object.insert(
+                "user_context".to_string(),
+                JsonValue::String(user_context.clone()),
+            );
+        }
+        if let Some(messages_summarized) = self.messages_summarized {
+            object.insert(
+                "messages_summarized".to_string(),
+                JsonValue::Number(i64_from_usize(messages_summarized, "messages_summarized")?),
+            );
+        }
+        if !self.pre_compact_discovered_tools.is_empty() {
+            object.insert(
+                "pre_compact_discovered_tools".to_string(),
+                JsonValue::Array(
+                    self.pre_compact_discovered_tools
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(preserved_segment) = &self.preserved_segment {
+            object.insert("preserved_segment".to_string(), preserved_segment.to_json());
+        }
+        Ok(JsonValue::Object(object))
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("compact_metadata must be an object".to_string())
+        })?;
+        let pre_compact_discovered_tools = object
+            .get("pre_compact_discovered_tools")
+            .and_then(JsonValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                            SessionError::Format(
+                                "pre_compact_discovered_tools must be strings".to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            trigger: CompactTrigger::from_json(
+                object
+                    .get("trigger")
+                    .ok_or_else(|| SessionError::Format("missing trigger".to_string()))?,
+            )?,
+            pre_tokens: required_usize(object, "pre_tokens")?,
+            user_context: object
+                .get("user_context")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned),
+            messages_summarized: object
+                .get("messages_summarized")
+                .map(|_| required_usize(object, "messages_summarized"))
+                .transpose()?,
+            pre_compact_discovered_tools,
+            preserved_segment: object
+                .get("preserved_segment")
+                .map(CompactPreservedSegment::from_json)
+                .transpose()?,
+        })
     }
 }
 
@@ -886,6 +1513,67 @@ impl SessionPromptEntry {
     }
 }
 
+impl InvokedSkill {
+    fn identity_key(&self) -> &str {
+        self.resolved_name.as_deref().unwrap_or(self.skill.as_str())
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("skill".to_string(), JsonValue::String(self.skill.clone()));
+        if let Some(resolved_name) = &self.resolved_name {
+            object.insert(
+                "resolved_name".to_string(),
+                JsonValue::String(resolved_name.clone()),
+            );
+        }
+        if let Some(path) = &self.path {
+            object.insert("path".to_string(), JsonValue::String(path.clone()));
+        }
+        if let Some(description) = &self.description {
+            object.insert(
+                "description".to_string(),
+                JsonValue::String(description.clone()),
+            );
+        }
+        if let Some(args) = &self.args {
+            object.insert("args".to_string(), JsonValue::String(args.clone()));
+        }
+        object.insert("prompt".to_string(), JsonValue::String(self.prompt.clone()));
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| SessionError::Format("invoked skill must be an object".to_string()))?;
+        Ok(Self {
+            skill: required_string(object, "skill")?,
+            resolved_name: object
+                .get("resolved_name")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            path: object
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            description: object
+                .get("description")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            args: object
+                .get("args")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            prompt: required_string(object, "prompt")?,
+        })
+    }
+}
+
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
@@ -997,17 +1685,88 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn invoked_skills_from_json(value: &JsonValue) -> Result<Vec<InvokedSkill>, SessionError> {
+    value
+        .as_array()
+        .ok_or_else(|| SessionError::Format("invoked_skills must be an array".to_string()))?
+        .iter()
+        .map(InvokedSkill::from_json)
+        .collect()
+}
+
+fn upsert_invoked_skill_entry(invoked_skills: &mut Vec<InvokedSkill>, invoked_skill: InvokedSkill) {
+    if let Some(existing) = invoked_skills.iter_mut().find(|existing| {
+        existing
+            .identity_key()
+            .eq_ignore_ascii_case(invoked_skill.identity_key())
+    }) {
+        *existing = invoked_skill;
+        return;
+    }
+
+    invoked_skills.push(invoked_skill);
+}
+
 fn current_time_millis() -> u64 {
-    SystemTime::now()
+    let wall_clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let mut candidate = wall_clock;
+    loop {
+        let previous = LAST_TIMESTAMP_MS.load(Ordering::Relaxed);
+        if candidate <= previous {
+            candidate = previous.saturating_add(1);
+        }
+        match LAST_TIMESTAMP_MS.compare_exchange(
+            previous,
+            candidate,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return candidate,
+            Err(actual) => candidate = actual.saturating_add(1),
+        }
+    }
 }
 
 fn generate_session_id() -> String {
     let millis = current_time_millis();
     let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("session-{millis}-{counter}")
+}
+
+fn generate_message_uuid() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom(&mut bytes).is_err() {
+        let millis = current_time_millis();
+        let counter = MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&millis.to_be_bytes());
+        bytes[8..].copy_from_slice(&counter.to_be_bytes());
+    }
+    // RFC 4122 variant + version 4 bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
@@ -1093,14 +1852,26 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, rotate_session_file_if_needed, ContentBlock, ConversationMessage,
-        MessageRole, Session, SessionFork,
+        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, AttachmentKind,
+        CompactBoundaryMetadata, CompactPreservedSegment, CompactTrigger, ContentBlock,
+        ConversationMessage, HookResultEvent, InvokedSkill, MessageRole, Session, SessionFork,
+        SystemMessageSubtype,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn session_timestamps_are_monotonic_under_tight_loops() {
+        let first = current_time_millis();
+        let second = current_time_millis();
+        let third = current_time_millis();
+
+        assert!(first < second);
+        assert!(second < third);
+    }
 
     #[test]
     fn persists_and_restores_session_jsonl() {
@@ -1156,7 +1927,27 @@ mod tests {
                 ("version".to_string(), JsonValue::Number(1)),
                 (
                     "messages".to_string(),
-                    JsonValue::Array(vec![ConversationMessage::user_text("legacy").to_json()]),
+                    JsonValue::Array(vec![JsonValue::Object(
+                        [
+                            ("role".to_string(), JsonValue::String("user".to_string())),
+                            (
+                                "blocks".to_string(),
+                                JsonValue::Array(vec![JsonValue::Object(
+                                    [
+                                        ("type".to_string(), JsonValue::String("text".to_string())),
+                                        (
+                                            "text".to_string(),
+                                            JsonValue::String("legacy".to_string()),
+                                        ),
+                                    ]
+                                    .into_iter()
+                                    .collect(),
+                                )]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
                 ),
             ]
             .into_iter()
@@ -1168,11 +1959,36 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 1);
-        assert_eq!(
-            restored.messages[0],
-            ConversationMessage::user_text("legacy")
-        );
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "legacy"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
         assert!(!restored.session_id.is_empty());
+    }
+
+    #[test]
+    fn loads_legacy_session_jsonl_without_message_uuids() {
+        let path = temp_session_path("legacy-jsonl");
+        let legacy = [
+            r#"{"type":"session_meta","version":1,"session_id":"legacy-jsonl","created_at_ms":1,"updated_at_ms":2}"#,
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"legacy jsonl"}]}}"#,
+        ]
+        .join("\n");
+        fs::write(&path, format!("{legacy}\n")).expect("legacy jsonl should write");
+
+        let restored = Session::load_from_path(&path).expect("legacy jsonl should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "legacy jsonl"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
+        assert_eq!(restored.session_id, "legacy-jsonl");
     }
 
     #[test]
@@ -1195,7 +2011,46 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "hi"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
+    }
+
+    #[test]
+    fn persists_invoked_skills_in_session_metadata() {
+        let path = temp_session_path("invoked-skills");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("run trace")
+            .expect("message should append");
+        session
+            .upsert_invoked_skill(InvokedSkill {
+                skill: "trace".to_string(),
+                resolved_name: Some("trace".to_string()),
+                path: Some("C:\\repo\\.agents\\skills\\trace\\SKILL.md".to_string()),
+                description: Some("Trace helper".to_string()),
+                args: Some("full".to_string()),
+                prompt: "# trace\nFollow the traces\n".to_string(),
+            })
+            .expect("invoked skill should persist");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.invoked_skills.len(), 1);
+        assert_eq!(restored.invoked_skills[0].skill, "trace");
+        assert_eq!(
+            restored.invoked_skills[0].resolved_name.as_deref(),
+            Some("trace")
+        );
+        assert_eq!(restored.invoked_skills[0].args.as_deref(), Some("full"));
+        assert!(restored.invoked_skills[0]
+            .prompt
+            .contains("Follow the traces"));
+        assert_eq!(restored.messages.len(), 1);
     }
 
     #[test]
@@ -1215,6 +2070,119 @@ mod tests {
         assert_eq!(compaction.count, 1);
         assert_eq!(compaction.removed_message_count, 4);
         assert!(compaction.summary.contains("summarized"));
+    }
+
+    #[test]
+    fn persists_compact_boundary_message_metadata() {
+        let path = temp_session_path("compact-boundary");
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::compact_boundary(CompactBoundaryMetadata {
+                trigger: CompactTrigger::Auto,
+                pre_tokens: 1234,
+                user_context: Some("preserve recent diagnostics".to_string()),
+                messages_summarized: Some(8),
+                pre_compact_discovered_tools: vec!["bash".to_string(), "read_file".to_string()],
+                preserved_segment: Some(CompactPreservedSegment {
+                    head: "message-head-uuid".to_string(),
+                    anchor: "summary-message-uuid".to_string(),
+                    tail: "message-tail-uuid".to_string(),
+                }),
+            }),
+            ConversationMessage::user_text("Summary:\ncarried work"),
+        ];
+        session.save_to_path(&path).expect("session should save");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(
+            restored.messages[0].subtype,
+            Some(SystemMessageSubtype::CompactBoundary)
+        );
+        let metadata = restored.messages[0]
+            .compact_metadata
+            .as_ref()
+            .expect("compact boundary metadata");
+        assert_eq!(metadata.trigger, CompactTrigger::Auto);
+        assert_eq!(metadata.pre_tokens, 1234);
+        assert_eq!(metadata.messages_summarized, Some(8));
+        assert_eq!(
+            metadata.pre_compact_discovered_tools,
+            vec!["bash".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(
+            metadata.preserved_segment.as_ref().map(|segment| (
+                segment.head.as_str(),
+                segment.anchor.as_str(),
+                segment.tail.as_str()
+            )),
+            Some((
+                "message-head-uuid",
+                "summary-message-uuid",
+                "message-tail-uuid"
+            ))
+        );
+    }
+
+    #[test]
+    fn persists_compact_summary_message_flags() {
+        let path = temp_session_path("compact-summary");
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage::compact_summary_user_text(
+            "Summary:\ncarry over context",
+            true,
+        )];
+        session.save_to_path(&path).expect("session should save");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert!(restored.messages[0].is_compact_summary);
+        assert!(restored.messages[0].is_visible_in_transcript_only);
+    }
+
+    #[test]
+    fn persists_attachment_and_hook_result_metadata() {
+        let path = temp_session_path("attachment-hook");
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::attachment_user_text(
+                "Previously invoked skills remain available after compaction.",
+                AttachmentKind::InvokedSkills,
+            ),
+            ConversationMessage::hook_result_user_text(
+                "SessionStart hook (compact) output:\nPreserve diagnostics",
+                Some(AttachmentKind::HookAdditionalContext),
+                HookResultEvent::SessionStart,
+                "compact",
+            ),
+        ];
+        session.save_to_path(&path).expect("session should save");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(
+            restored.messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InvokedSkills)
+        );
+        assert_eq!(
+            restored.messages[1]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::HookAdditionalContext)
+        );
+        let hook_metadata = restored.messages[1]
+            .hook_result_metadata
+            .as_ref()
+            .expect("hook result metadata");
+        assert_eq!(hook_metadata.event, HookResultEvent::SessionStart);
+        assert_eq!(hook_metadata.source, "compact");
     }
 
     #[test]
@@ -1365,6 +2333,49 @@ mod tests {
 
         // then
         assert!(error.to_string().contains("unsupported block type"));
+    }
+
+    #[test]
+    fn rejects_attachment_metadata_on_non_user_messages() {
+        let message = JsonValue::Object(
+            [
+                (
+                    "role".to_string(),
+                    JsonValue::String("assistant".to_string()),
+                ),
+                (
+                    "blocks".to_string(),
+                    JsonValue::Array(vec![JsonValue::Object(
+                        [
+                            ("type".to_string(), JsonValue::String("text".to_string())),
+                            ("text".to_string(), JsonValue::String("hello".to_string())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+                (
+                    "attachment_metadata".to_string(),
+                    JsonValue::Object(
+                        [(
+                            "kind".to_string(),
+                            JsonValue::String("invoked_skills".to_string()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let error = ConversationMessage::from_json(&message)
+            .expect_err("assistant messages should reject attachment metadata");
+
+        assert!(error
+            .to_string()
+            .contains("attachment_metadata is only supported on user messages"));
     }
 
     #[test]

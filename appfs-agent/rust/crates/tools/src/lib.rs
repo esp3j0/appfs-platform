@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -17,21 +19,30 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    prepare_background_shell_output, prepare_shell_command_output, read_file,
+    shell_task_output_path,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::{WorkerReadySnapshot, WorkerRegistry},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
+    tool_output_root, tool_result_path,
+    worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
+    write_file, ApiClient, ApiRequest, AssistantEvent, AttachmentKind, BashCommandInput,
+    BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
+    ConversationRuntime, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, InvokedSkill,
+    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
-    claw_config_home, user_home_dir,
+    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolContextUpdate, ToolError,
+    ToolExecutionResult, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::file_tools::{
+    edit_tool_result_text, parse_edit_tool_result, parse_read_tool_result, parse_write_tool_result,
+    prepare_edit, prepare_read, prepare_write, read_tool_result_text, record_edit_result,
+    record_read_result, record_write_result, write_tool_result_text,
+};
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -414,10 +425,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1 }
                 },
-                "required": ["path"],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["file_path"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -429,9 +444,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "content": { "type": "string" }
                 },
-                "required": ["path", "content"],
+                "anyOf": [
+                    { "required": ["path", "content"] },
+                    { "required": ["file_path", "content"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -443,11 +462,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "old_string": { "type": "string" },
                     "new_string": { "type": "string" },
                     "replace_all": { "type": "boolean" }
                 },
-                "required": ["path", "old_string", "new_string"],
+                "anyOf": [
+                    { "required": ["path", "old_string", "new_string"] },
+                    { "required": ["file_path", "old_string", "new_string"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -483,7 +506,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "-n": { "type": "boolean" },
                     "-i": { "type": "boolean" },
                     "type": { "type": "string" },
-                    "head_limit": { "type": "integer", "minimum": 1 },
+                    "head_limit": { "type": "integer", "minimum": 0 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
                 },
@@ -932,7 +955,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "worker_id": { "type": "string" },
-                    "prompt": { "type": "string" }
+                    "prompt": { "type": "string" },
+                    "task_receipt": {
+                        "type": "object",
+                        "properties": {
+                            "repo": { "type": "string" },
+                            "task_kind": { "type": "string" },
+                            "source_surface": { "type": "string" },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "objective_preview": { "type": "string" }
+                        },
+                        "required": ["repo", "task_kind", "source_surface", "objective_preview"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["worker_id"],
                 "additionalProperties": false
@@ -1175,6 +1213,13 @@ pub fn enforce_permission_check(
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
+}
+
+pub fn execute_tool_with_effects(name: &str, input: &Value) -> Result<ToolExecutionResult, String> {
+    match name {
+        "Skill" => from_value::<SkillInput>(input).and_then(execute_skill_tool_result),
+        _ => execute_tool(name, input).map(ToolExecutionResult::text),
+    }
 }
 
 fn execute_tool_with_enforcer(
@@ -1504,7 +1549,11 @@ fn run_worker_await_ready(input: WorkerIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_send_prompt(input: WorkerSendPromptInput) -> Result<String, String> {
-    let worker = global_worker_registry().send_prompt(&input.worker_id, input.prompt.as_deref())?;
+    let worker = global_worker_registry().send_prompt(
+        &input.worker_id,
+        input.prompt.as_deref(),
+        input.task_receipt,
+    )?;
     to_pretty_json(worker)
 }
 
@@ -1810,6 +1859,30 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+    let preflight = workspace_test_branch_preflight_details(command)?;
+    Some(branch_divergence_output(
+        command,
+        &preflight.branch,
+        &preflight.main_ref,
+        preflight.commits_behind,
+        preflight.commits_ahead,
+        &preflight.missing_fixes,
+    ))
+}
+
+fn powershell_test_branch_preflight(command: &str) -> Option<PowerShellCommandOutput> {
+    let preflight = workspace_test_branch_preflight_details(command)?;
+    Some(powershell_branch_divergence_output(
+        command,
+        &preflight.branch,
+        &preflight.main_ref,
+        preflight.commits_behind,
+        preflight.commits_ahead,
+        &preflight.missing_fixes,
+    ))
+}
+
+fn workspace_test_branch_preflight_details(command: &str) -> Option<BranchDivergencePreflight> {
     if !is_workspace_test_command(command) {
         return None;
     }
@@ -1822,27 +1895,33 @@ fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
         BranchFreshness::Stale {
             commits_behind,
             missing_fixes,
-        } => Some(branch_divergence_output(
-            command,
-            &branch,
-            &main_ref,
+        } => Some(BranchDivergencePreflight {
+            branch,
+            main_ref,
             commits_behind,
-            None,
-            &missing_fixes,
-        )),
+            commits_ahead: None,
+            missing_fixes,
+        }),
         BranchFreshness::Diverged {
             ahead,
             behind,
             missing_fixes,
-        } => Some(branch_divergence_output(
-            command,
-            &branch,
-            &main_ref,
-            behind,
-            Some(ahead),
-            &missing_fixes,
-        )),
+        } => Some(BranchDivergencePreflight {
+            branch,
+            main_ref,
+            commits_behind: behind,
+            commits_ahead: Some(ahead),
+            missing_fixes,
+        }),
     }
+}
+
+struct BranchDivergencePreflight {
+    branch: String,
+    main_ref: String,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: Vec<String>,
 }
 
 fn is_workspace_test_command(command: &str) -> bool {
@@ -1905,17 +1984,13 @@ fn branch_divergence_output(
     commits_ahead: Option<usize>,
     missing_fixes: &[String],
 ) -> BashCommandOutput {
-    let relation = commits_ahead.map_or_else(
-        || format!("is {commits_behind} commit(s) behind"),
-        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
-    );
-    let missing_summary = if missing_fixes.is_empty() {
-        "(none surfaced)".to_string()
-    } else {
-        missing_fixes.join("; ")
-    };
-    let stderr = format!(
-        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    let stderr = branch_divergence_stderr(
+        command,
+        branch,
+        main_ref,
+        commits_behind,
+        commits_ahead,
+        missing_fixes,
     );
 
     BashCommandOutput {
@@ -1955,27 +2030,102 @@ fn branch_divergence_output(
     }
 }
 
+fn powershell_branch_divergence_output(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> PowerShellCommandOutput {
+    PowerShellCommandOutput {
+        stdout: String::new(),
+        stderr: branch_divergence_stderr(
+            command,
+            branch,
+            main_ref,
+            commits_behind,
+            commits_ahead,
+            missing_fixes,
+        ),
+        interrupted: false,
+        raw_output_path: None,
+        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
+        is_image: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        structured_content: None,
+    }
+}
+
+fn branch_divergence_stderr(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> String {
+    let relation = commits_ahead.map_or_else(
+        || format!("is {commits_behind} commit(s) behind"),
+        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
+    );
+    let missing_summary = if missing_fixes.is_empty() {
+        "(none surfaced)".to_string()
+    } else {
+        missing_fixes.join("; ")
+    };
+    format!(
+        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    )
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let prepared = prepare_read(&input.path, input.offset, input.limit)?;
+    if let Some(dedup_output) = prepared.dedup_output {
+        return to_pretty_json(dedup_output);
+    }
+
+    let output = read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?;
+    record_read_result(
+        &prepared.normalized_path,
+        &output,
+        prepared.requested_offset,
+        prepared.limit,
+    )?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let prepared = prepare_write(&input.path)?;
+    let output = write_file(&input.path, &input.content).map_err(io_to_string)?;
+    record_write_result(&prepared.normalized_path, &output)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
+    let replace_all = input.replace_all.unwrap_or(false);
+    let prepared = prepare_edit(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        replace_all,
+    )?;
+    let output = edit_file(
+        &input.path,
+        &prepared.actual_old_string,
+        &prepared.actual_new_string,
+        replace_all,
     )
+    .map_err(io_to_string)?;
+    record_edit_result(&prepared.normalized_path)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2061,6 +2211,7 @@ fn io_to_string(error: std::io::Error) -> String {
 
 #[derive(Debug, Deserialize)]
 struct ReadFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -2068,12 +2219,14 @@ struct ReadFileInput {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct EditFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     old_string: String,
     new_string: String,
@@ -2225,6 +2378,43 @@ struct PowerShellInput {
     run_in_background: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PowerShellCommandOutput {
+    stdout: String,
+    stderr: String,
+    interrupted: bool,
+    #[serde(rename = "rawOutputPath", skip_serializing_if = "Option::is_none")]
+    raw_output_path: Option<String>,
+    #[serde(
+        rename = "returnCodeInterpretation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    return_code_interpretation: Option<String>,
+    #[serde(rename = "isImage", skip_serializing_if = "Option::is_none")]
+    is_image: Option<bool>,
+    #[serde(
+        rename = "persistedOutputPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    persisted_output_path: Option<String>,
+    #[serde(
+        rename = "persistedOutputSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    persisted_output_size: Option<u64>,
+    #[serde(rename = "backgroundTaskId", skip_serializing_if = "Option::is_none")]
+    background_task_id: Option<String>,
+    #[serde(rename = "backgroundedByUser", skip_serializing_if = "Option::is_none")]
+    backgrounded_by_user: Option<bool>,
+    #[serde(
+        rename = "assistantAutoBackgrounded",
+        skip_serializing_if = "Option::is_none"
+    )]
+    assistant_auto_backgrounded: Option<bool>,
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    structured_content: Option<Vec<serde_json::Value>>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AskUserQuestionInput {
     question: String,
@@ -2282,6 +2472,8 @@ struct WorkerSendPromptInput {
     worker_id: String,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    task_receipt: Option<WorkerTaskReceipt>,
 }
 
 const fn default_auto_recover_prompt_misdelivery() -> bool {
@@ -2392,13 +2584,85 @@ struct TodoWriteOutput {
     verification_nudge_needed: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SkillOutput {
     skill: String,
     path: String,
     args: Option<String>,
     description: Option<String>,
     prompt: String,
+    metadata: SkillMetadataOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutedSkill {
+    output: SkillOutput,
+    prompt: String,
+    invoked_skill: InvokedSkill,
+    allowed_tools: Vec<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    execution_context: Option<commands::SkillExecutionContext>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSkillExecution {
+    document: commands::SkillDocument,
+    prompt: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillMetadataOutput {
+    #[serde(rename = "resolvedName")]
+    resolved_name: String,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    description: String,
+    #[serde(rename = "hasUserSpecifiedDescription")]
+    has_user_specified_description: bool,
+    #[serde(
+        rename = "allowedTools",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    allowed_tools: Vec<String>,
+    #[serde(rename = "argumentHint", skip_serializing_if = "Option::is_none")]
+    argument_hint: Option<String>,
+    #[serde(
+        rename = "argumentNames",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    argument_names: Vec<String>,
+    #[serde(rename = "whenToUse", skip_serializing_if = "Option::is_none")]
+    when_to_use: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "disableModelInvocation")]
+    disable_model_invocation: bool,
+    #[serde(rename = "userInvocable")]
+    user_invocable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hooks: Option<Value>,
+    #[serde(rename = "executionContext", skip_serializing_if = "Option::is_none")]
+    execution_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shell: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2437,6 +2701,22 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForkedSkillRequest {
+    name: String,
+    description: String,
+    prompt: String,
+    subagent_type: String,
+    model: Option<String>,
+    allowed_tools: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForkedSkillExecutionResult {
+    agent_id: String,
+    result: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2996,17 +3276,310 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
 }
 
 fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
-    let skill_path = resolve_skill_path(&input.skill)?;
-    let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
-    let description = parse_skill_description(&prompt);
+    Ok(execute_skill_with_fork_runner(input, execute_forked_skill)?.output)
+}
 
-    Ok(SkillOutput {
+fn execute_skill_with_fork_runner<F>(
+    input: SkillInput,
+    fork_runner: F,
+) -> Result<ExecutedSkill, String>
+where
+    F: FnOnce(ForkedSkillRequest) -> Result<ForkedSkillExecutionResult, String>,
+{
+    let resolved = resolve_skill_for_execution(&input.skill, input.args.as_deref())?;
+    let document = resolved.document;
+    if document.disable_model_invocation {
+        return Err(format!(
+            "Skill {} cannot be used with Skill tool due to disable-model-invocation",
+            document.resolved_name
+        ));
+    }
+    let prompt = resolved.prompt;
+    let description = Some(document.description.clone());
+    let metadata = skill_metadata_output(document.clone());
+    let invoked_skill = InvokedSkill {
+        skill: input.skill.clone(),
+        resolved_name: Some(document.resolved_name.clone()),
+        path: Some(resolved.path.clone()),
+        description: description.clone(),
+        args: input.args.clone(),
+        prompt: prompt.clone(),
+    };
+
+    let mut output = SkillOutput {
         skill: input.skill,
-        path: skill_path.display().to_string(),
+        path: resolved.path,
         args: input.args,
         description,
+        prompt: prompt.clone(),
+        metadata,
+        status: None,
+        agent_id: None,
+        result: None,
+    };
+
+    if document.execution_context == Some(commands::SkillExecutionContext::Fork) {
+        let forked = fork_runner(build_forked_skill_request(&document, &prompt))?;
+        output.status = Some(String::from("forked"));
+        output.agent_id = Some(forked.agent_id);
+        output.result = Some(forked.result);
+    }
+
+    Ok(ExecutedSkill {
+        output,
         prompt,
+        invoked_skill,
+        allowed_tools: document.allowed_tools,
+        model: document.model,
+        effort: document.effort,
+        execution_context: document.execution_context,
     })
+}
+
+fn resolve_skill_for_execution(
+    skill: &str,
+    args: Option<&str>,
+) -> Result<ResolvedSkillExecution, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    match commands::resolve_skill(&cwd, skill) {
+        Ok(skill) => resolve_primary_skill_for_execution(&cwd, skill, args),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            resolve_compat_skill_for_execution(skill, args)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn resolve_primary_skill_for_execution(
+    cwd: &Path,
+    skill: commands::ResolvedSkill,
+    args: Option<&str>,
+) -> Result<ResolvedSkillExecution, String> {
+    let prompt_body = commands::render_resolved_skill_prompt(&skill, args);
+    match skill.source {
+        commands::ResolvedSkillSource::Filesystem { path } => {
+            let prompt = prepend_skill_base_directory(&prompt_body, path.parent());
+            Ok(ResolvedSkillExecution {
+                document: skill.document,
+                prompt,
+                path: path.display().to_string(),
+            })
+        }
+        commands::ResolvedSkillSource::Bundled { .. } => {
+            let reference_files = commands::resolved_skill_reference_files(&skill);
+            let prompt = if reference_files.is_empty() {
+                prompt_body
+            } else {
+                let base_dir = materialize_bundled_skill_files(
+                    cwd,
+                    skill.document.resolved_name.as_str(),
+                    &reference_files,
+                )?;
+                prepend_skill_base_directory(&prompt_body, Some(base_dir.as_path()))
+            };
+            Ok(ResolvedSkillExecution {
+                path: format!("bundled://{}", skill.document.resolved_name),
+                document: skill.document,
+                prompt,
+            })
+        }
+    }
+}
+
+fn resolve_compat_skill_for_execution(
+    skill: &str,
+    args: Option<&str>,
+) -> Result<ResolvedSkillExecution, String> {
+    let skill_path = resolve_skill_path_from_compat_roots(skill)?;
+    let document =
+        commands::load_skill_document(&skill_path, "Skill").map_err(|error| error.to_string())?;
+    let prompt_body = document.render_markdown_with_arguments(args);
+    let prompt = prepend_skill_base_directory(&prompt_body, skill_path.parent());
+    Ok(ResolvedSkillExecution {
+        document,
+        prompt,
+        path: skill_path.display().to_string(),
+    })
+}
+
+fn prepend_skill_base_directory(prompt: &str, base_dir: Option<&Path>) -> String {
+    match base_dir {
+        Some(base_dir) => format!(
+            "Base directory for this skill: {}\n\n{}",
+            base_dir.display(),
+            prompt
+        ),
+        None => prompt.to_string(),
+    }
+}
+
+fn materialize_bundled_skill_files(
+    cwd: &Path,
+    skill_name: &str,
+    files: &BTreeMap<String, String>,
+) -> Result<PathBuf, String> {
+    let base_dir = tool_output_root(cwd)
+        .join("skills")
+        .join(sanitize_bundled_skill_storage_name(skill_name));
+    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
+
+    for (relative_path, content) in files {
+        let target = resolve_bundled_skill_file_path(&base_dir, relative_path)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(&target, content).map_err(|error| error.to_string())?;
+    }
+
+    Ok(base_dir)
+}
+
+fn sanitize_bundled_skill_storage_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        String::from("skill")
+    } else {
+        sanitized
+    }
+}
+
+fn resolve_bundled_skill_file_path(
+    base_dir: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "bundled skill file path escapes skill dir: {relative_path}"
+        ));
+    }
+    Ok(base_dir.join(relative))
+}
+
+fn execute_skill_tool_result(input: SkillInput) -> Result<ToolExecutionResult, String> {
+    let executed = execute_skill_with_fork_runner(input, execute_forked_skill)?;
+    let output = to_pretty_json(executed.output.clone())?;
+    if executed.execution_context == Some(commands::SkillExecutionContext::Fork) {
+        return Ok(ToolExecutionResult::text(output).with_invoked_skill(executed.invoked_skill));
+    }
+
+    let context_update = ToolContextUpdate {
+        additional_allow_rules: executed.allowed_tools,
+        model_override: executed.model,
+        reasoning_effort: executed.effort,
+    };
+    let additional_messages = vec![ConversationMessage::attachment_user_text(
+        executed.prompt,
+        AttachmentKind::InvokedSkills,
+    )];
+
+    let result = ToolExecutionResult::text(output)
+        .with_additional_messages(additional_messages)
+        .with_invoked_skill(executed.invoked_skill);
+    if context_update.additional_allow_rules.is_empty()
+        && context_update.model_override.is_none()
+        && context_update.reasoning_effort.is_none()
+    {
+        Ok(result)
+    } else {
+        Ok(result.with_context_update(context_update))
+    }
+}
+
+fn build_forked_skill_request(
+    document: &commands::SkillDocument,
+    prompt: &str,
+) -> ForkedSkillRequest {
+    let subagent_type = normalize_subagent_type(document.agent.as_deref());
+    let allowed_tools = normalized_skill_allowed_tools(&document.allowed_tools)
+        .unwrap_or_else(|| allowed_tools_for_subagent(&subagent_type));
+
+    ForkedSkillRequest {
+        name: document.resolved_name.clone(),
+        description: format!("Execute skill {}", document.resolved_name),
+        prompt: prompt.to_string(),
+        subagent_type,
+        model: document.model.clone(),
+        allowed_tools,
+    }
+}
+
+fn normalized_skill_allowed_tools(raw_tools: &[String]) -> Option<BTreeSet<String>> {
+    let registry = GlobalToolRegistry::builtin();
+    let mut allowed = BTreeSet::new();
+
+    for raw_tool in raw_tools {
+        let base_name = raw_tool
+            .split_once('(')
+            .map_or(raw_tool.as_str(), |(head, _)| head)
+            .trim();
+        if base_name.is_empty() {
+            continue;
+        }
+        if let Ok(Some(normalized)) = registry.normalize_allowed_tools(&[base_name.to_string()]) {
+            allowed.extend(normalized);
+        }
+    }
+
+    (!allowed.is_empty()).then_some(allowed)
+}
+
+fn execute_forked_skill(request: ForkedSkillRequest) -> Result<ForkedSkillExecutionResult, String> {
+    let job = prepare_agent_job(
+        request.description,
+        request.prompt,
+        Some(request.subagent_type.as_str()),
+        Some(request.name.as_str()),
+        request.model.as_deref(),
+        Some(request.allowed_tools),
+    )?;
+    let result = run_agent_job(&job).inspect_err(|error| {
+        let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
+    })?;
+
+    Ok(ForkedSkillExecutionResult {
+        agent_id: job.manifest.agent_id.clone(),
+        result,
+    })
+}
+
+fn skill_metadata_output(document: commands::SkillDocument) -> SkillMetadataOutput {
+    SkillMetadataOutput {
+        resolved_name: document.resolved_name,
+        display_name: document.display_name,
+        description: document.description,
+        has_user_specified_description: document.has_user_specified_description,
+        allowed_tools: document.allowed_tools,
+        argument_hint: document.argument_hint,
+        argument_names: document.argument_names,
+        when_to_use: document.when_to_use,
+        version: document.version,
+        model: document.model,
+        disable_model_invocation: document.disable_model_invocation,
+        user_invocable: document.user_invocable,
+        hooks: document.hooks,
+        execution_context: document
+            .execution_context
+            .map(commands::SkillExecutionContext::as_str)
+            .map(ToString::to_string),
+        agent: document.agent,
+        effort: document.effort,
+        paths: document.paths,
+        shell: document.shell,
+    }
 }
 
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
@@ -3031,21 +3604,13 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
     Ok(cwd.join(".clawd-todos.json"))
 }
 
-fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    match commands::resolve_skill_path(&cwd, skill) {
-        Ok(path) => Ok(path),
-        Err(_) => resolve_skill_path_from_compat_roots(skill),
-    }
-}
-
 fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBuf, String> {
     let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
     if requested.is_empty() {
         return Err(String::from("skill must not be empty"));
     }
 
-    for root in skill_lookup_roots() {
+    for root in compat_skill_lookup_roots() {
         if let Some(path) = resolve_skill_path_in_root(&root, requested) {
             return Ok(path);
         }
@@ -3066,21 +3631,15 @@ struct SkillLookupRoot {
     origin: SkillLookupOrigin,
 }
 
-fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
+fn compat_skill_lookup_roots() -> Vec<SkillLookupRoot> {
     let mut roots = Vec::new();
 
     if let Ok(cwd) = std::env::current_dir() {
-        push_project_skill_lookup_roots(&mut roots, &cwd);
+        push_project_compat_skill_lookup_roots(&mut roots, &cwd);
     }
 
-    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
-    }
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
-    }
-    if let Some(home) = user_home_dir() {
-        push_home_skill_lookup_roots(&mut roots, &home);
+    if let Ok(home) = std::env::var("HOME") {
+        push_home_compat_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
     }
     if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
@@ -3114,21 +3673,15 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     roots
 }
 
-fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
+fn push_project_compat_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
     for ancestor in cwd.ancestors() {
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
 }
 
-fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
+fn push_home_compat_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
     push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
         roots,
         home.join(".agents").join("skills"),
@@ -3259,37 +3812,8 @@ fn resolve_skill_path_in_legacy_commands_dir(
 fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bool {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|contents| parse_skill_name(&contents))
+        .and_then(|contents| commands::extract_skill_frontmatter_name(&contents))
         .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-}
-
-fn parse_skill_name(contents: &str) -> Option<String> {
-    parse_skill_frontmatter_value(contents, "name")
-}
-
-fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
-            let value = value
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3304,10 +3828,36 @@ fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOu
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
-    if input.description.trim().is_empty() {
+    let job = prepare_agent_job(
+        input.description,
+        input.prompt,
+        input.subagent_type.as_deref(),
+        input.name.as_deref(),
+        input.model.as_deref(),
+        None,
+    )?;
+    let manifest = job.manifest.clone();
+    if let Err(error) = spawn_fn(job) {
+        let error = format!("failed to spawn sub-agent: {error}");
+        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        return Err(error);
+    }
+
+    Ok(manifest)
+}
+
+fn prepare_agent_job(
+    description: String,
+    prompt: String,
+    subagent_type: Option<&str>,
+    name: Option<&str>,
+    model: Option<&str>,
+    allowed_tools_override: Option<BTreeSet<String>>,
+) -> Result<AgentJob, String> {
+    if description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
-    if input.prompt.trim().is_empty() {
+    if prompt.trim().is_empty() {
         return Err(String::from("prompt must not be empty"));
     }
 
@@ -3316,41 +3866,39 @@ where
     std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
-    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
-    let agent_name = input
-        .name
-        .as_deref()
+    let normalized_subagent_type = normalize_subagent_type(subagent_type);
+    let resolved_model = resolve_agent_model(model);
+    let agent_name = name
         .map(slugify_agent_name)
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| slugify_agent_name(&input.description));
+        .unwrap_or_else(|| slugify_agent_name(&description));
     let created_at = iso8601_now();
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let allowed_tools = allowed_tools_override
+        .unwrap_or_else(|| allowed_tools_for_subagent(&normalized_subagent_type));
 
     let output_contents = format!(
         "# Agent Task
 
-- id: {}
-- name: {}
-- description: {}
-- subagent_type: {}
-- created_at: {}
+- id: {agent_id}
+- name: {agent_name}
+- description: {description}
+- subagent_type: {normalized_subagent_type}
+- created_at: {created_at}
 
 ## Prompt
 
-{}
-",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
+{prompt}
+"
     );
     std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
     let manifest = AgentOutput {
         agent_id,
         name: agent_name,
-        description: input.description,
+        description,
         subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
+        model: Some(resolved_model),
         status: String::from("running"),
         output_file: output_file.display().to_string(),
         manifest_file: manifest_file.display().to_string(),
@@ -3364,20 +3912,12 @@ where
     };
     write_agent_manifest(&manifest)?;
 
-    let manifest_for_spawn = manifest.clone();
-    let job = AgentJob {
-        manifest: manifest_for_spawn,
-        prompt: input.prompt,
+    Ok(AgentJob {
+        manifest,
+        prompt,
         system_prompt,
         allowed_tools,
-    };
-    if let Err(error) = spawn_fn(job) {
-        let error = format!("failed to spawn sub-agent: {error}");
-        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
-        return Err(error);
-    }
-
-    Ok(manifest)
+    })
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
@@ -3388,7 +3928,7 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     let _ =
                         persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
@@ -3407,13 +3947,14 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+fn run_agent_job(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)?;
+    Ok(final_text)
 }
 
 fn build_agent_runtime(
@@ -3807,25 +4348,36 @@ impl ProviderRuntimeClient {
         fallback_config: &ProviderFallbackConfig,
         runtime_config: &RuntimeConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config.primary().map_or(model, str::to_string);
-        let primary = build_provider_entry(&primary_model, runtime_config)?;
-        let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model, runtime_config) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
-                }
-            }
-        }
+        let chain = build_provider_chain(&model, fallback_config, runtime_config)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
         })
     }
+}
+
+fn build_provider_chain(
+    model: &str,
+    fallback_config: &ProviderFallbackConfig,
+    runtime_config: &RuntimeConfig,
+) -> Result<Vec<ProviderEntry>, String> {
+    let primary_model = fallback_config
+        .primary()
+        .map_or_else(|| model.to_string(), str::to_string);
+    let primary = build_provider_entry(&primary_model, runtime_config)?;
+    let mut chain = vec![primary];
+    for fallback_model in fallback_config.fallbacks() {
+        match build_provider_entry(fallback_model, runtime_config) {
+            Ok(entry) => chain.push(entry),
+            Err(error) => {
+                eprintln!(
+                    "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                );
+            }
+        }
+    }
+    Ok(chain)
 }
 
 fn load_runtime_config_for_cwd() -> Result<RuntimeConfig, runtime::ConfigError> {
@@ -3887,7 +4439,18 @@ impl ApiClient for ProviderRuntimeClient {
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
-        let chain = &self.chain;
+        let runtime_config =
+            load_runtime_config_for_cwd().unwrap_or_else(|_| RuntimeConfig::empty());
+        let fallback_config = runtime_config.provider_fallbacks().clone();
+        let override_chain;
+        let chain = if let Some(model_override) = request.model_override.as_deref() {
+            override_chain =
+                build_provider_chain(model_override, &fallback_config, &runtime_config)
+                    .map_err(RuntimeError::new)?;
+            &override_chain
+        } else {
+            &self.chain
+        };
         let mut last_error: Option<ApiError> = None;
         for (index, entry) in chain.iter().enumerate() {
             let message_request = MessageRequest {
@@ -3897,6 +4460,7 @@ impl ApiClient for ProviderRuntimeClient {
                 system: system.clone(),
                 tools: (!tools.is_empty()).then(|| tools.clone()),
                 tool_choice: tool_choice.clone(),
+                reasoning_effort: request.reasoning_effort.clone(),
                 stream: true,
                 ..Default::default()
             };
@@ -4026,7 +4590,7 @@ impl SubagentToolExecutor {
 }
 
 impl ToolExecutor for SubagentToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<ToolExecutionResult, ToolError> {
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
@@ -4034,8 +4598,16 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
-            .map_err(ToolError::new)
+        match tool_name {
+            "Skill" => execute_skill_tool_result(
+                serde_json::from_value(value)
+                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?,
+            )
+            .map_err(ToolError::new),
+            _ => execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+                .map(ToolExecutionResult::text)
+                .map_err(ToolError::new),
+        }
     }
 }
 
@@ -4044,6 +4616,721 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
         .into_iter()
         .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
         .collect()
+}
+
+const PERSISTED_OUTPUT_TAG: &str = "<persisted-output>";
+const PERSISTED_OUTPUT_CLOSING_TAG: &str = "</persisted-output>";
+const PERSISTED_OUTPUT_PREVIEW_BYTES: usize = 2_000;
+const INTERRUPTED_COMMAND_TAG: &str = "<error>Command was aborted before completion</error>";
+const GLOB_RESULT_PERSIST_THRESHOLD_CHARS: usize = 100_000;
+const GREP_RESULT_PERSIST_THRESHOLD_CHARS: usize = 20_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelVisibleToolResult {
+    pub content: Vec<ToolResultContentBlock>,
+    pub is_error: bool,
+}
+
+impl ModelVisibleToolResult {
+    fn raw_text(output: &str, is_error: bool) -> Self {
+        Self {
+            content: vec![ToolResultContentBlock::Text {
+                text: output.to_string(),
+            }],
+            is_error,
+        }
+    }
+}
+
+#[must_use]
+pub fn model_visible_tool_result(
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    model_visible_tool_result_with_id(None, tool_name, output, is_error)
+}
+
+fn model_visible_tool_result_with_id(
+    tool_use_id: Option<&str>,
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if tool_name == "Skill" {
+        if let Some((skill_output, trailing_text)) = parse_skill_tool_result(output) {
+            let mut result = skill_tool_result_to_model_visible_result(&skill_output, is_error);
+            append_trailing_tool_text(&mut result.content, trailing_text);
+            return result;
+        }
+    }
+
+    if let Some((read_output, trailing_text)) = parse_read_tool_result_for_tool(tool_name, output) {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&read_tool_result_text(&read_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((write_output, trailing_text)) = parse_write_tool_result_for_tool(tool_name, output)
+    {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&write_tool_result_text(&write_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((edit_output, trailing_text)) = parse_edit_tool_result_for_tool(tool_name, output) {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&edit_tool_result_text(&edit_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) {
+        let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((search_output, trailing_text)) = parse_search_tool_result(tool_name, output) {
+        let mut result =
+            search_tool_result_to_model_visible_result(tool_use_id, &search_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    ModelVisibleToolResult::raw_text(output, is_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillModelVisibleOutput {
+    skill: String,
+    status: Option<String>,
+    result: Option<String>,
+}
+
+fn parse_skill_tool_result(output: &str) -> Option<(SkillModelVisibleOutput, &str)> {
+    if let Ok(parsed) = serde_json::from_str::<SkillModelVisibleOutput>(output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = serde_json::from_str::<SkillModelVisibleOutput>(json_prefix).ok()?;
+    Some((parsed, trailing_text))
+}
+
+fn skill_tool_result_to_model_visible_result(
+    output: &SkillModelVisibleOutput,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    let text = if output.status.as_deref() == Some("forked") {
+        let result = output
+            .result
+            .as_deref()
+            .unwrap_or("Skill execution completed");
+        format!(
+            "Skill \"{}\" completed (forked execution).\n\nResult:\n{}",
+            output.skill, result
+        )
+    } else {
+        format!("Launching skill: {}", output.skill)
+    };
+
+    ModelVisibleToolResult::raw_text(&text, is_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchToolResult {
+    text: String,
+    persistence_threshold_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NormalizedShellToolResult {
+    stdout: String,
+    stderr: String,
+    interrupted: bool,
+    structured_content: Option<Vec<Value>>,
+    persisted_output_path: Option<String>,
+    persisted_output_size: Option<u64>,
+    background_task_id: Option<String>,
+    backgrounded_by_user: Option<bool>,
+    assistant_auto_backgrounded: Option<bool>,
+    background_output_path: Option<String>,
+}
+
+impl From<BashCommandOutput> for NormalizedShellToolResult {
+    fn from(value: BashCommandOutput) -> Self {
+        let background_output_path = value.raw_output_path.clone().or_else(|| {
+            value
+                .background_task_id
+                .as_deref()
+                .and_then(derive_background_output_path)
+        });
+        Self {
+            stdout: value.stdout,
+            stderr: value.stderr,
+            interrupted: value.interrupted,
+            structured_content: value.structured_content,
+            persisted_output_path: value.persisted_output_path,
+            persisted_output_size: value.persisted_output_size,
+            background_task_id: value.background_task_id,
+            backgrounded_by_user: value.backgrounded_by_user,
+            assistant_auto_backgrounded: value.assistant_auto_backgrounded,
+            background_output_path,
+        }
+    }
+}
+
+impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
+    fn from(value: PowerShellCommandOutput) -> Self {
+        let background_output_path = value.raw_output_path.clone().or_else(|| {
+            value
+                .background_task_id
+                .as_deref()
+                .and_then(derive_background_output_path)
+        });
+        Self {
+            stdout: value.stdout,
+            stderr: value.stderr,
+            interrupted: value.interrupted,
+            structured_content: value.structured_content,
+            persisted_output_path: value.persisted_output_path,
+            persisted_output_size: value.persisted_output_size,
+            background_task_id: value.background_task_id,
+            backgrounded_by_user: value.backgrounded_by_user,
+            assistant_auto_backgrounded: value.assistant_auto_backgrounded,
+            background_output_path,
+        }
+    }
+}
+
+fn derive_background_output_path(task_id: &str) -> Option<String> {
+    // Older transcripts may only persist backgroundTaskId, so keep a
+    // session-aware fallback for replay/resume when rawOutputPath is absent.
+    let cwd = std::env::current_dir().ok()?;
+    Some(
+        shell_task_output_path(&cwd, task_id)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn parse_shell_tool_result<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(NormalizedShellToolResult, &'a str)> {
+    if let Some(parsed) = parse_shell_tool_result_json(tool_name, output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = parse_shell_tool_result_json(tool_name, json_prefix)?;
+    Some((parsed, trailing_text))
+}
+
+fn parse_shell_tool_result_json(
+    tool_name: &str,
+    output: &str,
+) -> Option<NormalizedShellToolResult> {
+    match tool_name {
+        "bash" => serde_json::from_str::<BashCommandOutput>(output)
+            .ok()
+            .map(NormalizedShellToolResult::from),
+        "PowerShell" => serde_json::from_str::<PowerShellCommandOutput>(output)
+            .ok()
+            .map(NormalizedShellToolResult::from),
+        _ => None,
+    }
+}
+
+fn parse_search_tool_result<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(SearchToolResult, &'a str)> {
+    if let Some(parsed) = parse_search_tool_result_json(tool_name, output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = parse_search_tool_result_json(tool_name, json_prefix)?;
+    Some((parsed, trailing_text))
+}
+
+fn parse_search_tool_result_json(tool_name: &str, output: &str) -> Option<SearchToolResult> {
+    match tool_name {
+        "glob_search" | "Glob" => {
+            serde_json::from_str::<GlobSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: glob_tool_result_text(&result),
+                    persistence_threshold_chars: GLOB_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
+        "grep_search" | "Grep" => {
+            serde_json::from_str::<GrepSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: grep_tool_result_text(&result),
+                    persistence_threshold_chars: GREP_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn split_json_prefix(input: &str) -> Option<(&str, &str)> {
+    let start = input.find(|ch: char| !ch.is_whitespace())?;
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = None;
+
+    for (offset, ch) in input[start..].char_indices() {
+        if offset == 0 {
+            match ch {
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                _ => return None,
+            }
+            continue;
+        }
+
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    end = Some(start + offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    Some((&input[start..end], &input[end..]))
+}
+
+fn parse_read_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(crate::file_tools::ReadToolOutput, &'a str)> {
+    match tool_name {
+        "read_file" | "Read" => parse_read_tool_result(output),
+        _ => None,
+    }
+}
+
+fn parse_write_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(runtime::WriteFileOutput, &'a str)> {
+    match tool_name {
+        "write_file" | "Write" => parse_write_tool_result(output),
+        _ => None,
+    }
+}
+
+fn parse_edit_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(runtime::EditFileOutput, &'a str)> {
+    match tool_name {
+        "edit_file" | "Edit" => parse_edit_tool_result(output),
+        _ => None,
+    }
+}
+
+fn shell_tool_result_to_model_visible_result(
+    output: &NormalizedShellToolResult,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if let Some(structured_content) = output
+        .structured_content
+        .as_ref()
+        .filter(|content| !content.is_empty())
+    {
+        return ModelVisibleToolResult {
+            content: structured_content
+                .iter()
+                .map(tool_result_content_block_from_value)
+                .collect(),
+            is_error: is_error || output.interrupted,
+        };
+    }
+
+    let mut sections = Vec::new();
+    let mut processed_stdout = normalize_shell_stdout(&output.stdout);
+    if let Some(path) = output.persisted_output_path.as_deref() {
+        let (preview, has_more) =
+            generate_tool_result_preview(&processed_stdout, PERSISTED_OUTPUT_PREVIEW_BYTES);
+        processed_stdout = build_large_tool_result_message(
+            path,
+            output.persisted_output_size.unwrap_or(0),
+            &preview,
+            has_more,
+        );
+    }
+    if !processed_stdout.is_empty() {
+        sections.push(processed_stdout);
+    }
+
+    let mut error_message = output.stderr.trim().to_string();
+    if output.interrupted {
+        if !error_message.is_empty() {
+            error_message.push('\n');
+        }
+        error_message.push_str(INTERRUPTED_COMMAND_TAG);
+    }
+    if !error_message.is_empty() {
+        sections.push(error_message);
+    }
+
+    if let Some(background_info) = build_background_info(output) {
+        sections.push(background_info);
+    }
+
+    ModelVisibleToolResult {
+        content: vec![ToolResultContentBlock::Text {
+            text: sections.join("\n"),
+        }],
+        is_error: is_error || output.interrupted,
+    }
+}
+
+fn search_tool_result_to_model_visible_result(
+    tool_use_id: Option<&str>,
+    output: &SearchToolResult,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    let mut text = output.text.clone();
+    if text.chars().count() > output.persistence_threshold_chars {
+        if let Some(tool_use_id) = tool_use_id {
+            if let Ok(persisted) = persist_model_visible_tool_text(tool_use_id, &text) {
+                let (preview, has_more) =
+                    generate_tool_result_preview(&text, PERSISTED_OUTPUT_PREVIEW_BYTES);
+                text = build_large_tool_result_message(
+                    &persisted.path,
+                    persisted.original_size,
+                    &preview,
+                    has_more,
+                );
+            }
+        }
+    }
+
+    ModelVisibleToolResult {
+        content: vec![ToolResultContentBlock::Text { text }],
+        is_error,
+    }
+}
+
+fn glob_tool_result_text(output: &GlobSearchOutput) -> String {
+    if output.num_files == 0 {
+        return String::from("No files found");
+    }
+
+    let mut lines = output.filenames.clone();
+    if output.truncated {
+        lines.push(String::from(
+            "(Results are truncated. Consider using a more specific path or pattern.)",
+        ));
+    }
+    lines.join("\n")
+}
+
+fn grep_tool_result_text(output: &GrepSearchOutput) -> String {
+    let mode = output.mode.as_deref().unwrap_or("files_with_matches");
+    let limit_info = format_search_limit_info(output.applied_limit, output.applied_offset);
+
+    match mode {
+        "content" => {
+            let mut result = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            if !limit_info.is_empty() {
+                result.push_str("\n\n[Showing results with pagination = ");
+                result.push_str(&limit_info);
+                result.push(']');
+            }
+            result
+        }
+        "count" => {
+            let raw_content = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            let matches = output.num_matches.unwrap_or(0);
+            let files = output.num_files;
+            let summary = if limit_info.is_empty() {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}.",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            } else {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}. with pagination = {limit_info}",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            };
+            format!("{raw_content}{summary}")
+        }
+        _ => {
+            if output.num_files == 0 {
+                return String::from("No files found");
+            }
+
+            let header = if limit_info.is_empty() {
+                format!(
+                    "Found {} {}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            } else {
+                format!(
+                    "Found {} {} {limit_info}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            };
+            format!("{header}\n{}", output.filenames.join("\n"))
+        }
+    }
+}
+
+fn format_search_limit_info(applied_limit: Option<usize>, applied_offset: Option<usize>) -> String {
+    let mut parts = Vec::new();
+    if let Some(limit) = applied_limit {
+        parts.push(format!("limit: {limit}"));
+    }
+    if let Some(offset) = applied_offset {
+        parts.push(format!("offset: {offset}"));
+    }
+    parts.join(", ")
+}
+
+fn tool_result_content_block_from_value(value: &Value) -> ToolResultContentBlock {
+    match value {
+        Value::String(text) => ToolResultContentBlock::Text { text: text.clone() },
+        _ => ToolResultContentBlock::Json {
+            value: value.clone(),
+        },
+    }
+}
+
+fn normalize_shell_stdout(stdout: &str) -> String {
+    strip_leading_blank_lines(stdout).trim_end().to_string()
+}
+
+fn strip_leading_blank_lines(mut text: &str) -> &str {
+    while let Some(newline_idx) = text.find('\n') {
+        let (line, rest) = text.split_at(newline_idx + 1);
+        if line.trim().is_empty() {
+            text = rest;
+        } else {
+            return text;
+        }
+    }
+
+    if text.trim().is_empty() {
+        ""
+    } else {
+        text
+    }
+}
+
+fn generate_tool_result_preview(content: &str, max_bytes: usize) -> (String, bool) {
+    if content.len() <= max_bytes {
+        return (content.to_string(), false);
+    }
+
+    let mut cut_point = max_bytes.min(content.len());
+    while cut_point > 0 && !content.is_char_boundary(cut_point) {
+        cut_point -= 1;
+    }
+
+    let truncated = &content[..cut_point];
+    let final_cut = truncated
+        .rfind('\n')
+        .filter(|idx| *idx > cut_point / 2)
+        .unwrap_or(cut_point);
+
+    (content[..final_cut].to_string(), true)
+}
+
+fn build_large_tool_result_message(
+    filepath: &str,
+    original_size: u64,
+    preview: &str,
+    has_more: bool,
+) -> String {
+    let mut message = format!(
+        "{PERSISTED_OUTPUT_TAG}\nOutput too large ({}). Full output saved to: {filepath}\n\nPreview (first {}):\n{preview}",
+        format_file_size(original_size),
+        format_file_size(PERSISTED_OUTPUT_PREVIEW_BYTES as u64),
+    );
+    if has_more {
+        message.push_str("\n...\n");
+    } else {
+        message.push('\n');
+    }
+    message.push_str(PERSISTED_OUTPUT_CLOSING_TAG);
+    message
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedModelVisibleToolText {
+    path: String,
+    original_size: u64,
+}
+
+fn persist_model_visible_tool_text(
+    tool_use_id: &str,
+    content: &str,
+) -> std::io::Result<PersistedModelVisibleToolText> {
+    let cwd = std::env::current_dir()?;
+    let path = tool_result_path(&cwd, tool_use_id, "txt");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => file.write_all(content.as_bytes())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(PersistedModelVisibleToolText {
+        path: path.to_string_lossy().into_owned(),
+        original_size: u64::try_from(content.len()).expect("content length fits u64"),
+    })
+}
+
+fn format_file_size(size_in_bytes: u64) -> String {
+    if size_in_bytes < 1_024 {
+        return format!("{size_in_bytes} bytes");
+    }
+
+    let kb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024);
+    if kb_tenths < 10 * 1_024 {
+        return format!("{}KB", format_size_unit(kb_tenths));
+    }
+
+    let mb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024 * 1_024);
+    if mb_tenths < 10 * 1_024 {
+        return format!("{}MB", format_size_unit(mb_tenths));
+    }
+
+    let gb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024 * 1_024 * 1_024);
+    format!("{}GB", format_size_unit(gb_tenths))
+}
+
+fn scale_to_tenths(size_in_bytes: u128, unit_size: u128) -> u128 {
+    ((size_in_bytes * 10) + (unit_size / 2)) / unit_size
+}
+
+fn format_size_unit(size_in_tenths: u128) -> String {
+    let whole = size_in_tenths / 10;
+    let fraction = size_in_tenths % 10;
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+fn build_background_info(output: &NormalizedShellToolResult) -> Option<String> {
+    let task_id = output.background_task_id.as_deref()?;
+    let output_path = output.background_output_path.as_deref();
+
+    let message = if output.assistant_auto_backgrounded.unwrap_or(false) {
+        match output_path {
+            Some(path) => format!(
+                "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: {task_id}. It is still running - you will be notified when it completes. Output is being written to: {path}. In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+            ),
+            None => format!(
+                "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: {task_id}. It is still running - you will be notified when it completes. In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+            ),
+        }
+    } else if output.backgrounded_by_user.unwrap_or(false) {
+        match output_path {
+            Some(path) => {
+                format!(
+                    "Command was manually backgrounded by user with ID: {task_id}. Output is being written to: {path}"
+                )
+            }
+            None => format!("Command was manually backgrounded by user with ID: {task_id}"),
+        }
+    } else {
+        match output_path {
+            Some(path) => {
+                format!("Command running in background with ID: {task_id}. Output is being written to: {path}")
+            }
+            None => format!("Command running in background with ID: {task_id}"),
+        }
+    };
+
+    Some(message)
+}
+
+fn append_trailing_tool_text(content: &mut Vec<ToolResultContentBlock>, trailing_text: &str) {
+    let trimmed = trailing_text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if content.len() == 1 {
+        if let Some(ToolResultContentBlock::Text { text }) = content.first_mut() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(trimmed);
+            return;
+        }
+    }
+
+    content.push(ToolResultContentBlock::Text {
+        text: trimmed.to_string(),
+    });
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -4067,16 +5354,23 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let result = model_visible_tool_result_with_id(
+                            Some(tool_use_id),
+                            tool_name,
+                            output,
+                            *is_error,
+                        );
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -5059,9 +6353,11 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    claw_config_home().ok_or_else(|| {
-        String::from("unable to resolve a claw config home; set CLAW_CONFIG_HOME, HOME, or USERPROFILE")
-    })
+    if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".claw"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
@@ -5200,9 +6496,9 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(input: PowerShellInput) -> std::io::Result<PowerShellCommandOutput> {
     let _ = &input.description;
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+    if let Some(output) = powershell_test_branch_preflight(&input.command) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;
@@ -5295,33 +6591,34 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
+) -> std::io::Result<PowerShellCommandOutput> {
+    let cwd = std::env::current_dir()?;
+
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
+        let background_output = prepare_background_shell_output(&cwd, "powershell")?;
+        std::process::Command::new(shell)
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(command)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(background_output.stdout)
+            .stderr(background_output.stderr)
             .spawn()?;
-        return Ok(runtime::BashCommandOutput {
+        return Ok(PowerShellCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
-            raw_output_path: None,
             interrupted: false,
+            raw_output_path: Some(background_output.output_path),
             is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
+            background_task_id: Some(background_output.task_id),
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
             return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
             persisted_output_path: None,
             persisted_output_size: None,
-            sandbox_status: None,
+            structured_content: None,
         });
     }
 
@@ -5331,6 +6628,7 @@ fn execute_shell_command(
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(command);
+    process.current_dir(&cwd);
     process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -5341,25 +6639,28 @@ fn execute_shell_command(
         loop {
             if let Some(status) = child.try_wait()? {
                 let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
+                let prepared_output = prepare_shell_command_output(
+                    &cwd,
+                    "powershell",
+                    &output.stdout,
+                    &output.stderr,
+                );
+                return Ok(PowerShellCommandOutput {
+                    stdout: prepared_output.stdout,
+                    stderr: prepared_output.stderr,
                     interrupted: false,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
                     return_code_interpretation: status
                         .code()
                         .filter(|code| *code != 0)
                         .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+                    persisted_output_path: prepared_output.persisted_output_path,
+                    persisted_output_size: prepared_output.persisted_output_size,
                     structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -5375,22 +6676,25 @@ Command exceeded timeout of {timeout_ms} ms",
                         stderr.trim_end()
                     )
                 };
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
+                let prepared_output = prepare_shell_command_output(
+                    &cwd,
+                    "powershell",
+                    &output.stdout,
+                    stderr.as_bytes(),
+                );
+                return Ok(PowerShellCommandOutput {
+                    stdout: prepared_output.stdout,
+                    stderr: prepared_output.stderr,
                     interrupted: true,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
                     return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(false),
+                    persisted_output_path: prepared_output.persisted_output_path,
+                    persisted_output_size: prepared_output.persisted_output_size,
                     structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -5398,26 +6702,25 @@ Command exceeded timeout of {timeout_ms} ms",
     }
 
     let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
+    let prepared_output =
+        prepare_shell_command_output(&cwd, "powershell", &output.stdout, &output.stderr);
+    Ok(PowerShellCommandOutput {
+        stdout: prepared_output.stdout,
+        stderr: prepared_output.stderr,
         interrupted: false,
+        raw_output_path: None,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
         return_code_interpretation: output
             .status
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+        persisted_output_path: prepared_output.persisted_output_path,
+        persisted_output_size: prepared_output.persisted_output_size,
         structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
     })
 }
 
@@ -5466,18 +6769,7 @@ fn make_cell_id(index: usize) -> String {
     format!("cell-{}", index + 1)
 }
 
-fn parse_skill_description(contents: &str) -> Option<String> {
-    for line in contents.lines() {
-        if let Some(value) = line.strip_prefix("description:") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
+mod file_tools;
 pub mod lane_completion;
 pub mod pdf_extract;
 
@@ -5496,23 +6788,624 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        derive_agent_state, execute_agent_with_spawn, execute_skill_with_fork_runner, execute_tool,
+        execute_tool_with_effects, final_assistant_text, maybe_commit_provenance,
+        model_visible_tool_result, model_visible_tool_result_with_id, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, ForkedSkillExecutionResult, ForkedSkillRequest,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ModelVisibleToolResult,
+        PowerShellCommandOutput, ProviderRuntimeClient, SkillInput, SubagentToolExecutor,
     };
-    use api::OutputContentBlock;
-    use runtime::ProviderFallbackConfig;
+    use api::{OutputContentBlock, ToolResultContentBlock};
+    #[cfg(windows)]
+    use runtime::{bash_shell_path, set_shell_if_windows};
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, tool_output_root, ApiRequest, AssistantEvent,
+        AttachmentKind, BashCommandOutput, ContentBlock, ConversationRuntime, PermissionMode,
+        PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
+    use runtime::{GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn restore_cwd(original_dir: &Path) {
+        let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = if original_dir.is_dir() {
+            original_dir
+        } else {
+            fallback.as_path()
+        };
+        std::env::set_current_dir(target).expect("restore cwd");
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
+    }
+
+    fn bash_output(
+        stdout: &str,
+        stderr: &str,
+        interrupted: bool,
+        structured_content: Option<Vec<serde_json::Value>>,
+    ) -> BashCommandOutput {
+        BashCommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            raw_output_path: None,
+            interrupted,
+            is_image: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            dangerously_disable_sandbox: None,
+            return_code_interpretation: None,
+            no_output_expected: None,
+            structured_content,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            sandbox_status: None,
+        }
+    }
+
+    fn powershell_output(stdout: &str, stderr: &str, interrupted: bool) -> PowerShellCommandOutput {
+        PowerShellCommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            interrupted,
+            raw_output_path: None,
+            return_code_interpretation: None,
+            is_image: None,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            structured_content: None,
+        }
+    }
+
+    fn shell_model_result<T: serde::Serialize>(
+        output: &T,
+        tool_name: &str,
+    ) -> ModelVisibleToolResult {
+        let serialized = serde_json::to_string_pretty(output).expect("serialize shell output");
+        model_visible_tool_result(tool_name, &serialized, false)
+    }
+
+    fn search_model_result<T: serde::Serialize>(
+        output: &T,
+        tool_name: &str,
+    ) -> ModelVisibleToolResult {
+        let serialized = serde_json::to_string_pretty(output).expect("serialize search output");
+        model_visible_tool_result(tool_name, &serialized, false)
+    }
+
+    #[test]
+    fn model_visible_tool_result_wraps_shell_stdout_and_stderr() {
+        let output = bash_output("\n\nhello\n", "warning\n", false, None);
+        let result = shell_model_result(&output, "bash");
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "hello\nwarning".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_wraps_persisted_output_for_shell_tools() {
+        let mut output = bash_output("\npreview line\n", "", false, None);
+        output.persisted_output_path = Some("C:\\temp\\bash-output.txt".to_string());
+        output.persisted_output_size = Some(4_096);
+
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.starts_with("<persisted-output>\n"));
+        assert!(text
+            .contains("Output too large (4KB). Full output saved to: C:\\temp\\bash-output.txt"));
+        assert!(text.contains("Preview (first 2KB):\npreview line\n</persisted-output>"));
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_preserves_structured_content_blocks() {
+        let output = bash_output(
+            "",
+            "",
+            false,
+            Some(vec![json!("note"), json!({ "ok": true })]),
+        );
+        let result = shell_model_result(&output, "bash");
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![
+                    ToolResultContentBlock::Text {
+                        text: "note".to_string(),
+                    },
+                    ToolResultContentBlock::Json {
+                        value: json!({ "ok": true }),
+                    },
+                ],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_parses_shell_json_prefix_before_hook_feedback() {
+        let serialized = serde_json::to_string_pretty(&bash_output("hello\n", "", false, None))
+            .expect("serialize shell output");
+        let output = format!("{serialized}\n\nHook feedback:\nreview me");
+
+        let result = model_visible_tool_result("bash", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "hello\n\nHook feedback:\nreview me".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_falls_back_to_raw_text_when_shell_output_is_not_json() {
+        let result = model_visible_tool_result("bash", "not json", true);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "not json".to_string(),
+                }],
+                is_error: true,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_inline_skill_results_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "skill": "trace",
+            "path": "C:\\repo\\.agents\\skills\\trace\\SKILL.md",
+            "prompt": "# trace\n",
+            "metadata": {
+                "resolvedName": "trace",
+                "description": "trace",
+                "hasUserSpecifiedDescription": false,
+                "disableModelInvocation": false,
+                "userInvocable": true
+            }
+        }))
+        .expect("serialize skill result");
+
+        let result = model_visible_tool_result("Skill", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Launching skill: trace".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_forked_skill_results_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "skill": "trace",
+            "status": "forked",
+            "agentId": "agent_123",
+            "result": "All checks passed"
+        }))
+        .expect("serialize forked skill result");
+
+        let result = model_visible_tool_result("Skill", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Skill \"trace\" completed (forked execution).\n\nResult:\nAll checks passed".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_marks_interrupted_shell_output_as_error() {
+        let output = bash_output("partial", "timeout reached", true, None);
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains("partial"));
+        assert!(text.contains("timeout reached"));
+        assert!(text.contains("<error>Command was aborted before completion</error>"));
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_uses_generic_background_message_for_explicit_backgrounding() {
+        let mut output = bash_output("", "", false, None);
+        output.background_task_id = Some("b1234xyz".to_string());
+        output.raw_output_path = Some(
+            "C:\\temp\\.claw\\sessions\\workspace\\session\\tasks\\b1234xyz.output".to_string(),
+        );
+
+        let result = shell_model_result(&output, "bash");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            text,
+            "Command running in background with ID: b1234xyz. Output is being written to: C:\\temp\\.claw\\sessions\\workspace\\session\\tasks\\b1234xyz.output"
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_uses_powershell_raw_output_path_when_present() {
+        let mut output = powershell_output("", "", false);
+        output.background_task_id = Some("b1234xyz".to_string());
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+                .to_string(),
+        );
+
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(
+            text.starts_with(
+                "Command running in background with ID: b1234xyz. Output is being written to: "
+            ),
+            "unexpected background message: {text}"
+        );
+        assert!(
+            text.ends_with(
+                "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+            ),
+            "unexpected background message: {text}"
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_matches_ts_autobackground_message() {
+        let mut output = powershell_output("", "", false);
+        output.background_task_id = Some("babc1234".to_string());
+        output.assistant_auto_backgrounded = Some(true);
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output"
+                .to_string(),
+        );
+
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains(
+            "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: babc1234."
+        ));
+        assert!(text.contains("It is still running - you will be notified when it completes."));
+        assert!(text.contains(
+            "Output is being written to: C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output."
+        ));
+        assert!(text.contains(
+            "In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+        ));
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 5,
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_empty_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 3,
+                num_files: 0,
+                filenames: Vec::new(),
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "No files found".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_read_results_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "type": "text",
+            "file": {
+                "filePath": "C:\\repo\\demo.txt",
+                "content": "alpha\nbeta",
+                "numLines": 2,
+                "startLine": 7,
+                "totalLines": 20
+            }
+        }))
+        .expect("serialize read result");
+
+        let result = model_visible_tool_result("read_file", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "     7\talpha\n     8\tbeta".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_read_unchanged_stub_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "type": "file_unchanged",
+            "file": {
+                "filePath": "C:\\repo\\demo.txt"
+            }
+        }))
+        .expect("serialize read unchanged result");
+
+        let result = model_visible_tool_result("read_file", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: super::file_tools::FILE_UNCHANGED_STUB.to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_write_and_edit_results_like_ts() {
+        let write_output = serde_json::to_string_pretty(&json!({
+            "type": "create",
+            "filePath": "C:\\repo\\demo.txt",
+            "content": "alpha",
+            "structuredPatch": [],
+            "originalFile": serde_json::Value::Null,
+            "gitDiff": serde_json::Value::Null
+        }))
+        .expect("serialize write result");
+        let write_result = model_visible_tool_result("write_file", &write_output, false);
+        assert_eq!(
+            write_result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "File created successfully at: C:\\repo\\demo.txt".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+
+        let edit_output = serde_json::to_string_pretty(&json!({
+            "filePath": "C:\\repo\\demo.txt",
+            "oldString": "alpha",
+            "newString": "omega",
+            "originalFile": "alpha\n",
+            "structuredPatch": [],
+            "userModified": false,
+            "replaceAll": true,
+            "gitDiff": serde_json::Value::Null
+        }))
+        .expect("serialize edit result");
+        let edit_result = model_visible_tool_result("edit_file", &edit_output, false);
+        assert_eq!(
+            edit_result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "The file C:\\repo\\demo.txt has been updated. All occurrences were successfully replaced.".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_count_results_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("count".to_string()),
+                num_files: 2,
+                filenames: Vec::new(),
+                num_lines: None,
+                content: Some("src/lib.rs:2\nsrc/main.rs:1".to_string()),
+                num_matches: Some(3),
+                applied_limit: Some(10),
+                applied_offset: Some(5),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs:2\nsrc/main.rs:1\n\nFound 3 total occurrences across 2 files. with pagination = limit: 10, offset: 5".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_files_with_matches_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("files_with_matches".to_string()),
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                num_lines: None,
+                content: None,
+                num_matches: None,
+                applied_limit: Some(25),
+                applied_offset: Some(3),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Found 2 files limit: 25, offset: 3\nsrc/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_persists_large_grep_results_for_tool_use_id() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("grep-wrapper-persist");
+        let restore_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fs::create_dir_all(&root).expect("create root");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let content = "alpha\n".repeat(4_100);
+        let serialized = serde_json::to_string_pretty(&GrepSearchOutput {
+            mode: Some("content".to_string()),
+            num_files: 0,
+            filenames: Vec::new(),
+            num_lines: Some(4_100),
+            content: Some(content.clone()),
+            num_matches: None,
+            applied_limit: None,
+            applied_offset: None,
+        })
+        .expect("serialize grep output");
+
+        let result = model_visible_tool_result_with_id(
+            Some("tool:grep/1"),
+            "grep_search",
+            &serialized,
+            false,
+        );
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.starts_with("<persisted-output>\n"));
+        let persisted_path = text
+            .lines()
+            .find_map(|line| {
+                line.split_once("Full output saved to: ")
+                    .map(|(_, path)| PathBuf::from(path))
+            })
+            .expect("persisted output path should be present in wrapper text");
+        assert!(persisted_path.exists(), "persisted output should exist");
+        assert_eq!(
+            fs::read_to_string(&persisted_path).expect("read persisted output"),
+            content
+        );
+        assert!(!result.is_error);
+
+        restore_cwd(&restore_dir);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -5681,7 +7574,7 @@ mod tests {
 
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
-        use std::fs;
+        let _guard = env_guard();
         // Write a .claw/settings.json in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
         let claw_dir = worktree.join(".claw");
@@ -5715,7 +7608,7 @@ mod tests {
             "config-level trustedRoots should auto-resolve trust without per-call override"
         );
 
-        std::env::set_current_dir(original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         fs::remove_dir_all(&worktree).ok();
     }
 
@@ -5857,9 +7750,9 @@ mod tests {
 
     #[test]
     fn recovery_loop_state_file_reflects_transitions() {
+        let _guard = env_guard();
         // End-to-end proof: .claw/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
-        use std::fs;
 
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
@@ -5939,7 +7832,7 @@ mod tests {
             "is_ready must be true in state file at ready_for_prompt"
         );
 
-        std::env::set_current_dir(original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         fs::remove_dir_all(&worktree).ok();
     }
 
@@ -6690,10 +8583,17 @@ mod tests {
             .expect("path")
             .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
+        assert_eq!(output["description"], "help");
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
             .contains("Guide on using oh-my-codex plugin"));
+        assert!(output["prompt"]
+            .as_str()
+            .expect("prompt")
+            .contains("ARGUMENTS: overview"));
+        assert_eq!(output["metadata"]["resolvedName"], "help");
+        assert_eq!(output["metadata"]["description"], "help");
 
         let dollar_result = execute_tool(
             "Skill",
@@ -6763,7 +8663,7 @@ mod tests {
             .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         fs::remove_dir_all(root).expect("temp project should clean up");
     }
 
@@ -6781,7 +8681,7 @@ mod tests {
         fs::create_dir_all(&nested).expect("nested cwd should exist");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: trace\ndescription: Project-local trace helper\n---\n# trace\n",
+            "---\nname: trace\ndescription: Project-local trace helper\narguments: [target]\nargument-hint: [target]\nallowed-tools: Bash, Read\neffort: high\n---\n# trace\n",
         )
         .expect("skill file should exist");
 
@@ -6804,8 +8704,18 @@ mod tests {
             .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
+        let prompt = output["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("Base directory for this skill: "));
+        assert!(prompt.ends_with("# trace\n"));
+        assert_eq!(output["metadata"]["argumentNames"][0], "target");
+        assert_eq!(output["metadata"]["argumentHint"], "target");
+        assert_eq!(output["metadata"]["allowedTools"][0], "Bash");
+        assert!(output["metadata"]["executionContext"].is_null());
+        assert!(output["metadata"]["agent"].is_null());
+        assert_eq!(output["metadata"]["effort"], "high");
+        assert!(output["metadata"]["paths"].is_null());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -6819,6 +8729,357 @@ mod tests {
             None => std::env::remove_var("CODEX_HOME"),
         }
         fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_tool_execution_result_injects_prompt_and_context_for_inline_skills() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_path("skills-inline-effects-home");
+        let skill_dir = home.join(".agents").join("skills").join("trace");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: trace\nallowed-tools: Bash(git:*), Read\nmodel: claude-sonnet-4-6\neffort: high\n---\n# trace\nFollow the traces\n",
+        )
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let result = execute_tool_with_effects(
+            "Skill",
+            &json!({
+                "skill": "trace"
+            }),
+        )
+        .expect("Skill should succeed");
+
+        let output: serde_json::Value =
+            serde_json::from_str(&result.output).expect("valid skill output json");
+        assert_eq!(output["skill"], "trace");
+        assert_eq!(result.invoked_skills.len(), 1);
+        assert_eq!(result.invoked_skills[0].skill, "trace");
+        assert_eq!(
+            result.invoked_skills[0].resolved_name.as_deref(),
+            Some("trace")
+        );
+        assert_eq!(result.additional_messages.len(), 1);
+        assert_eq!(
+            result.additional_messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InvokedSkills),
+        );
+        assert!(matches!(
+            result.additional_messages[0].blocks.first(),
+            Some(ContentBlock::Text { text })
+                if text.contains("Base directory for this skill: ")
+                    && text.ends_with("# trace\nFollow the traces\n")
+        ));
+        let context_update = result.context_update.expect("inline skill context update");
+        assert_eq!(
+            context_update.additional_allow_rules,
+            vec!["Bash(git:*)", "Read"]
+        );
+        assert_eq!(
+            context_update.model_override.as_deref(),
+            Some("claude-sonnet-4-6"),
+        );
+        assert_eq!(context_update.reasoning_effort.as_deref(), Some("high"));
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn skill_substitutes_named_and_indexed_arguments_in_prompt() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_path("skills-substitution-home");
+        let skill_dir = home.join(".agents").join("skills").join("plan");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\narguments: [topic, depth]\n---\nTopic: $topic\nFirst: $0\nSecond: $ARGUMENTS[1]\nRaw: $ARGUMENTS\n",
+        )
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let result = execute_tool(
+            "Skill",
+            &json!({
+                "skill": "plan",
+                "args": "alpha \"two words\" tail"
+            }),
+        )
+        .expect("Skill should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let prompt = output["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("Base directory for this skill: "));
+        assert!(prompt.contains("Topic: alpha"));
+        assert!(prompt.contains("First: alpha"));
+        assert!(prompt.contains("Second: two words"));
+        assert!(prompt.contains("Raw: alpha \"two words\" tail"));
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn forked_skill_executes_via_subagent_request() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_path("skills-forked-home");
+        let skill_dir = home.join(".agents").join("skills").join("triage");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: triage\ndescription: Triage the issue\narguments: [topic]\nallowed-tools: Read, Grep(Edit)\ncontext: fork\nagent: Explore\nmodel: claude-sonnet-4-6\n---\n# triage\nTopic: $topic\n",
+        )
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let captured = Arc::new(Mutex::new(None::<ForkedSkillRequest>));
+        let captured_for_runner = Arc::clone(&captured);
+        let output = execute_skill_with_fork_runner(
+            SkillInput {
+                skill: "triage".to_string(),
+                args: Some("\"bug bash\"".to_string()),
+            },
+            move |request| {
+                *captured_for_runner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+                Ok(ForkedSkillExecutionResult {
+                    agent_id: String::from("agent_skill_triage"),
+                    result: String::from("Triage complete"),
+                })
+            },
+        )
+        .expect("forked skill should succeed");
+
+        assert_eq!(output.output.status.as_deref(), Some("forked"));
+        assert_eq!(
+            output.output.agent_id.as_deref(),
+            Some("agent_skill_triage")
+        );
+        assert_eq!(output.output.result.as_deref(), Some("Triage complete"));
+        assert_eq!(
+            output.output.metadata.execution_context.as_deref(),
+            Some("fork")
+        );
+        assert_eq!(output.invoked_skill.skill, "triage");
+        assert_eq!(output.invoked_skill.args.as_deref(), Some("\"bug bash\""));
+        assert_eq!(
+            output.invoked_skill.resolved_name.as_deref(),
+            Some("triage")
+        );
+
+        let request = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("runner should capture request");
+        assert_eq!(request.name, "triage");
+        assert_eq!(request.subagent_type, "Explore");
+        assert_eq!(request.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert!(request.prompt.contains("Topic: bug bash"));
+        assert_eq!(
+            request.allowed_tools,
+            BTreeSet::from([String::from("read_file"), String::from("grep_search"),])
+        );
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn skill_rejects_disable_model_invocation_frontmatter() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_path("skills-disabled-home");
+        let skill_dir = home.join(".agents").join("skills").join("internal");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: internal\ndisable-model-invocation: true\n---\n# internal\n",
+        )
+        .expect("skill file should exist");
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let error = execute_tool("Skill", &json!({ "skill": "internal" }))
+            .expect_err("disabled model invocation should be rejected");
+        assert!(error.contains("disable-model-invocation"));
+
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn read_file_activates_conditional_skill_visibility() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("conditional-skill-activation");
+        let home = root.join("home");
+        let source_file = root.join("src").join("lib.rs");
+        let skill_dir = root.join(".claw").join("skills").join("rustacean");
+        fs::create_dir_all(
+            source_file
+                .parent()
+                .expect("source file should have parent"),
+        )
+        .expect("source dir should exist");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(&source_file, "fn helper() {}\n").expect("write source file");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: rustacean\ndescription: Rust path guidance\npaths: src/**\n---\n\n# rustacean\n",
+        )
+        .expect("skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let hidden = execute_tool("Skill", &json!({ "skill": "rustacean" }))
+            .expect_err("conditional skill should be hidden before file touch");
+        assert!(hidden.contains("unknown skill"));
+
+        execute_tool("read_file", &json!({ "path": "src/lib.rs" }))
+            .expect("read_file should activate conditional skills");
+
+        let activated = execute_tool("Skill", &json!({ "skill": "rustacean" }))
+            .expect("conditional skill should be visible after read");
+        let activated_output: serde_json::Value =
+            serde_json::from_str(&activated).expect("valid json");
+        assert_eq!(activated_output["metadata"]["paths"][0], "src");
+        let prompt = activated_output["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("Base directory for this skill: "));
+        assert!(prompt.ends_with("\n# rustacean\n"));
+
+        restore_cwd(&original_dir);
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn bundled_skill_extracts_reference_files_under_tool_output_root() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("bundled-skill-output");
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let active_cwd = std::env::current_dir().expect("active cwd");
+
+        let result = execute_tool(
+            "Skill",
+            &json!({
+                "skill": "verify",
+                "args": "check the login flow"
+            }),
+        )
+        .expect("bundled verify should execute");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["path"], "bundled://verify");
+        let prompt = output["prompt"].as_str().expect("prompt");
+        let expected_root = tool_output_root(&active_cwd).join("skills").join("verify");
+        let expected_root_text = expected_root.display().to_string();
+        assert!(prompt.contains(&format!(
+            "Base directory for this skill: {expected_root_text}"
+        )));
+        assert!(prompt.contains("## User Request\n\ncheck the login flow"));
+        assert!(expected_root.join("examples").join("cli.md").is_file());
+        assert!(expected_root.join("examples").join("server.md").is_file());
+
+        restore_cwd(&original_dir);
+        fs::remove_dir_all(root).expect("temp root should clean up");
+    }
+
+    #[test]
+    fn bundled_skillify_uses_session_snapshot_context() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("bundled-skillify");
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let messages = vec![
+            runtime::ConversationMessage::user_text("older guidance"),
+            runtime::ConversationMessage::compact_boundary(runtime::CompactBoundaryMetadata {
+                trigger: runtime::CompactTrigger::Manual,
+                pre_tokens: 200,
+                user_context: None,
+                messages_summarized: Some(3),
+                pre_compact_discovered_tools: Vec::new(),
+                preserved_segment: None,
+            }),
+            runtime::ConversationMessage::compact_summary_user_text("summarized turn", false),
+            runtime::ConversationMessage::user_text("keep the repo-local save option"),
+        ];
+
+        let result = runtime::with_tool_session_snapshot(
+            &messages,
+            Some("Compacted workflow summary"),
+            || {
+                execute_tool(
+                    "Skill",
+                    &json!({
+                        "skill": "skillify",
+                        "args": "capture this repo workflow"
+                    }),
+                )
+            },
+        )
+        .expect("bundled skillify should execute");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["path"], "bundled://skillify");
+        let prompt = output["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("Compacted workflow summary"));
+        assert!(prompt.contains("keep the repo-local save option"));
+        assert!(prompt.contains("capture this repo workflow"));
+        assert!(!prompt.contains("older guidance"));
+        assert!(!prompt.contains("summarized turn"));
+        assert!(!prompt.contains("Base directory for this skill: "));
+
+        restore_cwd(&original_dir);
+        fs::remove_dir_all(root).expect("temp root should clean up");
     }
 
     #[test]
@@ -6879,7 +9140,7 @@ mod tests {
             "Project-local agents compatibility helper"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7067,7 +9328,7 @@ mod tests {
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -7704,14 +9965,36 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
-            .expect("bash should succeed");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
+        let success = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'hello'",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+        let failure = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'oops' >&2; exit 7",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -7719,8 +10002,15 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+        let timeout = execute_tool(
+            "bash",
+            &json!({
+                "command": "sleep 1",
+                "timeout": 10,
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -7731,11 +10021,17 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": "sleep 1", "run_in_background": true }),
+            &json!({
+                "command": "sleep 1",
+                "run_in_background": true,
+                "dangerouslyDisableSandbox": true
+            }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert!(background_output["rawOutputPath"].as_str().is_some());
+        assert!(background_output["backgroundedByUser"].is_null());
         assert_eq!(background_output["noOutputExpected"], true);
     }
 
@@ -7785,7 +10081,7 @@ mod tests {
             "fix: unblock workspace tests"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7819,33 +10115,77 @@ mod tests {
             "preflight_blocked:branch_divergence"
         );
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
+    fn powershell_workspace_tests_are_blocked_without_structured_content() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("powershell-workspace-test-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/stale-powershell-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: unblock powershell workspace tests",
+        );
+        run_git(&root, &["checkout", "feature/stale-powershell-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "PowerShell",
+            &json!({ "command": "cargo test --workspace --all-targets" }),
+        )
+        .expect("preflight should return structured output");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+        assert!(output_json["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("branch divergence detected before workspace tests"));
+        assert!(output_json.get("structuredContent").is_none());
+
+        restore_cwd(&original_dir);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn file_tools_cover_read_write_and_edit_behaviors() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let demo_path = root.join("nested/demo.txt");
+        let demo_path_string = demo_path.to_string_lossy().into_owned();
+        let existing_path = root.join("nested/existing.txt");
+        let existing_path_string = existing_path.to_string_lossy().into_owned();
+        let created_by_edit_path = root.join("nested/created-by-edit.txt");
+        let created_by_edit_path_string = created_by_edit_path.to_string_lossy().into_owned();
 
         let write_create = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("write create should succeed");
         let write_create_output: serde_json::Value =
             serde_json::from_str(&write_create).expect("json");
         assert_eq!(write_create_output["type"], "create");
-        assert!(root.join("nested/demo.txt").exists());
+        assert!(demo_path.exists());
 
         let write_update = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\ngamma\n" }),
         )
         .expect("write update should succeed");
         let write_update_output: serde_json::Value =
@@ -7853,56 +10193,108 @@ mod tests {
         assert_eq!(write_update_output["type"], "update");
         assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
 
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+        let read_full = execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
             .expect("read full should succeed");
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
         assert_eq!(read_full_output["file"]["startLine"], 1);
 
+        let read_full_again =
+            execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
+                .expect("deduped read should succeed");
+        let read_full_again_output: serde_json::Value =
+            serde_json::from_str(&read_full_again).expect("json");
+        assert_eq!(read_full_again_output["type"], "file_unchanged");
+
         let read_slice = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 1, "limit": 1 }),
         )
         .expect("read slice should succeed");
         let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
-        assert_eq!(read_slice_output["file"]["content"], "beta");
-        assert_eq!(read_slice_output["file"]["startLine"], 2);
+        assert_eq!(read_slice_output["file"]["content"], "alpha");
+        assert_eq!(read_slice_output["file"]["startLine"], 1);
 
         let read_past_end = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 50 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 50 }),
         )
         .expect("read past EOF should succeed");
         let read_past_end_output: serde_json::Value =
             serde_json::from_str(&read_past_end).expect("json");
         assert_eq!(read_past_end_output["file"]["content"], "");
-        assert_eq!(read_past_end_output["file"]["startLine"], 4);
+        assert_eq!(read_past_end_output["file"]["startLine"], 50);
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
         assert!(!read_error.is_empty());
 
+        fs::write(&existing_path, "before\n").expect("seed existing file");
+        let write_without_read = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "after\n" }),
+        )
+        .expect_err("existing file write should require a prior read");
+        assert!(write_without_read.contains("Read it first before writing to it"));
+
+        execute_tool(
+            "read_file",
+            &json!({ "path": existing_path_string.as_str() }),
+        )
+        .expect("existing file read should succeed");
+        let write_after_read = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "after\n" }),
+        )
+        .expect("existing file write after read should succeed");
+        let write_after_read_output: serde_json::Value =
+            serde_json::from_str(&write_after_read).expect("json");
+        assert_eq!(write_after_read_output["type"], "update");
+        assert_eq!(write_after_read_output["originalFile"], "before\n");
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&existing_path, "user edit\n").expect("simulate external edit");
+        let stale_write = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "stale\n" }),
+        )
+        .expect_err("stale write should fail");
+        assert!(stale_write.contains("modified since read"));
+
+        execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
+            .expect("full read should refresh edit state");
         let edit_once = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "alpha", "new_string": "omega" }),
         )
         .expect("single edit should succeed");
         let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
         assert_eq!(edit_once_output["replaceAll"], false);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\ngamma\n"
         );
 
         execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
+        let edit_ambiguous = execute_tool(
+            "edit_file",
+            &json!({
+                "path": demo_path_string.as_str(),
+                "old_string": "alpha",
+                "new_string": "omega"
+            }),
+        )
+        .expect_err("ambiguous edit should fail without replace_all");
+        assert!(edit_ambiguous.contains("replace_all is false"));
+
         let edit_all = execute_tool(
             "edit_file",
             &json!({
-                "path": "nested/demo.txt",
+                "path": demo_path_string.as_str(),
                 "old_string": "alpha",
                 "new_string": "omega",
                 "replace_all": true
@@ -7912,25 +10304,38 @@ mod tests {
         let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
         assert_eq!(edit_all_output["replaceAll"], true);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\nomega\n"
         );
 
         let edit_same = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
-        assert!(edit_same.contains("must differ"));
+        assert!(edit_same.contains("No changes to make"));
 
         let edit_missing = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "missing", "new_string": "omega" }),
         )
         .expect_err("missing substring should fail");
-        assert!(edit_missing.contains("old_string not found"));
+        assert!(edit_missing.contains("String to replace not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        execute_tool(
+            "edit_file",
+            &json!({
+                "path": created_by_edit_path_string.as_str(),
+                "old_string": "",
+                "new_string": "created by edit\n"
+            }),
+        )
+        .expect("edit should be able to create a new file");
+        assert_eq!(
+            fs::read_to_string(&created_by_edit_path).expect("read created-by-edit file"),
+            "created by edit\n"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -7992,6 +10397,25 @@ mod tests {
         .expect("grep count should succeed");
         let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
         assert_eq!(grep_count_output["numMatches"], 3);
+        assert_eq!(grep_count_output["filenames"], json!([]));
+        let grep_count_content = grep_count_output["content"].as_str().expect("content");
+        let grep_count_lines = grep_count_content
+            .lines()
+            .map(|line| line.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert_eq!(grep_count_lines.len(), 2);
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/lib.rs:2")),
+            "unexpected grep count lines: {grep_count_lines:?}"
+        );
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/notes.txt:1")),
+            "unexpected grep count lines: {grep_count_lines:?}"
+        );
 
         let grep_error = execute_tool(
             "grep_search",
@@ -8000,7 +10424,7 @@ mod tests {
         .expect_err("invalid regex should fail");
         assert!(!grep_error.is_empty());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8116,7 +10540,7 @@ mod tests {
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -8189,7 +10613,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -8250,7 +10674,7 @@ mod tests {
             .join("plan-mode.json")
             .exists());
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        restore_cwd(&original_dir);
         match original_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
@@ -8409,11 +10833,15 @@ printf 'pwsh:%s' "$1"
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        assert!(output.get("rawOutputPath").is_none());
+        assert!(output.get("noOutputExpected").is_none());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        assert!(background_output["rawOutputPath"].as_str().is_some());
+        assert!(background_output.get("noOutputExpected").is_none());
+        assert!(background_output["backgroundedByUser"].is_null());
+        assert!(background_output["assistantAutoBackgrounded"].is_null());
     }
 
     #[test]
@@ -8533,9 +10961,21 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
         let registry = super::GlobalToolRegistry::builtin();
         let result = registry
-            .execute("bash", &json!({ "command": "printf 'ok'" }))
+            .execute(
+                "bash",
+                &json!({
+                    "command": "printf 'ok'",
+                    "dangerouslyDisableSandbox": true
+                }),
+            )
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");

@@ -99,7 +99,11 @@ fn lane_event_emission_serializes_prompt_misdelivery_failures() {
         .observe(&worker.worker_id, "Ready for input\n>")
         .expect("worker should become ready");
     registry
-        .send_prompt(&worker.worker_id, Some("Run lane event parity checks"))
+        .send_prompt(
+            &worker.worker_id,
+            Some("Run lane event parity checks"),
+            None,
+        )
         .expect("prompt dispatch should succeed");
 
     let failed = registry

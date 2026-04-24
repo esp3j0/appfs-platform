@@ -52,12 +52,14 @@ use runtime::{
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
     OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
     PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutionResult, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
+    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -162,7 +164,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     set_shell_if_windows()?;
     match parse_args(&args)? {
-        CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
+        CliAction::DumpManifests {
+            output_format,
+            manifests_dir,
+        } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
         CliAction::Agents {
             args,
@@ -255,6 +260,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
+        manifests_dir: Option<PathBuf>,
     },
     BootstrapPlan {
         output_format: CliOutputFormat,
@@ -531,7 +537,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "dump-manifests" => Ok(CliAction::DumpManifests { output_format }),
+        "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
@@ -1142,6 +1148,40 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         output_format,
     })
 }
+
+fn parse_dump_manifests_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut manifests_dir: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--manifests-dir" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| String::from("--manifests-dir requires a path"))?;
+            manifests_dir = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--manifests-dir=") {
+            if value.is_empty() {
+                return Err(String::from("--manifests-dir requires a path"));
+            }
+            manifests_dir = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        return Err(format!("unknown dump-manifests option: {arg}"));
+    }
+
+    Ok(CliAction::DumpManifests {
+        output_format,
+        manifests_dir,
+    })
+}
+
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1841,9 +1881,66 @@ fn looks_like_slash_command_token(token: &str) -> bool {
         .any(|spec| spec.name == name || spec.aliases.contains(&name))
 }
 
-fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn dump_manifests(
+    manifests_dir: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
+    dump_manifests_at_path(&workspace_dir, manifests_dir, output_format)
+}
+
+const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+
+fn upstream_repo_root(paths: &UpstreamPaths) -> PathBuf {
+    paths
+        .commands_path()
+        .parent()
+        .and_then(Path::parent)
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+fn dump_manifests_at_path(
+    workspace_dir: &Path,
+    manifests_dir: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = if let Some(dir) = manifests_dir {
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        UpstreamPaths::from_repo_root(resolved)
+    } else {
+        let resolved = workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_dir.to_path_buf());
+        UpstreamPaths::from_workspace_dir(&resolved)
+    };
+    let source_root = upstream_repo_root(&paths);
+    if !source_root.exists() {
+        return Err(format!(
+            "Manifest source directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+        )
+        .into());
+    }
+
+    let required_paths = [
+        ("src/commands.ts", paths.commands_path()),
+        ("src/tools.ts", paths.tools_path()),
+        ("src/entrypoints/cli.tsx", paths.cli_path()),
+    ];
+    let missing = required_paths
+        .iter()
+        .filter_map(|(label, path)| (!path.is_file()).then_some(*label))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Manifest source files are missing.\n  repo root: {}\n  missing: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+            missing.join(", "),
+        )
+        .into());
+    }
+
     match extract_manifest(&paths) {
         Ok(manifest) => {
             match output_format {
@@ -1864,7 +1961,11 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
             }
             Ok(())
         }
-        Err(error) => Err(format!("failed to extract manifests: {error}").into()),
+        Err(error) => Err(format!(
+            "failed to extract manifests: {error}\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display()
+        )
+        .into()),
     }
 }
 
@@ -2729,6 +2830,58 @@ fn run_resume_command(
     session: &Session,
     command: &SlashCommand,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    run_resume_command_with_compactor(session_path, session, command, &mut run_resume_full_compact)
+}
+
+fn run_resume_full_compact(
+    session: &Session,
+) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>> {
+    let system_prompt = build_system_prompt()?;
+    let resolved_model = resolve_repl_model(DEFAULT_MODEL.to_string());
+    let mut runtime = build_runtime(
+        session.clone(),
+        &session.session_id,
+        resolved_model,
+        system_prompt,
+        true,
+        false,
+        None,
+        default_permission_mode(),
+        None,
+    )?;
+    Ok(runtime.compact(CompactionConfig {
+        max_estimated_tokens: 0,
+        ..CompactionConfig::default()
+    })?)
+}
+
+fn format_resume_compact_message(
+    removed: usize,
+    kept: usize,
+    skipped: bool,
+    user_display_message: Option<&str>,
+) -> String {
+    let mut message = format_compact_report(removed, kept, skipped);
+    if let Some(user_display_message) = user_display_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        message.push('\n');
+        message.push_str(user_display_message);
+    }
+    message
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_resume_command_with_compactor<F>(
+    session_path: &Path,
+    session: &Session,
+    command: &SlashCommand,
+    compact_with_runtime: &mut F,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>>
+where
+    F: FnMut(&Session) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>>,
+{
     match command {
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -2736,20 +2889,19 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
+            let result = compact_with_runtime(session)?;
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
-                message: Some(format_compact_report(removed, kept, skipped)),
+                message: Some(format_resume_compact_message(
+                    removed,
+                    kept,
+                    skipped,
+                    result.user_display_message.as_deref(),
+                )),
                 json: None,
             })
         }
@@ -3052,6 +3204,7 @@ struct SessionHandle {
 struct ManagedSessionSummary {
     id: String,
     path: PathBuf,
+    updated_at_ms: u64,
     modified_epoch_millis: u128,
     message_count: usize,
     parent_session_id: Option<String>,
@@ -4449,7 +4602,7 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        let result = self.runtime.compact(CompactionConfig::default())?;
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -4467,6 +4620,9 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if let Some(message) = result.user_display_message.as_deref() {
+            println!("{message}");
+        }
         Ok(())
     }
 
@@ -4662,7 +4818,7 @@ fn collect_sessions_from_dir(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, updated_at_ms, message_count, parent_session_id, branch_name) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -4675,6 +4831,7 @@ fn collect_sessions_from_dir(
                         .and_then(|fork| fork.branch_name.clone());
                     (
                         session.session_id,
+                        session.updated_at_ms,
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
@@ -4686,6 +4843,7 @@ fn collect_sessions_from_dir(
                         .unwrap_or("unknown")
                         .to_string(),
                     0,
+                    0,
                     None,
                     None,
                 ),
@@ -4693,6 +4851,7 @@ fn collect_sessions_from_dir(
         sessions.push(ManagedSessionSummary {
             id,
             path,
+            updated_at_ms,
             modified_epoch_millis,
             message_count,
             parent_session_id,
@@ -4719,8 +4878,9 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
 
     sessions.sort_by(|left, right| {
         right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.modified_epoch_millis.cmp(&left.modified_epoch_millis))
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(sessions)
@@ -5405,9 +5565,14 @@ fn collect_hook_list_entries(
         &mut entries,
         "config",
         true,
-        runtime_config.hooks().pre_tool_use(),
-        runtime_config.hooks().post_tool_use(),
-        runtime_config.hooks().post_tool_use_failure(),
+        HookCommandSets {
+            pre_tool_use: runtime_config.hooks().pre_tool_use(),
+            post_tool_use: runtime_config.hooks().post_tool_use(),
+            post_tool_use_failure: runtime_config.hooks().post_tool_use_failure(),
+            pre_compact: runtime_config.hooks().pre_compact(),
+            post_compact: runtime_config.hooks().post_compact(),
+            session_start: runtime_config.hooks().session_start(),
+        },
     );
 
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
@@ -5417,31 +5582,71 @@ fn collect_hook_list_entries(
             &mut entries,
             &format!("plugin:{}", plugin.metadata().id),
             plugin.is_enabled(),
-            &plugin.hooks().pre_tool_use,
-            &plugin.hooks().post_tool_use,
-            &plugin.hooks().post_tool_use_failure,
+            HookCommandSets {
+                pre_tool_use: &plugin.hooks().pre_tool_use,
+                post_tool_use: &plugin.hooks().post_tool_use,
+                post_tool_use_failure: &plugin.hooks().post_tool_use_failure,
+                pre_compact: &plugin.hooks().pre_compact,
+                post_compact: &plugin.hooks().post_compact,
+                session_start: &plugin.hooks().session_start,
+            },
         );
     }
 
     Ok(entries)
 }
 
+#[derive(Clone, Copy)]
+struct HookCommandSets<'a> {
+    pre_tool_use: &'a [String],
+    post_tool_use: &'a [String],
+    post_tool_use_failure: &'a [String],
+    pre_compact: &'a [String],
+    post_compact: &'a [String],
+    session_start: &'a [String],
+}
+
 fn extend_hook_list_entries(
     entries: &mut Vec<HookListEntry>,
     source: &str,
     enabled: bool,
-    pre_tool_use: &[String],
-    post_tool_use: &[String],
-    post_tool_use_failure: &[String],
+    commands: HookCommandSets<'_>,
 ) {
-    append_hook_list_entries(entries, source, enabled, "PreToolUse", pre_tool_use);
-    append_hook_list_entries(entries, source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PreToolUse",
+        commands.pre_tool_use,
+    );
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PostToolUse",
+        commands.post_tool_use,
+    );
     append_hook_list_entries(
         entries,
         source,
         enabled,
         "PostToolUseFailure",
-        post_tool_use_failure,
+        commands.post_tool_use_failure,
+    );
+    append_hook_list_entries(entries, source, enabled, "PreCompact", commands.pre_compact);
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PostCompact",
+        commands.post_compact,
+    );
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "SessionStart",
+        commands.session_start,
     );
 }
 
@@ -6482,6 +6687,9 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
     )
+    .with_pre_compact(hooks.pre_compact)
+    .with_post_compact(hooks.post_compact)
+    .with_session_start(hooks.session_start)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7039,6 +7247,26 @@ impl AnthropicRuntimeClient {
             progress_reporter,
         })
     }
+
+    fn provider_client_for_model(&self, model: &str) -> Result<ProviderClient, RuntimeError> {
+        let cwd = env::current_dir().map_err(|error| RuntimeError::new(error.to_string()))?;
+        let runtime_config = load_runtime_config_for_cwd(&cwd).map_err(|error| {
+            RuntimeError::new(format!(
+                "failed to load runtime config for model override: {error}"
+            ))
+        })?;
+        let provider_override = runtime_config
+            .provider()
+            .map(provider_override_from_runtime_config);
+        let oauth = runtime_config.oauth().cloned();
+        ProviderClient::from_model_with_anthropic_auth_resolver(
+            model,
+            provider_override.as_ref(),
+            || resolve_cli_auth_source(oauth.as_ref()),
+        )
+        .map(|client| client.with_prompt_cache(PromptCache::new(&self.session_id)))
+        .map_err(|error| RuntimeError::new(error.to_string()))
+    }
 }
 
 fn resolve_cli_auth_source(oauth: Option<&OAuthConfig>) -> Result<AuthSource, api::ApiError> {
@@ -7097,17 +7325,29 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let allow_tools = self.enable_tools && request.allow_tools;
+        let effective_model = request
+            .model_override
+            .clone()
+            .unwrap_or_else(|| self.model.clone());
         let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            model: effective_model.clone(),
+            max_tokens: max_tokens_for_model(&effective_model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
+            tools: allow_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: allow_tools.then_some(ToolChoice::Auto),
+            reasoning_effort: request.reasoning_effort.clone(),
             stream: true,
             ..Default::default()
+        };
+        let override_client;
+        let client = if request.model_override.is_some() {
+            override_client = self.provider_client_for_model(&effective_model)?;
+            &override_client
+        } else {
+            &self.client
         };
 
         self.runtime.block_on(async {
@@ -7119,7 +7359,7 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(client, &message_request, is_post_tool && attempt == 1)
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
@@ -7145,11 +7385,11 @@ impl AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
+        client: &ProviderClient,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
+        let mut stream = client
             .stream_message(message_request)
             .await
             .map_err(|error| {
@@ -7276,7 +7516,7 @@ impl AnthropicRuntimeClient {
             }
         }
 
-        push_prompt_cache_record(&self.client, &mut events);
+        push_prompt_cache_record(client, &mut events);
 
         if !saw_stop
             && events.iter().any(|event| {
@@ -7294,8 +7534,7 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
+        let response = client
             .send_message(&MessageRequest {
                 stream: false,
                 ..message_request.clone()
@@ -7305,7 +7544,7 @@ impl AnthropicRuntimeClient {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
         let mut events = response_to_events(response, out)?;
-        push_prompt_cache_record(&self.client, &mut events);
+        push_prompt_cache_record(client, &mut events);
         Ok(events)
     }
 }
@@ -8188,7 +8427,7 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<ToolExecutionResult, ToolError> {
         let resolved_tool_name = strip_tool_call_prefix(tool_name);
         if self
             .allowed_tools
@@ -8203,17 +8442,25 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let result = if resolved_tool_name == "ToolSearch" {
             self.execute_search_tool(value)
+                .map(ToolExecutionResult::text)
         } else if self.tool_registry.has_runtime_tool(resolved_tool_name) {
             self.execute_runtime_tool(resolved_tool_name, value)
+                .map(ToolExecutionResult::text)
+        } else if mvp_tool_specs()
+            .iter()
+            .any(|spec| spec.name == resolved_tool_name)
+        {
+            execute_tool_with_effects(resolved_tool_name, &value).map_err(ToolError::new)
         } else {
             self.tool_registry
                 .execute(resolved_tool_name, &value)
+                .map(ToolExecutionResult::text)
                 .map_err(ToolError::new)
         };
         match result {
             Ok(output) => {
                 if self.emit_output {
-                    let markdown = format_tool_result(resolved_tool_name, &output, false);
+                    let markdown = format_tool_result(resolved_tool_name, &output.output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -8267,16 +8514,18 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let result = model_visible_tool_result(tool_name, output, *is_error);
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -8333,7 +8582,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw dump-manifests")?;
+    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
@@ -8476,7 +8725,8 @@ mod tests {
         render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
         render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        run_resume_command_with_compactor, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
@@ -9143,6 +9393,33 @@ mod tests {
     }
 
     #[test]
+    fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir".to_string(),
+                "/tmp/upstream".to_string(),
+            ])
+            .expect("dump-manifests should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir=/tmp/upstream".to_string(),
+            ])
+            .expect("inline dump-manifests flag should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
+            }
+        );
+    }
+
+    #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -9775,16 +10052,12 @@ mod tests {
                     input: r#"{"command":"ls -la"}"#.to_string(),
                 },
             ]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result(
+                "toolu_abcdefghijklmnop",
+                "bash",
+                "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .",
+                false,
+            ),
         ];
 
         // when
@@ -9815,16 +10088,12 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "errs".to_string();
-        session.messages = vec![ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: "short".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "   ".to_string(),
-                is_error: true,
-            }],
-            usage: None,
-        }];
+        session.messages = vec![ConversationMessage::tool_result(
+            "short",
+            "read_file",
+            "   ",
+            true,
+        )];
 
         // when
         let markdown =
@@ -11029,6 +11298,73 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn resume_compact_uses_runtime_compactor_and_persists_result() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let session_path = root.join("session.jsonl");
+        let mut original = Session::new();
+        original
+            .push_user_text("Preserve compact context")
+            .expect("session should append");
+        original
+            .save_to_path(&session_path)
+            .expect("session should save");
+
+        let session = Session::load_from_path(&session_path).expect("session should load");
+        let mut compacted_session = session.clone();
+        compacted_session.messages = vec![
+            ConversationMessage::compact_boundary(runtime::CompactBoundaryMetadata {
+                trigger: runtime::CompactTrigger::Manual,
+                pre_tokens: 42,
+                user_context: None,
+                messages_summarized: Some(1),
+                pre_compact_discovered_tools: Vec::new(),
+                preserved_segment: None,
+            }),
+            ConversationMessage::compact_summary_user_text(
+                "This session is being continued from a previous conversation.\nSummary:\nCarry over prior work.",
+                true,
+            ),
+            ConversationMessage::attachment_user_text(
+                "Previously invoked skills remain available after compaction.",
+                runtime::AttachmentKind::InvokedSkills,
+            ),
+        ];
+        compacted_session.record_compaction("Carry over prior work.", 1);
+
+        let mut compactor_called = false;
+        let outcome = run_resume_command_with_compactor(
+            &session_path,
+            &session,
+            &SlashCommand::Compact,
+            &mut |input_session| {
+                compactor_called = true;
+                assert_eq!(input_session.messages.len(), 1);
+                Ok(runtime::CompactionResult {
+                    summary: "Carry over prior work.".to_string(),
+                    formatted_summary: "formatted".to_string(),
+                    compacted_session: compacted_session.clone(),
+                    removed_message_count: 1,
+                    user_display_message: Some("pre compact note\npost compact note".to_string()),
+                })
+            },
+        )
+        .expect("resume compact should succeed");
+
+        let restored = Session::load_from_path(&session_path).expect("session should reload");
+        assert!(compactor_called);
+        assert_eq!(outcome.session, compacted_session);
+        assert_eq!(restored, compacted_session);
+        let message = outcome.message.expect("resume compact report should exist");
+        assert!(message.contains("Result           compacted"));
+        assert!(message.contains("Messages removed 1"));
+        assert!(message.contains("pre compact note"));
+        assert!(message.contains("post compact note"));
+
+        remove_dir_all_with_retry(&root);
+    }
+
+    #[test]
     fn branch_delete_removes_only_merged_unprotected_local_branches() {
         let _guard = cwd_lock()
             .lock()
@@ -11200,9 +11536,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -11242,9 +11576,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -11296,6 +11628,24 @@ UU conflicted.rs",
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn cwd_guard() -> MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn cwd_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = cwd_guard();
+            panic!("poison cwd lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = cwd_guard();
+    }
+
     fn temp_workspace(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -11306,9 +11656,7 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let rendered = crate::init::render_init_claude_md(&workspace_root);
         assert!(rendered.contains("# CLAUDE.md"));
@@ -11324,16 +11672,7 @@ UU conflicted.rs",
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
         ];
 
         let converted = super::convert_messages(&messages);
@@ -11950,7 +12289,7 @@ UU conflicted.rs",
             .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
             .expect("discovered mcp tool should execute");
         let tool_json: serde_json::Value =
-            serde_json::from_str(&tool_output).expect("tool output should be json");
+            serde_json::from_str(&tool_output.output).expect("tool output should be json");
         assert_eq!(tool_json["structuredContent"]["echoed"], "hello");
 
         let wrapped_output = executor
@@ -11960,14 +12299,14 @@ UU conflicted.rs",
             )
             .expect("generic mcp wrapper should execute");
         let wrapped_json: serde_json::Value =
-            serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
+            serde_json::from_str(&wrapped_output.output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
             .expect("tool search should execute");
         let search_json: serde_json::Value =
-            serde_json::from_str(&search_output).expect("search output should be json");
+            serde_json::from_str(&search_output.output).expect("search output should be json");
         assert_eq!(search_json["matches"][0], "mcp__alpha__echo");
         assert_eq!(search_json["pending_mcp_servers"][0], "broken");
         assert_eq!(
@@ -11987,7 +12326,7 @@ UU conflicted.rs",
             .execute("ListMcpResourcesTool", r#"{"server":"alpha"}"#)
             .expect("resources should list");
         let listed_json: serde_json::Value =
-            serde_json::from_str(&listed).expect("resource output should be json");
+            serde_json::from_str(&listed.output).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
 
         let read = executor
@@ -11997,7 +12336,7 @@ UU conflicted.rs",
             )
             .expect("resource should read");
         let read_json: serde_json::Value =
-            serde_json::from_str(&read).expect("resource read output should be json");
+            serde_json::from_str(&read.output).expect("resource read output should be json");
         assert_eq!(
             read_json["contents"][0]["text"],
             "contents for file://guide.txt"
@@ -12048,7 +12387,7 @@ UU conflicted.rs",
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
             .expect("tool search should execute");
         let search_json: serde_json::Value =
-            serde_json::from_str(&search_output).expect("search output should be json");
+            serde_json::from_str(&search_output.output).expect("search output should be json");
         assert_eq!(search_json["pending_mcp_servers"][0], "remote");
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["server_name"],
@@ -12083,7 +12422,7 @@ UU conflicted.rs",
             )
             .expect("prefixed tool call name should be allow-listed");
         let json: serde_json::Value =
-            serde_json::from_str(&output).expect("tool search output should be valid json");
+            serde_json::from_str(&output.output).expect("tool search output should be valid json");
         assert!(json["query"].is_string());
     }
 
@@ -12252,7 +12591,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{dump_manifests_at_path, format_sandbox_report, CliOutputFormat, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -12303,5 +12642,87 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn dump_manifests_shows_helpful_error_when_manifests_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_missing_manifests_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("failed to create temp workspace");
+
+        let result = dump_manifests_at_path(&workspace, None, CliOutputFormat::Text);
+        assert!(
+            result.is_err(),
+            "expected an error when manifests are missing"
+        );
+
+        let error_msg = result
+            .expect_err("missing manifests should error")
+            .to_string();
+        assert!(
+            error_msg.contains("Manifest source files are missing"),
+            "error message should mention missing manifest sources: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("repo root:"),
+            "error message should label the repo root path: {error_msg}"
+        );
+        let expected_root_name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("temp root should have utf8 name");
+        assert!(
+            error_msg.contains(expected_root_name),
+            "error message should contain the resolved repo root path: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("src/commands.ts"),
+            "error message should mention missing commands.ts: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
+            "error message should explain how to supply the upstream path: {error_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_manifests_uses_explicit_manifest_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_explicit_manifest_dir_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let upstream = root.join("upstream");
+        std::fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
+        std::fs::create_dir_all(upstream.join("src/entrypoints"))
+            .expect("upstream fixture should exist");
+        std::fs::write(
+            upstream.join("src/commands.ts"),
+            "import FooCommand from './commands/foo'\n",
+        )
+        .expect("commands fixture should write");
+        std::fs::write(
+            upstream.join("src/tools.ts"),
+            "import ReadTool from './tools/read'\n",
+        )
+        .expect("tools fixture should write");
+        std::fs::write(
+            upstream.join("src/entrypoints/cli.tsx"),
+            "startupProfiler()\n",
+        )
+        .expect("cli fixture should write");
+
+        let result = dump_manifests_at_path(&workspace, Some(&upstream), CliOutputFormat::Text);
+        assert!(
+            result.is_ok(),
+            "explicit manifest dir should succeed: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

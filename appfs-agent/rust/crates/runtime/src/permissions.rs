@@ -37,6 +37,7 @@ pub enum PermissionOverride {
 pub struct PermissionContext {
     override_decision: Option<PermissionOverride>,
     override_reason: Option<String>,
+    additional_allow_rules: Vec<String>,
 }
 
 impl PermissionContext {
@@ -48,6 +49,7 @@ impl PermissionContext {
         Self {
             override_decision,
             override_reason,
+            additional_allow_rules: Vec::new(),
         }
     }
 
@@ -59,6 +61,17 @@ impl PermissionContext {
     #[must_use]
     pub fn override_reason(&self) -> Option<&str> {
         self.override_reason.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_additional_allow_rules(mut self, additional_allow_rules: Vec<String>) -> Self {
+        self.additional_allow_rules = additional_allow_rules;
+        self
+    }
+
+    #[must_use]
+    pub fn additional_allow_rules(&self) -> &[String] {
+        &self.additional_allow_rules
     }
 }
 
@@ -184,6 +197,8 @@ impl PermissionPolicy {
         let required_mode = self.required_mode_for(tool_name);
         let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
         let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
+        let contextual_allow_rule =
+            Self::find_matching_raw_rule(context.additional_allow_rules(), tool_name, input);
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
@@ -224,6 +239,7 @@ impl PermissionPolicy {
                     );
                 }
                 if allow_rule.is_some()
+                    || contextual_allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
                     || current_mode >= required_mode
                 {
@@ -249,6 +265,7 @@ impl PermissionPolicy {
         }
 
         if allow_rule.is_some()
+            || contextual_allow_rule.is_some()
             || current_mode == PermissionMode::Allow
             || current_mode >= required_mode
         {
@@ -321,6 +338,13 @@ impl PermissionPolicy {
         input: &str,
     ) -> Option<&'a PermissionRule> {
         rules.iter().find(|rule| rule.matches(tool_name, input))
+    }
+
+    fn find_matching_raw_rule(rules: &[String], tool_name: &str, input: &str) -> Option<String> {
+        rules
+            .iter()
+            .find(|rule| PermissionRule::parse(rule).matches(tool_name, input))
+            .cloned()
     }
 }
 
