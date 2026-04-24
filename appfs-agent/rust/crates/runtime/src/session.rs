@@ -131,6 +131,16 @@ pub struct SessionPromptEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokedSkill {
+    pub skill: String,
+    pub resolved_name: Option<String>,
+    pub path: Option<String>,
+    pub description: Option<String>,
+    pub args: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,
 }
@@ -154,6 +164,7 @@ pub struct Session {
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
+    pub invoked_skills: Vec<InvokedSkill>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -168,6 +179,7 @@ impl PartialEq for Session {
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
+            && self.invoked_skills == other.invoked_skills
     }
 }
 
@@ -218,6 +230,7 @@ impl Session {
             fork: None,
             workspace_root: None,
             prompt_history: Vec::new(),
+            invoked_skills: Vec::new(),
             persistence: None,
         }
     }
@@ -304,6 +317,27 @@ impl Session {
         });
     }
 
+    pub fn upsert_invoked_skill(
+        &mut self,
+        invoked_skill: InvokedSkill,
+    ) -> Result<(), SessionError> {
+        let previous_updated_at_ms = self.updated_at_ms;
+        let previous_invoked_skills = self.invoked_skills.clone();
+        self.touch();
+        upsert_invoked_skill_entry(&mut self.invoked_skills, invoked_skill);
+
+        let persistence_path = self.persistence_path().map(Path::to_path_buf);
+        if let Some(path) = persistence_path {
+            if let Err(error) = self.save_to_path(path) {
+                self.updated_at_ms = previous_updated_at_ms;
+                self.invoked_skills = previous_invoked_skills;
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
     #[must_use]
     pub fn fork(&self, branch_name: Option<String>) -> Self {
         let now = current_time_millis();
@@ -320,6 +354,7 @@ impl Session {
             }),
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
+            invoked_skills: self.invoked_skills.clone(),
             persistence: None,
         }
     }
@@ -370,6 +405,17 @@ impl Session {
                     self.prompt_history
                         .iter()
                         .map(SessionPromptEntry::to_jsonl_record)
+                        .collect(),
+                ),
+            );
+        }
+        if !self.invoked_skills.is_empty() {
+            object.insert(
+                "invoked_skills".to_string(),
+                JsonValue::Array(
+                    self.invoked_skills
+                        .iter()
+                        .map(InvokedSkill::to_json)
                         .collect(),
                 ),
             );
@@ -428,6 +474,11 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
+        let invoked_skills = object
+            .get("invoked_skills")
+            .map(invoked_skills_from_json)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -438,6 +489,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            invoked_skills,
             persistence: None,
         })
     }
@@ -452,6 +504,7 @@ impl Session {
         let mut fork = None;
         let mut workspace_root = None;
         let mut prompt_history = Vec::new();
+        let mut invoked_skills = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -490,6 +543,9 @@ impl Session {
                         .get("workspace_root")
                         .and_then(JsonValue::as_str)
                         .map(PathBuf::from);
+                    if let Some(value) = object.get("invoked_skills") {
+                        invoked_skills = invoked_skills_from_json(value)?;
+                    }
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -532,6 +588,7 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            invoked_skills,
             persistence: None,
         })
     }
@@ -635,6 +692,17 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if !self.invoked_skills.is_empty() {
+            object.insert(
+                "invoked_skills".to_string(),
+                JsonValue::Array(
+                    self.invoked_skills
+                        .iter()
+                        .map(InvokedSkill::to_json)
+                        .collect(),
+                ),
             );
         }
         Ok(JsonValue::Object(object))
@@ -1445,6 +1513,67 @@ impl SessionPromptEntry {
     }
 }
 
+impl InvokedSkill {
+    fn identity_key(&self) -> &str {
+        self.resolved_name.as_deref().unwrap_or(self.skill.as_str())
+    }
+
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("skill".to_string(), JsonValue::String(self.skill.clone()));
+        if let Some(resolved_name) = &self.resolved_name {
+            object.insert(
+                "resolved_name".to_string(),
+                JsonValue::String(resolved_name.clone()),
+            );
+        }
+        if let Some(path) = &self.path {
+            object.insert("path".to_string(), JsonValue::String(path.clone()));
+        }
+        if let Some(description) = &self.description {
+            object.insert(
+                "description".to_string(),
+                JsonValue::String(description.clone()),
+            );
+        }
+        if let Some(args) = &self.args {
+            object.insert("args".to_string(), JsonValue::String(args.clone()));
+        }
+        object.insert("prompt".to_string(), JsonValue::String(self.prompt.clone()));
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| SessionError::Format("invoked skill must be an object".to_string()))?;
+        Ok(Self {
+            skill: required_string(object, "skill")?,
+            resolved_name: object
+                .get("resolved_name")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            path: object
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            description: object
+                .get("description")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            args: object
+                .get("args")
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .and_then(|value| normalize_optional_string(Some(value))),
+            prompt: required_string(object, "prompt")?,
+        })
+    }
+}
+
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
@@ -1554,6 +1683,28 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn invoked_skills_from_json(value: &JsonValue) -> Result<Vec<InvokedSkill>, SessionError> {
+    value
+        .as_array()
+        .ok_or_else(|| SessionError::Format("invoked_skills must be an array".to_string()))?
+        .iter()
+        .map(InvokedSkill::from_json)
+        .collect()
+}
+
+fn upsert_invoked_skill_entry(invoked_skills: &mut Vec<InvokedSkill>, invoked_skill: InvokedSkill) {
+    if let Some(existing) = invoked_skills.iter_mut().find(|existing| {
+        existing
+            .identity_key()
+            .eq_ignore_ascii_case(invoked_skill.identity_key())
+    }) {
+        *existing = invoked_skill;
+        return;
+    }
+
+    invoked_skills.push(invoked_skill);
 }
 
 fn current_time_millis() -> u64 {
@@ -1703,7 +1854,7 @@ mod tests {
     use super::{
         cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, AttachmentKind,
         CompactBoundaryMetadata, CompactPreservedSegment, CompactTrigger, ContentBlock,
-        ConversationMessage, HookResultEvent, MessageRole, Session, SessionFork,
+        ConversationMessage, HookResultEvent, InvokedSkill, MessageRole, Session, SessionFork,
         SystemMessageSubtype,
     };
     use crate::json::JsonValue;
@@ -1866,6 +2017,40 @@ mod tests {
             [ContentBlock::Text { text }] if text == "hi"
         ));
         assert!(!restored.messages[0].uuid.is_empty());
+    }
+
+    #[test]
+    fn persists_invoked_skills_in_session_metadata() {
+        let path = temp_session_path("invoked-skills");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("run trace")
+            .expect("message should append");
+        session
+            .upsert_invoked_skill(InvokedSkill {
+                skill: "trace".to_string(),
+                resolved_name: Some("trace".to_string()),
+                path: Some("C:\\repo\\.agents\\skills\\trace\\SKILL.md".to_string()),
+                description: Some("Trace helper".to_string()),
+                args: Some("full".to_string()),
+                prompt: "# trace\nFollow the traces\n".to_string(),
+            })
+            .expect("invoked skill should persist");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.invoked_skills.len(), 1);
+        assert_eq!(restored.invoked_skills[0].skill, "trace");
+        assert_eq!(
+            restored.invoked_skills[0].resolved_name.as_deref(),
+            Some("trace")
+        );
+        assert_eq!(restored.invoked_skills[0].args.as_deref(), Some("full"));
+        assert!(restored.invoked_skills[0]
+            .prompt
+            .contains("Follow the traces"));
+        assert_eq!(restored.messages.len(), 1);
     }
 
     #[test]

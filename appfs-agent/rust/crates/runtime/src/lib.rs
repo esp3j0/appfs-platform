@@ -45,7 +45,6 @@ mod tool_session;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
-mod user_paths;
 mod windows_shell;
 pub mod worker_boot;
 
@@ -83,8 +82,8 @@ pub use context::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolContextUpdate,
+    ToolError, ToolExecutionResult, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, resolve_tool_path,
@@ -162,8 +161,8 @@ pub use sandbox::{
 pub use session::{
     AttachmentKind, AttachmentMetadata, CompactBoundaryMetadata, CompactPreservedSegment,
     CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, HookResultMetadata,
-    MessageRole, Session, SessionCompaction, SessionError, SessionFork, SessionPromptEntry,
-    SystemMessageSubtype,
+    InvokedSkill, MessageRole, Session, SessionCompaction, SessionError, SessionFork,
+    SessionPromptEntry, SystemMessageSubtype,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -176,12 +175,15 @@ pub use stale_branch::{
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};
+pub use tool_session::{
+    current_tool_session_compaction_summary, current_tool_session_messages,
+    with_tool_session_snapshot,
+};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
-pub use user_paths::{claw_config_home, user_home_dir};
 pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,

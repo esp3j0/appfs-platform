@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::session::{
     AttachmentKind, CompactBoundaryMetadata, CompactPreservedSegment, CompactTrigger, ContentBlock,
-    ConversationMessage, MessageRole, Session,
+    ConversationMessage, InvokedSkill, MessageRole, Session,
 };
 
 const NO_TOOLS_PREAMBLE: &str = r"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
@@ -508,7 +508,7 @@ fn collect_post_compact_context_messages(session: &Session) -> Vec<ConversationM
     if let Some(plan_mode) = create_plan_mode_context_message(&session.messages) {
         messages.push(plan_mode);
     }
-    if let Some(skills) = create_invoked_skills_context_message(&session.messages) {
+    if let Some(skills) = create_invoked_skills_context_message(session) {
         messages.push(skills);
     }
 
@@ -648,15 +648,16 @@ fn create_plan_mode_context_message(
     ))
 }
 
-fn create_invoked_skills_context_message(
-    messages: &[ConversationMessage],
-) -> Option<ConversationMessage> {
+fn create_invoked_skills_context_message(session: &Session) -> Option<ConversationMessage> {
     let mut skills = BTreeMap::new();
-    for output in successful_tool_outputs(messages, "Skill") {
-        let Some(parsed) = parse_tool_result_json_prefix::<CompactSkillOutput>(output) else {
-            continue;
-        };
-        skills.insert(parsed.skill.clone(), parsed);
+    if session.invoked_skills.is_empty() {
+        for skill in legacy_invoked_skills_from_messages(&session.messages) {
+            skills.insert(skill.skill.clone(), skill);
+        }
+    } else {
+        for skill in &session.invoked_skills {
+            skills.insert(skill.skill.clone(), skill.clone());
+        }
     }
 
     if skills.is_empty() {
@@ -666,7 +667,11 @@ fn create_invoked_skills_context_message(
     let mut content = String::from("Previously invoked skills remain available after compaction.");
     for skill in skills.into_values() {
         let _ = write!(content, "\n\nSkill `{}`", skill.skill);
-        let _ = write!(content, "\nPath: {}", skill.path);
+        if let Some(path) = skill.path.as_deref().map(str::trim) {
+            if !path.is_empty() {
+                let _ = write!(content, "\nPath: {path}");
+            }
+        }
         if let Some(description) = skill.description.as_deref().map(str::trim) {
             if !description.is_empty() {
                 let _ = write!(content, "\nDescription: {description}");
@@ -685,6 +690,20 @@ fn create_invoked_skills_context_message(
         content,
         AttachmentKind::InvokedSkills,
     ))
+}
+
+fn legacy_invoked_skills_from_messages(messages: &[ConversationMessage]) -> Vec<InvokedSkill> {
+    successful_tool_outputs(messages, "Skill")
+        .filter_map(parse_tool_result_json_prefix::<CompactSkillOutput>)
+        .map(|parsed| InvokedSkill {
+            skill: parsed.skill,
+            resolved_name: None,
+            path: Some(parsed.path),
+            description: parsed.description,
+            args: parsed.args,
+            prompt: parsed.prompt,
+        })
+        .collect()
 }
 
 fn successful_tool_outputs<'a>(
@@ -1181,7 +1200,8 @@ mod tests {
         BuildCompactionResultOptions, CompactionConfig, CompactionLayout, PreservedSegmentAnchor,
     };
     use crate::session::{
-        AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, MessageRole, Session,
+        AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, InvokedSkill,
+        MessageRole, Session,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1257,19 +1277,6 @@ mod tests {
                 false,
             ),
             ConversationMessage::tool_result(
-                "skill-1",
-                "Skill",
-                serde_json::to_string_pretty(&json!({
-                    "skill": "$compact",
-                    "path": workspace.join(".codex").join("skills").join("compact").join("SKILL.md").display().to_string(),
-                    "args": "full",
-                    "description": "Compact guidance",
-                    "prompt": "Prefer TS full compact parity over local summaries."
-                }))
-                .expect("skill json should serialize"),
-                false,
-            ),
-            ConversationMessage::tool_result(
                 "agent-1",
                 "Agent",
                 serde_json::to_string_pretty(&json!({
@@ -1285,6 +1292,22 @@ mod tests {
                 false,
             ),
         ];
+        session.invoked_skills.push(InvokedSkill {
+            skill: "$compact".to_string(),
+            resolved_name: Some("compact".to_string()),
+            path: Some(
+                workspace
+                    .join(".codex")
+                    .join("skills")
+                    .join("compact")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string(),
+            ),
+            description: Some("Compact guidance".to_string()),
+            args: Some("full".to_string()),
+            prompt: "Prefer TS full compact parity over local summaries.".to_string(),
+        });
         session
     }
 
@@ -1692,5 +1715,42 @@ mod tests {
         assert!(rendered[3].contains("Prefer TS full compact parity over local summaries."));
 
         fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    }
+
+    #[test]
+    fn invoked_skills_context_falls_back_to_legacy_skill_tool_results() {
+        let workspace = temp_dir("legacy-invoked-skills");
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage::tool_result(
+            "skill-1",
+            "Skill",
+            serde_json::to_string_pretty(&json!({
+                "skill": "trace",
+                "path": workspace.join(".codex").join("skills").join("trace").join("SKILL.md").display().to_string(),
+                "args": "focus",
+                "description": "Trace helper",
+                "prompt": "Trace the failure end to end."
+            }))
+            .expect("skill json should serialize"),
+            false,
+        )];
+
+        let message = super::create_invoked_skills_context_message(&session)
+            .expect("legacy skill context message");
+        let rendered = match &message.blocks[0] {
+            ContentBlock::Text { text } => text,
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
+                panic!("expected text attachment")
+            }
+        };
+        assert!(rendered.contains("Skill `trace`"));
+        assert!(rendered.contains("Trace the failure end to end."));
+        assert_eq!(
+            message
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InvokedSkills)
+        );
     }
 }

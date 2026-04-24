@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use commands::activate_conditional_skills_for_paths;
 use runtime::{
     resolve_tool_path, resolve_tool_path_allow_missing, tool_output_root, EditFileOutput,
     ReadFileOutput, TextFilePayload, WriteFileOutput,
@@ -134,6 +135,13 @@ fn with_context_state_map<R>(action: impl FnOnce(&mut ContextStateMap) -> R) -> 
     Ok(action(context_states))
 }
 
+fn activate_skills_for_path(path: &Path) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    activate_conditional_skills_for_paths(&[path.to_path_buf()], &cwd)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn get_state_for_path(path: &Path) -> Result<Option<FileToolState>, String> {
     let normalized_path = normalize_state_path(path);
     with_context_state_map(|states| states.get(&normalized_path).cloned())
@@ -201,6 +209,7 @@ pub(crate) fn prepare_read(
     limit: Option<usize>,
 ) -> Result<PreparedRead, String> {
     let normalized_path = resolve_tool_path(path).map_err(|error| error.to_string())?;
+    activate_skills_for_path(&normalized_path)?;
     let requested_offset = offset.unwrap_or(1);
 
     let dedup_output = get_state_for_path(&normalized_path)?.and_then(|state| {
@@ -256,6 +265,7 @@ pub(crate) fn record_read_result(
 pub(crate) fn prepare_write(path: &str) -> Result<PreparedWrite, String> {
     let normalized_path =
         resolve_tool_path_allow_missing(path).map_err(|error| error.to_string())?;
+    activate_skills_for_path(&normalized_path)?;
     if !normalized_path.exists() {
         return Ok(PreparedWrite { normalized_path });
     }
@@ -296,6 +306,7 @@ pub(crate) fn prepare_edit(
 
     let normalized_path =
         resolve_tool_path_allow_missing(path).map_err(|error| error.to_string())?;
+    activate_skills_for_path(&normalized_path)?;
     let file_exists = normalized_path.exists();
 
     if !file_exists {

@@ -106,23 +106,6 @@ def _network_error_message(url: str, err: BaseException) -> str:
     return f"{err.__class__.__name__} url={url}"
 
 
-def _rewrite_loopback_storage_host(storage_host: str, app_host: str) -> str:
-    storage = urllib.parse.urlparse(storage_host)
-    app = urllib.parse.urlparse(app_host)
-    if storage.scheme == "" or storage.netloc == "":
-        return storage_host.rstrip("/")
-    if app.scheme == "" or app.hostname is None:
-        return storage_host.rstrip("/")
-    if storage.hostname not in ("127.0.0.1", "localhost"):
-        return storage_host.rstrip("/")
-    host = app.hostname
-    port = storage.port
-    netloc = host if port is None else f"{host}:{port}"
-    return urllib.parse.urlunparse(
-        (storage.scheme, netloc, storage.path, storage.params, storage.query, storage.fragment)
-    ).rstrip("/")
-
-
 def _json_request(method: str, url: str, *, body: dict[str, Any] | None, timeout_sec: float) -> dict[str, Any]:
     data = None
     headers: dict[str, str] = {}
@@ -195,7 +178,7 @@ class HuoyanClient(HuoyanApiClientProtocol):
         storage_host = str(options.get("storagehost", "")).strip()
         if storage_host == "":
             raise RuntimeError("fireeye app options did not include storagehost")
-        self.storage_host = _rewrite_loopback_storage_host(storage_host, self.host)
+        self.storage_host = storage_host.rstrip("/")
         return self.storage_host
 
     def reset_storage_host_cache(self) -> None:
@@ -288,6 +271,9 @@ class HuoyanBackend:
     app_id: str = field(default_factory=lambda: os.getenv("APPFS_HUOYAN_APP_ID", "huoyan"))
     user_id: int = field(default_factory=lambda: _env_int("APPFS_HUOYAN_USER_ID", 1))
     case_mode: str = field(default_factory=lambda: os.getenv("APPFS_HUOYAN_CASE_MODE", "singlebox").strip().lower() or "singlebox")
+    bootstrap_mode: str = field(
+        default_factory=lambda: os.getenv("APPFS_HUOYAN_BOOTSTRAP_MODE", "").strip().lower()
+    )
     default_case_id: int | None = field(
         default_factory=lambda: (_env_int("APPFS_HUOYAN_CASE_ID", 0) or None)
     )
@@ -302,12 +288,19 @@ class HuoyanBackend:
         }
     )
     session_scopes: dict[str, str] = field(default_factory=dict)
-    opened_case_ids: dict[int, int] = field(default_factory=dict)
     scope_cache: dict[str, _BuiltScope] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.client is None:
             self.client = HuoyanClient()
+        if self.bootstrap_mode == "":
+            self.bootstrap_mode = "case" if self.default_scope == "case" else "home"
+        if self.bootstrap_mode not in {"home", "case", "attached_case"}:
+            raise ValueError(f"unsupported huoyan bootstrap mode: {self.bootstrap_mode}")
+        if self.bootstrap_mode in {"case", "attached_case"} and self.default_case_id is None:
+            raise ValueError(
+                f"APPFS_HUOYAN_BOOTSTRAP_MODE={self.bootstrap_mode} requires APPFS_HUOYAN_CASE_ID"
+            )
 
     def _snapshot_manifest(self, template: str) -> dict[str, Any]:
         return {
@@ -332,9 +325,23 @@ class HuoyanBackend:
         }
 
     def _initial_scope(self) -> str:
-        if self.default_scope == "case" and self.default_case_id is not None:
-            return self._case_scope(self.default_case_id)
+        if self.bootstrap_mode in {"case", "attached_case"}:
+            return self._attached_case_scope()
         return DEFAULT_HOME_SCOPE
+
+    def _attached_case_scope(self) -> str:
+        if self.default_case_id is None:
+            raise ValueError("huoyan case bootstrap requires default_case_id")
+        return self._case_scope(self.default_case_id)
+
+    def _assert_attached_scope(self, scope: str) -> None:
+        if self.bootstrap_mode != "attached_case":
+            return
+        attached_scope = self._attached_case_scope()
+        if scope != attached_scope:
+            raise ValueError(
+                f"attached_case bootstrap only supports current case scope {attached_scope}, got {scope}"
+            )
 
     def _case_scope(self, case_id: int) -> str:
         return f"case:{case_id}"
@@ -351,14 +358,7 @@ class HuoyanBackend:
         return case_id
 
     def _analysis_cid(self, case_id: int) -> int:
-        if self.case_mode == "singlebox":
-            return self.opened_case_ids.get(case_id, 1)
-        return case_id
-
-    def _evidence_cid(self, case_id: int) -> int:
-        if self.case_mode == "singlebox":
-            return self.opened_case_ids.get(case_id, case_id)
-        return case_id
+        return 1 if self.case_mode == "singlebox" else case_id
 
     def connector_info(self) -> dict[str, Any]:
         return {
@@ -369,7 +369,12 @@ class HuoyanBackend:
             "supports_snapshot": True,
             "supports_live": False,
             "supports_action": False,
-            "optional_features": ["structure_sync", "case_scope", "fireeye_tree"],
+            "optional_features": [
+                "structure_sync",
+                "case_scope",
+                "fireeye_tree",
+                "attached_case_bootstrap",
+            ],
         }
 
     def health(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -386,6 +391,7 @@ class HuoyanBackend:
     def get_app_structure(self, request: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         session_id = str(context.get("session_id", ""))
         scope = self.session_scopes.get(session_id, self._initial_scope())
+        self._assert_attached_scope(scope)
         built = self._build_scope(scope, force_refresh=True)
         self.session_scopes[session_id] = scope
         return self._structure_response(request, built.snapshot)
@@ -401,6 +407,15 @@ class HuoyanBackend:
             scope = target_scope.strip()
         else:
             scope = previous_scope
+
+        if self.bootstrap_mode == "attached_case":
+            attached_scope = self._attached_case_scope()
+            if previous_scope != attached_scope:
+                previous_scope = attached_scope
+            if scope != attached_scope:
+                raise ValueError(
+                    f"attached_case bootstrap does not support leaving current case scope {attached_scope}"
+                )
 
         self._transition_scope(previous_scope, scope, reason)
         built = self._build_scope(scope, force_refresh=True)
@@ -499,7 +514,9 @@ class HuoyanBackend:
         raise ValueError("huoyan backend does not expose custom action files yet")
 
     def _reset_client_storage_host_cache(self) -> None:
-        self.client.reset_storage_host_cache()
+        reset = getattr(self.client, "reset_storage_host_cache", None)
+        if callable(reset):
+            reset()
 
     def _open_case(self, case_id: int) -> None:
         cases = self._list_cases()
@@ -509,16 +526,7 @@ class HuoyanBackend:
         path = self._case_open_path(target)
         if path == "":
             raise ValueError(f"case {case_id} is missing openable path")
-        response = self.client.open_case(path=path)
-        opened_case = response.get("case")
-        if isinstance(opened_case, dict):
-            raw_id = opened_case.get("Id")
-            try:
-                opened_case_id = int(raw_id)
-            except (TypeError, ValueError):
-                opened_case_id = 0
-            if opened_case_id > 0:
-                self.opened_case_ids[case_id] = opened_case_id
+        self.client.open_case(path=path)
         self._reset_client_storage_host_cache()
         if self.open_wait_sec > 0:
             time.sleep(self.open_wait_sec)
@@ -530,6 +538,16 @@ class HuoyanBackend:
             time.sleep(self.open_wait_sec)
 
     def _transition_scope(self, previous_scope: str, next_scope: str, reason: str) -> None:
+        if self.bootstrap_mode == "attached_case":
+            attached_scope = self._attached_case_scope()
+            if previous_scope != attached_scope:
+                previous_scope = attached_scope
+            if next_scope != attached_scope:
+                raise ValueError(
+                    f"attached_case bootstrap does not support leaving current case scope {attached_scope}"
+                )
+            return
+
         if previous_scope == next_scope:
             return
 
@@ -546,21 +564,32 @@ class HuoyanBackend:
         if location == "":
             return ""
 
-        if location.lower().endswith(".gec"):
-            return location
+        location_path = Path(location)
+        if location_path.is_file() and location_path.suffix.lower() == ".gec":
+            return str(location_path)
 
-        case_name = str(case.get("Name", "")).strip()
-        if case_name == "":
-            return location
+        candidate_names = [
+            str(case.get("DisplayName", "")).strip(),
+            str(case.get("Name", "")).strip(),
+            location_path.name.strip(),
+            str(case.get("CaseNumber", "")).strip(),
+        ]
 
-        base = location.rstrip("\\/")
-        if base == "":
-            return f"{case_name}.gec"
+        if location_path.is_dir():
+            gec_files = sorted(
+                child for child in location_path.iterdir() if child.is_file() and child.suffix.lower() == ".gec"
+            )
+            if gec_files:
+                return str(gec_files[0])
 
-        last_backslash = base.rfind("\\")
-        last_slash = base.rfind("/")
-        separator = "\\" if last_backslash > last_slash else "/"
-        return f"{base}{separator}{case_name}.gec"
+            for name in candidate_names:
+                if name == "":
+                    continue
+                candidate = location_path / f"{name}.gec"
+                if candidate.exists():
+                    return str(candidate)
+
+        return location
 
     def _list_cases(self) -> list[dict[str, Any]]:
         response = self.client.list_cases(
@@ -662,7 +691,7 @@ class HuoyanBackend:
 
     def _build_case_scope(self, case_id: int) -> _BuiltScope:
         analysis_cid = self._analysis_cid(case_id)
-        raw_evidences = self.client.list_evidences(case_id=self._evidence_cid(case_id)).get("evidences", [])
+        raw_evidences = self.client.list_evidences(case_id=case_id).get("evidences", [])
         evidences: dict[int, dict[str, Any]] = {}
         if isinstance(raw_evidences, list):
             for evidence in raw_evidences:

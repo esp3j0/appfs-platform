@@ -10,7 +10,9 @@ workspace = true
 
 [dependencies]
 api = { path = "../api" }
+glob = "0.3"
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 serde_json.workspace = true
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread"] }
