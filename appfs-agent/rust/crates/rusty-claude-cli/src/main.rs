@@ -45,7 +45,7 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, clear_oauth_credentials, detect_appfs_environment,
     format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt, parse_oauth_callback_request_target,
+    load_oauth_credentials, load_system_prompt_with_appfs, parse_oauth_callback_request_target,
     pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
     set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
@@ -2208,7 +2208,7 @@ fn print_system_prompt(
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = load_system_prompt_with_appfs(cwd, date, env::consts::OS, "unknown")?;
     let message = sections.join("\n\n");
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -6606,7 +6606,7 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    Ok(load_system_prompt_with_appfs(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,

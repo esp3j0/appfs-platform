@@ -15,7 +15,7 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    grep_search, load_system_prompt_with_appfs,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -3383,6 +3383,11 @@ fn resolve_primary_skill_for_execution(
                 prompt,
             })
         }
+        commands::ResolvedSkillSource::Generated { id, base_dir } => Ok(ResolvedSkillExecution {
+            path: format!("generated://{id}"),
+            document: skill.document,
+            prompt: prepend_skill_base_directory(&prompt_body, base_dir.as_deref()),
+        }),
     }
 }
 
@@ -3981,7 +3986,7 @@ fn build_agent_runtime(
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
+    let mut prompt = load_system_prompt_with_appfs(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,

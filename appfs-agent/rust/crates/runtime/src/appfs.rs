@@ -5,7 +5,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 const CONTROL_DIR_NAME: &str = "_appfs";
@@ -108,6 +108,59 @@ pub struct AppfsEnvironment {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptControlDoc {
+    app_id: String,
+    description: Option<String>,
+    events_path: Option<String>,
+    current_scope_path: Option<String>,
+    available_scopes_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptRecommendedAction {
+    #[serde(default)]
+    use_when: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptContactRoute {
+    #[serde(default)]
+    mention_tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptActionsDoc {
+    app_id: String,
+    #[serde(default)]
+    recommended_actions: Vec<AppfsPromptRecommendedAction>,
+    #[serde(default)]
+    contact_routes: Vec<AppfsPromptContactRoute>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptCurrentScopeDoc {
+    app_id: String,
+    active_scope: String,
+    display_name: Option<String>,
+    primary_resource: Option<String>,
+    structure_revision_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptAvailableScopeEntry {
+    scope_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppfsPromptAvailableScopesDoc {
+    app_id: String,
+    active_scope: Option<String>,
+    #[serde(default)]
+    scopes: Vec<AppfsPromptAvailableScopeEntry>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct AppfsAttachEnv {
     schema: Option<String>,
@@ -162,6 +215,12 @@ pub fn detect_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
 #[must_use]
 pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
     resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+}
+
+#[must_use]
+pub fn build_appfs_prompt_section(cwd: &Path) -> Option<String> {
+    let environment = detect_appfs_environment(cwd)?;
+    Some(render_appfs_prompt_section(&environment))
 }
 
 fn resolve_appfs_environment_with_attach_env(
@@ -576,13 +635,384 @@ fn generate_ephemeral_attach_id() -> String {
     format!("attach-{now:x}-{}-{seq:x}", process::id())
 }
 
+fn render_appfs_prompt_section(environment: &AppfsEnvironment) -> String {
+    if let (Some(app_id), Some(app_root)) = (
+        environment.current_app_id.as_deref(),
+        environment.current_app_root.as_deref(),
+    ) {
+        return render_current_app_prompt_section(environment, app_id, app_root);
+    }
+
+    render_mount_prompt_section(environment)
+}
+
+#[derive(Debug, Clone)]
+struct AppfsPromptAppSummary {
+    app_id: String,
+    description: Option<String>,
+    skill_name: String,
+    when_to_use: String,
+    active_scope: Option<String>,
+}
+
+fn render_mount_prompt_section(environment: &AppfsEnvironment) -> String {
+    let register_path = environment
+        .register_app_path
+        .as_deref()
+        .map(|path| display_virtualish_path(&environment.mount_root, path))
+        .unwrap_or_else(|| "_appfs/register_app.act".to_string());
+    let list_path = environment
+        .list_apps_path
+        .as_deref()
+        .map(|path| display_virtualish_path(&environment.mount_root, path))
+        .unwrap_or_else(|| "_appfs/list_apps.act".to_string());
+    let events_path = environment
+        .control_events_path
+        .as_deref()
+        .map(|path| display_virtualish_path(&environment.mount_root, path))
+        .unwrap_or_else(|| "_appfs/_stream/events.evt.jsonl".to_string());
+    let mut lines = render_appfs_overview_lines(
+        environment,
+        None,
+        None,
+        &events_path,
+        Some(&register_path),
+        Some(&list_path),
+    );
+    append_mounted_apps_lines(&mut lines, environment, None);
+    lines.join("\n")
+}
+
+fn render_current_app_prompt_section(
+    environment: &AppfsEnvironment,
+    app_id: &str,
+    app_root: &Path,
+) -> String {
+    let control_doc: Option<AppfsPromptControlDoc> =
+        read_json_file(&app_root.join("_app").join("control.res.json"));
+    let current_scope_doc: Option<AppfsPromptCurrentScopeDoc> =
+        read_json_file(&app_root.join("_app").join("current_scope.res.json"));
+    let available_scopes_doc: Option<AppfsPromptAvailableScopesDoc> =
+        read_json_file(&app_root.join("_app").join("available_scopes.res.json"));
+    let events_path = control_doc
+        .as_ref()
+        .and_then(|doc| doc.events_path.clone())
+        .or_else(|| {
+            environment
+                .current_app_events_path
+                .as_deref()
+                .map(|path| display_virtualish_path(app_root, path))
+        })
+        .unwrap_or_else(|| "_stream/events.evt.jsonl".to_string());
+
+    let current_app_id = control_doc
+        .as_ref()
+        .map_or(app_id, |doc| doc.app_id.as_str());
+    let mut lines = render_appfs_overview_lines(
+        environment,
+        Some(current_app_id),
+        Some(app_root),
+        &events_path,
+        None,
+        None,
+    );
+
+    if let Some(doc) = control_doc
+        .as_ref()
+        .and_then(|doc| doc.description.as_deref())
+    {
+        lines.push(format!("- Current app purpose: {doc}"));
+    }
+
+    if let Some(scope_doc) = current_scope_doc.as_ref() {
+        let scope_label = scope_doc
+            .display_name
+            .as_deref()
+            .map_or_else(String::new, |name| format!(" ({name})"));
+        lines.push(format!(
+            "- You are currently inside app `{}` rooted at `{}` with active scope `{}`{scope_label}.",
+            scope_doc.app_id,
+            app_root.display(),
+            scope_doc.active_scope
+        ));
+        lines.push(format!(
+            "- Current scope details for app `{}`: `{}`{scope_label}.",
+            scope_doc.app_id, scope_doc.active_scope
+        ));
+        if let Some(resource) = scope_doc.primary_resource.as_deref() {
+            lines.push(format!(
+                "- Primary resource for the current scope: `{resource}`."
+            ));
+        }
+        if let Some(revision) = scope_doc.structure_revision_hint.as_deref() {
+            lines.push(format!("- Structure revision hint: `{revision}`."));
+        }
+    } else if let Some(doc) = control_doc
+        .as_ref()
+        .and_then(|doc| doc.current_scope_path.as_deref())
+    {
+        lines.push(format!("- Current scope details are described in `{doc}`."));
+    }
+
+    if let Some(scopes_doc) = available_scopes_doc.as_ref() {
+        let scope_names = scopes_doc
+            .scopes
+            .iter()
+            .take(6)
+            .map(|scope| {
+                scope.display_name.as_deref().map_or_else(
+                    || format!("`{}`", scope.scope_id),
+                    |display_name| format!("`{}` ({display_name})", scope.scope_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !scope_names.is_empty() {
+            lines.push(format!(
+                "- Known scopes for app `{}` (active `{}`): {}.",
+                scopes_doc.app_id,
+                scopes_doc.active_scope.as_deref().unwrap_or("<unknown>"),
+                scope_names.join(", ")
+            ));
+        }
+    } else if let Some(doc) = control_doc
+        .as_ref()
+        .and_then(|doc| doc.available_scopes_path.as_deref())
+    {
+        lines.push(format!("- Alternate scopes are listed in `{doc}`."));
+    }
+
+    append_mounted_apps_lines(&mut lines, environment, Some(current_app_id));
+
+    lines.join("\n")
+}
+
+fn render_appfs_overview_lines(
+    environment: &AppfsEnvironment,
+    current_app_id: Option<&str>,
+    current_app_root: Option<&Path>,
+    events_path: &str,
+    register_path: Option<&str>,
+    list_path: Option<&str>,
+) -> Vec<String> {
+    let mut lines = vec![
+        "# AppFS workspace guidance".to_string(),
+        "- AppFS mounts bridge-backed software into a filesystem. After an app implements the AppFS bridge contract, reading and writing inside the mount interacts with the underlying software."
+            .to_string(),
+        "- Each mounted app appears as a directory under the AppFS mount root. The platform control plane lives under `/_appfs`."
+            .to_string(),
+        format!(
+            "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation, then inspect `{events_path}` for `action.completed` or `action.failed`."
+        ),
+        "- Never use `write_file` or `edit_file` on `*.act` files because those tools overwrite the sink. Use `bash` (or another append-capable tool) to append exactly one JSON object plus a trailing newline."
+            .to_string(),
+        "- Do not guess act schemas or payload shapes. For each mounted app, load its `appfs-<app>` skill to learn what actions exist, what parameters each action expects, and when to use them."
+            .to_string(),
+        format!("- Current AppFS mount root: `{}`.", environment.mount_root.display()),
+    ];
+
+    if let (Some(app_id), Some(app_root)) = (current_app_id, current_app_root) {
+        lines.push(format!(
+            "- Your current working area is inside app `{app_id}` rooted at `{}`.",
+            app_root.display()
+        ));
+    } else {
+        lines.push(
+            "- You are inside an AppFS mount, but not currently inside a specific app root."
+                .to_string(),
+        );
+    }
+
+    if let Some(register_path) = register_path {
+        lines.push(format!(
+            "- Platform registration actions are available at `{register_path}`."
+        ));
+    }
+    if let Some(list_path) = list_path {
+        lines.push(format!(
+            "- To inspect the mounted app registry from the filesystem, use `{list_path}` and the platform event stream."
+        ));
+    }
+
+    lines
+}
+
+fn current_app_skill_name(app_id: &str) -> String {
+    format!("appfs-{app_id}")
+}
+
+fn current_app_skill_when_to_use(
+    app_id: &str,
+    control_doc: Option<&AppfsPromptControlDoc>,
+    actions_doc: Option<&AppfsPromptActionsDoc>,
+) -> String {
+    let mut clauses = vec![format!(
+        "Use it when the user wants to work with the current `{app_id}` app."
+    )];
+    clauses.push(
+        "Load it before performing app-specific control or action-file operations.".to_string(),
+    );
+
+    if let Some(description) = control_doc
+        .and_then(|doc| doc.description.as_deref())
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        clauses.push(format!("App context: {description}"));
+    }
+
+    let mention_tokens = actions_doc
+        .into_iter()
+        .flat_map(|doc| doc.contact_routes.iter())
+        .flat_map(|route| route.mention_tokens.iter())
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !mention_tokens.is_empty() {
+        clauses.push(format!(
+            "Especially use it when the user asks to message {}.",
+            mention_tokens.join(" / ")
+        ));
+    }
+
+    let use_when = actions_doc
+        .into_iter()
+        .flat_map(|doc| doc.recommended_actions.iter())
+        .flat_map(|action| action.use_when.iter())
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !use_when.is_empty() {
+        clauses.push(use_when.join(" "));
+    }
+
+    clauses.join(" ")
+}
+
+fn append_mounted_apps_lines(
+    lines: &mut Vec<String>,
+    environment: &AppfsEnvironment,
+    current_app_id: Option<&str>,
+) {
+    let app_summaries = collect_prompt_app_summaries(environment, current_app_id);
+    lines.push(String::new());
+    lines.push("## Mounted apps".to_string());
+    if app_summaries.is_empty() {
+        lines.push(
+            "- No mounted apps were discovered from the current AppFS registry. Use the platform control plane or move into an app root to discover app-specific skills."
+                .to_string(),
+        );
+        return;
+    }
+
+    for summary in app_summaries {
+        let mut line = format!("- `{}` -> skill `{}`.", summary.app_id, summary.skill_name);
+        if let Some(scope) = summary.active_scope.as_deref() {
+            line.push_str(&format!(" Active scope: `{scope}`."));
+        }
+        if let Some(description) = summary.description.as_deref() {
+            line.push_str(&format!(" Purpose: {description}"));
+        }
+        line.push_str(&format!(" When to use: {}", summary.when_to_use));
+        lines.push(line);
+    }
+}
+
+fn collect_prompt_app_summaries(
+    environment: &AppfsEnvironment,
+    current_app_id: Option<&str>,
+) -> Vec<AppfsPromptAppSummary> {
+    let mut app_ids = environment
+        .registered_apps
+        .iter()
+        .map(|app| app.app_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(app_id) = current_app_id {
+        if !app_ids.iter().any(|existing| existing == app_id) {
+            app_ids.push(app_id.to_string());
+        }
+    }
+    app_ids.sort();
+    app_ids.dedup();
+
+    app_ids
+        .into_iter()
+        .filter_map(|app_id| build_prompt_app_summary(environment, &app_id))
+        .collect()
+}
+
+fn build_prompt_app_summary(
+    environment: &AppfsEnvironment,
+    app_id: &str,
+) -> Option<AppfsPromptAppSummary> {
+    let app_root = environment.mount_root.join(app_id);
+    let control_doc: Option<AppfsPromptControlDoc> =
+        read_json_file(&app_root.join("_app").join("control.res.json"));
+    let actions_doc: Option<AppfsPromptActionsDoc> =
+        read_json_file(&app_root.join("_app").join("actions.res.json"));
+    let scope_doc: Option<AppfsPromptCurrentScopeDoc> =
+        read_json_file(&app_root.join("_app").join("current_scope.res.json"));
+
+    if control_doc.is_none() && actions_doc.is_none() && !app_root.exists() {
+        return None;
+    }
+
+    let effective_app_id = actions_doc
+        .as_ref()
+        .map(|doc| doc.app_id.as_str())
+        .or_else(|| control_doc.as_ref().map(|doc| doc.app_id.as_str()))
+        .unwrap_or(app_id);
+
+    let active_scope = scope_doc
+        .as_ref()
+        .map(|doc| doc.active_scope.clone())
+        .or_else(|| {
+            environment
+                .registered_apps
+                .iter()
+                .find(|app| app.app_id == app_id)
+                .and_then(|app| app.active_scope.clone())
+        });
+
+    Some(AppfsPromptAppSummary {
+        app_id: effective_app_id.to_string(),
+        description: control_doc.as_ref().and_then(|doc| doc.description.clone()),
+        skill_name: current_app_skill_name(effective_app_id),
+        when_to_use: current_app_skill_when_to_use(
+            effective_app_id,
+            control_doc.as_ref(),
+            actions_doc.as_ref(),
+        ),
+        active_scope,
+    })
+}
+
+fn display_virtualish_path(base: &Path, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(base) {
+        let rendered = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !rendered.is_empty() {
+            return rendered;
+        }
+    }
+    path.display().to_string()
+}
+
+fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_appfs_environment, resolve_appfs_environment_with_attach_env, AppfsAttachEnv,
-        AppfsAttachSource, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
-        AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND,
-        APPFS_RUNTIME_MANIFEST_REL_PATH, APPFS_SCHEMA_VERSION,
+        build_appfs_prompt_section, detect_appfs_environment,
+        resolve_appfs_environment_with_attach_env, AppfsAttachEnv, AppfsAttachSource,
+        AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
+        APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
+        APPFS_SCHEMA_VERSION,
     };
     use std::env;
     use std::fs;
@@ -634,6 +1064,138 @@ mod tests {
         )
         .expect("write registry");
         fs::write(app_root.join("_stream").join("events.evt.jsonl"), "").expect("write events");
+    }
+
+    fn seed_aiim_prompt_files(app_root: &Path) {
+        fs::create_dir_all(app_root.join("_app")).expect("create _app dir");
+        fs::write(
+            app_root.join("_app").join("control.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "description": "AIIM demo app for incident chat, contact messaging, and scope switching.",
+  "events_path": "_stream/events.evt.jsonl",
+  "current_scope_path": "_app/current_scope.res.json",
+  "available_scopes_path": "_app/available_scopes.res.json",
+  "actions": [
+    {
+      "name": "enter_scope",
+      "path": "_app/enter_scope.act",
+      "summary": "Switch the app structure to a named scope such as chat-001 or chat-long.",
+      "input_schema": "_meta/schemas/enter_scope.input.schema.json",
+      "example_payload": {
+        "target_scope": "chat-long"
+      }
+    }
+  ]
+}"#,
+        )
+        .expect("write control doc");
+        fs::write(
+            app_root.join("_app").join("actions.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "recommended_actions": [
+    {
+      "name": "send_message",
+      "path": "contacts/zhangsan/send_message.act",
+      "summary": "Send a direct message to 张三 / zhangsan.",
+      "input_schema": "_meta/schemas/send_message.input.schema.json",
+      "use_when": [
+        "User asks to tell 张三 / zhangsan / 老张 something."
+      ],
+      "example_payload": {
+        "text": "明天上午十点开会",
+        "priority": "normal"
+      }
+    }
+  ],
+  "contact_routes": [
+    {
+      "contact_id": "zhangsan",
+      "profile_path": "contacts/zhangsan/profile.res.json",
+      "send_message_path": "contacts/zhangsan/send_message.act",
+      "mention_tokens": [
+        "张三",
+        "老张",
+        "zhangsan"
+      ]
+    }
+  ]
+}"#,
+        )
+        .expect("write actions doc");
+        fs::write(
+            app_root.join("_app").join("current_scope.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "active_scope": "chat-001",
+  "display_name": "Default chat view",
+  "primary_resource": "chats/chat-001/messages.res.jsonl",
+  "entered_via": "_app/enter_scope.act"
+}"#,
+        )
+        .expect("write current scope");
+        fs::write(
+            app_root.join("_app").join("available_scopes.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "active_scope": "chat-001",
+  "scopes": [
+    {
+      "scope_id": "chat-001",
+      "display_name": "Default chat view"
+    },
+    {
+      "scope_id": "chat-long",
+      "display_name": "Long chat stress view"
+    }
+  ]
+}"#,
+        )
+        .expect("write available scopes");
+    }
+
+    fn seed_scheduler_prompt_files(app_root: &Path) {
+        fs::create_dir_all(app_root.join("_app")).expect("create _app dir");
+        fs::write(
+            app_root.join("_app").join("control.res.json"),
+            r#"{
+  "app_id": "scheduler",
+  "description": "Scheduler app for room bookings and meeting setup.",
+  "events_path": "_stream/events.evt.jsonl",
+  "current_scope_path": "_app/current_scope.res.json",
+  "available_scopes_path": "_app/available_scopes.res.json"
+}"#,
+        )
+        .expect("write control doc");
+        fs::write(
+            app_root.join("_app").join("current_scope.res.json"),
+            r#"{
+  "app_id": "scheduler",
+  "active_scope": "meeting-room-a",
+  "display_name": "Room A",
+  "primary_resource": "meetings/today.res.jsonl"
+}"#,
+        )
+        .expect("write current scope");
+        fs::write(
+            app_root.join("_app").join("available_scopes.res.json"),
+            r#"{
+  "app_id": "scheduler",
+  "active_scope": "meeting-room-a",
+  "scopes": [
+    {
+      "scope_id": "meeting-room-a",
+      "display_name": "Room A"
+    },
+    {
+      "scope_id": "meeting-room-b",
+      "display_name": "Room B"
+    }
+  ]
+}"#,
+        )
+        .expect("write available scopes");
     }
 
     fn write_manifest(mount_root: &Path, runtime_session_id: &str) -> PathBuf {
@@ -818,6 +1380,50 @@ mod tests {
         assert!(detected.runtime_session_id.is_none());
         assert!(detected.attach_id.starts_with("attach-"));
         assert_eq!(detected.current_app_id.as_deref(), Some("aiim"));
+    }
+
+    #[test]
+    fn appfs_prompt_section_surfaces_current_app_guidance() {
+        let temp = TempDirGuard::new("appfs-prompt");
+        let mount_root = temp.path().join("mnt");
+        let app_root = mount_root.join("aiim");
+        let cwd = app_root.join("workspace");
+        seed_heuristic_mount(&mount_root);
+        seed_aiim_prompt_files(&app_root);
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let prompt = build_appfs_prompt_section(&cwd).expect("expected appfs prompt section");
+
+        assert!(prompt.contains("AppFS mounts bridge-backed software into a filesystem"));
+        assert!(prompt.contains("Do not guess act schemas or payload shapes"));
+        assert!(prompt.contains("## Mounted apps"));
+        assert!(prompt.contains("`aiim` -> skill `appfs-aiim`"));
+        assert!(prompt.contains(
+            "When to use: Use it when the user wants to work with the current `aiim` app."
+        ));
+        assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
+        assert!(prompt.contains("chat-long"));
+        assert!(prompt.contains("_stream/events.evt.jsonl"));
+    }
+
+    #[test]
+    fn appfs_prompt_section_surfaces_generated_skill_without_actions_doc() {
+        let temp = TempDirGuard::new("appfs-prompt-control-only");
+        let mount_root = temp.path().join("mnt");
+        let app_root = mount_root.join("scheduler");
+        let cwd = app_root.join("workspace");
+        seed_heuristic_mount(&mount_root);
+        seed_scheduler_prompt_files(&app_root);
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let prompt = build_appfs_prompt_section(&cwd).expect("expected appfs prompt section");
+
+        assert!(prompt.contains("## Mounted apps"));
+        assert!(prompt.contains("`scheduler` -> skill `appfs-scheduler`"));
+        assert!(prompt.contains("Scheduler app for room bookings and meeting setup."));
+        assert!(prompt.contains("meeting-room-b"));
+        assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
+        assert!(!prompt.contains("message 张三 / 老张 / zhangsan"));
     }
 
     #[test]

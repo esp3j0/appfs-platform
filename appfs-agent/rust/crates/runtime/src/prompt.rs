@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::appfs::build_appfs_prompt_section;
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
 
@@ -435,6 +436,20 @@ pub fn load_system_prompt(
         .with_project_context(project_context)
         .with_runtime_config(config)
         .build())
+}
+
+pub fn load_system_prompt_with_appfs(
+    cwd: impl Into<PathBuf>,
+    current_date: impl Into<String>,
+    os_name: impl Into<String>,
+    os_version: impl Into<String>,
+) -> Result<Vec<String>, PromptBuildError> {
+    let cwd = cwd.into();
+    let mut sections = load_system_prompt(&cwd, current_date, os_name, os_version)?;
+    if let Some(section) = build_appfs_prompt_section(&cwd) {
+        sections.push(section);
+    }
+    Ok(sections)
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
