@@ -149,6 +149,14 @@ fn current_appfs_environment() -> Result<Option<runtime::AppfsEnvironment>, Stri
     Ok(detect_appfs_environment(&cwd))
 }
 
+fn appfs_environment_for_path(path: &Path) -> Result<Option<runtime::AppfsEnvironment>, String> {
+    let target = path.parent().unwrap_or(path);
+    if let Some(environment) = detect_appfs_environment(target) {
+        return Ok(Some(environment));
+    }
+    current_appfs_environment()
+}
+
 fn is_appfs_act_path(path: &Path) -> Result<bool, String> {
     if !path
         .extension()
@@ -158,7 +166,7 @@ fn is_appfs_act_path(path: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let Some(environment) = current_appfs_environment()? else {
+    let Some(environment) = appfs_environment_for_path(path)? else {
         return Ok(false);
     };
 
