@@ -7,7 +7,7 @@ use clap_complete::{
 use std::path::{Path, PathBuf};
 
 /// Mount backend type
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum MountBackend {
     /// FUSE filesystem (Linux only)
     Fuse,
@@ -511,8 +511,9 @@ pub enum ServeCommand {
         #[arg(long)]
         session_id: Option<String>,
 
-        /// Poll interval in milliseconds for action sink scanning
-        #[arg(long, default_value_t = 200)]
+        /// Fallback poll interval in milliseconds for action sink scanning when no write wake arrives.
+        /// Set to 0 to disable fallback polling (default).
+        #[arg(long, default_value_t = 0)]
         poll_ms: u64,
 
         /// Optional HTTP bridge endpoint for out-of-process adapters.
@@ -617,8 +618,9 @@ pub enum AppfsCommand {
         #[arg(long)]
         gid: Option<u32>,
 
-        /// Poll interval in milliseconds for action sink scanning
-        #[arg(long, default_value_t = 200)]
+        /// Fallback poll interval in milliseconds for action sink scanning when no write wake arrives.
+        /// Set to 0 to disable fallback polling (default).
+        #[arg(long, default_value_t = 0)]
         poll_ms: u64,
     },
     /// Launch one appfs-agent process inside an AppFS-backed workspace
@@ -655,8 +657,9 @@ pub enum AppfsCommand {
         #[arg(long)]
         gid: Option<u32>,
 
-        /// Poll interval in milliseconds for action sink scanning
-        #[arg(long, default_value_t = 200)]
+        /// Fallback poll interval in milliseconds for action sink scanning when no write wake arrives.
+        /// Set to 0 to disable fallback polling (default).
+        #[arg(long, default_value_t = 0)]
         poll_ms: u64,
 
         /// Relative workspace path inside the mounted AppFS view
@@ -678,6 +681,123 @@ pub enum AppfsCommand {
         /// Arguments passed through to the launched appfs-agent child process
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         agent_args: Vec<String>,
+    },
+    /// Start AppFS from a declarative compose file
+    Compose {
+        #[command(subcommand)]
+        command: AppfsComposeCommand,
+    },
+    /// Query an AppFS database without walking the mounted filesystem
+    Query {
+        #[command(subcommand)]
+        command: AppfsQueryCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AppfsComposeCommand {
+    /// Start AppFS from `appfs-compose.yaml`
+    Up {
+        /// Optional compose file path.
+        /// Defaults to appfs-compose.yaml / appfs-compose.yml in the current directory.
+        #[arg(
+            short = 'f',
+            long = "file",
+            value_name = "FILE",
+            add = ArgValueCompleter::new(PathCompleter::file())
+        )]
+        file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AppfsQueryFormat {
+    Json,
+    Text,
+}
+
+impl std::fmt::Display for AppfsQueryFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppfsQueryFormat::Json => write!(f, "json"),
+            AppfsQueryFormat::Text => write!(f, "text"),
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AppfsQueryCommand {
+    /// Return a bounded directory tree from the AppFS database
+    Tree {
+        /// AgentFS database path
+        #[arg(long, value_name = "DB", add = ArgValueCompleter::new(PathCompleter::file()))]
+        db: PathBuf,
+
+        /// Root path inside AppFS
+        #[arg(long, default_value = "huoyan")]
+        root: String,
+
+        /// Maximum depth below root
+        #[arg(long, default_value_t = 2)]
+        max_depth: usize,
+
+        /// Maximum entries returned per directory, 0 means unlimited
+        #[arg(long, default_value_t = 100)]
+        max_entries_per_dir: usize,
+
+        /// Include files in addition to directories
+        #[arg(long)]
+        include_files: bool,
+
+        /// Include internal AppFS paths such as _meta and _stream
+        #[arg(long)]
+        include_internal: bool,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = AppfsQueryFormat::Json)]
+        format: AppfsQueryFormat,
+    },
+    /// Return paths matching a glob from the AppFS database
+    Glob {
+        /// AgentFS database path
+        #[arg(long, value_name = "DB", add = ArgValueCompleter::new(PathCompleter::file()))]
+        db: PathBuf,
+
+        /// Root path inside AppFS. The pattern is evaluated relative to this root.
+        #[arg(long, default_value = "huoyan")]
+        root: String,
+
+        /// Glob pattern, for example "**/*.res.jsonl"
+        #[arg(long)]
+        pattern: String,
+
+        /// Maximum depth below root
+        #[arg(long, default_value_t = 64)]
+        max_depth: usize,
+
+        /// Maximum returned results
+        #[arg(long, default_value_t = 100)]
+        max_results: usize,
+
+        /// Maximum entries scanned before truncating
+        #[arg(long, default_value_t = 500000)]
+        max_scanned_entries: usize,
+
+        /// Include directories in results
+        #[arg(long)]
+        include_dirs: bool,
+
+        /// Match case-insensitively
+        #[arg(long)]
+        ignore_case: bool,
+
+        /// Include internal AppFS paths such as _meta and _stream
+        #[arg(long)]
+        include_internal: bool,
+
+        /// Output format
+        #[arg(long, value_enum, default_value_t = AppfsQueryFormat::Json)]
+        format: AppfsQueryFormat,
     },
 }
 
@@ -759,7 +879,7 @@ fn id_or_path_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppfsCommand, Args, Command, MountBackend};
+    use super::{AppfsCommand, AppfsComposeCommand, Args, Command, MountBackend};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -804,6 +924,30 @@ mod tests {
                 assert_eq!(poll_ms, 150);
             }
             other => panic!("unexpected command shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_appfs_compose_up_command() {
+        let args = Args::parse_from([
+            "agentfs",
+            "appfs",
+            "compose",
+            "up",
+            "-f",
+            "appfs-compose.yaml",
+        ]);
+
+        match args.command {
+            Command::Appfs {
+                command:
+                    AppfsCommand::Compose {
+                        command: AppfsComposeCommand::Up { file },
+                    },
+            } => {
+                assert_eq!(file, Some(PathBuf::from("appfs-compose.yaml")));
+            }
+            _ => panic!("expected appfs compose up command"),
         }
     }
 
@@ -861,7 +1005,7 @@ mod tests {
                 assert!(!system);
                 assert_eq!(uid, None);
                 assert_eq!(gid, None);
-                assert_eq!(poll_ms, 200);
+                assert_eq!(poll_ms, 0);
                 assert_eq!(workspace, PathBuf::from("workspace"));
                 assert_eq!(attach_id.as_deref(), Some("agent-planner"));
                 assert_eq!(attach_role.as_deref(), Some("planner"));

@@ -95,6 +95,8 @@ pub struct MountArgs {
     pub adapter_bridge_circuit_breaker_failures: u32,
     /// Circuit breaker cooldown in milliseconds before retrying bridge calls.
     pub adapter_bridge_circuit_breaker_cooldown_ms: u64,
+    /// Optional in-process action wake handle for AppFS hybrid action dispatch.
+    pub action_wake: Option<appfs::ActionWakeHandle>,
 }
 
 #[cfg(any(unix, target_os = "windows"))]
@@ -158,6 +160,7 @@ fn wrap_mount_fs_if_appfs_enabled(
         appfs::mount_runtime::MountSnapshotReadThroughConfig {
             runtimes: runtime_args,
             managed: args.managed_appfs,
+            action_wake: args.action_wake.clone(),
         },
     ))
 }
@@ -735,8 +738,8 @@ async fn mount_winfsp_backend(args: MountArgs, ready_tx: Option<MountReadyTx>) -
     eprintln!("Mounted at {}", mountpoint.display());
     eprintln!("Press Ctrl+C to unmount and exit.");
 
-    // Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    // Wait for a console shutdown signal so the MountHandle can unmount cleanly.
+    crate::shutdown_signal::wait_for_shutdown_signal().await?;
 
     // MountHandle will be dropped automatically and unmount
     Ok(())
@@ -874,7 +877,7 @@ fn mount_fuse(args: MountArgs, ready_tx: Option<MountReadyTx>) -> Result<()> {
             eprintln!("Mounted at {}", mountpoint.display());
             eprintln!("Press Ctrl+C to unmount and exit.");
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+                _ = crate::shutdown_signal::wait_for_shutdown_signal() => {}
                 _ = wait_for_external_unmount(mountpoint.clone()) => {
                     eprintln!(
                         "Mountpoint {} was unmounted externally; exiting foreground mode.",
@@ -1086,7 +1089,7 @@ async fn mount_nfs_backend(args: MountArgs, ready_tx: Option<MountReadyTx>) -> R
 
         eprintln!("Mounted at {}", mountpoint.display());
         eprintln!("Press Ctrl+C to unmount and exit.");
-        tokio::signal::ctrl_c().await?;
+        crate::shutdown_signal::wait_for_shutdown_signal().await?;
 
         // Handle drops automatically when we exit this scope
     } else {
@@ -1471,6 +1474,7 @@ mod appfs_mount_mode_tests {
             adapter_bridge_max_backoff_ms: 1000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3000,
+            action_wake: None,
         }
     }
 

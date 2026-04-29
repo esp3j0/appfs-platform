@@ -17,8 +17,9 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
 use tracing;
@@ -47,6 +48,13 @@ const OPEN_RDONLY: i32 = 0x0000;
 const OPEN_WRONLY: i32 = 0x0001;
 const OPEN_RDWR: i32 = 0x0002;
 const OPEN_NO_READ_HINT: i32 = 0x2000_0000;
+const WINFSP_VOLUME_INFO_CACHE_MS_ENV: &str = "APPFS_WINFSP_VOLUME_INFO_CACHE_MS";
+const DEFAULT_WINFSP_VOLUME_INFO_CACHE_MS: u64 = 1000;
+
+// NT directory wildcard characters used by Win32 query-directory calls.
+const DOS_STAR: char = '<';
+const DOS_QM: char = '>';
+const DOS_DOT: char = '"';
 
 // Reparse tag/constants for symbolic links
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
@@ -186,6 +194,17 @@ fn volume_capacity(bytes_used: u64) -> (u64, u64) {
     (total_size, free_size)
 }
 
+fn volume_info_cache_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        let ttl_ms = std::env::var(WINFSP_VOLUME_INFO_CACHE_MS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_WINFSP_VOLUME_INFO_CACHE_MS);
+        Duration::from_millis(ttl_ms)
+    })
+}
+
 fn granted_access_to_open_flags(granted_access: u32) -> i32 {
     let wants_read =
         granted_access == 0 || (granted_access & (FILE_READ_DATA | GENERIC_READ_ACCESS)) != 0;
@@ -210,6 +229,50 @@ fn granted_access_to_open_flags(granted_access: u32) -> i32 {
     flags
 }
 
+struct CachedDirectoryEntries {
+    entries: Vec<(String, Stats)>,
+    name_index: HashMap<String, usize>,
+}
+
+struct CachedVolumeInfo {
+    total_size: u64,
+    free_size: u64,
+    cached_at: Instant,
+}
+
+impl CachedDirectoryEntries {
+    fn new(entries: Vec<(String, Stats)>) -> Self {
+        let mut name_index = HashMap::with_capacity(entries.len());
+        for (index, (name, _stats)) in entries.iter().enumerate() {
+            name_index.insert(
+                AgentFSWinFsp::sanitize_dir_entry_name(name).to_string(),
+                index,
+            );
+        }
+        Self {
+            entries,
+            name_index,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.name_index.get(name).copied()
+    }
+
+    fn get(&self, name: &str) -> Option<&(String, Stats)> {
+        self.index_of(name)
+            .and_then(|index| self.entries.get(index))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(String, Stats)> {
+        self.entries.iter()
+    }
+}
+
 /// Tracks an open file or directory handle
 struct OpenFile {
     /// The file handle (None for directories)
@@ -226,6 +289,8 @@ struct OpenFile {
     deleted: std::sync::atomic::AtomicBool,
     /// Path to the file (for deletion on close)
     path: String,
+    /// Cached directory entries for a directory handle.
+    dir_entries: Mutex<Option<Arc<CachedDirectoryEntries>>>,
 }
 
 /// WinFsp filesystem adapter wrapping an AgentFS FileSystem.
@@ -233,6 +298,10 @@ pub struct AgentFSWinFsp {
     fs: Arc<Mutex<dyn FileSystem + Send>>,
     handle: Handle,
     open_files: Mutex<HashMap<u64, OpenFile>>,
+    path_stats_cache: Mutex<HashMap<String, Stats>>,
+    ino_stats_cache: Mutex<HashMap<i64, Stats>>,
+    dir_entries_cache: Mutex<HashMap<i64, Arc<CachedDirectoryEntries>>>,
+    volume_info_cache: Mutex<Option<CachedVolumeInfo>>,
     next_fh: AtomicU64,
 }
 
@@ -243,6 +312,10 @@ impl AgentFSWinFsp {
             fs,
             handle,
             open_files: Mutex::new(HashMap::new()),
+            path_stats_cache: Mutex::new(HashMap::new()),
+            ino_stats_cache: Mutex::new(HashMap::new()),
+            dir_entries_cache: Mutex::new(HashMap::new()),
+            volume_info_cache: Mutex::new(None),
             next_fh: AtomicU64::new(1),
         }
     }
@@ -260,6 +333,91 @@ impl AgentFSWinFsp {
 
     fn win_path_to_unix(path: &U16CStr) -> String {
         path.to_string_lossy().replace('\\', "/")
+    }
+
+    fn normalize_cache_path(path: &str) -> String {
+        let normalized = path.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{trimmed}")
+        }
+    }
+
+    fn join_child_path(parent: &str, name: &str) -> String {
+        let parent = Self::normalize_cache_path(parent);
+        if parent == "/" {
+            format!("/{name}")
+        } else {
+            format!("{parent}/{name}")
+        }
+    }
+
+    fn remember_path_stats(&self, path: &str, stats: &Stats) {
+        self.path_stats_cache
+            .lock()
+            .insert(Self::normalize_cache_path(path), stats.clone());
+        self.ino_stats_cache.lock().insert(stats.ino, stats.clone());
+    }
+
+    fn clear_metadata_caches(&self) {
+        self.path_stats_cache.lock().clear();
+        self.ino_stats_cache.lock().clear();
+        self.dir_entries_cache.lock().clear();
+        self.volume_info_cache.lock().take();
+    }
+
+    fn invalidate_cached_stats(&self, path: &str, ino: i64) {
+        let normalized = Self::normalize_cache_path(path);
+        self.path_stats_cache.lock().remove(&normalized);
+        self.ino_stats_cache.lock().remove(&ino);
+
+        if let Some((parent, _)) = normalized.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            if let Some(parent_stats) = self.lookup_cached_path_stats(parent) {
+                self.dir_entries_cache.lock().remove(&parent_stats.ino);
+            }
+        }
+    }
+
+    fn lookup_cached_path_stats(&self, path: &str) -> Option<Stats> {
+        self.path_stats_cache
+            .lock()
+            .get(&Self::normalize_cache_path(path))
+            .cloned()
+    }
+
+    fn lookup_cached_ino_stats(&self, ino: i64) -> Option<Stats> {
+        self.ino_stats_cache.lock().get(&ino).cloned()
+    }
+
+    fn cached_volume_info(&self) -> Option<(u64, u64)> {
+        let ttl = volume_info_cache_ttl();
+        if ttl.is_zero() {
+            return None;
+        }
+
+        self.volume_info_cache.lock().as_ref().and_then(|cached| {
+            if cached.cached_at.elapsed() <= ttl {
+                Some((cached.total_size, cached.free_size))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn remember_volume_info(&self, total_size: u64, free_size: u64) {
+        if volume_info_cache_ttl().is_zero() {
+            return;
+        }
+        *self.volume_info_cache.lock() = Some(CachedVolumeInfo {
+            total_size,
+            free_size,
+            cached_at: Instant::now(),
+        });
     }
 
     /// Parse a path into (parent_ino, name) for operations that need a parent directory.
@@ -309,6 +467,10 @@ impl AgentFSWinFsp {
 
     /// Look up a path and return its stats. Walks the entire path.
     fn path_lookup(&self, path: &str) -> Result<Option<Stats>> {
+        if let Some(stats) = self.lookup_cached_path_stats(path) {
+            return Ok(Some(stats));
+        }
+
         let path = path.trim_start_matches('/');
         if path.is_empty() {
             let fs = self.fs.clone();
@@ -317,7 +479,11 @@ impl AgentFSWinFsp {
 
         let (parent_ino, name) = self.parse_path(path)?;
         let fs = self.fs.clone();
-        Ok(self.block_on(async move { fs.lock().lookup(parent_ino, &name).await })?)
+        let stats = self.block_on(async move { fs.lock().lookup(parent_ino, &name).await })?;
+        if let Some(stats) = stats.as_ref() {
+            self.remember_path_stats(path, stats);
+        }
+        Ok(stats)
     }
 
     fn refresh_open_stats(&self, path: &str, fallback: &Stats) -> Stats {
@@ -329,6 +495,274 @@ impl AgentFSWinFsp {
 
     fn sanitize_dir_entry_name(name: &str) -> &str {
         name.trim_end_matches('\0')
+    }
+
+    fn normalize_directory_pattern(pattern: &str) -> &str {
+        let pattern = pattern.trim_end_matches('\0');
+        pattern.rsplit(['\\', '/']).next().unwrap_or(pattern)
+    }
+
+    fn directory_pattern_matches(name: &str, pattern: &str) -> bool {
+        let pattern = Self::normalize_directory_pattern(pattern);
+        if pattern.is_empty() {
+            return true;
+        }
+
+        // Win32 treats "*.*" as "match everything", including names without dots.
+        if matches!(pattern, "*" | "*.*") {
+            return true;
+        }
+
+        let lowered_name: Vec<char> = name.to_lowercase().chars().collect();
+        let lowered_pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+        let mut cache = HashMap::new();
+
+        fn matches_impl(
+            name: &[char],
+            pattern: &[char],
+            name_idx: usize,
+            pattern_idx: usize,
+            cache: &mut HashMap<(usize, usize), bool>,
+        ) -> bool {
+            if let Some(result) = cache.get(&(name_idx, pattern_idx)) {
+                return *result;
+            }
+
+            let result = if pattern_idx == pattern.len() {
+                name_idx == name.len()
+            } else {
+                match pattern[pattern_idx] {
+                    '*' => (name_idx..=name.len()).any(|next_idx| {
+                        matches_impl(name, pattern, next_idx, pattern_idx + 1, cache)
+                    }),
+                    '?' => {
+                        name_idx < name.len()
+                            && matches_impl(name, pattern, name_idx + 1, pattern_idx + 1, cache)
+                    }
+                    DOS_DOT => {
+                        ((name_idx < name.len() && name[name_idx] == '.')
+                            && matches_impl(name, pattern, name_idx + 1, pattern_idx + 1, cache))
+                            || (name_idx == name.len()
+                                && matches_impl(name, pattern, name_idx, pattern_idx + 1, cache))
+                    }
+                    DOS_QM => {
+                        if name_idx < name.len() && name[name_idx] != '.' {
+                            matches_impl(name, pattern, name_idx + 1, pattern_idx + 1, cache)
+                        } else {
+                            let mut next_pattern_idx = pattern_idx;
+                            while next_pattern_idx < pattern.len()
+                                && pattern[next_pattern_idx] == DOS_QM
+                            {
+                                next_pattern_idx += 1;
+                            }
+                            matches_impl(name, pattern, name_idx, next_pattern_idx, cache)
+                        }
+                    }
+                    DOS_STAR => {
+                        let last_dot_idx = name
+                            .iter()
+                            .enumerate()
+                            .skip(name_idx)
+                            .rfind(|(_, ch)| **ch == '.')
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(name.len());
+                        (name_idx..=last_dot_idx).any(|next_idx| {
+                            matches_impl(name, pattern, next_idx, pattern_idx + 1, cache)
+                        })
+                    }
+                    literal => {
+                        name_idx < name.len()
+                            && literal == name[name_idx]
+                            && matches_impl(name, pattern, name_idx + 1, pattern_idx + 1, cache)
+                    }
+                }
+            };
+
+            cache.insert((name_idx, pattern_idx), result);
+            result
+        }
+
+        matches_impl(
+            lowered_name.as_slice(),
+            lowered_pattern.as_slice(),
+            0,
+            0,
+            &mut cache,
+        )
+    }
+
+    fn should_include_dir_entry(name: &str, pattern: Option<&str>) -> bool {
+        match pattern {
+            Some(pattern) => Self::directory_pattern_matches(name, pattern),
+            None => true,
+        }
+    }
+
+    fn set_dir_entry_name<const BUFFER_SIZE: usize>(
+        dir_info: &mut DirInfo<BUFFER_SIZE>,
+        name: &str,
+    ) -> winfsp::Result<()> {
+        let encoded: Vec<u16> = name.encode_utf16().collect();
+        dir_info
+            .set_name_raw(encoded.as_slice())
+            .map_err(|_| FspError::NTSTATUS(STATUS_OBJECT_NAME_INVALID))
+    }
+
+    fn fill_dir_info<const BUFFER_SIZE: usize>(
+        dir_info: &mut DirInfo<BUFFER_SIZE>,
+        name: &str,
+        stats: &Stats,
+    ) -> winfsp::Result<()> {
+        fill_file_info(stats, dir_info.file_info_mut());
+        Self::set_dir_entry_name(dir_info, Self::sanitize_dir_entry_name(name))
+    }
+
+    fn list_directory_entries(
+        &self,
+        dir_ino: i64,
+        dir_path: &str,
+    ) -> winfsp::Result<Vec<(String, Stats)>> {
+        let fs = self.fs.clone();
+        let entries = self.block_on(async move { fs.lock().readdir_plus(dir_ino).await });
+
+        match entries {
+            Ok(Some(entries)) => {
+                let fs = self.fs.clone();
+                let dir_stats = self.block_on(async move { fs.lock().getattr(dir_ino).await });
+                let dir_stats = match dir_stats {
+                    Ok(Some(stats)) => stats,
+                    Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                };
+
+                let parent_ino = if dir_path == "/" {
+                    1
+                } else {
+                    match self.parse_path(dir_path) {
+                        Ok((pino, _)) => pino,
+                        Err(e) => return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e))),
+                    }
+                };
+                let fs = self.fs.clone();
+                let parent_stats =
+                    self.block_on(async move { fs.lock().getattr(parent_ino).await });
+                let parent_stats = match parent_stats {
+                    Ok(Some(stats)) => stats,
+                    Ok(None) => dir_stats.clone(),
+                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+                };
+                self.remember_path_stats(dir_path, &dir_stats);
+
+                let mut all_entries: Vec<(String, Stats)> = Vec::with_capacity(entries.len() + 2);
+                all_entries.push((".".to_string(), dir_stats));
+                all_entries.push(("..".to_string(), parent_stats));
+                for entry in entries {
+                    self.remember_path_stats(
+                        &Self::join_child_path(dir_path, &entry.name),
+                        &entry.stats,
+                    );
+                    all_entries.push((entry.name, entry.stats));
+                }
+                Ok(all_entries)
+            }
+            Ok(None) => Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+            Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+        }
+    }
+
+    fn cached_directory_entries(
+        &self,
+        fh: u64,
+        dir_ino: i64,
+        dir_path: &str,
+    ) -> winfsp::Result<Arc<CachedDirectoryEntries>> {
+        if let Some(cached) = {
+            let open_files = self.open_files.lock();
+            open_files
+                .get(&fh)
+                .and_then(|open_file| open_file.dir_entries.lock().clone())
+        } {
+            return Ok(cached);
+        }
+
+        if let Some(cached) = self.dir_entries_cache.lock().get(&dir_ino).cloned() {
+            let open_files = self.open_files.lock();
+            if let Some(open_file) = open_files.get(&fh) {
+                *open_file.dir_entries.lock() = Some(cached.clone());
+            }
+            return Ok(cached);
+        }
+
+        let entries = Arc::new(CachedDirectoryEntries::new(
+            self.list_directory_entries(dir_ino, dir_path)?,
+        ));
+        {
+            let open_files = self.open_files.lock();
+            if let Some(open_file) = open_files.get(&fh) {
+                *open_file.dir_entries.lock() = Some(entries.clone());
+            }
+        }
+        self.dir_entries_cache
+            .lock()
+            .insert(dir_ino, entries.clone());
+        Ok(entries)
+    }
+
+    fn cached_directory_entries_if_loaded(&self, fh: u64) -> Option<Arc<CachedDirectoryEntries>> {
+        let open_files = self.open_files.lock();
+        open_files
+            .get(&fh)
+            .and_then(|open_file| open_file.dir_entries.lock().clone())
+    }
+
+    fn lookup_directory_entry(
+        &self,
+        dir_ino: i64,
+        dir_path: &str,
+        query_name: &str,
+    ) -> winfsp::Result<Option<(String, Stats)>> {
+        let name = Self::sanitize_dir_entry_name(Self::normalize_directory_pattern(query_name));
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if name == "." {
+            let fs = self.fs.clone();
+            let stats = self.block_on(async move { fs.lock().getattr(dir_ino).await });
+            return match stats {
+                Ok(Some(stats)) => Ok(Some((".".to_string(), stats))),
+                Ok(None) => Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+            };
+        }
+        if name == ".." {
+            let parent_ino = if dir_path == "/" {
+                1
+            } else {
+                match self.parse_path(dir_path) {
+                    Ok((parent_ino, _)) => parent_ino,
+                    Err(e) => return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e))),
+                }
+            };
+            let fs = self.fs.clone();
+            let stats = self.block_on(async move { fs.lock().getattr(parent_ino).await });
+            return match stats {
+                Ok(Some(stats)) => Ok(Some(("..".to_string(), stats))),
+                Ok(None) => Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
+                Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+            };
+        }
+
+        let fs = self.fs.clone();
+        let name_owned = name.to_string();
+        let stats = self.block_on(async move { fs.lock().lookup(dir_ino, &name_owned).await });
+        match stats {
+            Ok(Some(stats)) => {
+                self.remember_path_stats(&Self::join_child_path(dir_path, name), &stats);
+                Ok(Some((name.to_string(), stats)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+        }
     }
 
     /// Delete a file or directory by path.
@@ -347,6 +781,7 @@ impl AgentFSWinFsp {
                 fs_guard.unlink(parent_ino, &name).await
             }
         })?;
+        self.clear_metadata_caches();
         Ok(())
     }
 
@@ -541,7 +976,7 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<FileSecurity> {
         let path = Self::win_path_to_unix(file_name);
 
-        tracing::debug!("WinFsp::get_security_by_name: {}", path);
+        tracing::trace!("WinFsp::get_security_by_name: {}", path);
 
         match self.path_lookup(&path) {
             Ok(Some(stats)) => {
@@ -578,7 +1013,7 @@ impl FileSystemContext for AgentFSWinFsp {
         let path = Self::win_path_to_unix(file_name);
         let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
 
-        tracing::debug!(
+        tracing::trace!(
             "WinFsp::open: path={} create_options=0x{:x} granted_access=0x{:x} delete_on_close={}",
             path,
             create_options,
@@ -605,6 +1040,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                             deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
+                            dir_entries: Mutex::new(None),
                         },
                     );
                     Ok(FileContext { fh })
@@ -620,6 +1056,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                             deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
+                            dir_entries: Mutex::new(None),
                         },
                     );
                     Ok(FileContext { fh })
@@ -633,7 +1070,7 @@ impl FileSystemContext for AgentFSWinFsp {
                     match file {
                         Ok(file) => {
                             let refreshed_stats = self.refresh_open_stats(&path, &stats);
-                            tracing::debug!(
+                            tracing::trace!(
                                 "WinFsp::open refreshed path={} ino={} -> {} size={}",
                                 path,
                                 stats.ino,
@@ -653,6 +1090,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     ),
                                     deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
+                                    dir_entries: Mutex::new(None),
                                 },
                             );
                             Ok(FileContext { fh })
@@ -703,9 +1141,10 @@ impl FileSystemContext for AgentFSWinFsp {
 
         match existing {
             Ok(Some(stats)) => {
+                self.remember_path_stats(&path, &stats);
                 // File already exists - open it directly
                 // WinFsp will call overwrite() if truncation is needed
-                tracing::debug!(
+                tracing::trace!(
                     "WinFsp::create: file exists, opening {} (ino={})",
                     path,
                     stats.ino
@@ -726,6 +1165,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                             deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
+                            dir_entries: Mutex::new(None),
                         },
                     );
                     Ok(FileContext { fh })
@@ -741,6 +1181,7 @@ impl FileSystemContext for AgentFSWinFsp {
                             delete_on_close: std::sync::atomic::AtomicBool::new(delete_on_close),
                             deleted: std::sync::atomic::AtomicBool::new(false),
                             path: path_owned,
+                            dir_entries: Mutex::new(None),
                         },
                     );
                     Ok(FileContext { fh })
@@ -753,7 +1194,7 @@ impl FileSystemContext for AgentFSWinFsp {
                     match file {
                         Ok(file) => {
                             let refreshed_stats = self.refresh_open_stats(&path, &stats);
-                            tracing::debug!(
+                            tracing::trace!(
                                 "WinFsp::create refreshed existing path={} ino={} -> {} size={}",
                                 path,
                                 stats.ino,
@@ -773,6 +1214,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     ),
                                     deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
+                                    dir_entries: Mutex::new(None),
                                 },
                             );
                             Ok(FileContext { fh })
@@ -822,6 +1264,8 @@ impl FileSystemContext for AgentFSWinFsp {
 
                 match result {
                     Ok(stats) => {
+                        self.clear_metadata_caches();
+                        self.remember_path_stats(&path, &stats);
                         fill_file_info(&stats, file_info.as_mut());
 
                         let fh = self.alloc_fh();
@@ -841,6 +1285,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     ),
                                     deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
+                                    dir_entries: Mutex::new(None),
                                 },
                             );
                             Ok(FileContext { fh })
@@ -857,6 +1302,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                     ),
                                     deleted: std::sync::atomic::AtomicBool::new(false),
                                     path: path_owned,
+                                    dir_entries: Mutex::new(None),
                                 },
                             );
                             Ok(FileContext { fh })
@@ -882,6 +1328,7 @@ impl FileSystemContext for AgentFSWinFsp {
                                             ),
                                             deleted: std::sync::atomic::AtomicBool::new(false),
                                             path: path_owned,
+                                            dir_entries: Mutex::new(None),
                                         },
                                     );
                                     Ok(FileContext { fh })
@@ -919,7 +1366,7 @@ impl FileSystemContext for AgentFSWinFsp {
             )
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "WinFsp::cleanup: fh={} flags=0x{:x} should_delete={} is_dir={} path={}",
             context.fh,
             flags,
@@ -956,13 +1403,23 @@ impl FileSystemContext for AgentFSWinFsp {
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
             let ino = open_file.ino;
+            let path = open_file.path.clone();
             drop(open_files);
+
+            if let Some(stats) = self
+                .lookup_cached_path_stats(&path)
+                .or_else(|| self.lookup_cached_ino_stats(ino))
+            {
+                fill_file_info(&stats, file_info);
+                return Ok(());
+            }
 
             let fs = self.fs.clone();
             let stats = self.block_on(async move { fs.lock().getattr(ino).await });
 
             match stats {
                 Ok(Some(stats)) => {
+                    self.remember_path_stats(&path, &stats);
                     fill_file_info(&stats, file_info);
                     Ok(())
                 }
@@ -1011,6 +1468,7 @@ impl FileSystemContext for AgentFSWinFsp {
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
             let ino = open_file.ino;
+            let path = open_file.path.clone();
             tracing::debug!(
                 "WinFsp::set_basic_info: fh={} ino={} last_access_time={} last_write_time={}",
                 context.fh,
@@ -1031,15 +1489,39 @@ impl FileSystemContext for AgentFSWinFsp {
                 TimeChange::Set((last_write_time as i64 / 10_000_000) - 11644473600, 0)
             };
 
+            // MSYS/Git Bash can issue access-time-only metadata updates while
+            // listing. Persisting those touches turns read-only enumeration into
+            // hundreds of DB writes and invalidates hot directory caches. AgentFS
+            // does not rely on atime freshness, so treat access-only updates as
+            // a successful no-op.
+            if matches!(mtime, TimeChange::Omit) {
+                if let Some(stats) = self
+                    .lookup_cached_path_stats(&path)
+                    .or_else(|| self.lookup_cached_ino_stats(ino))
+                {
+                    fill_file_info(&stats, file_info);
+                    return Ok(());
+                }
+                let fs = self.fs.clone();
+                let stats = self.block_on(async move { fs.lock().getattr(ino).await });
+                if let Ok(Some(stats)) = stats {
+                    self.remember_path_stats(&path, &stats);
+                    fill_file_info(&stats, file_info);
+                }
+                return Ok(());
+            }
+
             let fs = self.fs.clone();
             let result = self.block_on(async move { fs.lock().utimens(ino, atime, mtime).await });
 
             match result {
                 Ok(()) => {
+                    self.clear_metadata_caches();
                     let fs = self.fs.clone();
                     let stats = self.block_on(async move { fs.lock().getattr(ino).await });
                     match stats {
                         Ok(Some(stats)) => {
+                            self.remember_path_stats(&path, &stats);
                             fill_file_info(&stats, file_info);
                             Ok(())
                         }
@@ -1136,7 +1618,10 @@ impl FileSystemContext for AgentFSWinFsp {
         });
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.clear_metadata_caches();
+                Ok(())
+            }
             Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
         }
     }
@@ -1144,17 +1629,19 @@ impl FileSystemContext for AgentFSWinFsp {
     fn read_directory(
         &self,
         context: &Self::FileContext,
-        _pattern: Option<&U16CStr>,
+        pattern: Option<&U16CStr>,
         marker: winfsp::filesystem::DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let pattern_str = pattern.map(|p| p.to_string_lossy());
         let marker_str = marker
             .inner_as_cstr()
             .map(|m| m.to_string_lossy())
             .unwrap_or_else(|| "<none>".to_string());
-        tracing::debug!(
-            "WinFsp::read_directory: fh={} marker={} is_none={} is_current={} is_parent={}",
+        tracing::trace!(
+            "WinFsp::read_directory: fh={} pattern={} marker={} is_none={} is_current={} is_parent={}",
             context.fh,
+            pattern_str.as_deref().unwrap_or("<none>"),
             marker_str,
             marker.is_none(),
             marker.is_current(),
@@ -1169,94 +1656,98 @@ impl FileSystemContext for AgentFSWinFsp {
             }
         };
 
-        let fs = self.fs.clone();
-        let entries = self.block_on(async move { fs.lock().readdir_plus(dir_ino).await });
+        let all_entries = self.cached_directory_entries(context.fh, dir_ino, &dir_path)?;
+        let original_entry_count = all_entries.len();
+        tracing::trace!(
+            "WinFsp::read_directory: fh={} entry_count={}",
+            context.fh,
+            original_entry_count
+        );
 
-        match entries {
-            Ok(Some(entries)) => {
-                let fs = self.fs.clone();
-                let dir_stats = self.block_on(async move { fs.lock().getattr(dir_ino).await });
-                let dir_stats = match dir_stats {
-                    Ok(Some(stats)) => stats,
-                    Ok(None) => return Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
-                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
-                };
+        let marker_name = marker
+            .inner_as_cstr()
+            .map(|marker_name| marker_name.to_string_lossy());
+        let marker_name = marker_name
+            .as_deref()
+            .map(Self::sanitize_dir_entry_name)
+            .filter(|name| !name.is_empty());
+        let start_idx = marker_name
+            .and_then(|name| all_entries.index_of(name))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let mut cursor = 0u32;
 
-                let parent_ino = if dir_path == "/" {
-                    1
-                } else {
-                    match self.parse_path(&dir_path) {
-                        Ok((pino, _)) => pino,
-                        Err(e) => return Err(FspError::NTSTATUS(anyhow_to_ntstatus(&e))),
-                    }
-                };
-                let fs = self.fs.clone();
-                let parent_stats =
-                    self.block_on(async move { fs.lock().getattr(parent_ino).await });
-                let parent_stats = match parent_stats {
-                    Ok(Some(stats)) => stats,
-                    Ok(None) => dir_stats.clone(),
-                    Err(e) => return Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
-                };
-
-                let mut all_entries: Vec<(String, Stats)> = Vec::with_capacity(entries.len() + 2);
-                all_entries.push((".".to_string(), dir_stats));
-                all_entries.push(("..".to_string(), parent_stats));
-                for entry in entries {
-                    all_entries.push((entry.name, entry.stats));
-                }
-                tracing::debug!(
-                    "WinFsp::read_directory: fh={} entry_count={} entries={:?}",
-                    context.fh,
-                    all_entries.len(),
-                    all_entries
-                        .iter()
-                        .map(|(name, _)| name.clone())
-                        .collect::<Vec<_>>()
-                );
-
-                // Determine starting index based on marker.
-                // The marker is the filename (U16CStr) of the last entry returned
-                // in the previous call. We need to find it and skip past it.
-                let start_idx = if let Some(marker_name) = marker.inner_as_cstr() {
-                    let marker_str = marker_name.to_string_lossy();
-                    let marker_str = Self::sanitize_dir_entry_name(&marker_str);
-                    let mut idx = 0usize;
-                    for (i, (name, _stats)) in all_entries.iter().enumerate() {
-                        if Self::sanitize_dir_entry_name(name) == marker_str {
-                            idx = i + 1;
-                            break;
-                        }
-                    }
-                    idx
-                } else {
-                    0
-                };
-                let mut cursor = 0u32;
-
-                for (name, stats) in all_entries.iter().skip(start_idx) {
-                    let mut dir_info: DirInfo<255> = DirInfo::default();
-                    fill_file_info(stats, dir_info.file_info_mut());
-                    let name = Self::sanitize_dir_entry_name(name);
-
-                    // Set the name using WideNameInfo trait
-                    if dir_info.set_name(name).is_ok() {
-                        // Use the proper WinFsp API to append to buffer
-                        // This handles variable-length entries correctly
-                        if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                            // Buffer is full, stop adding more entries
-                            break;
-                        }
-                    }
-                }
-
-                // Finalize the buffer
-                DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-
-                Ok(cursor)
+        for (name, stats) in all_entries.entries.iter().skip(start_idx) {
+            let name = Self::sanitize_dir_entry_name(name);
+            if !Self::should_include_dir_entry(name, pattern_str.as_deref()) {
+                continue;
             }
-            Ok(None) => Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
-            Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
+            let mut dir_info: DirInfo<255> = DirInfo::default();
+
+            // Directory entries must not include a trailing NUL in their
+            // reported name, otherwise PowerShell/.NET treats the name as
+            // containing an embedded null character.
+            if Self::fill_dir_info(&mut dir_info, name, stats).is_ok() {
+                // Use the proper WinFsp API to append to buffer
+                // This handles variable-length entries correctly
+                if !dir_info.append_to_buffer(buffer, &mut cursor) {
+                    // Buffer is full, stop adding more entries
+                    break;
+                }
+            }
+        }
+
+        // Finalize the buffer
+        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+
+        Ok(cursor)
+    }
+
+    fn get_dir_info_by_name(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        out_dir_info: &mut DirInfo,
+    ) -> winfsp::Result<()> {
+        let query_name = file_name.to_string_lossy();
+        tracing::trace!(
+            "WinFsp::get_dir_info_by_name: fh={} query={}",
+            context.fh,
+            query_name
+        );
+
+        let (dir_ino, dir_path) = {
+            let open_files = self.open_files.lock();
+            match open_files.get(&context.fh) {
+                Some(open_file) => (open_file.ino, open_file.path.clone()),
+                None => return Err(FspError::NTSTATUS(STATUS_INVALID_PARAMETER)),
+            }
+        };
+
+        let normalized_query = Self::normalize_directory_pattern(&query_name);
+        let entry = if normalized_query.contains(['*', '?', DOS_STAR, DOS_QM, DOS_DOT]) {
+            let entries = self.cached_directory_entries(context.fh, dir_ino, &dir_path)?;
+            let found = entries
+                .iter()
+                .find(|(name, _stats)| {
+                    Self::should_include_dir_entry(
+                        Self::sanitize_dir_entry_name(name),
+                        Some(normalized_query),
+                    )
+                })
+                .map(|(name, stats)| (name.clone(), stats.clone()));
+            Ok(found)
+        } else if let Some(entries) = self.cached_directory_entries_if_loaded(context.fh) {
+            Ok(entries
+                .get(Self::sanitize_dir_entry_name(normalized_query))
+                .map(|(name, stats)| (name.clone(), stats.clone())))
+        } else {
+            self.lookup_directory_entry(dir_ino, &dir_path, normalized_query)
+        }?;
+
+        match entry {
+            Some((name, stats)) => Self::fill_dir_info(out_dir_info, &name, &stats),
+            None => Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
         }
     }
 
@@ -1268,10 +1759,15 @@ impl FileSystemContext for AgentFSWinFsp {
     ) -> winfsp::Result<u32> {
         let open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get(&context.fh) {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
             let file = open_file.file.clone();
             let buf_len = buffer.len();
             let is_dir = open_file.is_dir;
             let is_symlink = open_file.is_symlink;
+            let path = open_file.path.clone();
+            let ino = open_file.ino;
             drop(open_files);
 
             // file is Option<BoxedFile>, need to handle None case
@@ -1294,6 +1790,9 @@ impl FileSystemContext for AgentFSWinFsp {
                 Ok(data) => {
                     let len = data.len().min(buffer.len());
                     buffer[..len].copy_from_slice(&data[..len]);
+                    if len > 0 {
+                        self.invalidate_cached_stats(&path, ino);
+                    }
                     Ok(len as u32)
                 }
                 Err(e) => Err(FspError::NTSTATUS(error_to_ntstatus(&e))),
@@ -1357,6 +1856,7 @@ impl FileSystemContext for AgentFSWinFsp {
 
             match result {
                 Ok(()) => {
+                    self.clear_metadata_caches();
                     let fs = self.fs.clone();
                     let stats = self.block_on(async move { fs.lock().getattr(ino).await });
                     if let Ok(Some(stats)) = stats {
@@ -1427,6 +1927,7 @@ impl FileSystemContext for AgentFSWinFsp {
 
             match result {
                 Ok(()) => {
+                    self.clear_metadata_caches();
                     let fs = self.fs.clone();
                     if let Ok(Some(stats)) =
                         self.block_on(async move { fs.lock().getattr(ino).await })
@@ -1480,6 +1981,7 @@ impl FileSystemContext for AgentFSWinFsp {
 
             match result {
                 Ok(()) => {
+                    self.clear_metadata_caches();
                     let fs = self.fs.clone();
                     if let Ok(Some(stats)) =
                         self.block_on(async move { fs.lock().getattr(ino).await })
@@ -1534,12 +2036,19 @@ impl FileSystemContext for AgentFSWinFsp {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
+        if let Some((total_size, free_size)) = self.cached_volume_info() {
+            out_volume_info.total_size = total_size;
+            out_volume_info.free_size = free_size;
+            return Ok(());
+        }
+
         let fs = self.fs.clone();
         let stats = self.block_on(async move { fs.lock().statfs().await });
 
         match stats {
             Ok(stats) => {
                 let (total_size, free_size) = volume_capacity(stats.bytes_used);
+                self.remember_volume_info(total_size, free_size);
                 out_volume_info.total_size = total_size;
                 out_volume_info.free_size = free_size;
                 Ok(())
@@ -1555,7 +2064,7 @@ impl FileSystemContext for AgentFSWinFsp {
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
         let path = Self::win_path_to_unix(file_name);
-        tracing::debug!("WinFsp::get_reparse_point_by_name path={}", path);
+        tracing::trace!("WinFsp::get_reparse_point_by_name path={}", path);
         let stats = self
             .path_lookup(&path)
             .map_err(|e| FspError::NTSTATUS(anyhow_to_ntstatus(&e)))?;
@@ -1652,6 +2161,8 @@ impl FileSystemContext for AgentFSWinFsp {
             path,
             stats.ino
         );
+        self.clear_metadata_caches();
+        self.remember_path_stats(&path, &stats);
 
         let mut open_files = self.open_files.lock();
         if let Some(open_file) = open_files.get_mut(&context.fh) {
@@ -1715,6 +2226,8 @@ pub fn mount(fs: Arc<Mutex<dyn FileSystem + Send>>, opts: MountOpts) -> Result<(
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
+    volume_params.pass_query_directory_pattern(true);
+    volume_params.pass_query_directory_filename(true);
     volume_params.filesystem_name(&opts.fsname);
     volume_params.reparse_points(true);
     volume_params.reparse_points_access_check(true);
@@ -1725,7 +2238,9 @@ pub fn mount(fs: Arc<Mutex<dyn FileSystem + Send>>, opts: MountOpts) -> Result<(
     // handled by set_delete/cleanup instead of kernel prechecks.
     volume_params.post_disposition_only_when_necessary(false);
 
-    let mut host = winfsp::host::FileSystemHost::new(volume_params, adapter)?;
+    let mut host_options = winfsp::host::FileSystemParams::default_params(volume_params);
+    host_options.use_dir_info_by_name = true;
+    let mut host = winfsp::host::FileSystemHost::new_with_options(host_options, adapter)?;
 
     let mountpoint_str = mountpoint.to_string_lossy().to_string();
     tracing::info!("Mounting WinFsp filesystem at {}", mountpoint_str);
@@ -1747,19 +2262,32 @@ pub fn unmount(_mountpoint: &std::path::Path, _lazy: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        anyhow_to_ntstatus, resolve_truncate_size, volume_capacity, AgentFSWinFsp,
-        STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+        anyhow_to_ntstatus, resolve_truncate_size, volume_capacity, AgentFSWinFsp, FileContext,
+        OpenFile, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
     };
     use agentfs_sdk::error::Result as SdkResult;
     use agentfs_sdk::filesystem::{DirEntry, FileSystem, FilesystemStats, TimeChange};
     use agentfs_sdk::{BoxedFile, Stats};
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Arc,
+        },
+    };
+    use winfsp::filesystem::{DirInfo, FileInfo, FileSystemContext, VolumeInfo};
+    use winfsp::U16CString;
 
     struct MockFs {
         by_parent: HashMap<(i64, String), Stats>,
         by_ino: HashMap<i64, Stats>,
+        lookup_calls: Arc<AtomicUsize>,
+        getattr_calls: Arc<AtomicUsize>,
+        readdir_plus_calls: Arc<AtomicUsize>,
+        statfs_calls: Arc<AtomicUsize>,
+        utimens_calls: Arc<AtomicUsize>,
     }
 
     impl MockFs {
@@ -1770,6 +2298,11 @@ mod tests {
             Self {
                 by_parent: HashMap::new(),
                 by_ino,
+                lookup_calls: Arc::new(AtomicUsize::new(0)),
+                getattr_calls: Arc::new(AtomicUsize::new(0)),
+                readdir_plus_calls: Arc::new(AtomicUsize::new(0)),
+                statfs_calls: Arc::new(AtomicUsize::new(0)),
+                utimens_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1784,10 +2317,14 @@ mod tests {
     #[async_trait]
     impl FileSystem for MockFs {
         async fn lookup(&self, parent_ino: i64, name: &str) -> SdkResult<Option<Stats>> {
+            self.lookup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.by_parent.get(&(parent_ino, name.to_string())).cloned())
         }
 
         async fn getattr(&self, ino: i64) -> SdkResult<Option<Stats>> {
+            self.getattr_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.by_ino.get(&ino).cloned())
         }
 
@@ -1800,7 +2337,19 @@ mod tests {
         }
 
         async fn readdir_plus(&self, _ino: i64) -> SdkResult<Option<Vec<DirEntry>>> {
-            Ok(Some(Vec::new()))
+            self.readdir_plus_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut entries: Vec<DirEntry> = self
+                .by_parent
+                .iter()
+                .filter(|((parent_ino, _), _)| *parent_ino == _ino)
+                .map(|((_parent_ino, name), stats)| DirEntry {
+                    name: name.clone(),
+                    stats: stats.clone(),
+                })
+                .collect();
+            entries.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(Some(entries))
         }
 
         async fn chmod(&self, _ino: i64, _mode: u32) -> SdkResult<()> {
@@ -1817,7 +2366,9 @@ mod tests {
             _atime: TimeChange,
             _mtime: TimeChange,
         ) -> SdkResult<()> {
-            unimplemented!()
+            self.utimens_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
 
         async fn open(&self, _ino: i64, _flags: i32) -> SdkResult<BoxedFile> {
@@ -1892,6 +2443,8 @@ mod tests {
         }
 
         async fn statfs(&self) -> SdkResult<FilesystemStats> {
+            self.statfs_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(FilesystemStats {
                 inodes: self.by_ino.len() as u64,
                 bytes_used: 0,
@@ -1922,6 +2475,42 @@ mod tests {
         let handle = rt.handle().clone();
         let adapter = AgentFSWinFsp::new(Arc::new(Mutex::new(fs)), handle);
         rt.block_on(async move { f(&adapter) })
+    }
+
+    fn blank_volume_info() -> VolumeInfo {
+        // VolumeInfo contains private label fields and WinFsp passes it as an
+        // out-parameter. Zero-initialization matches that call pattern in tests.
+        unsafe { std::mem::zeroed() }
+    }
+
+    fn blank_file_info() -> FileInfo {
+        // FileInfo is an out-parameter in WinFsp callbacks.
+        unsafe { std::mem::zeroed() }
+    }
+
+    fn with_open_directory_context<T>(
+        fs: MockFs,
+        dir_ino: i64,
+        dir_path: &str,
+        f: impl FnOnce(&AgentFSWinFsp, FileContext) -> T,
+    ) -> T {
+        with_adapter(fs, |adapter| {
+            let fh = adapter.alloc_fh();
+            adapter.open_files.lock().insert(
+                fh,
+                OpenFile {
+                    file: None,
+                    ino: dir_ino,
+                    is_dir: true,
+                    is_symlink: false,
+                    delete_on_close: AtomicBool::new(false),
+                    deleted: AtomicBool::new(false),
+                    path: dir_path.to_string(),
+                    dir_entries: Mutex::new(None),
+                },
+            );
+            f(adapter, FileContext { fh })
+        })
     }
 
     #[test]
@@ -1956,6 +2545,32 @@ mod tests {
     }
 
     #[test]
+    fn volume_info_is_cached_until_metadata_changes() {
+        let fs = MockFs::new();
+        let statfs_calls = fs.statfs_calls.clone();
+        with_adapter(fs, |adapter| {
+            let mut first = blank_volume_info();
+            adapter
+                .get_volume_info(&mut first)
+                .expect("first volume info");
+            let mut second = blank_volume_info();
+            adapter
+                .get_volume_info(&mut second)
+                .expect("cached volume info");
+            assert_eq!(first.total_size, second.total_size);
+            assert_eq!(first.free_size, second.free_size);
+            assert_eq!(statfs_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+            adapter.clear_metadata_caches();
+            let mut third = blank_volume_info();
+            adapter
+                .get_volume_info(&mut third)
+                .expect("refreshed volume info");
+            assert_eq!(statfs_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
     fn nested_missing_dotpath_maps_to_not_found() {
         with_adapter(MockFs::new(), |adapter| {
             let err = adapter
@@ -1986,5 +2601,250 @@ mod tests {
             AgentFSWinFsp::sanitize_dir_entry_name("settings.json"),
             "settings.json"
         );
+    }
+
+    #[test]
+    fn directory_pattern_matches_exact_name_case_insensitively() {
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "info.res.jsonl",
+            "INFO.RES.JSONL"
+        ));
+        assert!(!AgentFSWinFsp::directory_pattern_matches(
+            "other.res.jsonl",
+            "info.res.jsonl"
+        ));
+    }
+
+    #[test]
+    fn directory_pattern_matches_common_wildcards() {
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "info.res.jsonl",
+            "*.jsonl"
+        ));
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "账户信息.res.jsonl",
+            "*.res.jsonl"
+        ));
+        assert!(AgentFSWinFsp::directory_pattern_matches("huoyan", "*.*"));
+        assert!(AgentFSWinFsp::directory_pattern_matches("a1", "a?"));
+        assert!(!AgentFSWinFsp::directory_pattern_matches("a12", "a?"));
+    }
+
+    #[test]
+    fn directory_pattern_matches_leaf_name_from_query_path() {
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "账户信息.res.jsonl",
+            r".\*.res.jsonl"
+        ));
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "账户信息.res.jsonl",
+            r"C:\mnt\appfs\*.res.jsonl"
+        ));
+    }
+
+    #[test]
+    fn directory_pattern_matches_nt_dos_wildcards() {
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "info.res.jsonl",
+            "<.res.jsonl"
+        ));
+        assert!(AgentFSWinFsp::directory_pattern_matches(
+            "ab.txt", "a>>.txt"
+        ));
+        assert!(AgentFSWinFsp::directory_pattern_matches("a", "a\""));
+    }
+
+    #[test]
+    fn directory_entries_are_cached_per_open_directory_handle() {
+        let fs = MockFs::new()
+            .with_child(1, "a.txt", test_stats(2, 0o100644, 7))
+            .with_child(1, "b.txt", test_stats(3, 0o100644, 9));
+        let readdir_plus_calls = fs.readdir_plus_calls.clone();
+
+        with_open_directory_context(fs, 1, "/", |adapter, context| {
+            let first = adapter
+                .cached_directory_entries(context.fh, 1, "/")
+                .expect("first directory scan");
+            let second = adapter
+                .cached_directory_entries(context.fh, 1, "/")
+                .expect("cached directory scan");
+
+            assert_eq!(first.len(), second.len());
+            assert_eq!(
+                readdir_plus_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "repeated WinFsp read_directory calls on one handle should not rescan the DB"
+            );
+        });
+    }
+
+    #[test]
+    fn get_file_info_uses_cached_directory_stats() {
+        let fs = MockFs::new().with_child(1, "notes.txt", test_stats(2, 0o100644, 7));
+        let getattr_calls = fs.getattr_calls.clone();
+
+        with_open_directory_context(fs, 1, "/", |adapter, dir_context| {
+            adapter
+                .cached_directory_entries(dir_context.fh, 1, "/")
+                .expect("directory cache should load");
+            let getattr_after_scan = getattr_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+            let fh = adapter.alloc_fh();
+            adapter.open_files.lock().insert(
+                fh,
+                OpenFile {
+                    file: None,
+                    ino: 2,
+                    is_dir: false,
+                    is_symlink: false,
+                    delete_on_close: AtomicBool::new(false),
+                    deleted: AtomicBool::new(false),
+                    path: "/notes.txt".to_string(),
+                    dir_entries: Mutex::new(None),
+                },
+            );
+            let mut info = blank_file_info();
+            <AgentFSWinFsp as FileSystemContext>::get_file_info(
+                adapter,
+                &FileContext { fh },
+                &mut info,
+            )
+            .expect("cached get_file_info should succeed");
+
+            assert_eq!(info.file_size, 7);
+            assert_eq!(
+                getattr_calls.load(std::sync::atomic::Ordering::SeqCst),
+                getattr_after_scan,
+                "get_file_info should use stats cached from readdir_plus"
+            );
+        });
+    }
+
+    #[test]
+    fn access_time_only_set_basic_info_is_metadata_noop() {
+        let fs = MockFs::new().with_child(1, "notes.txt", test_stats(2, 0o100644, 7));
+        let readdir_plus_calls = fs.readdir_plus_calls.clone();
+        let utimens_calls = fs.utimens_calls.clone();
+
+        with_open_directory_context(fs, 1, "/", |adapter, dir_context| {
+            adapter
+                .cached_directory_entries(dir_context.fh, 1, "/")
+                .expect("directory cache should load");
+
+            let fh = adapter.alloc_fh();
+            adapter.open_files.lock().insert(
+                fh,
+                OpenFile {
+                    file: None,
+                    ino: 2,
+                    is_dir: false,
+                    is_symlink: false,
+                    delete_on_close: AtomicBool::new(false),
+                    deleted: AtomicBool::new(false),
+                    path: "/notes.txt".to_string(),
+                    dir_entries: Mutex::new(None),
+                },
+            );
+            let mut info = blank_file_info();
+            <AgentFSWinFsp as FileSystemContext>::set_basic_info(
+                adapter,
+                &FileContext { fh },
+                0,
+                0,
+                11644473600 * 10_000_000,
+                0,
+                0,
+                &mut info,
+            )
+            .expect("access-time-only update should be accepted");
+
+            assert_eq!(info.file_size, 7);
+            assert_eq!(
+                utimens_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "access-time-only update should not write through to the DB"
+            );
+
+            adapter
+                .cached_directory_entries(dir_context.fh, 1, "/")
+                .expect("directory cache should remain valid");
+            assert_eq!(
+                readdir_plus_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "access-time-only update should not clear directory caches"
+            );
+        });
+    }
+
+    #[test]
+    fn get_dir_info_by_name_exact_lookup_does_not_scan_directory() {
+        let fs = MockFs::new()
+            .with_child(1, "notes.txt", test_stats(2, 0o100644, 7))
+            .with_child(1, "账户信息.res.jsonl", test_stats(3, 0o100644, 123));
+        let lookup_calls = fs.lookup_calls.clone();
+        let readdir_plus_calls = fs.readdir_plus_calls.clone();
+
+        with_open_directory_context(fs, 1, "/", |adapter, context| {
+            let query = U16CString::from_str("账户信息.res.jsonl").expect("exact query");
+            let mut dir_info = DirInfo::<255>::default();
+
+            <AgentFSWinFsp as FileSystemContext>::get_dir_info_by_name(
+                adapter,
+                &context,
+                query.as_ucstr(),
+                &mut dir_info,
+            )
+            .expect("exact lookup should resolve matching entry");
+
+            assert_eq!(dir_info.file_info_mut().file_size, 123);
+            assert_eq!(lookup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                readdir_plus_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "exact WinFsp get_dir_info_by_name should avoid full directory scans"
+            );
+        });
+    }
+
+    #[test]
+    fn get_dir_info_by_name_matches_filtered_unicode_snapshot_entry() {
+        let fs = MockFs::new()
+            .with_child(1, "notes.txt", test_stats(2, 0o100644, 7))
+            .with_child(1, "账户信息.res.jsonl", test_stats(3, 0o100644, 123));
+
+        with_open_directory_context(fs, 1, "/", |adapter, context| {
+            let query = U16CString::from_str(r".\*.res.jsonl").expect("query pattern");
+            let mut dir_info = DirInfo::<255>::default();
+
+            <AgentFSWinFsp as FileSystemContext>::get_dir_info_by_name(
+                adapter,
+                &context,
+                query.as_ucstr(),
+                &mut dir_info,
+            )
+            .expect("wildcard filter should resolve matching entry");
+
+            assert_eq!(dir_info.file_info_mut().file_size, 123);
+        });
+    }
+
+    #[test]
+    fn get_dir_info_by_name_returns_not_found_for_non_matching_filter() {
+        let fs = MockFs::new().with_child(1, "notes.txt", test_stats(2, 0o100644, 7));
+
+        with_open_directory_context(fs, 1, "/", |adapter, context| {
+            let query = U16CString::from_str("*.res.jsonl").expect("query pattern");
+            let mut dir_info = DirInfo::<255>::default();
+
+            let err = <AgentFSWinFsp as FileSystemContext>::get_dir_info_by_name(
+                adapter,
+                &context,
+                query.as_ucstr(),
+                &mut dir_info,
+            )
+            .expect_err("non-matching wildcard should not resolve");
+
+            assert_eq!(err.to_ntstatus(), STATUS_OBJECT_NAME_NOT_FOUND);
+        });
     }
 }

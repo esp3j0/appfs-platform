@@ -1,15 +1,25 @@
-use agentfs_sdk::AppConnector;
+use agentfs_sdk::{
+    AgentFS as SdkAgentFS, AgentFSOptions, AgentFsGlobQuery, AgentFsGlobQueryResult,
+    AgentFsQueryEntryKind, AgentFsTreeQuery, AgentFsTreeQueryResult, AppConnector,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::opts::AppfsQueryFormat;
+
 mod action_dispatcher;
 mod bridge_resilience;
+pub(crate) mod compose;
 mod core;
 mod errors;
 mod events;
@@ -33,7 +43,7 @@ mod supervisor_control;
 mod tests;
 mod tree_sync;
 
-use journal::SnapshotExpandJournalEntry;
+use journal::{SnapshotExpandJournalDoc, SnapshotExpandJournalEntry};
 pub(crate) use runtime_config::{
     build_appfs_bridge_config, build_runtime_cli_args, normalize_appfs_session_id,
     resolve_runtime_cli_args, AppfsBridgeCliArgs, AppfsBridgeConfig, AppfsRuntimeCliArgs,
@@ -69,6 +79,82 @@ const MAX_SEGMENT_BYTES: usize = 255;
 const ALLOWED_SEGMENT_CHARS: &str =
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~";
 
+#[derive(Clone, Debug)]
+enum ManagedRuntimeBootstrapEntry {
+    Dir { rel_path: String },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManagedRuntimeBootstrapPlan {
+    entries: Vec<ManagedRuntimeBootstrapEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct AppRuntimeStartupBootstrap {
+    db_path: String,
+    manifest_json: String,
+    cursor: CursorState,
+    action_cursors: HashMap<String, ActionCursorState>,
+    snapshot_expand_journal: HashMap<String, SnapshotExpandJournalEntry>,
+    streaming_jobs: Vec<StreamingJob>,
+}
+
+#[derive(Clone)]
+struct ManagedRuntimeStartupContext {
+    runtime_args: Vec<ResolvedAppfsRuntimeCliArgs>,
+    existing_registry: Option<registry::AppfsAppsRegistryDoc>,
+    app_bootstrap: HashMap<String, AppRuntimeStartupBootstrap>,
+}
+
+#[derive(Clone)]
+pub struct ActionWakeHandle {
+    inner: Arc<ActionWakeState>,
+}
+
+struct ActionWakeState {
+    notify: tokio::sync::Notify,
+    pending: AtomicBool,
+}
+
+impl Default for ActionWakeHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ActionWakeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionWakeHandle").finish_non_exhaustive()
+    }
+}
+
+impl ActionWakeHandle {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(ActionWakeState {
+                notify: tokio::sync::Notify::new(),
+                pending: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub(crate) fn signal(&self) {
+        if !self.inner.pending.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_one();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self.inner.pending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppfsServeArgs {
     pub root: PathBuf,
@@ -77,6 +163,7 @@ pub struct AppfsServeArgs {
     pub app_ids: Vec<String>,
     pub session_id: Option<String>,
     pub poll_ms: u64,
+    pub action_wake: Option<ActionWakeHandle>,
     pub adapter_http_endpoint: Option<String>,
     pub adapter_http_timeout_ms: u64,
     pub adapter_grpc_endpoint: Option<String>,
@@ -119,6 +206,31 @@ pub struct AppfsLaunchArgs {
     pub agent_args: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppfsQueryTreeArgs {
+    pub db: PathBuf,
+    pub root: String,
+    pub max_depth: usize,
+    pub max_entries_per_dir: usize,
+    pub include_files: bool,
+    pub include_internal: bool,
+    pub format: AppfsQueryFormat,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppfsQueryGlobArgs {
+    pub db: PathBuf,
+    pub root: String,
+    pub pattern: String,
+    pub max_depth: usize,
+    pub max_results: usize,
+    pub max_scanned_entries: usize,
+    pub include_dirs: bool,
+    pub ignore_case: bool,
+    pub include_internal: bool,
+    pub format: AppfsQueryFormat,
+}
+
 fn build_managed_mount_args(args: &AppfsUpArgs) -> crate::cmd::MountArgs {
     crate::cmd::MountArgs {
         id_or_path: args.id_or_path.clone(),
@@ -143,6 +255,7 @@ fn build_managed_mount_args(args: &AppfsUpArgs) -> crate::cmd::MountArgs {
         adapter_bridge_max_backoff_ms: 1_000,
         adapter_bridge_circuit_breaker_failures: 5,
         adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+        action_wake: None,
     }
 }
 
@@ -338,84 +451,164 @@ fn terminate_launcher_child(child: &mut Child) {
     }
 }
 
-pub async fn handle_appfs_adapter_command(args: AppfsServeArgs) -> Result<()> {
-    let AppfsServeArgs {
-        root,
-        managed,
-        app_id,
-        app_ids,
-        session_id,
-        poll_ms,
-        adapter_http_endpoint,
-        adapter_http_timeout_ms,
-        adapter_grpc_endpoint,
-        adapter_grpc_timeout_ms,
-        adapter_bridge_max_retries,
-        adapter_bridge_initial_backoff_ms,
-        adapter_bridge_max_backoff_ms,
-        adapter_bridge_circuit_breaker_failures,
-        adapter_bridge_circuit_breaker_cooldown_ms,
-    } = args;
-
-    let bridge_args = AppfsBridgeCliArgs {
-        adapter_http_endpoint,
-        adapter_http_timeout_ms,
-        adapter_grpc_endpoint,
-        adapter_grpc_timeout_ms,
-        adapter_bridge_max_retries,
-        adapter_bridge_initial_backoff_ms,
-        adapter_bridge_max_backoff_ms,
-        adapter_bridge_circuit_breaker_failures,
-        adapter_bridge_circuit_breaker_cooldown_ms,
-    };
-    let (runtime_args, existing_registry) = if managed {
-        if app_id.is_some()
-            || !app_ids.is_empty()
-            || session_id.is_some()
-            || bridge_args.adapter_http_endpoint.is_some()
-            || bridge_args.adapter_grpc_endpoint.is_some()
-        {
-            anyhow::bail!(
-                "--managed does not accept explicit --app-id/--app/--session-id/adapter endpoint bootstrap flags; load them from the persisted AppFS registry instead"
-            );
-        }
-        let existing = registry::read_app_registry(&root)?;
-        let runtime_args = match existing.as_ref() {
-            Some(doc) => registry::runtime_args_from_registry(doc)?,
-            None => Vec::new(),
-        };
-        (runtime_args, existing)
+fn fallback_poll_interval(poll_ms: u64) -> Option<Duration> {
+    if poll_ms == 0 {
+        None
     } else {
-        (
-            build_runtime_cli_args(app_id, app_ids, session_id, bridge_args, Some("aiim"))?,
-            None,
-        )
-    };
-    let resolved_runtime_args = resolve_runtime_cli_args(runtime_args);
-    let mut supervisor = AppfsRuntimeSupervisor::new(root, resolved_runtime_args, managed)?;
-    supervisor.prepare_action_sinks()?;
-    supervisor.sync_registry_to_disk(existing_registry.as_ref())?;
-    supervisor.log_started();
-    eprintln!("Press Ctrl+C to stop.");
-
-    let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(MIN_POLL_MS)));
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("AppFS adapter stopping...");
-                return Ok(());
-            }
-            _ = interval.tick() => {
-                if let Err(err) = supervisor.poll_once() {
-                    eprintln!("AppFS adapter poll error: {err:#}");
-                }
-            }
-        }
+        Some(Duration::from_millis(poll_ms.max(MIN_POLL_MS)))
     }
 }
 
-pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
-    let mount_args = build_managed_mount_args(&args);
+async fn prepare_compose_runtime(runtime: &compose::schema::AppfsComposeRuntime) -> Result<String> {
+    if let Some(parent) = runtime.db.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create compose runtime db parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    if runtime.backend == crate::cmd::mount::MountBackend::Winfsp {
+        let mount_parent = runtime
+            .mountpoint
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "compose runtime winfsp mountpoint must include a parent directory: {}",
+                    runtime.mountpoint.display()
+                )
+            })?;
+        std::fs::create_dir_all(mount_parent).with_context(|| {
+            format!(
+                "failed to create compose runtime winfsp mountpoint parent directory {}",
+                mount_parent.display()
+            )
+        })?;
+        if runtime.mountpoint.exists() {
+            if !runtime.mountpoint.is_dir() {
+                anyhow::bail!(
+                    "compose runtime mountpoint exists but is not a directory: {}",
+                    runtime.mountpoint.display()
+                );
+            }
+            let is_empty = std::fs::read_dir(&runtime.mountpoint)
+                .with_context(|| {
+                    format!(
+                        "failed to inspect compose runtime winfsp mountpoint directory {}",
+                        runtime.mountpoint.display()
+                    )
+                })?
+                .next()
+                .is_none();
+            if !is_empty {
+                anyhow::bail!(
+                    "compose runtime winfsp mountpoint must be empty or absent: {}",
+                    runtime.mountpoint.display()
+                );
+            }
+            std::fs::remove_dir(&runtime.mountpoint).with_context(|| {
+                format!(
+                    "failed to remove empty compose runtime winfsp mountpoint placeholder {}",
+                    runtime.mountpoint.display()
+                )
+            })?;
+        }
+    } else if runtime.mountpoint.exists() {
+        if !runtime.mountpoint.is_dir() {
+            anyhow::bail!(
+                "compose runtime mountpoint exists but is not a directory: {}",
+                runtime.mountpoint.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(&runtime.mountpoint).with_context(|| {
+            format!(
+                "failed to create compose runtime mountpoint directory {}",
+                runtime.mountpoint.display()
+            )
+        })?;
+    }
+
+    let db_path = runtime
+        .db
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "compose runtime db path must be valid UTF-8: {}",
+                runtime.db.display()
+            )
+        })?
+        .to_string();
+    let sidecar_info_path = PathBuf::from(format!("{db_path}-info"));
+
+    if runtime.reset {
+        if runtime.db.exists() {
+            std::fs::remove_file(&runtime.db).with_context(|| {
+                format!(
+                    "failed to remove compose runtime db {}",
+                    runtime.db.display()
+                )
+            })?;
+        }
+        if sidecar_info_path.exists() {
+            std::fs::remove_file(&sidecar_info_path).with_context(|| {
+                format!(
+                    "failed to remove compose runtime sync sidecar {}",
+                    sidecar_info_path.display()
+                )
+            })?;
+        }
+    }
+
+    match runtime.init {
+        compose::schema::AppfsComposeInitMode::Never => {
+            if !runtime.db.exists() {
+                anyhow::bail!(
+                    "compose runtime db does not exist and runtime.init=never: {}",
+                    runtime.db.display()
+                );
+            }
+        }
+        compose::schema::AppfsComposeInitMode::IfMissing => {
+            if !runtime.db.exists() {
+                let _agent = crate::cmd::init::open_agentfs(AgentFSOptions::with_path(&db_path))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to initialize compose runtime db {}",
+                            runtime.db.display()
+                        )
+                    })?;
+            }
+        }
+        compose::schema::AppfsComposeInitMode::Always => {
+            let _agent = crate::cmd::init::open_agentfs(AgentFSOptions::with_path(&db_path))
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to initialize compose runtime db {}",
+                        runtime.db.display()
+                    )
+                })?;
+        }
+    }
+
+    Ok(db_path)
+}
+
+async fn run_managed_appfs_with_bootstrap<F>(
+    args: AppfsUpArgs,
+    bootstrap: F,
+    startup_context: Option<ManagedRuntimeStartupContext>,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let action_wake = ActionWakeHandle::new();
+    let mut mount_args = build_managed_mount_args(&args);
+    mount_args.action_wake = Some(action_wake.clone());
     let mountpoint = mount_args.mountpoint.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let mount_thread = std::thread::spawn(move || {
@@ -447,23 +640,29 @@ pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
         }
     }
 
-    let runtime_result = handle_appfs_adapter_command(AppfsServeArgs {
-        root: mountpoint,
-        managed: true,
-        app_id: None,
-        app_ids: Vec::new(),
-        session_id: None,
-        poll_ms: args.poll_ms,
-        adapter_http_endpoint: None,
-        adapter_http_timeout_ms: 5_000,
-        adapter_grpc_endpoint: None,
-        adapter_grpc_timeout_ms: 5_000,
-        adapter_bridge_max_retries: 2,
-        adapter_bridge_initial_backoff_ms: 100,
-        adapter_bridge_max_backoff_ms: 1_000,
-        adapter_bridge_circuit_breaker_failures: 5,
-        adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
-    })
+    bootstrap(&mountpoint)?;
+
+    let runtime_result = handle_appfs_adapter_command_with_startup_context(
+        AppfsServeArgs {
+            root: mountpoint,
+            managed: true,
+            app_id: None,
+            app_ids: Vec::new(),
+            session_id: None,
+            poll_ms: args.poll_ms,
+            action_wake: Some(action_wake),
+            adapter_http_endpoint: None,
+            adapter_http_timeout_ms: 5_000,
+            adapter_grpc_endpoint: None,
+            adapter_grpc_timeout_ms: 5_000,
+            adapter_bridge_max_retries: 2,
+            adapter_bridge_initial_backoff_ms: 100,
+            adapter_bridge_max_backoff_ms: 1_000,
+            adapter_bridge_circuit_breaker_failures: 5,
+            adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+        },
+        startup_context,
+    )
     .await;
 
     if let Err(err) = runtime_result {
@@ -476,6 +675,612 @@ pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
         Err(_) => Err(anyhow::anyhow!(
             "AppFS mount thread panicked during shutdown"
         )),
+    }
+}
+
+pub async fn handle_appfs_adapter_command(args: AppfsServeArgs) -> Result<()> {
+    handle_appfs_adapter_command_with_startup_context(args, None).await
+}
+
+async fn handle_appfs_adapter_command_with_startup_context(
+    args: AppfsServeArgs,
+    startup_context: Option<ManagedRuntimeStartupContext>,
+) -> Result<()> {
+    let AppfsServeArgs {
+        root,
+        managed,
+        app_id,
+        app_ids,
+        session_id,
+        poll_ms,
+        action_wake,
+        adapter_http_endpoint,
+        adapter_http_timeout_ms,
+        adapter_grpc_endpoint,
+        adapter_grpc_timeout_ms,
+        adapter_bridge_max_retries,
+        adapter_bridge_initial_backoff_ms,
+        adapter_bridge_max_backoff_ms,
+        adapter_bridge_circuit_breaker_failures,
+        adapter_bridge_circuit_breaker_cooldown_ms,
+    } = args;
+
+    let bridge_args = AppfsBridgeCliArgs {
+        adapter_http_endpoint,
+        adapter_http_timeout_ms,
+        adapter_grpc_endpoint,
+        adapter_grpc_timeout_ms,
+        adapter_bridge_max_retries,
+        adapter_bridge_initial_backoff_ms,
+        adapter_bridge_max_backoff_ms,
+        adapter_bridge_circuit_breaker_failures,
+        adapter_bridge_circuit_breaker_cooldown_ms,
+    };
+    let (resolved_runtime_args, existing_registry) = if managed {
+        if let Some(context) = startup_context.as_ref() {
+            (
+                context.runtime_args.clone(),
+                context.existing_registry.clone(),
+            )
+        } else {
+            if app_id.is_some()
+                || !app_ids.is_empty()
+                || session_id.is_some()
+                || bridge_args.adapter_http_endpoint.is_some()
+                || bridge_args.adapter_grpc_endpoint.is_some()
+            {
+                anyhow::bail!(
+                    "--managed does not accept explicit --app-id/--app/--session-id/adapter endpoint bootstrap flags; load them from the persisted AppFS registry instead"
+                );
+            }
+            let existing = registry::read_app_registry(&root)?;
+            let runtime_args = match existing.as_ref() {
+                Some(doc) => registry::runtime_args_from_registry(doc)?,
+                None => Vec::new(),
+            };
+            (resolve_runtime_cli_args(runtime_args), existing)
+        }
+    } else {
+        (
+            resolve_runtime_cli_args(build_runtime_cli_args(
+                app_id,
+                app_ids,
+                session_id,
+                bridge_args,
+                Some("aiim"),
+            )?),
+            None,
+        )
+    };
+    wait_for_managed_runtime_paths_ready(&root, &resolved_runtime_args, startup_context.as_ref())?;
+    let startup_bootstrap = startup_context.map(|context| context.app_bootstrap);
+    let mut supervisor =
+        AppfsRuntimeSupervisor::new(root, resolved_runtime_args, managed, startup_bootstrap)?;
+    supervisor.prepare_action_sinks()?;
+    supervisor.sync_registry_to_disk(existing_registry.as_ref())?;
+    supervisor.log_started();
+    match (action_wake.as_ref(), fallback_poll_interval(poll_ms)) {
+        (Some(_), Some(interval)) => {
+            eprintln!(
+                "AppFS adapter fallback polling enabled at {} ms alongside write wake events.",
+                interval.as_millis()
+            );
+        }
+        (Some(_), None) => {
+            eprintln!("AppFS adapter fallback polling disabled; relying on write wake events.");
+        }
+        (None, Some(interval)) => {
+            eprintln!(
+                "AppFS adapter fallback polling enabled at {} ms.",
+                interval.as_millis()
+            );
+        }
+        (None, None) => {
+            eprintln!(
+                "AppFS adapter fallback polling disabled and no write wake source is attached; action sinks will remain idle until --poll-ms is set."
+            );
+        }
+    }
+    eprintln!("Press Ctrl+C to stop.");
+
+    let mut interval = fallback_poll_interval(poll_ms).map(tokio::time::interval);
+    if let Some(interval) = interval.as_mut() {
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+    loop {
+        match (action_wake.as_ref(), interval.as_mut()) {
+            (Some(wake), Some(interval)) => {
+                tokio::select! {
+                    _ = crate::shutdown_signal::wait_for_shutdown_signal() => {
+                        eprintln!("AppFS adapter stopping...");
+                        return Ok(());
+                    }
+                    _ = wake.wait() => {
+                        if let Err(err) = supervisor.poll_once() {
+                            eprintln!("AppFS adapter poll error: {err:#}");
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if let Err(err) = supervisor.poll_once() {
+                            eprintln!("AppFS adapter poll error: {err:#}");
+                        }
+                    }
+                }
+            }
+            (Some(wake), None) => {
+                tokio::select! {
+                    _ = crate::shutdown_signal::wait_for_shutdown_signal() => {
+                        eprintln!("AppFS adapter stopping...");
+                        return Ok(());
+                    }
+                    _ = wake.wait() => {
+                        if let Err(err) = supervisor.poll_once() {
+                            eprintln!("AppFS adapter poll error: {err:#}");
+                        }
+                    }
+                }
+            }
+            (None, Some(interval)) => {
+                tokio::select! {
+                    _ = crate::shutdown_signal::wait_for_shutdown_signal() => {
+                        eprintln!("AppFS adapter stopping...");
+                        return Ok(());
+                    }
+                    _ = interval.tick() => {
+                        if let Err(err) = supervisor.poll_once() {
+                            eprintln!("AppFS adapter poll error: {err:#}");
+                        }
+                    }
+                }
+            }
+            (None, None) => {
+                crate::shutdown_signal::wait_for_shutdown_signal().await?;
+                eprintln!("AppFS adapter stopping...");
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn wait_for_managed_runtime_paths_ready(
+    root: &Path,
+    runtime_args: &[ResolvedAppfsRuntimeCliArgs],
+    startup_context: Option<&ManagedRuntimeStartupContext>,
+) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = root;
+        let _ = runtime_args;
+        let _ = startup_context;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if runtime_args.is_empty() {
+            return Ok(());
+        }
+
+        wait_for_runtime_path_visibility(root, true).with_context(|| {
+            format!(
+                "AppFS mount root is not visible yet for managed runtime startup: {}",
+                root.display()
+            )
+        })?;
+
+        for runtime in runtime_args {
+            let app_dir = root.join(&runtime.app_id);
+            let has_db_bootstrap = startup_context
+                .and_then(|ctx| ctx.app_bootstrap.get(&runtime.app_id))
+                .is_some();
+            let critical_paths = if has_db_bootstrap {
+                vec![
+                    (app_dir.clone(), true, "app root"),
+                    (app_dir.join("_meta"), true, "manifest parent"),
+                    (app_dir.join("_stream"), true, "stream dir"),
+                    (app_dir.join("_stream").join("from-seq"), true, "replay dir"),
+                ]
+            } else {
+                vec![
+                    (app_dir.clone(), true, "app root"),
+                    (app_dir.join("_meta"), true, "manifest parent"),
+                    (
+                        app_dir.join("_meta").join("manifest.res.json"),
+                        false,
+                        "manifest",
+                    ),
+                    (app_dir.join("_stream"), true, "stream dir"),
+                    (app_dir.join("_stream").join("from-seq"), true, "replay dir"),
+                    (
+                        app_dir.join("_stream").join("events.evt.jsonl"),
+                        false,
+                        "events stream",
+                    ),
+                    (
+                        app_dir.join("_stream").join("cursor.res.json"),
+                        false,
+                        "cursor file",
+                    ),
+                    (
+                        app_dir.join("_stream").join("inflight.jobs.res.json"),
+                        false,
+                        "jobs file",
+                    ),
+                    (
+                        app_dir.join("_stream").join(ACTION_CURSORS_FILENAME),
+                        false,
+                        "action cursors file",
+                    ),
+                    (
+                        app_dir
+                            .join("_stream")
+                            .join(SNAPSHOT_EXPAND_JOURNAL_FILENAME),
+                        false,
+                        "snapshot journal",
+                    ),
+                ]
+            };
+
+            for (path, expect_dir, label) in critical_paths {
+                wait_for_runtime_path_visibility(&path, expect_dir).with_context(|| {
+                    format!(
+                        "managed runtime startup path is not visible yet for app {} ({label}): {}",
+                        runtime.app_id,
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn build_managed_runtime_bootstrap_plan(
+    _agent: &SdkAgentFS,
+    app_ids: &[String],
+) -> Result<ManagedRuntimeBootstrapPlan> {
+    let mut plan = ManagedRuntimeBootstrapPlan::default();
+    plan.entries.push(ManagedRuntimeBootstrapEntry::Dir {
+        rel_path: "_appfs".to_string(),
+    });
+
+    for app_id in app_ids {
+        let app_root = app_id.clone();
+        for rel_path in [
+            app_root.clone(),
+            format!("{app_root}/_meta"),
+            format!("{app_root}/_stream"),
+            format!("{app_root}/_stream/from-seq"),
+        ] {
+            plan.entries
+                .push(ManagedRuntimeBootstrapEntry::Dir { rel_path });
+        }
+    }
+
+    Ok(plan)
+}
+
+async fn build_managed_runtime_startup_context(
+    agent: &SdkAgentFS,
+    registry_doc: registry::AppfsAppsRegistryDoc,
+    runtime_args: Vec<ResolvedAppfsRuntimeCliArgs>,
+    db_path: &str,
+) -> Result<ManagedRuntimeStartupContext> {
+    let mut app_bootstrap = HashMap::new();
+    for runtime in &runtime_args {
+        let app_id = &runtime.app_id;
+        let manifest_path = format!("/{app_id}/_meta/manifest.res.json");
+        let manifest_bytes = agent.fs.read_file(&manifest_path).await?.ok_or_else(|| {
+            anyhow::anyhow!("managed runtime bootstrap source missing from db: {manifest_path}")
+        })?;
+        let manifest_json = String::from_utf8(manifest_bytes).with_context(|| {
+            format!("managed runtime bootstrap manifest is not valid UTF-8: {manifest_path}")
+        })?;
+
+        let cursor_path = format!("/{app_id}/_stream/cursor.res.json");
+        let cursor: CursorState =
+            serde_json::from_slice(&agent.fs.read_file(&cursor_path).await?.ok_or_else(|| {
+                anyhow::anyhow!("managed runtime bootstrap source missing from db: {cursor_path}")
+            })?)
+            .with_context(|| {
+                format!(
+                    "failed to parse managed runtime bootstrap cursor {}",
+                    cursor_path
+                )
+            })?;
+
+        let action_cursors_path = format!("/{app_id}/_stream/{ACTION_CURSORS_FILENAME}");
+        let action_cursors: ActionCursorDoc =
+            serde_json::from_slice(&agent.fs.read_file(&action_cursors_path).await?.ok_or_else(
+                || {
+                    anyhow::anyhow!(
+                        "managed runtime bootstrap source missing from db: {action_cursors_path}"
+                    )
+                },
+            )?)
+            .with_context(|| {
+                format!(
+                    "failed to parse managed runtime bootstrap action cursors {}",
+                    action_cursors_path
+                )
+            })?;
+
+        let journal_path = format!("/{app_id}/_stream/{SNAPSHOT_EXPAND_JOURNAL_FILENAME}");
+        let snapshot_expand_journal: SnapshotExpandJournalDoc =
+            serde_json::from_slice(&agent.fs.read_file(&journal_path).await?.ok_or_else(|| {
+                anyhow::anyhow!("managed runtime bootstrap source missing from db: {journal_path}")
+            })?)
+            .with_context(|| {
+                format!(
+                    "failed to parse managed runtime bootstrap snapshot journal {}",
+                    journal_path
+                )
+            })?;
+
+        let jobs_path = format!("/{app_id}/_stream/inflight.jobs.res.json");
+        let streaming_jobs: Vec<StreamingJob> =
+            serde_json::from_slice(&agent.fs.read_file(&jobs_path).await?.ok_or_else(|| {
+                anyhow::anyhow!("managed runtime bootstrap source missing from db: {jobs_path}")
+            })?)
+            .with_context(|| {
+                format!(
+                    "failed to parse managed runtime bootstrap jobs {}",
+                    jobs_path
+                )
+            })?;
+
+        app_bootstrap.insert(
+            app_id.clone(),
+            AppRuntimeStartupBootstrap {
+                db_path: db_path.to_string(),
+                manifest_json,
+                cursor,
+                action_cursors: action_cursors.actions,
+                snapshot_expand_journal: snapshot_expand_journal.resources,
+                streaming_jobs,
+            },
+        );
+    }
+
+    Ok(ManagedRuntimeStartupContext {
+        runtime_args,
+        existing_registry: Some(registry_doc),
+        app_bootstrap,
+    })
+}
+
+fn apply_managed_runtime_bootstrap_plan(
+    mount_root: &Path,
+    plan: &ManagedRuntimeBootstrapPlan,
+) -> Result<()> {
+    for entry in &plan.entries {
+        match entry {
+            ManagedRuntimeBootstrapEntry::Dir { rel_path } => {
+                let path = mount_root.join(rel_path);
+                std::fs::create_dir_all(&path).with_context(|| {
+                    format!(
+                        "failed to precreate managed runtime dir on mount {}",
+                        path.display()
+                    )
+                })?;
+                #[cfg(target_os = "windows")]
+                wait_for_runtime_path_visibility(&path, true).with_context(|| {
+                    format!(
+                        "managed runtime startup path is not visible yet after directory bootstrap: {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_runtime_path_visibility(path: &Path, expect_dir: bool) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 40;
+    for attempt in 0..MAX_ATTEMPTS {
+        refresh_runtime_parent_directory(path);
+        let ready = if expect_dir {
+            path.is_dir()
+        } else {
+            path.is_file() && std::fs::read(path).is_ok()
+        };
+        if ready {
+            return Ok(());
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
+        }
+    }
+    anyhow::bail!(
+        "path did not become visible in time: {} (expect_dir={expect_dir})",
+        path.display()
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_runtime_parent_directory(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for _ in entries.take(1) {}
+    }
+}
+
+pub async fn handle_appfs_up_command(args: AppfsUpArgs) -> Result<()> {
+    run_managed_appfs_with_bootstrap(args, |_| Ok(()), None).await
+}
+
+pub async fn handle_appfs_query_tree_command(args: AppfsQueryTreeArgs) -> Result<()> {
+    let db_path = args
+        .db
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("query db path must be valid UTF-8: {}", args.db.display()))?
+        .to_string();
+    let agent = crate::cmd::init::open_agentfs(AgentFSOptions::with_path(db_path)).await?;
+    let result = agent
+        .query_tree(AgentFsTreeQuery {
+            root: args.root,
+            max_depth: args.max_depth,
+            max_entries_per_dir: args.max_entries_per_dir,
+            include_files: args.include_files,
+            exclude_internal: !args.include_internal,
+        })
+        .await?;
+    match args.format {
+        AppfsQueryFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        AppfsQueryFormat::Text => print_tree_query_text(&result),
+    }
+    Ok(())
+}
+
+pub async fn handle_appfs_query_glob_command(args: AppfsQueryGlobArgs) -> Result<()> {
+    let db_path = args
+        .db
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("query db path must be valid UTF-8: {}", args.db.display()))?
+        .to_string();
+    let agent = crate::cmd::init::open_agentfs(AgentFSOptions::with_path(db_path)).await?;
+    let result = agent
+        .query_glob(AgentFsGlobQuery {
+            root: args.root,
+            pattern: args.pattern,
+            max_depth: args.max_depth,
+            max_results: args.max_results,
+            max_scanned_entries: args.max_scanned_entries,
+            include_dirs: args.include_dirs,
+            case_sensitive: !args.ignore_case,
+            exclude_internal: !args.include_internal,
+        })
+        .await?;
+    match args.format {
+        AppfsQueryFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        AppfsQueryFormat::Text => print_glob_query_text(&result),
+    }
+    Ok(())
+}
+
+fn print_tree_query_text(result: &AgentFsTreeQueryResult) {
+    for entry in &result.entries {
+        let indent = "  ".repeat(entry.depth.saturating_sub(1));
+        let suffix = if entry.kind == AgentFsQueryEntryKind::Directory {
+            "/"
+        } else {
+            ""
+        };
+        println!("{indent}{}{suffix}", entry.name);
+    }
+    if result.truncated {
+        eprintln!(
+            "tree output truncated after scanning {} entries",
+            result.scanned_entries
+        );
+    }
+}
+
+fn print_glob_query_text(result: &AgentFsGlobQueryResult) {
+    for entry in &result.results {
+        println!("{}", entry.path);
+    }
+    if result.truncated {
+        eprintln!(
+            "glob output truncated after scanning {} entries",
+            result.scanned_entries
+        );
+    }
+}
+
+pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    let compose_doc = compose::loader::load_compose_doc(compose_path.as_deref(), &cwd)?;
+    let db_path = prepare_compose_runtime(&compose_doc.runtime).await?;
+
+    let (mut connector_supervisor, resolved_apps) =
+        compose::connector_supervisor::ComposeConnectorSupervisor::resolve_apps(&compose_doc)?;
+
+    let agent = agentfs_sdk::AgentFS::open(AgentFSOptions::with_path(db_path.clone())).await?;
+    let registry_doc = compose::reconcile::bootstrap_registry_from_resolved_apps_in_agentfs(
+        &agent,
+        &resolved_apps,
+    )
+    .await?;
+    for resolved_app in resolved_apps.values() {
+        let session_id = normalize_appfs_session_id(resolved_app.session_id.clone());
+        let bridge_config =
+            build_appfs_bridge_config(bridge_args_from_resolved_compose_app(resolved_app));
+        tree_sync::ensure_app_structure_initialized_in_db(
+            &agent,
+            &resolved_app.app_id,
+            &session_id,
+            &bridge_config,
+        )
+        .await?;
+    }
+    let startup_app_ids = resolved_apps
+        .values()
+        .map(|app| app.app_id.clone())
+        .collect::<Vec<_>>();
+    let startup_plan = build_managed_runtime_bootstrap_plan(&agent, &startup_app_ids).await?;
+    let resolved_runtime_args =
+        resolve_runtime_cli_args(registry::runtime_args_from_registry(&registry_doc)?);
+    let startup_context = build_managed_runtime_startup_context(
+        &agent,
+        registry_doc,
+        resolved_runtime_args,
+        &db_path,
+    )
+    .await?;
+    drop(agent);
+
+    let result = run_managed_appfs_with_bootstrap(
+        AppfsUpArgs {
+            id_or_path: db_path,
+            mountpoint: compose_doc.runtime.mountpoint.clone(),
+            backend: compose_doc.runtime.backend,
+            auto_unmount: compose_doc.runtime.auto_unmount,
+            allow_root: compose_doc.runtime.allow_root,
+            allow_other: compose_doc.runtime.allow_other,
+            uid: compose_doc.runtime.uid,
+            gid: compose_doc.runtime.gid,
+            poll_ms: compose_doc.runtime.poll_ms,
+        },
+        move |mount_root| apply_managed_runtime_bootstrap_plan(mount_root, &startup_plan),
+        Some(startup_context),
+    )
+    .await;
+
+    connector_supervisor.shutdown();
+    result
+}
+
+fn bridge_args_from_resolved_compose_app(
+    app: &compose::connector_supervisor::ResolvedComposeApp,
+) -> AppfsBridgeCliArgs {
+    AppfsBridgeCliArgs {
+        adapter_http_endpoint: match app.transport_kind {
+            compose::schema::AppfsComposeTransportKind::Http => Some(app.endpoint.clone()),
+            compose::schema::AppfsComposeTransportKind::Grpc => None,
+        },
+        adapter_http_timeout_ms: app.transport.http_timeout_ms,
+        adapter_grpc_endpoint: match app.transport_kind {
+            compose::schema::AppfsComposeTransportKind::Http => None,
+            compose::schema::AppfsComposeTransportKind::Grpc => Some(app.endpoint.clone()),
+        },
+        adapter_grpc_timeout_ms: app.transport.grpc_timeout_ms,
+        adapter_bridge_max_retries: app.transport.bridge_max_retries,
+        adapter_bridge_initial_backoff_ms: app.transport.bridge_initial_backoff_ms,
+        adapter_bridge_max_backoff_ms: app.transport.bridge_max_backoff_ms,
+        adapter_bridge_circuit_breaker_failures: app.transport.bridge_circuit_breaker_failures,
+        adapter_bridge_circuit_breaker_cooldown_ms: app
+            .transport
+            .bridge_circuit_breaker_cooldown_ms,
     }
 }
 
@@ -710,6 +1515,7 @@ struct AppfsAdapter {
     app_id: String,
     session_id: String,
     app_dir: PathBuf,
+    direct_db_path: Option<String>,
     action_specs: Vec<ActionSpec>,
     snapshot_specs: Vec<SnapshotSpec>,
     events_path: PathBuf,
@@ -734,12 +1540,13 @@ struct AppfsAdapter {
 #[cfg(test)]
 mod supervisor_tests {
     use super::{
-        build_runtime_cli_args, registry, resolve_runtime_cli_args, runtime_config,
-        AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
+        build_runtime_cli_args, compose, registry, resolve_runtime_cli_args, runtime_config,
+        ActionWakeHandle, AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
     };
     use serde_json::{json, Value as JsonValue};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn bridge_args() -> AppfsBridgeCliArgs {
@@ -783,6 +1590,31 @@ mod supervisor_tests {
         assert!(mount_args.appfs_app_ids.is_empty());
         assert!(mount_args.adapter_http_endpoint.is_none());
         assert!(mount_args.adapter_grpc_endpoint.is_none());
+    }
+
+    #[test]
+    fn action_wake_handle_does_not_drop_pending_signal() {
+        let wake = ActionWakeHandle::new();
+        wake.signal();
+
+        crate::get_runtime().block_on(async move {
+            tokio::time::timeout(Duration::from_millis(50), wake.wait())
+                .await
+                .expect("wake should resolve immediately when already pending");
+        });
+    }
+
+    #[test]
+    fn fallback_poll_interval_is_disabled_by_default() {
+        assert_eq!(super::fallback_poll_interval(0), None);
+    }
+
+    #[test]
+    fn fallback_poll_interval_clamps_small_explicit_values() {
+        assert_eq!(
+            super::fallback_poll_interval(10),
+            Some(Duration::from_millis(super::MIN_POLL_MS))
+        );
     }
 
     #[test]
@@ -875,6 +1707,143 @@ mod supervisor_tests {
         );
     }
 
+    #[test]
+    fn prepare_compose_runtime_non_winfsp_creates_db_and_mountpoint_when_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = compose::schema::AppfsComposeRuntime {
+            db: temp.path().join(".agentfs/compose.db"),
+            mountpoint: temp.path().join("mnt/appfs"),
+            backend: crate::cmd::mount::MountBackend::Nfs,
+            init: compose::schema::AppfsComposeInitMode::IfMissing,
+            reset: false,
+            auto_unmount: true,
+            allow_root: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            poll_ms: 0,
+        };
+
+        let db_path = crate::get_runtime()
+            .block_on(super::prepare_compose_runtime(&runtime))
+            .expect("compose runtime should prepare");
+
+        assert_eq!(db_path, runtime.db.to_string_lossy().to_string());
+        assert!(runtime.db.exists());
+        assert!(runtime.mountpoint.exists());
+        assert!(runtime.mountpoint.is_dir());
+    }
+
+    #[test]
+    fn prepare_compose_runtime_winfsp_creates_parent_without_mountpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let mountpoint = temp.path().join("mnt/appfs");
+        let mount_parent = mountpoint.parent().expect("mount parent").to_path_buf();
+        let runtime = compose::schema::AppfsComposeRuntime {
+            db: temp.path().join(".agentfs/compose.db"),
+            mountpoint: mountpoint.clone(),
+            backend: crate::cmd::mount::MountBackend::Winfsp,
+            init: compose::schema::AppfsComposeInitMode::IfMissing,
+            reset: false,
+            auto_unmount: true,
+            allow_root: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            poll_ms: 0,
+        };
+
+        let db_path = crate::get_runtime()
+            .block_on(super::prepare_compose_runtime(&runtime))
+            .expect("compose runtime should prepare");
+
+        assert_eq!(db_path, runtime.db.to_string_lossy().to_string());
+        assert!(runtime.db.exists());
+        assert!(mount_parent.exists());
+        assert!(mount_parent.is_dir());
+        assert!(!mountpoint.exists());
+    }
+
+    #[test]
+    fn prepare_compose_runtime_winfsp_removes_empty_mountpoint_placeholder() {
+        let temp = TempDir::new().expect("tempdir");
+        let mountpoint = temp.path().join("mnt/appfs");
+        fs::create_dir_all(&mountpoint).expect("create mountpoint placeholder");
+        let runtime = compose::schema::AppfsComposeRuntime {
+            db: temp.path().join(".agentfs/compose.db"),
+            mountpoint: mountpoint.clone(),
+            backend: crate::cmd::mount::MountBackend::Winfsp,
+            init: compose::schema::AppfsComposeInitMode::IfMissing,
+            reset: false,
+            auto_unmount: true,
+            allow_root: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            poll_ms: 0,
+        };
+
+        crate::get_runtime()
+            .block_on(super::prepare_compose_runtime(&runtime))
+            .expect("compose runtime should prepare");
+
+        assert!(!mountpoint.exists());
+    }
+
+    #[test]
+    fn prepare_compose_runtime_reset_removes_existing_db_sidecar() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join(".agentfs/compose.db");
+        let sidecar_path = std::path::PathBuf::from(format!("{}-info", db_path.display()));
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("create parent");
+        fs::write(&db_path, b"stale").expect("write db");
+        fs::write(&sidecar_path, b"stale-sidecar").expect("write sidecar");
+
+        let runtime = compose::schema::AppfsComposeRuntime {
+            db: db_path.clone(),
+            mountpoint: temp.path().join("mnt/appfs"),
+            backend: crate::cmd::mount::MountBackend::default(),
+            init: compose::schema::AppfsComposeInitMode::IfMissing,
+            reset: true,
+            auto_unmount: true,
+            allow_root: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            poll_ms: 0,
+        };
+
+        crate::get_runtime()
+            .block_on(super::prepare_compose_runtime(&runtime))
+            .expect("compose runtime should prepare");
+
+        assert!(db_path.exists());
+        assert!(!sidecar_path.exists());
+    }
+
+    #[test]
+    fn prepare_compose_runtime_never_requires_existing_db() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime = compose::schema::AppfsComposeRuntime {
+            db: temp.path().join(".agentfs/missing.db"),
+            mountpoint: temp.path().join("mnt/appfs"),
+            backend: crate::cmd::mount::MountBackend::default(),
+            init: compose::schema::AppfsComposeInitMode::Never,
+            reset: false,
+            auto_unmount: true,
+            allow_root: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            poll_ms: 0,
+        };
+
+        let err = crate::get_runtime()
+            .block_on(super::prepare_compose_runtime(&runtime))
+            .expect_err("missing db should fail");
+        assert!(err.to_string().contains("runtime.init=never"));
+    }
+
     fn append_text(path: &std::path::Path, text: &str) {
         let mut file = OpenOptions::new()
             .create(true)
@@ -941,6 +1910,7 @@ mod supervisor_tests {
             temp.path().to_path_buf(),
             resolve_runtime_cli_args(runtime_args),
             false,
+            None,
         )
         .expect("supervisor");
         supervisor.prepare_action_sinks().expect("prepare sinks");
@@ -990,6 +1960,7 @@ mod supervisor_tests {
             temp.path().to_path_buf(),
             resolve_runtime_cli_args(runtime_args),
             false,
+            None,
         )
         .expect("supervisor");
         supervisor.prepare_action_sinks().expect("prepare sinks");
@@ -1020,6 +1991,41 @@ mod supervisor_tests {
     }
 
     #[test]
+    fn supervisor_poll_does_not_rewrite_runtime_manifest_without_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let runtime_args = build_runtime_cli_args(
+            Some("aiim".to_string()),
+            Vec::new(),
+            Some("sess-aiim".to_string()),
+            bridge_args(),
+            None,
+        )
+        .expect("build runtime args");
+        let mut supervisor = AppfsRuntimeSupervisor::new(
+            temp.path().to_path_buf(),
+            resolve_runtime_cli_args(runtime_args),
+            false,
+            None,
+        )
+        .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+        supervisor
+            .sync_registry_to_disk(None)
+            .expect("persist registry and manifest");
+
+        let manifest_path = super::runtime_manifest::runtime_manifest_path(temp.path());
+        let before = fs::read(&manifest_path).expect("read manifest before poll");
+
+        supervisor.poll_once().expect("poll once");
+
+        let after = fs::read(&manifest_path).expect("read manifest after poll");
+        assert_eq!(
+            before, after,
+            "runtime manifest should remain byte-for-byte stable when poll_once() has no state changes"
+        );
+    }
+
+    #[test]
     fn supervisor_preserves_existing_registry_registration_time() {
         let temp = TempDir::new().expect("tempdir");
         let runtime_args = build_runtime_cli_args(
@@ -1034,6 +2040,7 @@ mod supervisor_tests {
             temp.path().to_path_buf(),
             resolve_runtime_cli_args(runtime_args),
             false,
+            None,
         )
         .expect("supervisor");
         supervisor.prepare_action_sinks().expect("prepare sinks");
@@ -1089,7 +2096,7 @@ mod supervisor_tests {
     fn supervisor_can_register_app_dynamically_from_empty_runtime() {
         let temp = TempDir::new().expect("tempdir");
         let mut supervisor =
-            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false)
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None)
                 .expect("supervisor");
         supervisor.prepare_action_sinks().expect("prepare sinks");
 
@@ -1131,6 +2138,7 @@ mod supervisor_tests {
             temp.path().to_path_buf(),
             resolve_runtime_cli_args(runtime_args),
             false,
+            None,
         )
         .expect("supervisor");
         supervisor.prepare_action_sinks().expect("prepare sinks");
