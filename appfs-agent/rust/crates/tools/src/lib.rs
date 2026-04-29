@@ -15,7 +15,7 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    grep_search, load_system_prompt_with_appfs,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -43,6 +43,14 @@ use crate::file_tools::{
     prepare_edit, prepare_read, prepare_write, read_tool_result_text, record_edit_result,
     record_read_result, record_write_result, write_tool_result_text,
 };
+
+#[cfg(test)]
+pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -3383,6 +3391,11 @@ fn resolve_primary_skill_for_execution(
                 prompt,
             })
         }
+        commands::ResolvedSkillSource::Generated { id, base_dir } => Ok(ResolvedSkillExecution {
+            path: format!("generated://{id}"),
+            document: skill.document,
+            prompt: prepend_skill_base_directory(&prompt_body, base_dir.as_deref()),
+        }),
     }
 }
 
@@ -3981,7 +3994,7 @@ fn build_agent_runtime(
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
+    let mut prompt = load_system_prompt_with_appfs(
         cwd,
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
@@ -6808,8 +6821,7 @@ mod tests {
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::shared_test_env_lock()
     }
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -7414,6 +7426,29 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn remove_dir_all_with_retry(path: &Path, label: &str) {
+        for attempt in 0..10 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if attempt < 9 => {
+                    #[cfg(windows)]
+                    if error.raw_os_error() == Some(32) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+
+                    #[cfg(not(windows))]
+                    {
+                        let _ = error;
+                    }
+
+                    panic!("{label}: {error}");
+                }
+                Err(error) => panic!("{label}: {error}"),
+            }
+        }
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -8664,7 +8699,7 @@ mod tests {
             .ends_with(".claw/commands/handoff.md"));
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp project should clean up");
+        remove_dir_all_with_retry(&root, "temp project should clean up");
     }
 
     #[test]
@@ -8728,7 +8763,7 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -8990,7 +9025,7 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9026,7 +9061,7 @@ mod tests {
         assert!(expected_root.join("examples").join("server.md").is_file());
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp root should clean up");
+        remove_dir_all_with_retry(&root, "temp root should clean up");
     }
 
     #[test]
@@ -9079,7 +9114,7 @@ mod tests {
         assert!(!prompt.contains("Base directory for this skill: "));
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp root should clean up");
+        remove_dir_all_with_retry(&root, "temp root should clean up");
     }
 
     #[test]
@@ -9153,7 +9188,7 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9211,7 +9246,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9287,7 +9322,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]

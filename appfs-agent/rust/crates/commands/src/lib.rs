@@ -16,11 +16,11 @@ use plugins::{
     PluginError, PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry, PluginSummary,
 };
 use runtime::{
-    load_system_prompt, tool_output_root, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ConversationMessage, ConversationRuntime, McpOAuthConfig, McpServerConfig,
-    MessageRole, PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig, Session,
-    StaticToolExecutor,
+    detect_appfs_environment, load_system_prompt, tool_output_root, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ConversationMessage, ConversationRuntime,
+    McpOAuthConfig, McpServerConfig, MessageRole, PermissionMode, PermissionPolicy, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimeProviderConfig, RuntimeProviderKind,
+    ScopedMcpServerConfig, Session, StaticToolExecutor,
 };
 use serde_json::{json, Value};
 
@@ -44,8 +44,16 @@ pub struct ResolvedSkill {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedSkillSource {
-    Filesystem { path: PathBuf },
-    Bundled { id: BundledSkillId },
+    Filesystem {
+        path: PathBuf,
+    },
+    Bundled {
+        id: BundledSkillId,
+    },
+    Generated {
+        id: String,
+        base_dir: Option<PathBuf>,
+    },
 }
 
 #[must_use]
@@ -61,6 +69,9 @@ pub fn render_resolved_skill_prompt(skill: &ResolvedSkill, args: Option<&str>) -
             },
             args,
         ),
+        ResolvedSkillSource::Generated { .. } => {
+            skill.document.render_markdown_with_arguments(args)
+        }
     }
 }
 
@@ -72,6 +83,7 @@ pub fn resolved_skill_reference_files(skill: &ResolvedSkill) -> BTreeMap<String,
             id: *id,
             document: skill.document.clone(),
         }),
+        ResolvedSkillSource::Generated { .. } => BTreeMap::new(),
     }
 }
 
@@ -2120,6 +2132,13 @@ struct SkillSummary {
 enum SkillLocation {
     Filesystem(PathBuf),
     Bundled(BundledSkillId),
+    Generated(GeneratedSkill),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedSkill {
+    id: String,
+    base_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2461,6 +2480,10 @@ pub fn resolve_skill(cwd: &Path, skill: &str) -> std::io::Result<ResolvedSkill> 
             let source = match skill.location {
                 SkillLocation::Filesystem(path) => ResolvedSkillSource::Filesystem { path },
                 SkillLocation::Bundled(id) => ResolvedSkillSource::Bundled { id },
+                SkillLocation::Generated(generated) => ResolvedSkillSource::Generated {
+                    id: generated.id,
+                    base_dir: generated.base_dir,
+                },
             };
             return Ok(ResolvedSkill {
                 document: skill.document,
@@ -2491,6 +2514,10 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
                 SkillLocation::Bundled(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!("skill `{requested}` is bundled and has no filesystem path"),
+                )),
+                SkillLocation::Generated(generated) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("skill `{}` is generated for the current AppFS app and has no filesystem path", generated.id),
                 )),
             };
         }
@@ -3243,6 +3270,14 @@ fn load_skills_from_roots_impl(
 
     merge_skill_summaries(&mut skills, &mut active_sources, bundled_skill_summaries());
 
+    if let Some(cwd) = activation_cwd {
+        merge_skill_summaries(
+            &mut skills,
+            &mut active_sources,
+            generated_appfs_skill_summaries(cwd),
+        );
+    }
+
     for root in roots {
         merge_skill_summaries(
             &mut skills,
@@ -3269,6 +3304,310 @@ fn bundled_skill_summaries() -> Vec<SkillSummary> {
         .collect::<Vec<_>>();
     bundled_skills.sort_by(|left, right| left.name.cmp(&right.name));
     bundled_skills
+}
+
+fn generated_appfs_skill_summaries(cwd: &Path) -> Vec<SkillSummary> {
+    synthesize_appfs_skill(cwd).into_iter().collect()
+}
+
+fn synthesize_appfs_skill(cwd: &Path) -> Option<SkillSummary> {
+    let environment = detect_appfs_environment(cwd)?;
+    let fallback_app_id = environment.current_app_id?;
+    let app_root = environment.current_app_root?;
+    let control_doc = read_json_value(&app_root.join("_app").join("control.res.json"));
+    let actions_doc = read_json_value(&app_root.join("_app").join("actions.res.json"));
+    let current_scope_doc = read_json_value(&app_root.join("_app").join("current_scope.res.json"));
+    let available_scopes_doc =
+        read_json_value(&app_root.join("_app").join("available_scopes.res.json"));
+
+    let app_id = actions_doc
+        .as_ref()
+        .and_then(|doc| doc.get("app_id").and_then(Value::as_str))
+        .or_else(|| {
+            control_doc
+                .as_ref()
+                .and_then(|doc| doc.get("app_id").and_then(Value::as_str))
+        })
+        .unwrap_or(&fallback_app_id)
+        .to_string();
+
+    if control_doc.is_none()
+        && actions_doc.is_none()
+        && current_scope_doc.is_none()
+        && available_scopes_doc.is_none()
+    {
+        return None;
+    }
+
+    let skill_name = format!("appfs-{app_id}");
+    let description = format!("Operate the current {app_id} AppFS app through append-only action files and event streams.");
+    let when_to_use =
+        build_appfs_skill_when_to_use(&app_id, control_doc.as_ref(), actions_doc.as_ref());
+    let markdown_content = build_appfs_skill_markdown(
+        &app_id,
+        control_doc.as_ref(),
+        actions_doc.as_ref(),
+        current_scope_doc.as_ref(),
+        available_scopes_doc.as_ref(),
+    );
+    let contents = format!(
+        "---\nname: {}\ndescription: {}\nwhen_to_use: {}\nallowed-tools: {}\n---\n\n{markdown_content}\n",
+        yaml_quote_scalar(&skill_name),
+        yaml_quote_scalar(&description),
+        yaml_quote_scalar(&when_to_use),
+        yaml_quote_scalar("bash, read_file, glob_search"),
+    );
+    let document = parse_skill_document(&contents, skill_name.clone(), "Skill");
+
+    Some(SkillSummary {
+        name: document.user_facing_name().to_string(),
+        description: Some(document.description.clone()),
+        location: SkillLocation::Generated(GeneratedSkill {
+            id: skill_name.clone(),
+            base_dir: Some(app_root),
+        }),
+        document,
+        source: DefinitionSource::ProjectClaw,
+        shadowed_by: None,
+        origin: SkillOrigin::SkillsDir,
+    })
+}
+
+fn build_appfs_skill_when_to_use(
+    app_id: &str,
+    control_doc: Option<&Value>,
+    actions_doc: Option<&Value>,
+) -> String {
+    let mut clauses = vec![format!(
+        "Use when the user wants to work with the current {app_id} AppFS app."
+    )];
+    clauses.push(
+        "Load it before performing app-specific control or action-file operations.".to_string(),
+    );
+
+    if let Some(description) = control_doc
+        .and_then(|doc| doc.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        clauses.push(format!("App context: {description}"));
+    }
+
+    let mentions = actions_doc
+        .and_then(|doc| doc.get("contact_routes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route.get("mention_tokens").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(4)
+        .collect::<Vec<_>>();
+    if !mentions.is_empty() {
+        clauses.push(format!(
+            "Especially use it when the user asks to message {}.",
+            mentions.join(" / ")
+        ));
+    }
+
+    let actions = actions_doc
+        .and_then(|doc| doc.get("recommended_actions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("use_when").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(2)
+        .collect::<Vec<_>>();
+    if !actions.is_empty() {
+        clauses.push(actions.join(" "));
+    }
+
+    clauses.join(" ")
+}
+
+fn build_appfs_skill_markdown(
+    app_id: &str,
+    control_doc: Option<&Value>,
+    actions_doc: Option<&Value>,
+    current_scope_doc: Option<&Value>,
+    available_scopes_doc: Option<&Value>,
+) -> String {
+    let mut lines = vec![
+        format!("# appfs-{app_id}"),
+        String::new(),
+        format!(
+            "Operate the mounted `{app_id}` AppFS app by reading resource files and appending one JSON object line to `*.act` sinks."
+        ),
+        String::new(),
+        "## AppFS action rules".to_string(),
+        "- Every `*.act` file is an append-only JSONL sink.".to_string(),
+        "- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string(),
+        "- Use `bash` to append exactly one JSON object plus a trailing newline.".to_string(),
+        "- After appending to an action, inspect `_stream/events.evt.jsonl` for `action.completed` or `action.failed`.".to_string(),
+        "- A reliable check is `tail -n 20 _stream/events.evt.jsonl`.".to_string(),
+    ];
+
+    if let Some(description) = control_doc
+        .and_then(|doc| doc.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        lines.push(String::new());
+        lines.push("## App overview".to_string());
+        lines.push(format!("- {description}"));
+    }
+
+    if let Some(scope_doc) = current_scope_doc {
+        if let Some(active_scope) = scope_doc.get("active_scope").and_then(Value::as_str) {
+            lines.push(String::new());
+            lines.push("## Current scope".to_string());
+            lines.push(format!("- Active scope: `{active_scope}`."));
+        }
+        if let Some(resource) = scope_doc.get("primary_resource").and_then(Value::as_str) {
+            lines.push(format!("- Primary resource: `{resource}`."));
+        }
+    }
+
+    if let Some(scopes_doc) = available_scopes_doc {
+        let scopes = scopes_doc
+            .get("scopes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|scope| scope.get("scope_id").and_then(Value::as_str))
+            .map(|scope| format!("`{scope}`"))
+            .collect::<Vec<_>>();
+        if !scopes.is_empty() {
+            lines.push(format!("- Known scopes: {}.", scopes.join(", ")));
+        }
+    }
+
+    if let Some(actions) = control_doc
+        .and_then(|doc| doc.get("actions"))
+        .and_then(Value::as_array)
+    {
+        append_appfs_skill_action_section(&mut lines, "## App control actions", actions);
+    }
+
+    if let Some(actions) = actions_doc
+        .and_then(|doc| doc.get("recommended_actions"))
+        .and_then(Value::as_array)
+    {
+        lines.push(String::new());
+        lines.push("## Recommended actions".to_string());
+        for action in actions {
+            let path = action
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let summary = action
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("App action");
+            let mut line = format!("- `{path}`: {summary}");
+            if let Some(example) = action.get("example_payload") {
+                if let Ok(example_text) = serde_json::to_string(example) {
+                    line.push_str(&format!(
+                        " Append with: `printf '%s\\n' '{}' >> {path}`.",
+                        example_text.replace('\'', r"'\''")
+                    ));
+                }
+            }
+            lines.push(line);
+            if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
+                let reasons = use_when
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>();
+                if !reasons.is_empty() {
+                    lines.push(format!("  Use when: {}", reasons.join(" ")));
+                }
+            }
+        }
+    }
+
+    if let Some(routes) = actions_doc
+        .and_then(|doc| doc.get("contact_routes"))
+        .and_then(Value::as_array)
+    {
+        lines.push(String::new());
+        lines.push("## Contact routing".to_string());
+        for route in routes {
+            let mention_tokens = route
+                .get("mention_tokens")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|token| format!("`{token}`"))
+                .collect::<Vec<_>>();
+            let path = route
+                .get("send_message_path")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let mentions = if mention_tokens.is_empty() {
+                "<none>".to_string()
+            } else {
+                mention_tokens.join(", ")
+            };
+            lines.push(format!("- {mentions} -> `{path}`."));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("When the task matches this app, load this skill first, then follow the action rules above.".to_string());
+    lines.join("\n")
+}
+
+fn append_appfs_skill_action_section(lines: &mut Vec<String>, title: &str, actions: &[Value]) {
+    if actions.is_empty() {
+        return;
+    }
+
+    lines.push(String::new());
+    lines.push(title.to_string());
+    for action in actions {
+        let path = action
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let summary = action
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("App action");
+        let mut line = format!("- `{path}`: {summary}");
+        if let Some(example) = action.get("example_payload") {
+            if let Ok(example_text) = serde_json::to_string(example) {
+                line.push_str(&format!(
+                    " Append with: `printf '%s\\n' '{}' >> {path}`.",
+                    example_text.replace('\'', r"'\''")
+                ));
+            }
+        }
+        lines.push(line);
+        if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
+            let reasons = use_when
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !reasons.is_empty() {
+                lines.push(format!("  Use when: {}", reasons.join(" ")));
+            }
+        }
+    }
+}
+
+fn read_json_value(path: &Path) -> Option<Value> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn yaml_quote_scalar(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn load_skills_from_root(
@@ -4436,10 +4775,11 @@ mod tests {
         handle_slash_command_with_compactor, load_agents_from_roots, load_skills_from_roots,
         load_skills_from_roots_for_context, normalize_relative_match_path, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
-        resolve_skill, resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand,
+        render_resolved_skill_prompt, render_skills_report, render_slash_command_help,
+        render_slash_command_help_detail, resolve_skill, resolve_skill_path,
+        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4511,10 +4851,141 @@ mod tests {
         .expect("write command");
     }
 
+    fn seed_appfs_skill_mount(root: &Path) -> PathBuf {
+        let mount_root = root.join("mnt");
+        let app_root = mount_root.join("aiim");
+        fs::create_dir_all(mount_root.join("_appfs")).expect("control dir");
+        fs::create_dir_all(app_root.join("_app")).expect("app control dir");
+        fs::create_dir_all(app_root.join("_stream")).expect("stream dir");
+        fs::write(mount_root.join("_appfs").join("register_app.act"), "").expect("register act");
+        fs::write(
+            app_root.join("_app").join("actions.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "recommended_actions": [
+    {
+      "name": "send_message",
+      "path": "contacts/zhangsan/send_message.act",
+      "summary": "Send a direct message to 张三 / zhangsan.",
+      "use_when": [
+        "User asks to tell 张三 / zhangsan / 老张 something."
+      ],
+      "example_payload": {
+        "text": "明天上午十点开会",
+        "priority": "normal"
+      }
+    }
+  ],
+  "contact_routes": [
+    {
+      "contact_id": "zhangsan",
+      "send_message_path": "contacts/zhangsan/send_message.act",
+      "mention_tokens": ["张三", "老张", "zhangsan"]
+    }
+  ]
+}"#,
+        )
+        .expect("write actions doc");
+        fs::write(
+            app_root.join("_app").join("current_scope.res.json"),
+            r#"{"app_id":"aiim","active_scope":"chat-001","primary_resource":"chats/chat-001/messages.res.jsonl"}"#,
+        )
+        .expect("write current scope");
+        fs::write(
+            app_root.join("_app").join("available_scopes.res.json"),
+            r#"{"app_id":"aiim","active_scope":"chat-001","scopes":[{"scope_id":"chat-001"},{"scope_id":"chat-long"}]}"#,
+        )
+        .expect("write scopes");
+        app_root
+    }
+
+    fn seed_control_only_appfs_skill_mount(root: &Path) -> PathBuf {
+        let mount_root = root.join("mnt");
+        let app_root = mount_root.join("scheduler");
+        fs::create_dir_all(mount_root.join("_appfs")).expect("control dir");
+        fs::create_dir_all(app_root.join("_app")).expect("app control dir");
+        fs::create_dir_all(app_root.join("_stream")).expect("stream dir");
+        fs::write(mount_root.join("_appfs").join("register_app.act"), "").expect("register act");
+        fs::write(
+            app_root.join("_app").join("control.res.json"),
+            r#"{
+  "app_id": "scheduler",
+  "description": "Manage meeting scheduling flows inside the current scheduler app.",
+  "events_path": "_stream/events.evt.jsonl",
+  "current_scope_path": "_app/current_scope.res.json",
+  "available_scopes_path": "_app/available_scopes.res.json",
+  "actions": [
+    {
+      "name": "enter_scope",
+      "path": "_app/enter_scope.act",
+      "summary": "Switch to a named scheduling scope.",
+      "example_payload": {
+        "target_scope": "meeting-room-a"
+      }
+    },
+    {
+      "name": "schedule_meeting",
+      "path": "meetings/create.act",
+      "summary": "Create a new meeting with room and attendees.",
+      "example_payload": {
+        "topic": "Design review",
+        "room": "A-301"
+      }
+    }
+  ]
+}"#,
+        )
+        .expect("write control doc");
+        fs::write(
+            app_root.join("_app").join("current_scope.res.json"),
+            r#"{"app_id":"scheduler","active_scope":"meeting-room-a","primary_resource":"meetings/today.res.jsonl"}"#,
+        )
+        .expect("write current scope");
+        fs::write(
+            app_root.join("_app").join("available_scopes.res.json"),
+            r#"{"app_id":"scheduler","active_scope":"meeting-room-a","scopes":[{"scope_id":"meeting-room-a"},{"scope_id":"meeting-room-b"}]}"#,
+        )
+        .expect("write scopes");
+        app_root
+    }
+
     fn parse_error_message(input: &str) -> String {
         SlashCommand::parse(input)
             .expect_err("slash command should be rejected")
             .to_string()
+    }
+
+    #[test]
+    fn resolves_generated_appfs_skill_for_current_app() {
+        let workspace = temp_dir("generated-appfs-skill");
+        let app_root = seed_appfs_skill_mount(&workspace);
+        let cwd = app_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let resolved = resolve_skill(&cwd, "appfs-aiim").expect("generated appfs skill");
+        let prompt = render_resolved_skill_prompt(&resolved, None);
+
+        assert!(prompt.contains("append-only JSONL"));
+        assert!(prompt.contains("contacts/zhangsan/send_message.act"));
+        assert!(prompt.contains("张三"));
+        assert!(prompt.contains("tail -n"));
+    }
+
+    #[test]
+    fn resolves_generated_appfs_skill_from_control_doc_without_actions_doc() {
+        let workspace = temp_dir("generated-appfs-skill-control-only");
+        let app_root = seed_control_only_appfs_skill_mount(&workspace);
+        let cwd = app_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let resolved = resolve_skill(&cwd, "appfs-scheduler").expect("generated scheduler skill");
+        let prompt = render_resolved_skill_prompt(&resolved, None);
+
+        assert!(prompt.contains("Manage meeting scheduling flows"));
+        assert!(prompt.contains("`_app/enter_scope.act`"));
+        assert!(prompt.contains("`meetings/create.act`"));
+        assert!(prompt.contains("meeting-room-b"));
+        assert!(!prompt.contains("contacts/zhangsan/send_message.act"));
     }
 
     #[allow(clippy::too_many_lines)]

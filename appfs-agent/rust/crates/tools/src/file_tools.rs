@@ -6,8 +6,8 @@ use std::time::UNIX_EPOCH;
 
 use commands::activate_conditional_skills_for_paths;
 use runtime::{
-    resolve_tool_path, resolve_tool_path_allow_missing, tool_output_root, EditFileOutput,
-    ReadFileOutput, TextFilePayload, WriteFileOutput,
+    detect_appfs_environment, resolve_tool_path, resolve_tool_path_allow_missing, tool_output_root,
+    EditFileOutput, ReadFileOutput, TextFilePayload, WriteFileOutput,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,8 @@ const READ_BEFORE_WRITE_ERROR: &str =
     "File has not been read yet. Read it first before writing to it.";
 const FILE_UNEXPECTEDLY_MODIFIED_ERROR: &str =
     "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.";
+const APPFS_ACT_WRITE_ERROR_PREFIX: &str =
+    "AppFS action files (`*.act`) are append-only JSONL sinks and must not be overwritten with write_file or edit_file.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FileUnchangedPayload {
@@ -140,6 +142,52 @@ fn activate_skills_for_path(path: &Path) -> Result<(), String> {
     activate_conditional_skills_for_paths(&[path.to_path_buf()], &cwd)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn current_appfs_environment() -> Result<Option<runtime::AppfsEnvironment>, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(detect_appfs_environment(&cwd))
+}
+
+fn appfs_environment_for_path(path: &Path) -> Result<Option<runtime::AppfsEnvironment>, String> {
+    let target = path.parent().unwrap_or(path);
+    if let Some(environment) = detect_appfs_environment(target) {
+        return Ok(Some(environment));
+    }
+    current_appfs_environment()
+}
+
+fn is_appfs_act_path(path: &Path) -> Result<bool, String> {
+    if !path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("act"))
+    {
+        return Ok(false);
+    }
+
+    let Some(environment) = appfs_environment_for_path(path)? else {
+        return Ok(false);
+    };
+
+    let candidates = vec![
+        environment.current_app_root.clone(),
+        environment.control_dir.clone(),
+        Some(environment.mount_root.clone()),
+    ];
+
+    let is_match = candidates
+        .into_iter()
+        .flatten()
+        .any(|root| path.starts_with(root.as_path()));
+    Ok(is_match)
+}
+
+fn appfs_act_write_error(path: &Path) -> String {
+    format!(
+        "{APPFS_ACT_WRITE_ERROR_PREFIX} Use `bash` to append exactly one JSON object and a trailing newline, for example: `printf '%s\\n' '{{...}}' >> {}`.",
+        path.display()
+    )
 }
 
 fn get_state_for_path(path: &Path) -> Result<Option<FileToolState>, String> {
@@ -266,6 +314,9 @@ pub(crate) fn prepare_write(path: &str) -> Result<PreparedWrite, String> {
     let normalized_path =
         resolve_tool_path_allow_missing(path).map_err(|error| error.to_string())?;
     activate_skills_for_path(&normalized_path)?;
+    if is_appfs_act_path(&normalized_path)? {
+        return Err(appfs_act_write_error(&normalized_path));
+    }
     if !normalized_path.exists() {
         return Ok(PreparedWrite { normalized_path });
     }
@@ -307,6 +358,9 @@ pub(crate) fn prepare_edit(
     let normalized_path =
         resolve_tool_path_allow_missing(path).map_err(|error| error.to_string())?;
     activate_skills_for_path(&normalized_path)?;
+    if is_appfs_act_path(&normalized_path)? {
+        return Err(appfs_act_write_error(&normalized_path));
+    }
     let file_exists = normalized_path.exists();
 
     if !file_exists {
@@ -557,4 +611,121 @@ fn apply_curly_single_quotes(value: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prepare_edit, prepare_write};
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos();
+            let path =
+                env::temp_dir().join(format!("file-tools-{label}-{}-{unique}", process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn seed_appfs_mount(root: &Path) -> PathBuf {
+        let mount_root = root.join("mnt");
+        let app_root = mount_root.join("aiim");
+        let control_dir = mount_root.join("_appfs");
+        fs::create_dir_all(&control_dir).expect("create control dir");
+        fs::write(mount_root.join("_appfs").join("register_app.act"), "")
+            .expect("write register action");
+        fs::write(control_dir.join("unregister_app.act"), "").expect("write unregister action");
+        fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
+        fs::write(
+            control_dir.join("apps.registry.json"),
+            r#"{"version":1,"apps":[{"app_id":"aiim","active_scope":"chat-001"}]}"#,
+        )
+        .expect("write registry");
+        fs::create_dir_all(app_root.join("_app")).expect("create app control dir");
+        fs::create_dir_all(app_root.join("_stream")).expect("create app stream dir");
+        fs::create_dir_all(app_root.join("contacts").join("zhangsan")).expect("create contact dir");
+        app_root
+    }
+
+    #[test]
+    fn rejects_write_file_on_appfs_act_path() {
+        let _lock = env_lock();
+        let temp = TempDirGuard::new("reject-act-write");
+        let app_root = seed_appfs_mount(temp.path());
+        let previous = env::current_dir().expect("cwd");
+        env::set_current_dir(&app_root).expect("change cwd");
+
+        let result = prepare_write("contacts/zhangsan/send_message.act")
+            .expect_err("AppFS act path should reject write_file");
+
+        env::set_current_dir(previous).expect("restore cwd");
+        assert!(result.contains("append-only JSONL sinks"));
+        assert!(result.contains("printf '%s\\n'"));
+    }
+
+    #[test]
+    fn rejects_edit_file_on_appfs_act_path() {
+        let _lock = env_lock();
+        let temp = TempDirGuard::new("reject-act-edit");
+        let app_root = seed_appfs_mount(temp.path());
+        let previous = env::current_dir().expect("cwd");
+        env::set_current_dir(&app_root).expect("change cwd");
+
+        let result = prepare_edit(
+            "contacts/zhangsan/send_message.act",
+            "",
+            "{\"text\":\"hi\"}",
+            false,
+        )
+        .expect_err("AppFS act path should reject edit_file");
+
+        env::set_current_dir(previous).expect("restore cwd");
+        assert!(result.contains("append-only JSONL sinks"));
+        assert!(result.contains("write_file or edit_file"));
+    }
+
+    #[test]
+    fn rejects_write_file_on_non_contact_appfs_act_path() {
+        let _lock = env_lock();
+        let temp = TempDirGuard::new("reject-generic-act-write");
+        let app_root = seed_appfs_mount(temp.path());
+        fs::create_dir_all(app_root.join("meetings")).expect("create meetings dir");
+        let previous = env::current_dir().expect("cwd");
+        env::set_current_dir(&app_root).expect("change cwd");
+
+        let result = prepare_write("meetings/create.act")
+            .expect_err("generic AppFS act path should reject write_file");
+
+        env::set_current_dir(previous).expect("restore cwd");
+        assert!(result.contains("append-only JSONL sinks"));
+        assert!(result.contains("printf '%s\\n'"));
+    }
 }
