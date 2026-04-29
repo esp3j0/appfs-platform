@@ -7428,6 +7428,29 @@ mod tests {
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
     }
 
+    fn remove_dir_all_with_retry(path: &Path, label: &str) {
+        for attempt in 0..10 {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if attempt < 9 => {
+                    #[cfg(windows)]
+                    if error.raw_os_error() == Some(32) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+
+                    #[cfg(not(windows))]
+                    {
+                        let _ = error;
+                    }
+
+                    panic!("{label}: {error}");
+                }
+                Err(error) => panic!("{label}: {error}"),
+            }
+        }
+    }
+
     fn run_git(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
             .args(args)
@@ -8676,7 +8699,7 @@ mod tests {
             .ends_with(".claw/commands/handoff.md"));
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp project should clean up");
+        remove_dir_all_with_retry(&root, "temp project should clean up");
     }
 
     #[test]
@@ -8740,7 +8763,7 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9002,7 +9025,7 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9038,7 +9061,7 @@ mod tests {
         assert!(expected_root.join("examples").join("server.md").is_file());
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp root should clean up");
+        remove_dir_all_with_retry(&root, "temp root should clean up");
     }
 
     #[test]
@@ -9091,7 +9114,7 @@ mod tests {
         assert!(!prompt.contains("Base directory for this skill: "));
 
         restore_cwd(&original_dir);
-        fs::remove_dir_all(root).expect("temp root should clean up");
+        remove_dir_all_with_retry(&root, "temp root should clean up");
     }
 
     #[test]
@@ -9165,7 +9188,7 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9223,7 +9246,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
@@ -9299,7 +9322,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        fs::remove_dir_all(root).expect("temp tree should clean up");
+        remove_dir_all_with_retry(&root, "temp tree should clean up");
     }
 
     #[test]
