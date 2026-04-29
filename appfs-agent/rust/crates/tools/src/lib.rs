@@ -44,6 +44,14 @@ use crate::file_tools::{
     record_read_result, record_write_result, write_tool_result_text,
 };
 
+#[cfg(test)]
+pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -6813,8 +6821,7 @@ mod tests {
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::shared_test_env_lock()
     }
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {

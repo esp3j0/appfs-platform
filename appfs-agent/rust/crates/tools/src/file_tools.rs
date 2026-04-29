@@ -612,7 +612,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDirGuard {
@@ -643,8 +642,7 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::shared_test_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -652,9 +650,17 @@ mod tests {
     fn seed_appfs_mount(root: &Path) -> PathBuf {
         let mount_root = root.join("mnt");
         let app_root = mount_root.join("aiim");
-        fs::create_dir_all(mount_root.join("_appfs")).expect("create control dir");
+        let control_dir = mount_root.join("_appfs");
+        fs::create_dir_all(&control_dir).expect("create control dir");
         fs::write(mount_root.join("_appfs").join("register_app.act"), "")
             .expect("write register action");
+        fs::write(control_dir.join("unregister_app.act"), "").expect("write unregister action");
+        fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
+        fs::write(
+            control_dir.join("apps.registry.json"),
+            r#"{"version":1,"apps":[{"app_id":"aiim","active_scope":"chat-001"}]}"#,
+        )
+        .expect("write registry");
         fs::create_dir_all(app_root.join("_app")).expect("create app control dir");
         fs::create_dir_all(app_root.join("_stream")).expect("create app stream dir");
         fs::create_dir_all(app_root.join("contacts").join("zhangsan")).expect("create contact dir");
