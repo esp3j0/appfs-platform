@@ -118,27 +118,6 @@ struct AppfsPromptControlDoc {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct AppfsPromptRecommendedAction {
-    #[serde(default)]
-    use_when: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AppfsPromptContactRoute {
-    #[serde(default)]
-    mention_tokens: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AppfsPromptActionsDoc {
-    app_id: String,
-    #[serde(default)]
-    recommended_actions: Vec<AppfsPromptRecommendedAction>,
-    #[serde(default)]
-    contact_routes: Vec<AppfsPromptContactRoute>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct AppfsPromptCurrentScopeDoc {
     app_id: String,
     active_scope: String,
@@ -646,15 +625,6 @@ fn render_appfs_prompt_section(environment: &AppfsEnvironment) -> String {
     render_mount_prompt_section(environment)
 }
 
-#[derive(Debug, Clone)]
-struct AppfsPromptAppSummary {
-    app_id: String,
-    description: Option<String>,
-    skill_name: String,
-    when_to_use: String,
-    active_scope: Option<String>,
-}
-
 fn render_mount_prompt_section(environment: &AppfsEnvironment) -> String {
     let register_path = environment
         .register_app_path
@@ -671,7 +641,7 @@ fn render_mount_prompt_section(environment: &AppfsEnvironment) -> String {
         .as_deref()
         .map(|path| display_virtualish_path(&environment.mount_root, path))
         .unwrap_or_else(|| "_appfs/_stream/events.evt.jsonl".to_string());
-    let mut lines = render_appfs_overview_lines(
+    let lines = render_appfs_overview_lines(
         environment,
         None,
         None,
@@ -679,8 +649,16 @@ fn render_mount_prompt_section(environment: &AppfsEnvironment) -> String {
         Some(&register_path),
         Some(&list_path),
     );
-    append_mounted_apps_lines(&mut lines, environment, None);
     lines.join("\n")
+}
+
+fn summarize_registered_app_ids(environment: &AppfsEnvironment) -> Option<String> {
+    let app_ids = environment
+        .registered_apps
+        .iter()
+        .map(|app| format!("`{}`", app.app_id))
+        .collect::<Vec<_>>();
+    (!app_ids.is_empty()).then(|| app_ids.join(", "))
 }
 
 fn render_current_app_prompt_section(
@@ -781,8 +759,6 @@ fn render_current_app_prompt_section(
         lines.push(format!("- Alternate scopes are listed in `{doc}`."));
     }
 
-    append_mounted_apps_lines(&mut lines, environment, Some(current_app_id));
-
     lines.join("\n")
 }
 
@@ -807,6 +783,8 @@ fn render_appfs_overview_lines(
             .to_string(),
         "- Do not guess act schemas or payload shapes. For each mounted app, load its `appfs-<app>` skill to learn what actions exist, what parameters each action expects, and when to use them."
             .to_string(),
+        "- Mounted app skills are listed separately in the skill listing attachment. Use the `Skill` tool to load the matching app skill before doing app-specific work."
+            .to_string(),
         format!("- Current AppFS mount root: `{}`.", environment.mount_root.display()),
     ];
 
@@ -820,6 +798,11 @@ fn render_appfs_overview_lines(
             "- You are inside an AppFS mount, but not currently inside a specific app root."
                 .to_string(),
         );
+        if let Some(app_ids) = summarize_registered_app_ids(environment) {
+            lines.push(format!(
+                "- Mounted apps currently detected under this root: {app_ids}. Use the skill listing to load the matching `appfs-<app>` skill before doing app-specific work."
+            ));
+        }
     }
 
     if let Some(register_path) = register_path {
@@ -835,157 +818,6 @@ fn render_appfs_overview_lines(
 
     lines
 }
-
-fn current_app_skill_name(app_id: &str) -> String {
-    format!("appfs-{app_id}")
-}
-
-fn current_app_skill_when_to_use(
-    app_id: &str,
-    control_doc: Option<&AppfsPromptControlDoc>,
-    actions_doc: Option<&AppfsPromptActionsDoc>,
-) -> String {
-    let mut clauses = vec![format!(
-        "Use it when the user wants to work with the current `{app_id}` app."
-    )];
-    clauses.push(
-        "Load it before performing app-specific control or action-file operations.".to_string(),
-    );
-
-    if let Some(description) = control_doc
-        .and_then(|doc| doc.description.as_deref())
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        clauses.push(format!("App context: {description}"));
-    }
-
-    let mention_tokens = actions_doc
-        .into_iter()
-        .flat_map(|doc| doc.contact_routes.iter())
-        .flat_map(|route| route.mention_tokens.iter())
-        .take(4)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !mention_tokens.is_empty() {
-        clauses.push(format!(
-            "Especially use it when the user asks to message {}.",
-            mention_tokens.join(" / ")
-        ));
-    }
-
-    let use_when = actions_doc
-        .into_iter()
-        .flat_map(|doc| doc.recommended_actions.iter())
-        .flat_map(|action| action.use_when.iter())
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !use_when.is_empty() {
-        clauses.push(use_when.join(" "));
-    }
-
-    clauses.join(" ")
-}
-
-fn append_mounted_apps_lines(
-    lines: &mut Vec<String>,
-    environment: &AppfsEnvironment,
-    current_app_id: Option<&str>,
-) {
-    let app_summaries = collect_prompt_app_summaries(environment, current_app_id);
-    lines.push(String::new());
-    lines.push("## Mounted apps".to_string());
-    if app_summaries.is_empty() {
-        lines.push(
-            "- No mounted apps were discovered from the current AppFS registry. Use the platform control plane or move into an app root to discover app-specific skills."
-                .to_string(),
-        );
-        return;
-    }
-
-    for summary in app_summaries {
-        let mut line = format!("- `{}` -> skill `{}`.", summary.app_id, summary.skill_name);
-        if let Some(scope) = summary.active_scope.as_deref() {
-            line.push_str(&format!(" Active scope: `{scope}`."));
-        }
-        if let Some(description) = summary.description.as_deref() {
-            line.push_str(&format!(" Purpose: {description}"));
-        }
-        line.push_str(&format!(" When to use: {}", summary.when_to_use));
-        lines.push(line);
-    }
-}
-
-fn collect_prompt_app_summaries(
-    environment: &AppfsEnvironment,
-    current_app_id: Option<&str>,
-) -> Vec<AppfsPromptAppSummary> {
-    let mut app_ids = environment
-        .registered_apps
-        .iter()
-        .map(|app| app.app_id.clone())
-        .collect::<Vec<_>>();
-    if let Some(app_id) = current_app_id {
-        if !app_ids.iter().any(|existing| existing == app_id) {
-            app_ids.push(app_id.to_string());
-        }
-    }
-    app_ids.sort();
-    app_ids.dedup();
-
-    app_ids
-        .into_iter()
-        .filter_map(|app_id| build_prompt_app_summary(environment, &app_id))
-        .collect()
-}
-
-fn build_prompt_app_summary(
-    environment: &AppfsEnvironment,
-    app_id: &str,
-) -> Option<AppfsPromptAppSummary> {
-    let app_root = environment.mount_root.join(app_id);
-    let control_doc: Option<AppfsPromptControlDoc> =
-        read_json_file(&app_root.join("_app").join("control.res.json"));
-    let actions_doc: Option<AppfsPromptActionsDoc> =
-        read_json_file(&app_root.join("_app").join("actions.res.json"));
-    let scope_doc: Option<AppfsPromptCurrentScopeDoc> =
-        read_json_file(&app_root.join("_app").join("current_scope.res.json"));
-
-    if control_doc.is_none() && actions_doc.is_none() && !app_root.exists() {
-        return None;
-    }
-
-    let effective_app_id = actions_doc
-        .as_ref()
-        .map(|doc| doc.app_id.as_str())
-        .or_else(|| control_doc.as_ref().map(|doc| doc.app_id.as_str()))
-        .unwrap_or(app_id);
-
-    let active_scope = scope_doc
-        .as_ref()
-        .map(|doc| doc.active_scope.clone())
-        .or_else(|| {
-            environment
-                .registered_apps
-                .iter()
-                .find(|app| app.app_id == app_id)
-                .and_then(|app| app.active_scope.clone())
-        });
-
-    Some(AppfsPromptAppSummary {
-        app_id: effective_app_id.to_string(),
-        description: control_doc.as_ref().and_then(|doc| doc.description.clone()),
-        skill_name: current_app_skill_name(effective_app_id),
-        when_to_use: current_app_skill_when_to_use(
-            effective_app_id,
-            control_doc.as_ref(),
-            actions_doc.as_ref(),
-        ),
-        active_scope,
-    })
-}
-
 fn display_virtualish_path(base: &Path, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(base) {
         let rendered = relative
@@ -1396,14 +1228,12 @@ mod tests {
 
         assert!(prompt.contains("AppFS mounts bridge-backed software into a filesystem"));
         assert!(prompt.contains("Do not guess act schemas or payload shapes"));
-        assert!(prompt.contains("## Mounted apps"));
-        assert!(prompt.contains("`aiim` -> skill `appfs-aiim`"));
-        assert!(prompt.contains(
-            "When to use: Use it when the user wants to work with the current `aiim` app."
-        ));
+        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
         assert!(prompt.contains("chat-long"));
         assert!(prompt.contains("_stream/events.evt.jsonl"));
+        assert!(!prompt.contains("## Mounted apps"));
+        assert!(!prompt.contains("`aiim` -> skill `appfs-aiim`"));
     }
 
     #[test]
@@ -1418,12 +1248,30 @@ mod tests {
 
         let prompt = build_appfs_prompt_section(&cwd).expect("expected appfs prompt section");
 
-        assert!(prompt.contains("## Mounted apps"));
-        assert!(prompt.contains("`scheduler` -> skill `appfs-scheduler`"));
+        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Scheduler app for room bookings and meeting setup."));
         assert!(prompt.contains("meeting-room-b"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
+        assert!(!prompt.contains("## Mounted apps"));
+        assert!(!prompt.contains("`scheduler` -> skill `appfs-scheduler`"));
         assert!(!prompt.contains("message 张三 / 老张 / zhangsan"));
+    }
+
+    #[test]
+    fn appfs_prompt_section_surfaces_registered_apps_from_mount_root() {
+        let temp = TempDirGuard::new("appfs-prompt-mount-root");
+        let mount_root = temp.path().join("mnt");
+        let app_root = mount_root.join("aiim");
+        seed_heuristic_mount(&mount_root);
+        seed_aiim_prompt_files(&app_root);
+
+        let prompt = build_appfs_prompt_section(&mount_root).expect("expected appfs prompt section");
+
+        assert!(prompt.contains("You are inside an AppFS mount, but not currently inside a specific app root."));
+        assert!(prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`."));
+        assert!(prompt.contains("Use the skill listing to load the matching `appfs-<app>` skill"));
+        assert!(!prompt.contains("## Mounted apps"));
+        assert!(!prompt.contains("`aiim` -> skill `appfs-aiim`"));
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub enum AttachmentKind {
     RunningAgents,
     TodoList,
     PlanMode,
+    SkillListing,
     InvokedSkills,
     HookAdditionalContext,
 }
@@ -1166,6 +1167,7 @@ impl AttachmentKind {
             Self::RunningAgents => "running_agents",
             Self::TodoList => "todo_list",
             Self::PlanMode => "plan_mode",
+            Self::SkillListing => "skill_listing",
             Self::InvokedSkills => "invoked_skills",
             Self::HookAdditionalContext => "hook_additional_context",
         }
@@ -1179,6 +1181,7 @@ impl AttachmentKind {
             "running_agents" => Ok(Self::RunningAgents),
             "todo_list" => Ok(Self::TodoList),
             "plan_mode" => Ok(Self::PlanMode),
+            "skill_listing" => Ok(Self::SkillListing),
             "invoked_skills" => Ok(Self::InvokedSkills),
             "hook_additional_context" => Ok(Self::HookAdditionalContext),
             other => Err(SessionError::Format(format!(

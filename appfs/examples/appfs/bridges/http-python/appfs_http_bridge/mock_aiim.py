@@ -226,6 +226,17 @@ class MockAiimBackend:
                 "scope": None,
             },
             {
+                "path": "_app/skill.res.json",
+                "kind": "static_json_resource",
+                "manifest_entry": self._json_resource_manifest(
+                    "_app/skill.res.json",
+                    "_meta/schemas/app.skill.output.schema.json",
+                ),
+                "seed_content": self._app_skill_resource(),
+                "mutable": False,
+                "scope": None,
+            },
+            {
                 "path": "_app/actions.res.json",
                 "kind": "static_json_resource",
                 "manifest_entry": self._json_resource_manifest(
@@ -396,6 +407,24 @@ class MockAiimBackend:
                     "example_payload": {},
                 },
             ],
+        }
+
+    def _app_skill_resource(self) -> dict[str, Any]:
+        return {
+            "app_id": "aiim",
+            "description": "一个 AI 专用的聊天软件，用于收发消息。",
+            "when_to_use": [
+                "当用户想要向某人发送消息、查看聊天记录，或者处理其他与聊天相关的任务时使用。",
+                "在当前挂载的 AIIM app 上执行专用 act 或控制操作之前，先加载这个 skill。",
+            ],
+            "overview_markdown": "AIIM 是当前挂载出来的聊天软件。你可以用它查看聊天记录、给联系人发送消息，并在需要时切换不同聊天 scope 后再继续读取或操作。",
+            "allowed_tools": ["bash", "read_file", "glob_search"],
+            "include_generated_sections": {
+                "scope_summary": True,
+                "control_actions": True,
+                "recommended_actions": True,
+                "contact_routing": True,
+            },
         }
 
     def _app_actions_resource(self) -> dict[str, Any]:

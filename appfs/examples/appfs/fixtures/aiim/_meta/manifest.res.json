@@ -87,6 +87,11 @@
       "output_mode": "json",
       "output_schema": "_meta/schemas/app.control.output.schema.json"
     },
+    "_app/skill.res.json": {
+      "kind": "resource",
+      "output_mode": "json",
+      "output_schema": "_meta/schemas/app.skill.output.schema.json"
+    },
     "_app/actions.res.json": {
       "kind": "resource",
       "output_mode": "json",

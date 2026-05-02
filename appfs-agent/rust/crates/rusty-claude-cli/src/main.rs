@@ -59,6 +59,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
     execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
+    should_inject_model_facing_skill_listing, sync_model_facing_skill_listing,
     GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
@@ -179,8 +180,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => LiveCli::print_mcp(args.as_deref(), output_format)?,
         CliAction::Skills {
             args,
+            cwd,
             output_format,
-        } => LiveCli::print_skills(args.as_deref(), output_format)?,
+        } => LiveCli::print_skills_in(cwd.as_deref(), args.as_deref(), output_format)?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -208,25 +210,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             base_commit,
+            cwd,
             ..
         } => {
-            run_stale_base_preflight(base_commit.as_deref());
-            // Only consume piped stdin as prompt context when the permission
-            // mode is fully unattended. In modes where the permission
-            // prompter may invoke CliPermissionPrompter::decide(), stdin
-            // must remain available for interactive approval; otherwise the
-            // prompter's read_line() would hit EOF and deny every request.
-            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
-                read_piped_stdin()
-            } else {
-                None
-            };
-            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
-                &effective_prompt,
-                output_format,
-                compact,
-            )?;
+            run_with_optional_cwd(cwd.as_deref(), || {
+                run_stale_base_preflight(base_commit.as_deref());
+                // Only consume piped stdin as prompt context when the permission
+                // mode is fully unattended. In modes where the permission
+                // prompter may invoke CliPermissionPrompter::decide(), stdin
+                // must remain available for interactive approval; otherwise the
+                // prompter's read_line() would hit EOF and deny every request.
+                let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess)
+                {
+                    read_piped_stdin()
+                } else {
+                    None
+                };
+                let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+                LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
+                    &effective_prompt,
+                    output_format,
+                    compact,
+                )
+            })?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -275,6 +281,7 @@ enum CliAction {
     },
     Skills {
         args: Option<String>,
+        cwd: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
     PrintSystemPrompt {
@@ -302,6 +309,7 @@ enum CliAction {
     },
     Prompt {
         prompt: String,
+        cwd: Option<PathBuf>,
         model: String,
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
@@ -453,6 +461,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
+                    cwd: None,
                     model: resolve_model_alias_with_config(&model),
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
@@ -549,10 +558,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         }),
         "skills" => {
-            let args = join_optional_args(&rest[1..]);
+            let (cwd, args_vec) = parse_optional_cwd_prefix(&rest[1..])?;
+            let args = join_optional_args(&args_vec);
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
                     prompt,
+                    cwd,
                     model,
                     output_format,
                     allowed_tools,
@@ -563,6 +574,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
+                    cwd,
                     output_format,
                 }),
             }
@@ -576,12 +588,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "branch" => parse_branch_args(&rest[1..]),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
-            let prompt = rest[1..].join(" ");
+            let (cwd, prompt_args) = parse_optional_cwd_prefix(&rest[1..])?;
+            let prompt = prompt_args.join(" ");
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
             Ok(CliAction::Prompt {
                 prompt,
+                cwd,
                 model,
                 output_format,
                 allowed_tools,
@@ -602,6 +616,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         ),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
+            cwd: None,
             model,
             output_format,
             allowed_tools,
@@ -723,6 +738,7 @@ fn parse_direct_slash_cli_action(
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
                     prompt,
+                    cwd: None,
                     model,
                     output_format,
                     allowed_tools,
@@ -733,6 +749,7 @@ fn parse_direct_slash_cli_action(
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
+                    cwd: None,
                     output_format,
                 }),
             }
@@ -1069,6 +1086,37 @@ fn parse_system_prompt_args(
         date,
         output_format,
     })
+}
+
+fn parse_optional_cwd_prefix(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    if args.len() >= 2 && args[0] == "--cwd" {
+        return Ok((Some(PathBuf::from(&args[1])), args[2..].to_vec()));
+    }
+    if let Some(value) = args
+        .first()
+        .and_then(|arg| arg.strip_prefix("--cwd="))
+        .filter(|value| !value.is_empty())
+    {
+        return Ok((Some(PathBuf::from(value)), args[1..].to_vec()));
+    }
+    Ok((None, args.to_vec()))
+}
+
+fn run_with_optional_cwd<T, F>(
+    cwd: Option<&Path>,
+    action: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+{
+    let Some(target_cwd) = cwd else {
+        return action();
+    };
+    let previous_cwd = env::current_dir()?;
+    env::set_current_dir(target_cwd)?;
+    let result = action();
+    let _ = env::set_current_dir(previous_cwd);
+    result
 }
 
 fn parse_config_args(args: &[String]) -> Result<CliAction, String> {
@@ -4027,7 +4075,7 @@ impl LiveCli {
                 match classify_skills_slash_command(args.as_deref()) {
                     SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
                     SkillSlashDispatch::Local => {
-                        Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
+                        Self::print_skills_in(None, args.as_deref(), CliOutputFormat::Text)?;
                     }
                 }
                 false
@@ -4397,19 +4445,22 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_skills(
+    fn print_skills_in(
+        cwd_override: Option<&Path>,
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let cwd = env::current_dir()?;
-        match output_format {
-            CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
-                "{}",
-                serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
-            ),
-        }
-        Ok(())
+        run_with_optional_cwd(cwd_override, || {
+            let cwd = env::current_dir()?;
+            match output_format {
+                CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
+                ),
+            }
+            Ok(())
+        })
     }
 
     fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
@@ -7069,6 +7120,11 @@ fn build_runtime_with_plugin_state(
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
+    let cwd = env::current_dir()?;
+    let mut session = session;
+    if should_inject_model_facing_skill_listing(enable_tools, allowed_tools.as_ref()) {
+        sync_model_facing_skill_listing(&mut session, &cwd).map_err(std::io::Error::other)?;
+    }
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
@@ -9298,6 +9354,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9434,6 +9491,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
+                cwd: None,
                 model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
@@ -9464,6 +9522,7 @@ mod tests {
             parsed,
             CliAction::Prompt {
                 prompt: "summarize this".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9506,6 +9565,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
+                cwd: None,
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9633,6 +9693,7 @@ mod tests {
             parsed,
             CliAction::Prompt {
                 prompt: "do the thing".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -9697,6 +9758,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_prompt_subcommand_with_cwd_override() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "prompt".to_string(),
+            "--cwd".to_string(),
+            "/tmp/project".to_string(),
+            "hello".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("prompt cwd args should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                cwd: Some(PathBuf::from("/tmp/project")),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_skills_subcommand_with_cwd_override() {
+        let args = vec![
+            "skills".to_string(),
+            "--cwd".to_string(),
+            "/tmp/project".to_string(),
+            "help".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("skills cwd args should parse"),
+            CliAction::Skills {
+                args: Some("help".to_string()),
+                cwd: Some(PathBuf::from("/tmp/project")),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
     fn parses_login_and_logout_subcommands() {
         assert_eq!(
             parse_args(&["login".to_string()]).expect("login should parse"),
@@ -9740,6 +9845,7 @@ mod tests {
             parse_args(&["skills".to_string()]).expect("skills should parse"),
             CliAction::Skills {
                 args: None,
+                cwd: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -9752,6 +9858,7 @@ mod tests {
             .expect("skills help overview should invoke"),
             CliAction::Prompt {
                 prompt: "$help overview".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -10158,6 +10265,7 @@ mod tests {
             .expect("json /skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
+                cwd: None,
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -10182,6 +10290,7 @@ mod tests {
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "help me debug".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -10214,6 +10323,7 @@ mod tests {
             parse_args(&["/skills".to_string()]).expect("/skills should parse"),
             CliAction::Skills {
                 args: None,
+                cwd: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -10222,6 +10332,7 @@ mod tests {
                 .expect("/skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string()),
+                cwd: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -10234,6 +10345,7 @@ mod tests {
             .expect("/skills help overview should invoke"),
             CliAction::Prompt {
                 prompt: "$help overview".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -10252,6 +10364,7 @@ mod tests {
             .expect("/skills install should parse"),
             CliAction::Skills {
                 args: Some("install ./fixtures/help-skill".to_string()),
+                cwd: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -10260,6 +10373,7 @@ mod tests {
                 .expect("/skills /test should normalize to a single skill prompt prefix"),
             CliAction::Prompt {
                 prompt: "$test".to_string(),
+                cwd: None,
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,

@@ -3307,22 +3307,85 @@ fn bundled_skill_summaries() -> Vec<SkillSummary> {
 }
 
 fn generated_appfs_skill_summaries(cwd: &Path) -> Vec<SkillSummary> {
-    synthesize_appfs_skill(cwd).into_iter().collect()
+    let Some(environment) = detect_appfs_environment(cwd) else {
+        return Vec::new();
+    };
+
+    let mut candidates = BTreeMap::<String, PathBuf>::new();
+    for app in &environment.registered_apps {
+        candidates
+            .entry(app.app_id.clone())
+            .or_insert_with(|| environment.mount_root.join(&app.app_id));
+    }
+
+    if let (Some(app_id), Some(app_root)) = (
+        environment.current_app_id.as_ref(),
+        environment.current_app_root.as_ref(),
+    ) {
+        candidates
+            .entry(app_id.clone())
+            .or_insert_with(|| app_root.clone());
+    }
+
+    if candidates.is_empty() {
+        for child in discover_app_roots_under_mount(&environment.mount_root) {
+            if let Some(app_id) = child
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+            {
+                candidates.entry(app_id).or_insert(child);
+            }
+        }
+    }
+
+    let mut summaries = candidates
+        .into_iter()
+        .filter_map(|(app_id, app_root)| synthesize_appfs_skill_for_app(&app_id, &app_root))
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    summaries
 }
 
-fn synthesize_appfs_skill(cwd: &Path) -> Option<SkillSummary> {
-    let environment = detect_appfs_environment(cwd)?;
-    let fallback_app_id = environment.current_app_id?;
-    let app_root = environment.current_app_root?;
+fn discover_app_roots_under_mount(mount_root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(mount_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), "_appfs" | ".well-known") {
+                return None;
+            }
+            let looks_like_app =
+                path.join("_app").is_dir() || path.join("_stream").is_dir();
+            looks_like_app.then_some(path)
+        })
+        .collect()
+}
+
+fn synthesize_appfs_skill_for_app(fallback_app_id: &str, app_root: &Path) -> Option<SkillSummary> {
+    let skill_doc = read_json_value(&app_root.join("_app").join("skill.res.json"));
     let control_doc = read_json_value(&app_root.join("_app").join("control.res.json"));
     let actions_doc = read_json_value(&app_root.join("_app").join("actions.res.json"));
     let current_scope_doc = read_json_value(&app_root.join("_app").join("current_scope.res.json"));
     let available_scopes_doc =
         read_json_value(&app_root.join("_app").join("available_scopes.res.json"));
 
-    let app_id = actions_doc
+    let app_id = skill_doc
         .as_ref()
         .and_then(|doc| doc.get("app_id").and_then(Value::as_str))
+        .or_else(|| {
+            actions_doc
+                .as_ref()
+                .and_then(|doc| doc.get("app_id").and_then(Value::as_str))
+        })
         .or_else(|| {
             control_doc
                 .as_ref()
@@ -3331,7 +3394,8 @@ fn synthesize_appfs_skill(cwd: &Path) -> Option<SkillSummary> {
         .unwrap_or(&fallback_app_id)
         .to_string();
 
-    if control_doc.is_none()
+    if skill_doc.is_none()
+        && control_doc.is_none()
         && actions_doc.is_none()
         && current_scope_doc.is_none()
         && available_scopes_doc.is_none()
@@ -3340,22 +3404,28 @@ fn synthesize_appfs_skill(cwd: &Path) -> Option<SkillSummary> {
     }
 
     let skill_name = format!("appfs-{app_id}");
-    let description = format!("Operate the current {app_id} AppFS app through append-only action files and event streams.");
-    let when_to_use =
-        build_appfs_skill_when_to_use(&app_id, control_doc.as_ref(), actions_doc.as_ref());
+    let description = appfs_skill_override_description(skill_doc.as_ref()).unwrap_or_else(|| {
+        format!("Operate the current {app_id} AppFS app through append-only action files and event streams.")
+    });
+    let when_to_use = appfs_skill_override_when_to_use(skill_doc.as_ref()).unwrap_or_else(|| {
+        build_appfs_skill_when_to_use(&app_id, control_doc.as_ref(), actions_doc.as_ref())
+    });
     let markdown_content = build_appfs_skill_markdown(
         &app_id,
+        skill_doc.as_ref(),
         control_doc.as_ref(),
         actions_doc.as_ref(),
         current_scope_doc.as_ref(),
         available_scopes_doc.as_ref(),
     );
+    let allowed_tools = appfs_skill_allowed_tools(skill_doc.as_ref())
+        .unwrap_or_else(|| "bash, read_file, glob_search".to_string());
     let contents = format!(
         "---\nname: {}\ndescription: {}\nwhen_to_use: {}\nallowed-tools: {}\n---\n\n{markdown_content}\n",
         yaml_quote_scalar(&skill_name),
         yaml_quote_scalar(&description),
         yaml_quote_scalar(&when_to_use),
-        yaml_quote_scalar("bash, read_file, glob_search"),
+        yaml_quote_scalar(&allowed_tools),
     );
     let document = parse_skill_document(&contents, skill_name.clone(), "Skill");
 
@@ -3364,13 +3434,96 @@ fn synthesize_appfs_skill(cwd: &Path) -> Option<SkillSummary> {
         description: Some(document.description.clone()),
         location: SkillLocation::Generated(GeneratedSkill {
             id: skill_name.clone(),
-            base_dir: Some(app_root),
+            base_dir: Some(app_root.to_path_buf()),
         }),
         document,
         source: DefinitionSource::ProjectClaw,
         shadowed_by: None,
         origin: SkillOrigin::SkillsDir,
     })
+}
+
+fn appfs_skill_override_description(skill_doc: Option<&Value>) -> Option<String> {
+    skill_doc
+        .and_then(|doc| doc.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn appfs_skill_override_when_to_use(skill_doc: Option<&Value>) -> Option<String> {
+    let doc = skill_doc?;
+    if let Some(text) = doc
+        .get("when_to_use")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+
+    let clauses = doc
+        .get("when_to_use")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join(" "))
+    }
+}
+
+fn appfs_skill_allowed_tools(skill_doc: Option<&Value>) -> Option<String> {
+    let tools = skill_doc
+        .and_then(|doc| doc.get("allowed_tools"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+        .collect::<Vec<_>>();
+    if tools.is_empty() {
+        None
+    } else {
+        Some(tools.join(", "))
+    }
+}
+
+fn appfs_skill_overview_markdown(skill_doc: Option<&Value>, app_id: &str) -> (String, bool) {
+    if let Some(overview) = skill_doc
+        .and_then(|doc| doc.get("overview_markdown"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|overview| !overview.is_empty())
+    {
+        return (overview.to_string(), true);
+    }
+
+    if let Some(description) = appfs_skill_override_description(skill_doc) {
+        return (description, true);
+    }
+
+    (
+        format!(
+            "Operate the mounted `{app_id}` AppFS app by reading resource files and appending one JSON object line to `*.act` sinks."
+        ),
+        false,
+    )
+}
+
+fn appfs_skill_generated_section_enabled(skill_doc: Option<&Value>, section: &str) -> bool {
+    skill_doc
+        .and_then(|doc| doc.get("include_generated_sections"))
+        .and_then(|sections| sections.get(section))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
 }
 
 fn build_appfs_skill_when_to_use(
@@ -3430,17 +3583,18 @@ fn build_appfs_skill_when_to_use(
 
 fn build_appfs_skill_markdown(
     app_id: &str,
+    skill_doc: Option<&Value>,
     control_doc: Option<&Value>,
     actions_doc: Option<&Value>,
     current_scope_doc: Option<&Value>,
     available_scopes_doc: Option<&Value>,
 ) -> String {
+    let (overview_markdown, uses_skill_narrative) =
+        appfs_skill_overview_markdown(skill_doc, app_id);
     let mut lines = vec![
         format!("# appfs-{app_id}"),
         String::new(),
-        format!(
-            "Operate the mounted `{app_id}` AppFS app by reading resource files and appending one JSON object line to `*.act` sinks."
-        ),
+        overview_markdown,
         String::new(),
         "## AppFS action rules".to_string(),
         "- Every `*.act` file is an append-only JSONL sink.".to_string(),
@@ -3450,111 +3604,121 @@ fn build_appfs_skill_markdown(
         "- A reliable check is `tail -n 20 _stream/events.evt.jsonl`.".to_string(),
     ];
 
-    if let Some(description) = control_doc
-        .and_then(|doc| doc.get("description"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        lines.push(String::new());
-        lines.push("## App overview".to_string());
-        lines.push(format!("- {description}"));
-    }
-
-    if let Some(scope_doc) = current_scope_doc {
-        if let Some(active_scope) = scope_doc.get("active_scope").and_then(Value::as_str) {
+    if !uses_skill_narrative {
+        if let Some(description) = control_doc
+            .and_then(|doc| doc.get("description"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
             lines.push(String::new());
-            lines.push("## Current scope".to_string());
-            lines.push(format!("- Active scope: `{active_scope}`."));
-        }
-        if let Some(resource) = scope_doc.get("primary_resource").and_then(Value::as_str) {
-            lines.push(format!("- Primary resource: `{resource}`."));
+            lines.push("## App overview".to_string());
+            lines.push(format!("- {description}"));
         }
     }
 
-    if let Some(scopes_doc) = available_scopes_doc {
-        let scopes = scopes_doc
-            .get("scopes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|scope| scope.get("scope_id").and_then(Value::as_str))
-            .map(|scope| format!("`{scope}`"))
-            .collect::<Vec<_>>();
-        if !scopes.is_empty() {
-            lines.push(format!("- Known scopes: {}.", scopes.join(", ")));
-        }
-    }
-
-    if let Some(actions) = control_doc
-        .and_then(|doc| doc.get("actions"))
-        .and_then(Value::as_array)
-    {
-        append_appfs_skill_action_section(&mut lines, "## App control actions", actions);
-    }
-
-    if let Some(actions) = actions_doc
-        .and_then(|doc| doc.get("recommended_actions"))
-        .and_then(Value::as_array)
-    {
-        lines.push(String::new());
-        lines.push("## Recommended actions".to_string());
-        for action in actions {
-            let path = action
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let summary = action
-                .get("summary")
-                .and_then(Value::as_str)
-                .unwrap_or("App action");
-            let mut line = format!("- `{path}`: {summary}");
-            if let Some(example) = action.get("example_payload") {
-                if let Ok(example_text) = serde_json::to_string(example) {
-                    line.push_str(&format!(
-                        " Append with: `printf '%s\\n' '{}' >> {path}`.",
-                        example_text.replace('\'', r"'\''")
-                    ));
-                }
+    if appfs_skill_generated_section_enabled(skill_doc, "scope_summary") {
+        if let Some(scope_doc) = current_scope_doc {
+            if let Some(active_scope) = scope_doc.get("active_scope").and_then(Value::as_str) {
+                lines.push(String::new());
+                lines.push("## Current scope".to_string());
+                lines.push(format!("- Active scope: `{active_scope}`."));
             }
-            lines.push(line);
-            if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
-                let reasons = use_when
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>();
-                if !reasons.is_empty() {
-                    lines.push(format!("  Use when: {}", reasons.join(" ")));
-                }
+            if let Some(resource) = scope_doc.get("primary_resource").and_then(Value::as_str) {
+                lines.push(format!("- Primary resource: `{resource}`."));
             }
         }
-    }
 
-    if let Some(routes) = actions_doc
-        .and_then(|doc| doc.get("contact_routes"))
-        .and_then(Value::as_array)
-    {
-        lines.push(String::new());
-        lines.push("## Contact routing".to_string());
-        for route in routes {
-            let mention_tokens = route
-                .get("mention_tokens")
+        if let Some(scopes_doc) = available_scopes_doc {
+            let scopes = scopes_doc
+                .get("scopes")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(Value::as_str)
-                .map(|token| format!("`{token}`"))
+                .filter_map(|scope| scope.get("scope_id").and_then(Value::as_str))
+                .map(|scope| format!("`{scope}`"))
                 .collect::<Vec<_>>();
-            let path = route
-                .get("send_message_path")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let mentions = if mention_tokens.is_empty() {
-                "<none>".to_string()
-            } else {
-                mention_tokens.join(", ")
-            };
-            lines.push(format!("- {mentions} -> `{path}`."));
+            if !scopes.is_empty() {
+                lines.push(format!("- Known scopes: {}.", scopes.join(", ")));
+            }
+        }
+    }
+
+    if appfs_skill_generated_section_enabled(skill_doc, "control_actions") {
+        if let Some(actions) = control_doc
+            .and_then(|doc| doc.get("actions"))
+            .and_then(Value::as_array)
+        {
+            append_appfs_skill_action_section(&mut lines, "## App control actions", actions);
+        }
+    }
+
+    if appfs_skill_generated_section_enabled(skill_doc, "recommended_actions") {
+        if let Some(actions) = actions_doc
+            .and_then(|doc| doc.get("recommended_actions"))
+            .and_then(Value::as_array)
+        {
+            lines.push(String::new());
+            lines.push("## Recommended actions".to_string());
+            for action in actions {
+                let path = action
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let summary = action
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("App action");
+                let mut line = format!("- `{path}`: {summary}");
+                if let Some(example) = action.get("example_payload") {
+                    if let Ok(example_text) = serde_json::to_string(example) {
+                        line.push_str(&format!(
+                            " Append with: `printf '%s\\n' '{}' >> {path}`.",
+                            example_text.replace('\'', r"'\''")
+                        ));
+                    }
+                }
+                lines.push(line);
+                if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
+                    let reasons = use_when
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    if !reasons.is_empty() {
+                        lines.push(format!("  Use when: {}", reasons.join(" ")));
+                    }
+                }
+            }
+        }
+    }
+
+    if appfs_skill_generated_section_enabled(skill_doc, "contact_routing") {
+        if let Some(routes) = actions_doc
+            .and_then(|doc| doc.get("contact_routes"))
+            .and_then(Value::as_array)
+        {
+            lines.push(String::new());
+            lines.push("## Contact routing".to_string());
+            for route in routes {
+                let mention_tokens = route
+                    .get("mention_tokens")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|token| format!("`{token}`"))
+                    .collect::<Vec<_>>();
+                let path = route
+                    .get("send_message_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let mentions = if mention_tokens.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    mention_tokens.join(", ")
+                };
+                lines.push(format!("- {mentions} -> `{path}`."));
+            }
         }
     }
 
@@ -4108,6 +4272,89 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         },
         "unexpected": unexpected,
     })
+}
+
+const DEFAULT_MODEL_SKILL_LISTING_CHAR_BUDGET: usize = 8_000;
+const MAX_MODEL_SKILL_ENTRY_CHARS: usize = 320;
+
+pub fn render_model_facing_skill_listing(cwd: &Path) -> std::io::Result<Option<String>> {
+    render_model_facing_skill_listing_with_budget(cwd, DEFAULT_MODEL_SKILL_LISTING_CHAR_BUDGET)
+}
+
+pub fn render_model_facing_skill_listing_with_budget(
+    cwd: &Path,
+    budget_chars: usize,
+) -> std::io::Result<Option<String>> {
+    let roots = discover_skill_roots(cwd);
+    let mut skills = load_skills_from_roots_for_context(&roots, cwd)?;
+    skills.retain(|skill| skill.shadowed_by.is_none() && !skill.document.disable_model_invocation);
+    if skills.is_empty() {
+        return Ok(None);
+    }
+
+    skills.sort_by(|left, right| {
+        skill_listing_sort_key(left)
+            .cmp(&skill_listing_sort_key(right))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut lines = vec![
+        "Available skills. When one matches the user's request, invoke the `Skill` tool before responding. Use only the exact skill names listed below.".to_string(),
+        "If none of these fit, you may use `ToolSearch` to search for more specialized tools.".to_string(),
+        String::new(),
+    ];
+    let mut used_chars = lines.iter().map(|line| line.len()).sum::<usize>() + (lines.len() - 1);
+    let mut omitted = 0usize;
+
+    for skill in skills {
+        let entry = format_model_facing_skill_entry(&skill);
+        let separator_chars = usize::from(!lines.is_empty());
+        if used_chars + separator_chars + entry.len() > budget_chars {
+            omitted += 1;
+            continue;
+        }
+        used_chars += separator_chars + entry.len();
+        lines.push(entry);
+    }
+
+    if omitted > 0 {
+        lines.push(format!(
+            "_{omitted} additional skills omitted to stay within the context budget._"
+        ));
+    }
+
+    Ok(Some(lines.join("\n")))
+}
+
+fn skill_listing_sort_key(skill: &SkillSummary) -> (u8, String) {
+    let priority = match skill.location {
+        SkillLocation::Generated(_) => 0,
+        SkillLocation::Bundled(_) => 1,
+        SkillLocation::Filesystem(_) => 2,
+    };
+    (priority, skill.name.to_ascii_lowercase())
+}
+
+fn format_model_facing_skill_entry(skill: &SkillSummary) -> String {
+    let mut description = skill.document.description.trim().to_string();
+    if let Some(when_to_use) = skill
+        .document
+        .when_to_use
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        description.push_str(" Use when: ");
+        description.push_str(when_to_use);
+    }
+    if description.chars().count() > MAX_MODEL_SKILL_ENTRY_CHARS {
+        let truncated = description
+            .chars()
+            .take(MAX_MODEL_SKILL_ENTRY_CHARS - 1)
+            .collect::<String>();
+        description = format!("{truncated}…");
+    }
+    format!("- {}: {}", skill.name, description)
 }
 
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
@@ -4859,6 +5106,30 @@ mod tests {
         fs::create_dir_all(app_root.join("_stream")).expect("stream dir");
         fs::write(mount_root.join("_appfs").join("register_app.act"), "").expect("register act");
         fs::write(
+            app_root.join("_app").join("skill.res.json"),
+            r#"{
+  "app_id": "aiim",
+  "description": "一个 AI 专用的聊天软件，用于收发消息。",
+  "when_to_use": [
+    "当用户想要向某人发送消息、查看聊天记录，或者处理其他与聊天相关的任务时使用。",
+    "在当前挂载的 AIIM app 上执行专用 act 或控制操作之前，先加载这个 skill。"
+  ],
+  "overview_markdown": "AIIM 是当前挂载出来的聊天软件。你可以用它查看聊天记录、给联系人发送消息，并在需要时切换不同聊天 scope 后再继续读取或操作。",
+  "allowed_tools": [
+    "bash",
+    "read_file",
+    "glob_search"
+  ],
+  "include_generated_sections": {
+    "scope_summary": true,
+    "control_actions": true,
+    "recommended_actions": true,
+    "contact_routing": true
+  }
+}"#,
+        )
+        .expect("write skill doc");
+        fs::write(
             app_root.join("_app").join("actions.res.json"),
             r#"{
   "app_id": "aiim",
@@ -4965,10 +5236,26 @@ mod tests {
         let resolved = resolve_skill(&cwd, "appfs-aiim").expect("generated appfs skill");
         let prompt = render_resolved_skill_prompt(&resolved, None);
 
+        assert!(prompt.contains("AIIM 是当前挂载出来的聊天软件。"));
         assert!(prompt.contains("append-only JSONL"));
         assert!(prompt.contains("contacts/zhangsan/send_message.act"));
         assert!(prompt.contains("张三"));
         assert!(prompt.contains("tail -n"));
+    }
+
+    #[test]
+    fn resolves_generated_appfs_skill_from_mount_root() {
+        let workspace = temp_dir("generated-appfs-skill-root");
+        let app_root = seed_appfs_skill_mount(&workspace);
+        let mount_root = app_root
+            .parent()
+            .expect("app root should have mount root parent");
+
+        let resolved = resolve_skill(mount_root, "appfs-aiim").expect("generated appfs skill");
+        let prompt = render_resolved_skill_prompt(&resolved, None);
+
+        assert!(prompt.contains("AIIM 是当前挂载出来的聊天软件。"));
+        assert!(prompt.contains("contacts/zhangsan/send_message.act"));
     }
 
     #[test]
@@ -4986,6 +5273,67 @@ mod tests {
         assert!(prompt.contains("`meetings/create.act`"));
         assert!(prompt.contains("meeting-room-b"));
         assert!(!prompt.contains("contacts/zhangsan/send_message.act"));
+    }
+
+    #[test]
+    fn render_model_facing_skill_listing_includes_regular_and_appfs_skills() {
+        let workspace = temp_dir("model-facing-skill-listing");
+        let app_root = seed_appfs_skill_mount(&workspace);
+        let cwd = app_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace dir");
+        write_skill(
+            &workspace.join(".claw").join("skills"),
+            "trace",
+            "Trace repository state",
+        );
+
+        let listing = super::render_model_facing_skill_listing_with_budget(&cwd, 8_000)
+            .expect("listing should render")
+            .expect("listing should exist");
+
+        assert!(listing.contains("- appfs-aiim:"));
+        assert!(listing.contains("一个 AI 专用的聊天软件，用于收发消息。"));
+        assert!(listing.contains("当用户想要向某人发送消息、查看聊天记录"));
+        assert!(listing.contains("- trace:"));
+        assert!(listing.contains("invoke the `Skill` tool before responding"));
+    }
+
+    #[test]
+    fn render_model_facing_skill_listing_includes_appfs_skills_from_mount_root() {
+        let workspace = temp_dir("model-facing-skill-listing-root");
+        let app_root = seed_appfs_skill_mount(&workspace);
+        let mount_root = app_root
+            .parent()
+            .expect("app root should have mount root parent");
+
+        let listing = super::render_model_facing_skill_listing_with_budget(mount_root, 8_000)
+            .expect("listing should render")
+            .expect("listing should exist");
+
+        assert!(listing.contains("- appfs-aiim:"));
+        assert!(listing.contains("一个 AI 专用的聊天软件，用于收发消息。"));
+        assert!(listing.contains("当用户想要向某人发送消息、查看聊天记录"));
+    }
+
+    #[test]
+    fn render_model_facing_skill_listing_skips_disable_model_invocation_skills() {
+        let workspace = temp_dir("model-facing-skill-disable");
+        let skills_root = workspace.join(".claw").join("skills");
+        write_skill(&skills_root, "trace", "Trace repository state");
+        let internal_root = skills_root.join("internal");
+        fs::create_dir_all(&internal_root).expect("internal root");
+        fs::write(
+            internal_root.join("SKILL.md"),
+            "---\nname: internal\ndescription: Internal only\ndisable-model-invocation: true\n---\n\n# internal\n",
+        )
+        .expect("write internal skill");
+
+        let listing = super::render_model_facing_skill_listing_with_budget(&workspace, 8_000)
+            .expect("listing should render")
+            .expect("listing should exist");
+
+        assert!(listing.contains("- trace:"));
+        assert!(!listing.contains("- internal:"));
     }
 
     #[allow(clippy::too_many_lines)]

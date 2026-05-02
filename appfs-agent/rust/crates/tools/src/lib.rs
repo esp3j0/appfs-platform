@@ -52,6 +52,63 @@ pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+pub fn sync_model_facing_skill_listing(session: &mut Session, cwd: &Path) -> Result<(), String> {
+    let Some(content) =
+        commands::render_model_facing_skill_listing(cwd).map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+
+    if latest_skill_listing_content(session)
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|existing| existing == content.trim())
+    {
+        return Ok(());
+    }
+
+    session
+        .push_message(ConversationMessage::attachment_user_text(
+            content,
+            AttachmentKind::SkillListing,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+#[must_use]
+pub fn should_inject_model_facing_skill_listing(
+    enable_tools: bool,
+    allowed_tools: Option<&BTreeSet<String>>,
+) -> bool {
+    enable_tools
+        && allowed_tools
+            .map(|tools| tools.contains("Skill"))
+            .unwrap_or(true)
+}
+
+fn latest_skill_listing_content(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.attachment_metadata.as_ref().map(|metadata| metadata.kind)
+                == Some(AttachmentKind::SkillListing)
+        })
+        .map(conversation_message_text)
+}
+
+fn conversation_message_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect()
+}
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -3983,8 +4040,13 @@ fn build_agent_runtime(
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut session = Session::new();
+    if should_inject_model_facing_skill_listing(true, Some(&job.allowed_tools)) {
+        sync_model_facing_skill_listing(&mut session, &cwd)?;
+    }
     Ok(ConversationRuntime::new(
-        Session::new(),
+        session,
         api_client,
         tool_executor,
         permission_policy,
@@ -6805,9 +6867,11 @@ mod tests {
         execute_tool_with_effects, final_assistant_text, maybe_commit_provenance,
         model_visible_tool_result, model_visible_tool_result_with_id, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, ForkedSkillExecutionResult, ForkedSkillRequest,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ModelVisibleToolResult,
-        PowerShellCommandOutput, ProviderRuntimeClient, SkillInput, SubagentToolExecutor,
+        run_task_packet, should_inject_model_facing_skill_listing,
+        sync_model_facing_skill_listing, AgentInput, AgentJob,
+        ForkedSkillExecutionResult, ForkedSkillRequest, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
+        ProviderRuntimeClient, SkillInput, SubagentToolExecutor,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
     #[cfg(windows)]
@@ -7428,6 +7492,12 @@ mod tests {
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
     }
 
+    fn write_skill(root: &Path, name: &str, contents: &str) {
+        let skill_dir = root.join(".claw").join("skills").join(name);
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(skill_dir.join("SKILL.md"), contents).expect("skill file");
+    }
+
     fn remove_dir_all_with_retry(path: &Path, label: &str) {
         for attempt in 0..10 {
             match fs::remove_dir_all(path) {
@@ -7449,6 +7519,55 @@ mod tests {
                 Err(error) => panic!("{label}: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn syncs_model_facing_skill_listing_into_session_without_duplicates() {
+        let _guard = env_guard();
+        let workspace = temp_path("skill-listing-sync");
+        let cwd = workspace.join("project");
+        fs::create_dir_all(&cwd).expect("workspace dir");
+        write_skill(
+            &workspace,
+            "trace",
+            "---\nname: trace\ndescription: Trace repository state\nwhen_to_use: Use when tracing repository context.\n---\n\n# trace\n",
+        );
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let mut session = Session::new();
+        sync_model_facing_skill_listing(&mut session, &cwd).expect("sync should succeed");
+        sync_model_facing_skill_listing(&mut session, &cwd).expect("second sync should dedupe");
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::SkillListing)
+        );
+        let ContentBlock::Text { text } = &session.messages[0].blocks[0] else {
+            panic!("expected listing text");
+        };
+        assert!(text.contains("- trace: Trace repository state"));
+
+        restore_cwd(&original_dir);
+        remove_dir_all_with_retry(&workspace, "cleanup skill listing workspace");
+    }
+
+    #[test]
+    fn skips_skill_listing_when_skill_tool_is_unavailable() {
+        assert!(!should_inject_model_facing_skill_listing(false, None));
+        assert!(!should_inject_model_facing_skill_listing(
+            true,
+            Some(&BTreeSet::from([String::from("bash")]))
+        ));
+        assert!(should_inject_model_facing_skill_listing(
+            true,
+            Some(&BTreeSet::from([String::from("Skill"), String::from("bash")]))
+        ));
+        assert!(should_inject_model_facing_skill_listing(true, None));
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
