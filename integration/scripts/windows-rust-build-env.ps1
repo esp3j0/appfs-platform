@@ -53,6 +53,10 @@ function Resolve-MsvcToolsInstallDir {
 }
 
 function Initialize-WindowsRustBuildEnv {
+    if ([string]::IsNullOrWhiteSpace($env:RUSTUP_TOOLCHAIN)) {
+        $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
+    }
+
     $vcToolsInstallDir = Resolve-MsvcToolsInstallDir
     $vcInclude = Join-Path $vcToolsInstallDir "include"
     if (!(Test-Path $vcInclude -PathType Container)) {
