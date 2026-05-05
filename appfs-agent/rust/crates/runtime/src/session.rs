@@ -55,6 +55,7 @@ pub enum AttachmentKind {
     PlanMode,
     SkillListing,
     InvokedSkills,
+    AppfsEvents,
     HookAdditionalContext,
 }
 
@@ -166,6 +167,7 @@ pub struct Session {
     pub workspace_root: Option<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
     pub invoked_skills: Vec<InvokedSkill>,
+    pub appfs_event_cursors: BTreeMap<String, i64>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -181,6 +183,7 @@ impl PartialEq for Session {
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
             && self.invoked_skills == other.invoked_skills
+            && self.appfs_event_cursors == other.appfs_event_cursors
     }
 }
 
@@ -232,6 +235,7 @@ impl Session {
             workspace_root: None,
             prompt_history: Vec::new(),
             invoked_skills: Vec::new(),
+            appfs_event_cursors: BTreeMap::new(),
             persistence: None,
         }
     }
@@ -340,6 +344,55 @@ impl Session {
     }
 
     #[must_use]
+    pub fn appfs_event_cursor(&self, stream_id: &str) -> Option<i64> {
+        self.appfs_event_cursors.get(stream_id).copied()
+    }
+
+    pub fn update_appfs_event_cursors<I>(&mut self, updates: I) -> Result<(), SessionError>
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        for (stream_id, seq) in &updates {
+            if stream_id.trim().is_empty() {
+                return Err(SessionError::Format(
+                    "appfs event stream id cannot be empty".to_string(),
+                ));
+            }
+            if *seq < 0 {
+                return Err(SessionError::Format(format!(
+                    "appfs event cursor for {stream_id} cannot be negative"
+                )));
+            }
+        }
+        if updates.iter().all(|(stream_id, seq)| {
+            self.appfs_event_cursors
+                .get(stream_id)
+                .is_some_and(|existing| existing == seq)
+        }) {
+            return Ok(());
+        }
+
+        let previous_updated_at_ms = self.updated_at_ms;
+        let previous_appfs_event_cursors = self.appfs_event_cursors.clone();
+        self.touch();
+        for (stream_id, seq) in updates {
+            self.appfs_event_cursors.insert(stream_id, seq);
+        }
+
+        let persistence_path = self.persistence_path().map(Path::to_path_buf);
+        if let Some(path) = persistence_path {
+            if let Err(error) = self.append_persisted_meta_to_path(&path) {
+                self.updated_at_ms = previous_updated_at_ms;
+                self.appfs_event_cursors = previous_appfs_event_cursors;
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
     pub fn fork(&self, branch_name: Option<String>) -> Self {
         let now = current_time_millis();
         Self {
@@ -356,6 +409,7 @@ impl Session {
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
             invoked_skills: self.invoked_skills.clone(),
+            appfs_event_cursors: self.appfs_event_cursors.clone(),
             persistence: None,
         }
     }
@@ -421,6 +475,12 @@ impl Session {
                 ),
             );
         }
+        if !self.appfs_event_cursors.is_empty() {
+            object.insert(
+                "appfs_event_cursors".to_string(),
+                appfs_event_cursors_to_json(&self.appfs_event_cursors),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -480,6 +540,11 @@ impl Session {
             .map(invoked_skills_from_json)
             .transpose()?
             .unwrap_or_default();
+        let appfs_event_cursors = object
+            .get("appfs_event_cursors")
+            .map(appfs_event_cursors_from_json)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -491,6 +556,7 @@ impl Session {
             workspace_root,
             prompt_history,
             invoked_skills,
+            appfs_event_cursors,
             persistence: None,
         })
     }
@@ -506,6 +572,7 @@ impl Session {
         let mut workspace_root = None;
         let mut prompt_history = Vec::new();
         let mut invoked_skills = Vec::new();
+        let mut appfs_event_cursors = BTreeMap::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -546,6 +613,9 @@ impl Session {
                         .map(PathBuf::from);
                     if let Some(value) = object.get("invoked_skills") {
                         invoked_skills = invoked_skills_from_json(value)?;
+                    }
+                    if let Some(value) = object.get("appfs_event_cursors") {
+                        appfs_event_cursors = appfs_event_cursors_from_json(value)?;
                     }
                 }
                 "message" => {
@@ -590,6 +660,7 @@ impl Session {
             workspace_root,
             prompt_history,
             invoked_skills,
+            appfs_event_cursors,
             persistence: None,
         })
     }
@@ -664,6 +735,18 @@ impl Session {
         Ok(())
     }
 
+    fn append_persisted_meta_to_path(&self, path: &Path) -> Result<(), SessionError> {
+        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+        if needs_bootstrap {
+            self.save_to_path(path)?;
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        writeln!(file, "{}", self.meta_record()?.render())?;
+        Ok(())
+    }
+
     fn meta_record(&self) -> Result<JsonValue, SessionError> {
         let mut object = BTreeMap::new();
         object.insert(
@@ -704,6 +787,12 @@ impl Session {
                         .map(InvokedSkill::to_json)
                         .collect(),
                 ),
+            );
+        }
+        if !self.appfs_event_cursors.is_empty() {
+            object.insert(
+                "appfs_event_cursors".to_string(),
+                appfs_event_cursors_to_json(&self.appfs_event_cursors),
             );
         }
         Ok(JsonValue::Object(object))
@@ -1169,6 +1258,7 @@ impl AttachmentKind {
             Self::PlanMode => "plan_mode",
             Self::SkillListing => "skill_listing",
             Self::InvokedSkills => "invoked_skills",
+            Self::AppfsEvents => "appfs_events",
             Self::HookAdditionalContext => "hook_additional_context",
         }
     }
@@ -1183,6 +1273,7 @@ impl AttachmentKind {
             "plan_mode" => Ok(Self::PlanMode),
             "skill_listing" => Ok(Self::SkillListing),
             "invoked_skills" => Ok(Self::InvokedSkills),
+            "appfs_events" => Ok(Self::AppfsEvents),
             "hook_additional_context" => Ok(Self::HookAdditionalContext),
             other => Err(SessionError::Format(format!(
                 "unsupported attachment kind: {other}"
@@ -1697,6 +1788,41 @@ fn invoked_skills_from_json(value: &JsonValue) -> Result<Vec<InvokedSkill>, Sess
         .collect()
 }
 
+fn appfs_event_cursors_to_json(cursors: &BTreeMap<String, i64>) -> JsonValue {
+    JsonValue::Object(
+        cursors
+            .iter()
+            .map(|(stream_id, seq)| (stream_id.clone(), JsonValue::Number(*seq)))
+            .collect(),
+    )
+}
+
+fn appfs_event_cursors_from_json(value: &JsonValue) -> Result<BTreeMap<String, i64>, SessionError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| SessionError::Format("appfs_event_cursors must be an object".to_string()))?;
+    let mut cursors = BTreeMap::new();
+    for (stream_id, value) in object {
+        if stream_id.trim().is_empty() {
+            return Err(SessionError::Format(
+                "appfs event stream id cannot be empty".to_string(),
+            ));
+        }
+        let seq = value.as_i64().ok_or_else(|| {
+            SessionError::Format(format!(
+                "appfs event cursor for {stream_id} must be a number"
+            ))
+        })?;
+        if seq < 0 {
+            return Err(SessionError::Format(format!(
+                "appfs event cursor for {stream_id} cannot be negative"
+            )));
+        }
+        cursors.insert(stream_id.clone(), seq);
+    }
+    Ok(cursors)
+}
+
 fn upsert_invoked_skill_entry(invoked_skills: &mut Vec<InvokedSkill>, invoked_skill: InvokedSkill) {
     if let Some(existing) = invoked_skills.iter_mut().find(|existing| {
         existing
@@ -2053,6 +2179,29 @@ mod tests {
         assert!(restored.invoked_skills[0]
             .prompt
             .contains("Follow the traces"));
+        assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[test]
+    fn persists_appfs_event_cursors_in_session_metadata() {
+        let path = temp_session_path("appfs-event-cursors");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("watch appfs")
+            .expect("message should append");
+        session
+            .update_appfs_event_cursors([("platform".to_string(), 3), ("app:aiim".to_string(), 7)])
+            .expect("event cursors should persist");
+
+        let persisted = fs::read_to_string(&path).expect("session file should be readable");
+        assert_eq!(persisted.matches(r#""type":"session_meta""#).count(), 2);
+        assert_eq!(persisted.matches(r#""type":"message""#).count(), 1);
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.appfs_event_cursor("platform"), Some(3));
+        assert_eq!(restored.appfs_event_cursor("app:aiim"), Some(7));
         assert_eq!(restored.messages.len(), 1);
     }
 

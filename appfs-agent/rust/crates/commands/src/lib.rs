@@ -3363,8 +3363,7 @@ fn discover_app_roots_under_mount(mount_root: &Path) -> Vec<PathBuf> {
             if matches!(name.as_str(), "_appfs" | ".well-known") {
                 return None;
             }
-            let looks_like_app =
-                path.join("_app").is_dir() || path.join("_stream").is_dir();
+            let looks_like_app = path.join("_app").is_dir() || path.join("_stream").is_dir();
             looks_like_app.then_some(path)
         })
         .collect()
@@ -3412,6 +3411,7 @@ fn synthesize_appfs_skill_for_app(fallback_app_id: &str, app_root: &Path) -> Opt
     });
     let markdown_content = build_appfs_skill_markdown(
         &app_id,
+        app_root,
         skill_doc.as_ref(),
         control_doc.as_ref(),
         actions_doc.as_ref(),
@@ -3583,6 +3583,7 @@ fn build_appfs_skill_when_to_use(
 
 fn build_appfs_skill_markdown(
     app_id: &str,
+    app_root: &Path,
     skill_doc: Option<&Value>,
     control_doc: Option<&Value>,
     actions_doc: Option<&Value>,
@@ -3600,8 +3601,8 @@ fn build_appfs_skill_markdown(
         "- Every `*.act` file is an append-only JSONL sink.".to_string(),
         "- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string(),
         "- Use `bash` to append exactly one JSON object plus a trailing newline.".to_string(),
-        "- After appending to an action, inspect `_stream/events.evt.jsonl` for `action.completed` or `action.failed`.".to_string(),
-        "- A reliable check is `tail -n 20 _stream/events.evt.jsonl`.".to_string(),
+        "- After appending to an action, prefer the AppFS event reminder that is injected into the next model call; use `action.completed` or `action.failed` there to decide whether the action succeeded.".to_string(),
+        "- Only inspect `_stream/events.evt.jsonl` manually when debugging or when no AppFS event reminder appears.".to_string(),
     ];
 
     if !uses_skill_narrative {
@@ -3649,7 +3650,12 @@ fn build_appfs_skill_markdown(
             .and_then(|doc| doc.get("actions"))
             .and_then(Value::as_array)
         {
-            append_appfs_skill_action_section(&mut lines, "## App control actions", actions);
+            append_appfs_skill_action_section(
+                &mut lines,
+                "## App control actions",
+                actions,
+                app_root,
+            );
         }
     }
 
@@ -3671,11 +3677,8 @@ fn build_appfs_skill_markdown(
                     .unwrap_or("App action");
                 let mut line = format!("- `{path}`: {summary}");
                 if let Some(example) = action.get("example_payload") {
-                    if let Ok(example_text) = serde_json::to_string(example) {
-                        line.push_str(&format!(
-                            " Append with: `printf '%s\\n' '{}' >> {path}`.",
-                            example_text.replace('\'', r"'\''")
-                        ));
+                    if let Some(command) = format_appfs_append_example(app_root, path, example) {
+                        line.push_str(&format!(" Append with: `{command}`."));
                     }
                 }
                 lines.push(line);
@@ -3727,7 +3730,12 @@ fn build_appfs_skill_markdown(
     lines.join("\n")
 }
 
-fn append_appfs_skill_action_section(lines: &mut Vec<String>, title: &str, actions: &[Value]) {
+fn append_appfs_skill_action_section(
+    lines: &mut Vec<String>,
+    title: &str,
+    actions: &[Value],
+    app_root: &Path,
+) {
     if actions.is_empty() {
         return;
     }
@@ -3745,11 +3753,8 @@ fn append_appfs_skill_action_section(lines: &mut Vec<String>, title: &str, actio
             .unwrap_or("App action");
         let mut line = format!("- `{path}`: {summary}");
         if let Some(example) = action.get("example_payload") {
-            if let Ok(example_text) = serde_json::to_string(example) {
-                line.push_str(&format!(
-                    " Append with: `printf '%s\\n' '{}' >> {path}`.",
-                    example_text.replace('\'', r"'\''")
-                ));
+            if let Some(command) = format_appfs_append_example(app_root, path, example) {
+                line.push_str(&format!(" Append with: `{command}`."));
             }
         }
         lines.push(line);
@@ -3763,6 +3768,45 @@ fn append_appfs_skill_action_section(lines: &mut Vec<String>, title: &str, actio
             }
         }
     }
+}
+
+fn format_appfs_append_example(
+    app_root: &Path,
+    action_path: &str,
+    example: &Value,
+) -> Option<String> {
+    let example_text = serde_json::to_string(example).ok()?;
+    let target_path = appfs_action_target_path(app_root, action_path);
+    Some(format!(
+        "printf '%s\\n' {} >> {}",
+        bash_single_quote(&example_text),
+        bash_single_quote(&path_to_bash_display(&target_path))
+    ))
+}
+
+fn appfs_action_target_path(app_root: &Path, action_path: &str) -> PathBuf {
+    let relative_action_path = action_path.trim_start_matches(['/', '\\']);
+    app_root.join(relative_action_path)
+}
+
+fn path_to_bash_display(path: &Path) -> String {
+    let raw = path.display().to_string().replace('\\', "/");
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let rest = raw[2..].trim_start_matches('/');
+        if rest.is_empty() {
+            format!("/{drive}")
+        } else {
+            format!("/{drive}/{rest}")
+        }
+    } else {
+        raw
+    }
+}
+
+fn bash_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 fn read_json_value(path: &Path) -> Option<Value> {
@@ -5238,9 +5282,12 @@ mod tests {
 
         assert!(prompt.contains("AIIM 是当前挂载出来的聊天软件。"));
         assert!(prompt.contains("append-only JSONL"));
+        assert!(prompt.contains("AppFS event reminder"));
         assert!(prompt.contains("contacts/zhangsan/send_message.act"));
+        assert!(prompt.contains("printf '%s\\n'"));
+        assert!(prompt.contains(">> '"));
         assert!(prompt.contains("张三"));
-        assert!(prompt.contains("tail -n"));
+        assert!(!prompt.contains("tail -n"));
     }
 
     #[test]
@@ -5271,8 +5318,27 @@ mod tests {
         assert!(prompt.contains("Manage meeting scheduling flows"));
         assert!(prompt.contains("`_app/enter_scope.act`"));
         assert!(prompt.contains("`meetings/create.act`"));
+        assert!(prompt.contains("AppFS event reminder"));
         assert!(prompt.contains("meeting-room-b"));
         assert!(!prompt.contains("contacts/zhangsan/send_message.act"));
+    }
+
+    #[test]
+    fn appfs_append_examples_use_git_bash_drive_paths_on_windows_mounts() {
+        let command = super::format_appfs_append_example(
+            &PathBuf::from(r"C:\mnt\appfs-compose-aiim\aiim"),
+            r"\contacts\zhangsan\send_message.act",
+            &serde_json::json!({
+                "text": "明天上午十点开会",
+                "priority": "normal"
+            }),
+        )
+        .expect("append example");
+
+        assert!(command.starts_with("printf '%s\\n' '{"));
+        assert!(command
+            .contains("' >> '/c/mnt/appfs-compose-aiim/aiim/contacts/zhangsan/send_message.act'"));
+        assert!(!command.contains(r"C:\mnt"));
     }
 
     #[test]
