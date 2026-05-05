@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fmt::{Display, Formatter};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
+use crate::appfs::sync_appfs_event_reminders;
 use crate::compact::{
     build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
     select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
@@ -465,6 +467,11 @@ where
                 return Err(error);
             }
 
+            if let Err(error) = self.sync_appfs_events_before_model_call() {
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+
             let mut request =
                 ApiRequest::conversation(self.system_prompt.clone(), self.session.messages.clone());
             tool_context.apply_to_api_request(&mut request);
@@ -680,6 +687,14 @@ where
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    fn sync_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
+        let Ok(cwd) = env::current_dir() else {
+            return Ok(());
+        };
+        sync_appfs_event_reminders(&mut self.session, &cwd)
+            .map_err(|error| RuntimeError::new(format!("failed to sync AppFS events: {error}")))
     }
 
     pub fn compact(&mut self, config: CompactionConfig) -> Result<CompactionResult, RuntimeError> {

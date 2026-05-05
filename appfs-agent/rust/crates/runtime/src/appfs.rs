@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -5,6 +6,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::session::{AttachmentKind, ConversationMessage, Session, SessionError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,6 +18,9 @@ const REGISTRY_FILE: &str = "apps.registry.json";
 const APP_CONTROL_DIR_NAME: &str = "_app";
 const APP_STREAM_DIR_NAME: &str = "_stream";
 const EVENTS_FILE: &str = "events.evt.jsonl";
+const STREAM_CURSOR_FILE: &str = "cursor.res.json";
+const APPFS_EVENT_REMINDER_MAX_EVENTS: usize = 20;
+const APPFS_EVENT_REMINDER_FIELD_LIMIT: usize = 360;
 pub const APPFS_RUNTIME_MANIFEST_REL_PATH: &str = ".well-known/appfs/runtime.json";
 pub const APPFS_ATTACH_SCHEMA_ENV: &str = "APPFS_ATTACH_SCHEMA";
 pub const APPFS_RUNTIME_MANIFEST_ENV: &str = "APPFS_RUNTIME_MANIFEST";
@@ -200,6 +205,393 @@ pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
 pub fn build_appfs_prompt_section(cwd: &Path) -> Option<String> {
     let environment = detect_appfs_environment(cwd)?;
     Some(render_appfs_prompt_section(&environment))
+}
+
+pub fn sync_appfs_event_reminders(session: &mut Session, cwd: &Path) -> Result<(), SessionError> {
+    let Some(environment) = detect_appfs_environment(cwd) else {
+        return Ok(());
+    };
+    let streams = collect_appfs_event_streams(&environment);
+    if streams.is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor_updates = BTreeMap::new();
+    let mut new_events = Vec::new();
+    for stream in streams {
+        let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
+        if let Some(max_seq) = stream_max_seq {
+            match session.appfs_event_cursor(&stream.stream_id) {
+                Some(last_seq) if max_seq <= last_seq => continue,
+                None => {
+                    // First attach establishes a baseline so old event backlog does not
+                    // surprise the model; subsequent model-call cycles will surface deltas.
+                    cursor_updates.insert(stream.stream_id.clone(), max_seq);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(records) = read_appfs_event_records(&stream) else {
+            continue;
+        };
+        let max_seq = stream_max_seq
+            .or_else(|| records.iter().map(|record| record.seq).max())
+            .unwrap_or(0);
+        match session.appfs_event_cursor(&stream.stream_id) {
+            Some(last_seq) => {
+                if max_seq > last_seq {
+                    cursor_updates.insert(stream.stream_id.clone(), max_seq);
+                }
+                new_events.extend(records.into_iter().filter(|record| record.seq > last_seq));
+            }
+            None => {
+                // First attach establishes a baseline so old event backlog does not
+                // surprise the model; subsequent model-call cycles will surface deltas.
+                cursor_updates.insert(stream.stream_id.clone(), max_seq);
+            }
+        }
+    }
+
+    if !new_events.is_empty() {
+        let reminder = render_appfs_event_reminder(&new_events);
+        session.push_message(ConversationMessage::attachment_user_text(
+            reminder,
+            AttachmentKind::AppfsEvents,
+        ))?;
+    }
+
+    if !cursor_updates.is_empty() {
+        session.update_appfs_event_cursors(cursor_updates)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AppfsEventStream {
+    stream_id: String,
+    label: String,
+    app_id: Option<String>,
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppfsStreamCursor {
+    max_seq: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AppfsEventRecord {
+    label: String,
+    app_id: Option<String>,
+    seq: i64,
+    event_type: String,
+    event_path: Option<String>,
+    request_id: Option<String>,
+    content: Option<Value>,
+    error: Option<Value>,
+}
+
+fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEventStream> {
+    let mut streams = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(path) = &environment.control_events_path {
+        push_appfs_event_stream(
+            &mut streams,
+            &mut seen,
+            AppfsEventStream {
+                stream_id: "platform".to_string(),
+                label: "AppFS platform".to_string(),
+                app_id: None,
+                path: path.clone(),
+            },
+        );
+    }
+
+    for app in &environment.registered_apps {
+        push_appfs_event_stream(
+            &mut streams,
+            &mut seen,
+            AppfsEventStream {
+                stream_id: format!("app:{}", app.app_id),
+                label: format!("AppFS app `{}`", app.app_id),
+                app_id: Some(app.app_id.clone()),
+                path: environment
+                    .mount_root
+                    .join(&app.app_id)
+                    .join(APP_STREAM_DIR_NAME)
+                    .join(EVENTS_FILE),
+            },
+        );
+    }
+
+    if let (Some(app_id), Some(path)) = (
+        environment.current_app_id.as_ref(),
+        environment.current_app_events_path.as_ref(),
+    ) {
+        push_appfs_event_stream(
+            &mut streams,
+            &mut seen,
+            AppfsEventStream {
+                stream_id: format!("app:{app_id}"),
+                label: format!("AppFS app `{app_id}`"),
+                app_id: Some(app_id.clone()),
+                path: path.clone(),
+            },
+        );
+    }
+
+    streams
+}
+
+fn push_appfs_event_stream(
+    streams: &mut Vec<AppfsEventStream>,
+    seen: &mut BTreeSet<String>,
+    stream: AppfsEventStream,
+) {
+    if seen.insert(stream.stream_id.clone()) {
+        streams.push(stream);
+    }
+}
+
+fn read_appfs_event_records(stream: &AppfsEventStream) -> Option<Vec<AppfsEventRecord>> {
+    let contents = fs::read_to_string(&stream.path).ok()?;
+    let mut records = Vec::new();
+    for line in contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(seq) = value
+            .get("seq")
+            .and_then(Value::as_i64)
+            .filter(|seq| *seq >= 0)
+        else {
+            continue;
+        };
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let event_path = value
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let request_id = value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let content = value.get("content").cloned();
+        let error = value.get("error").cloned();
+        records.push(AppfsEventRecord {
+            label: stream.label.clone(),
+            app_id: stream.app_id.clone(),
+            seq,
+            event_type,
+            event_path,
+            request_id,
+            content,
+            error,
+        });
+    }
+    Some(records)
+}
+
+fn read_appfs_stream_max_seq_hint(stream: &AppfsEventStream) -> Option<i64> {
+    let cursor_path = stream.path.parent()?.join(STREAM_CURSOR_FILE);
+    let cursor: AppfsStreamCursor = read_json_file(&cursor_path)?;
+    Some(cursor.max_seq.max(0))
+}
+
+fn render_appfs_event_reminder(events: &[AppfsEventRecord]) -> String {
+    let omitted_count = events.len().saturating_sub(APPFS_EVENT_REMINDER_MAX_EVENTS);
+    let visible_start = events.len().saturating_sub(APPFS_EVENT_REMINDER_MAX_EVENTS);
+    let visible_events = &events[visible_start..];
+    let mut lines = vec![
+        "<system-reminder>".to_string(),
+        "New AppFS events were received since the previous model call.".to_string(),
+        "Use these as fresh context; do not re-run completed actions unless the user asks."
+            .to_string(),
+    ];
+    if omitted_count > 0 {
+        lines.push(format!(
+            "{omitted_count} older event(s) were omitted from this reminder."
+        ));
+    }
+    for event in visible_events {
+        let mut line = format!("- [{}] seq={} {}", event.label, event.seq, event.event_type);
+        if let Some(app_id) = &event.app_id {
+            line.push_str(&format!(" app={app_id}"));
+        }
+        if let Some(path) = &event.event_path {
+            line.push_str(&format!(" path={}", sanitize_reminder_text(path)));
+        }
+        if let Some(request_id) = &event.request_id {
+            line.push_str(&format!(
+                " request_id={}",
+                sanitize_reminder_text(request_id)
+            ));
+        }
+        if let Some(summary) = summarize_appfs_event(event) {
+            line.push_str(&format!(" summary={}", sanitize_reminder_text(&summary)));
+        }
+        lines.push(line);
+    }
+    lines.push("</system-reminder>".to_string());
+    lines.join("\n")
+}
+
+fn summarize_appfs_event(event: &AppfsEventRecord) -> Option<String> {
+    match event.event_type.as_str() {
+        "action.accepted" => summarize_progress_like_event(event, "action accepted"),
+        "action.progress" => summarize_progress_like_event(event, "action progress"),
+        "action.completed" => summarize_completed_event(event),
+        "action.failed" => summarize_failed_event(event),
+        "app.registered" => summarize_lifecycle_event(event, "app registered"),
+        "app.unregistered" => summarize_lifecycle_event(event, "app unregistered"),
+        "app.started" => summarize_lifecycle_event(event, "app started"),
+        "app.stopped" => summarize_lifecycle_event(event, "app stopped"),
+        _ => event
+            .content
+            .as_ref()
+            .map(|content| compact_event_json(content)),
+    }
+}
+
+fn summarize_progress_like_event(event: &AppfsEventRecord, label: &str) -> Option<String> {
+    let mut parts = vec![label.to_string()];
+    if let Some(content) = &event.content {
+        append_summary_field(&mut parts, content);
+        append_message_field(&mut parts, content);
+        append_number_field(&mut parts, content, "percent");
+        append_string_field(&mut parts, content, "phase");
+        append_string_field(&mut parts, content, "status");
+        if parts.len() == 1 {
+            parts.push(format!("details={}", compact_event_json(content)));
+        }
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_completed_event(event: &AppfsEventRecord) -> Option<String> {
+    let Some(content) = &event.content else {
+        return Some("action completed".to_string());
+    };
+    let mut parts = vec!["action completed".to_string()];
+    append_summary_field(&mut parts, content);
+    append_message_field(&mut parts, content);
+    for field in ["app_id", "session_id", "scope", "target_scope"] {
+        append_string_field(&mut parts, content, field);
+    }
+    for field in ["ok", "registered", "unregistered"] {
+        append_bool_field(&mut parts, content, field);
+    }
+    if let Some(payload) = content.get("payload").or_else(|| content.get("echo")) {
+        parts.push(format!("payload={}", compact_event_json(payload)));
+    } else if parts.len() == 1 {
+        parts.push(format!("details={}", compact_event_json(content)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_failed_event(event: &AppfsEventRecord) -> Option<String> {
+    let Some(error) = &event.error else {
+        return Some("action failed".to_string());
+    };
+    let mut parts = vec!["action failed".to_string()];
+    append_string_field(&mut parts, error, "code");
+    append_message_field(&mut parts, error);
+    append_bool_field(&mut parts, error, "retryable");
+    if parts.len() == 1 {
+        parts.push(format!("error={}", compact_event_json(error)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_lifecycle_event(event: &AppfsEventRecord, label: &str) -> Option<String> {
+    let mut parts = vec![label.to_string()];
+    if let Some(content) = &event.content {
+        append_string_field(&mut parts, content, "app_id");
+        append_string_field(&mut parts, content, "session_id");
+        append_summary_field(&mut parts, content);
+        append_message_field(&mut parts, content);
+        if parts.len() == 1 {
+            parts.push(format!("details={}", compact_event_json(content)));
+        }
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn append_summary_field(parts: &mut Vec<String>, value: &Value) {
+    append_string_field(parts, value, "summary");
+}
+
+fn append_message_field(parts: &mut Vec<String>, value: &Value) {
+    append_string_field(parts, value, "message");
+}
+
+fn append_string_field(parts: &mut Vec<String>, value: &Value, field: &str) {
+    if let Some(text) = value.get(field).and_then(Value::as_str) {
+        parts.push(format!("{field}={}", quote_summary_value(text)));
+    }
+}
+
+fn append_bool_field(parts: &mut Vec<String>, value: &Value, field: &str) {
+    if let Some(flag) = value.get(field).and_then(Value::as_bool) {
+        parts.push(format!("{field}={flag}"));
+    }
+}
+
+fn append_number_field(parts: &mut Vec<String>, value: &Value, field: &str) {
+    if let Some(number) = value.get(field).and_then(Value::as_f64) {
+        parts.push(format!("{field}={number}"));
+    }
+}
+
+fn quote_summary_value(value: &str) -> String {
+    let sanitized =
+        sanitize_reminder_text(&truncate_chars(value, APPFS_EVENT_REMINDER_FIELD_LIMIT))
+            .replace('\'', "\\'");
+    format!("'{sanitized}'")
+}
+
+fn compact_event_json(value: &Value) -> String {
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    truncate_chars(&rendered, APPFS_EVENT_REMINDER_FIELD_LIMIT)
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    let mut iter = value.chars();
+    let truncated = iter.by_ref().take(limit).collect::<String>();
+    if iter.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn sanitize_reminder_text(value: &str) -> String {
+    value
+        .replace("<system-reminder", "<system-reminder_")
+        .replace("</system-reminder", "</system-reminder_")
 }
 
 fn resolve_appfs_environment_with_attach_env(
@@ -777,7 +1169,7 @@ fn render_appfs_overview_lines(
         "- Each mounted app appears as a directory under the AppFS mount root. The platform control plane lives under `/_appfs`."
             .to_string(),
         format!(
-            "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation, then inspect `{events_path}` for `action.completed` or `action.failed`."
+            "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation. Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; only inspect `{events_path}` manually for debugging or if no reminder appears."
         ),
         "- Never use `write_file` or `edit_file` on `*.act` files because those tools overwrite the sink. Use `bash` (or another append-capable tool) to append exactly one JSON object plus a trailing newline."
             .to_string(),
@@ -841,11 +1233,12 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
 mod tests {
     use super::{
         build_appfs_prompt_section, detect_appfs_environment,
-        resolve_appfs_environment_with_attach_env, AppfsAttachEnv, AppfsAttachSource,
-        AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
-        APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
-        APPFS_SCHEMA_VERSION,
+        resolve_appfs_environment_with_attach_env, sync_appfs_event_reminders, AppfsAttachEnv,
+        AppfsAttachSource, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
+        AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND,
+        APPFS_RUNTIME_MANIFEST_REL_PATH, APPFS_SCHEMA_VERSION,
     };
+    use crate::session::{AttachmentKind, ContentBlock, Session};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1228,7 +1621,9 @@ mod tests {
 
         assert!(prompt.contains("AppFS mounts bridge-backed software into a filesystem"));
         assert!(prompt.contains("Do not guess act schemas or payload shapes"));
-        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
+        assert!(prompt.contains("Prefer the AppFS event reminder"));
+        assert!(prompt
+            .contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
         assert!(prompt.contains("chat-long"));
         assert!(prompt.contains("_stream/events.evt.jsonl"));
@@ -1248,7 +1643,8 @@ mod tests {
 
         let prompt = build_appfs_prompt_section(&cwd).expect("expected appfs prompt section");
 
-        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
+        assert!(prompt
+            .contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Scheduler app for room bookings and meeting setup."));
         assert!(prompt.contains("meeting-room-b"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
@@ -1265,13 +1661,147 @@ mod tests {
         seed_heuristic_mount(&mount_root);
         seed_aiim_prompt_files(&app_root);
 
-        let prompt = build_appfs_prompt_section(&mount_root).expect("expected appfs prompt section");
+        let prompt =
+            build_appfs_prompt_section(&mount_root).expect("expected appfs prompt section");
 
-        assert!(prompt.contains("You are inside an AppFS mount, but not currently inside a specific app root."));
-        assert!(prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`."));
+        assert!(prompt.contains(
+            "You are inside an AppFS mount, but not currently inside a specific app root."
+        ));
+        assert!(
+            prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`.")
+        );
         assert!(prompt.contains("Use the skill listing to load the matching `appfs-<app>` skill"));
         assert!(!prompt.contains("## Mounted apps"));
         assert!(!prompt.contains("`aiim` -> skill `appfs-aiim`"));
+    }
+
+    #[test]
+    fn sync_appfs_event_reminders_baselines_then_injects_new_events() {
+        let temp = TempDirGuard::new("appfs-event-reminders");
+        let mount_root = temp.path().join("mnt");
+        let app_root = mount_root.join("aiim");
+        let notion_root = mount_root.join("notion");
+        seed_heuristic_mount(&mount_root);
+        fs::create_dir_all(notion_root.join("_stream")).expect("create notion stream");
+
+        let write_cursor = |stream_dir: &Path, max_seq: i64| {
+            fs::write(
+                stream_dir.join("cursor.res.json"),
+                format!(r#"{{"min_seq":0,"max_seq":{max_seq},"retention_hint_sec":86400}}"#),
+            )
+            .expect("write stream cursor");
+        };
+
+        let control_events = mount_root
+            .join("_appfs")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let app_events = app_root.join("_stream").join("events.evt.jsonl");
+        let notion_events = notion_root.join("_stream").join("events.evt.jsonl");
+        fs::write(
+            &control_events,
+            r#"{"seq":1,"type":"runtime.started","path":"/_appfs","request_id":"old-platform"}"#,
+        )
+        .expect("write control baseline event");
+        fs::write(
+            &app_events,
+            r#"{"seq":1,"app":"aiim","type":"action.completed","path":"/old.act","request_id":"old-app"}"#,
+        )
+        .expect("write app baseline event");
+        fs::write(
+            &notion_events,
+            r#"{"seq":1,"app":"notion","type":"action.completed","path":"/old.act","request_id":"old-notion"}"#,
+        )
+        .expect("write second app baseline event");
+        write_cursor(&mount_root.join("_appfs").join("_stream"), 1);
+        write_cursor(&app_root.join("_stream"), 1);
+        write_cursor(&notion_root.join("_stream"), 1);
+
+        let mut session = Session::new();
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("baseline should sync");
+
+        assert!(session.messages.is_empty());
+        assert_eq!(session.appfs_event_cursor("platform"), Some(1));
+        assert_eq!(session.appfs_event_cursor("app:aiim"), Some(1));
+        assert_eq!(session.appfs_event_cursor("app:notion"), Some(1));
+
+        fs::write(
+            &control_events,
+            concat!(
+                r#"{"seq":1,"type":"runtime.started","path":"/_appfs","request_id":"old-platform"}"#,
+                "\n",
+                r#"{"seq":2,"type":"action.completed","path":"/_appfs/register_app.act","request_id":"new-platform","content":{"app_id":"scheduler","registered":true}}"#,
+                "\n"
+            ),
+        )
+        .expect("append control event");
+        fs::write(
+            &app_events,
+            concat!(
+                r#"{"seq":1,"app":"aiim","type":"action.completed","path":"/old.act","request_id":"old-app"}"#,
+                "\n",
+                r#"{"seq":2,"app":"aiim","type":"action.accepted","path":"/contacts/zhangsan/send_message.act","request_id":"new-app","content":{"status":"accepted"}}"#,
+                "\n",
+                r#"{"seq":3,"app":"aiim","type":"action.progress","path":"/contacts/zhangsan/send_message.act","request_id":"new-app","content":{"percent":50}}"#,
+                "\n",
+                r#"{"seq":4,"app":"aiim","type":"action.completed","path":"/contacts/zhangsan/send_message.act","request_id":"new-app","content":{"ok":true,"echo":{"text":"明天开会","priority":"normal"}}}"#,
+                "\n"
+            ),
+        )
+        .expect("append app event");
+        fs::write(
+            &notion_events,
+            concat!(
+                r#"{"seq":1,"app":"notion","type":"action.completed","path":"/old.act","request_id":"old-notion"}"#,
+                "\n",
+                r#"{"seq":2,"app":"notion","type":"action.failed","path":"/pages/create.act","request_id":"new-notion","error":{"code":"ERR_TIMEOUT","message":"timed out","retryable":true}}"#,
+                "\n"
+            ),
+        )
+        .expect("append second app event");
+        write_cursor(&mount_root.join("_appfs").join("_stream"), 2);
+        write_cursor(&app_root.join("_stream"), 4);
+        write_cursor(&notion_root.join("_stream"), 2);
+
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("new events should sync");
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::AppfsEvents)
+        );
+        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
+            panic!("expected text reminder");
+        };
+        assert!(text.contains("<system-reminder>"));
+        assert!(text.contains("action.completed"));
+        assert!(text.contains("app_id='scheduler'"));
+        assert!(text.contains("registered=true"));
+        assert!(text.contains("action.completed"));
+        assert!(text.contains("action.accepted"));
+        assert!(text.contains("action.progress"));
+        assert!(text.contains("action.failed"));
+        assert!(text.contains("app=aiim"));
+        assert!(text.contains("app=notion"));
+        assert!(text.contains("/contacts/zhangsan/send_message.act"));
+        assert!(text.contains("summary=action accepted; status='accepted'"));
+        assert!(text.contains("summary=action progress; percent=50"));
+        assert!(text.contains("summary=action completed; ok=true; payload="));
+        assert!(text.contains(
+            "summary=action failed; code='ERR_TIMEOUT'; message='timed out'; retryable=true"
+        ));
+        assert!(!text.contains("stream=app:"));
+        assert!(!text.contains("old-platform"));
+        assert!(!text.contains("/old.act"));
+        assert_eq!(session.appfs_event_cursor("platform"), Some(2));
+        assert_eq!(session.appfs_event_cursor("app:aiim"), Some(4));
+        assert_eq!(session.appfs_event_cursor("app:notion"), Some(2));
+
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("empty sync should succeed");
+        assert_eq!(session.messages.len(), 1);
     }
 
     #[test]
