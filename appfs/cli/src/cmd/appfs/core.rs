@@ -4,7 +4,7 @@ use agentfs_sdk::{
     ConnectorCredentialSummary, ConnectorError, ConnectorInfo, ConnectorTransport,
     DemoAppConnector, FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
     FetchSnapshotChunkResponse, HealthStatus, SnapshotMeta, SubmitActionOutcome,
-    SubmitActionRequest, SubmitActionResponse,
+    SubmitActionRequest, SubmitActionResponse, TinodeConnector,
 };
 use anyhow::{Context, Result};
 use serde_json::Value as JsonValue;
@@ -877,6 +877,17 @@ impl AppfsAdapter {
                 outcome: SubmitActionOutcome::Completed { content },
                 ..
             }) => {
+                let (content, side_events) = split_connector_side_events(content);
+                for event in side_events {
+                    self.emit_event(
+                        &normalized_path,
+                        &request_id,
+                        &event.event_type,
+                        event.content,
+                        event.error,
+                        client_token.clone(),
+                    )?;
+                }
                 self.emit_event(
                     &normalized_path,
                     &request_id,
@@ -1111,6 +1122,14 @@ pub(super) fn build_app_connector(
             Duration::from_millis(bridge_config.adapter_http_timeout_ms.max(1)),
             bridge_config.runtime_options,
         ))
+    } else if app_id == "tinode" {
+        Box::new(TinodeConnector::from_env().map_err(|err| {
+            anyhow::anyhow!(
+                "failed to initialize Tinode connector: {}: {}",
+                err.code,
+                err.message
+            )
+        })?)
     } else {
         Box::new(DemoAppConnector::new(app_id.to_string()))
     };
@@ -1126,6 +1145,43 @@ pub(super) fn build_app_connector(
         );
     }
     Ok(connector)
+}
+
+struct ConnectorSideEvent {
+    event_type: String,
+    content: Option<JsonValue>,
+    error: Option<JsonValue>,
+}
+
+fn split_connector_side_events(mut content: JsonValue) -> (JsonValue, Vec<ConnectorSideEvent>) {
+    let Some(object) = content.as_object_mut() else {
+        return (content, Vec::new());
+    };
+    let Some(raw_events) = object.remove("_appfs_events") else {
+        return (content, Vec::new());
+    };
+    let Some(raw_events) = raw_events.as_array() else {
+        return (content, Vec::new());
+    };
+
+    let events = raw_events
+        .iter()
+        .filter_map(|raw| {
+            let event_type = raw
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            Some(ConnectorSideEvent {
+                event_type,
+                content: raw.get("content").cloned(),
+                error: raw.get("error").cloned(),
+            })
+        })
+        .collect();
+
+    (content, events)
 }
 
 pub(super) fn parse_manifest_contract_json(
@@ -1834,10 +1890,10 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let adapter = AppfsAdapter::new_with_mount_path(
             temp.path().to_path_buf(),
-            "tinode".to_string(),
-            "private/default/tinode".to_string(),
+            "demo-private".to_string(),
+            "private/default/demo-private".to_string(),
             Some("default".to_string()),
-            Some("tinode:default".to_string()),
+            Some("demo-private:default".to_string()),
             "sess-test".to_string(),
             bridge_config(),
             None,
@@ -2547,6 +2603,31 @@ mod tests {
     }
 
     #[test]
+    fn connector_side_events_are_split_and_reserved_field_is_hidden() {
+        let (content, events) = super::split_connector_side_events(json!({
+            "ok": true,
+            "_appfs_events": [
+                {"type": "message.sent", "content": {"message_id": "m1"}},
+                {"type": "action.accepted", "content": {"ok": true}},
+                {"content": {"ignored": true}}
+            ]
+        }));
+
+        assert_eq!(content["ok"], true);
+        assert!(content.get("_appfs_events").is_none());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "message.sent");
+        assert_eq!(
+            events[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.get("message_id"))
+                .and_then(|value| value.as_str()),
+            Some("m1")
+        );
+    }
+
+    #[test]
     fn structured_bootstrap_exposes_app_control_actions() {
         let (_temp, adapter) = structured_adapter();
 
@@ -2587,7 +2668,7 @@ mod tests {
 
         append_text(
             &action_path,
-            "{\"client_token\":\"ensure-001\",\"expected_profile_id\":\"tinode:default\"}\n",
+            "{\"client_token\":\"ensure-001\",\"expected_profile_id\":\"demo-private:default\"}\n",
         );
         adapter.poll_once().expect("poll ensure credentials");
 
@@ -2606,17 +2687,17 @@ mod tests {
         );
         assert_eq!(
             content.get("profile_id").and_then(|value| value.as_str()),
-            Some("tinode:default")
+            Some("demo-private:default")
         );
         assert_eq!(
             content
                 .get("upstream_user_id")
                 .and_then(|value| value.as_str()),
-            Some("demo-user-tinode:default")
+            Some("demo-user-demo-private:default")
         );
         assert_eq!(
             content.get("login").and_then(|value| value.as_str()),
-            Some("demo-tinode:default")
+            Some("demo-demo-private:default")
         );
         assert!(content.get("token").is_none());
         assert!(!content.to_string().contains("demo-secret-token"));
@@ -2632,7 +2713,7 @@ mod tests {
 
         append_text(
             &action_path,
-            "{\"client_token\":\"ensure-mismatch-001\",\"expected_profile_id\":\"tinode:attacker\"}\n",
+            "{\"client_token\":\"ensure-mismatch-001\",\"expected_profile_id\":\"demo-private:attacker\"}\n",
         );
         adapter
             .poll_once()
