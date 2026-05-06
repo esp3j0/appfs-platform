@@ -68,7 +68,7 @@ Action names use singular verbs:
 1. `send_message.act`
 2. `create_group.act`
 3. `invite_members.act`
-4. `refresh_messages.act`
+4. `mark_read.act`
 
 Resource streams use AppFS resource suffixes:
 
@@ -115,7 +115,6 @@ Recommended v0 tree:
       contact.res.json
       messages.res.jsonl
       send_message.act
-      refresh_messages.act
   groups/
     index.res.jsonl
     create_group.act
@@ -124,7 +123,6 @@ Recommended v0 tree:
       messages.res.jsonl
       send_message.act
       invite_members.act
-      refresh_messages.act
   inbox/
     recent.res.jsonl
     unread.res.jsonl
@@ -263,7 +261,6 @@ Canonical per-contact path:
 ```text
 contacts/<contact-key>/messages.res.jsonl
 contacts/<contact-key>/send_message.act
-contacts/<contact-key>/refresh_messages.act
 ```
 
 Example:
@@ -470,7 +467,6 @@ groups/<group-key>/group.res.json
 groups/<group-key>/messages.res.jsonl
 groups/<group-key>/send_message.act
 groups/<group-key>/invite_members.act
-groups/<group-key>/refresh_messages.act
 ```
 
 ## `groups/create_group.act`
@@ -849,6 +845,9 @@ Error event example:
 5. Dynamic contact/group directories require app structure revision updates.
 6. `contacts/send_message.act` can be implemented first, then per-contact dirs can be added once structure refresh is solid.
 7. `inbox/unread.res.jsonl` can initially be a derived view from recent inbound events.
+8. Connector resolves `principal:<principal-id>` member refs through an AppFS-provided app instance registry/resolver. In v0 this may be implemented from an `apps.registry.json` snapshot: find the private app instance with `principal_id` matching the ref and `app_id = tinode`, take that instance's `profile_id`, then look up the target's `tinode_user_id` from Tinode connector private state. The connector must not infer another principal's profile by string concatenation alone.
+9. The Tinode connector credential store should be shared by `profile_id` across Tinode app instances in the same AppFS runtime, so resolving `principal:<principal-id>` can see already-ready profiles such as `tinode:incident-reporter`.
+10. If the target principal has no Tinode instance, no `profile_id`, or no ready Tinode user id, group creation or invitation should fail with `PROFILE_NOT_READY` and an actionable hint. The current principal's action must not silently create another principal's Tinode credentials in v0.
 
 ## v0 Minimum Slice
 
