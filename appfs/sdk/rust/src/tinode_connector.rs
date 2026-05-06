@@ -2,15 +2,15 @@ use crate::credential_store::{ConnectorCredentialRecord, ConnectorCredentialStat
 use crate::{
     connector_error_codes, ActionExecutionMode, AppConnector, AppStructureNode,
     AppStructureNodeKind, AppStructureSnapshot, AppStructureSyncResult, AuthStatus,
-    ConnectorContext, ConnectorError, ConnectorInfo, ConnectorTransport, FetchLivePageRequest,
-    FetchLivePageResponse, FetchSnapshotChunkRequest, FetchSnapshotChunkResponse,
-    GetAppStructureRequest, GetAppStructureResponse, HealthStatus, RefreshAppStructureRequest,
-    RefreshAppStructureResponse, SnapshotMeta, SnapshotRecord, SubmitActionOutcome,
-    SubmitActionRequest, SubmitActionResponse,
+    ConnectorContext, ConnectorError, ConnectorInboundEvent, ConnectorInfo, ConnectorTransport,
+    FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
+    FetchSnapshotChunkResponse, GetAppStructureRequest, GetAppStructureResponse, HealthStatus,
+    RefreshAppStructureRequest, RefreshAppStructureResponse, SnapshotMeta, SnapshotRecord,
+    SubmitActionOutcome, SubmitActionRequest, SubmitActionResponse,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::stream::MaybeTlsStream;
@@ -196,6 +196,9 @@ pub struct TinodeConnector {
     credentials: HashMap<String, ConnectorCredentialRecord>,
     contacts: HashMap<String, TinodeContact>,
     direct_messages: HashMap<String, Vec<TinodeMessageRecord>>,
+    inbox_recent: Vec<InboxRecord>,
+    unread_message_ids: HashSet<String>,
+    last_direct_seq_by_contact: HashMap<String, i64>,
     gateway: Box<dyn TinodeGateway>,
 }
 
@@ -212,6 +215,9 @@ impl TinodeConnector {
             credentials: HashMap::new(),
             contacts: HashMap::new(),
             direct_messages: HashMap::new(),
+            inbox_recent: Vec::new(),
+            unread_message_ids: HashSet::new(),
+            last_direct_seq_by_contact: HashMap::new(),
             gateway,
         }
     }
@@ -254,8 +260,9 @@ impl TinodeConnector {
             .map(|record| credential_status_label(record.credential_status))
             .unwrap_or("missing");
         format!(
-            "{TINODE_STRUCTURE_REVISION}-contacts{}-{credential_status}",
-            self.contacts.len()
+            "{TINODE_STRUCTURE_REVISION}-contacts{}-inbox{}-{credential_status}",
+            self.contacts.len(),
+            self.inbox_recent.len()
         )
     }
 
@@ -349,10 +356,10 @@ impl TinodeConnector {
 
         let records = match normalized.as_str() {
             "contacts/index.res.jsonl" => self.contact_index_records(),
+            "inbox/recent.res.jsonl" => self.inbox_records(false),
+            "inbox/unread.res.jsonl" => self.inbox_records(true),
             "contacts/search_results.res.jsonl"
             | "groups/index.res.jsonl"
-            | "inbox/recent.res.jsonl"
-            | "inbox/unread.res.jsonl"
             | "topics/index.res.jsonl" => Vec::new(),
             path if contact_messages_key(path).is_some() => {
                 let key = contact_messages_key(path).expect("checked contact messages path");
@@ -402,6 +409,19 @@ impl TinodeConnector {
                 record_key: message.message_id.clone(),
                 ordering_key: message.created_at_ms.to_string(),
                 line: message.to_resource_line(),
+            })
+            .collect()
+    }
+
+    fn inbox_records(&self, unread_only: bool) -> Vec<SnapshotRecord> {
+        self.inbox_recent
+            .iter()
+            .filter(|record| !unread_only || self.unread_message_ids.contains(&record.message_id))
+            .cloned()
+            .map(|record| SnapshotRecord {
+                record_key: record.message_id.clone(),
+                ordering_key: record.created_at_ms.to_string(),
+                line: record.to_resource_line(self.unread_message_ids.contains(&record.message_id)),
             })
             .collect()
     }
@@ -608,6 +628,185 @@ impl TinodeConnector {
 
         Ok(completed_response(ctx, content))
     }
+
+    fn drain_inbound_for_ctx(
+        &mut self,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<Vec<ConnectorInboundEvent>, ConnectorError> {
+        let Ok(profile_id) = effective_profile_id(ctx) else {
+            return Ok(Vec::new());
+        };
+        let Some(record) = self.credentials.get(&profile_id).cloned() else {
+            return Ok(Vec::new());
+        };
+        if record.credential_status != ConnectorCredentialStatus::Ready {
+            return Ok(Vec::new());
+        }
+        let credentials = credentials_from_record(&record)?;
+        let contacts = self.contacts.values().cloned().collect::<Vec<_>>();
+        if contacts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut events = Vec::new();
+        for contact in contacts {
+            let since_seq = self
+                .last_direct_seq_by_contact
+                .get(&contact.key)
+                .copied()
+                .or_else(|| {
+                    self.direct_messages.get(&contact.key).and_then(|messages| {
+                        messages.iter().filter_map(|message| message.seq).max()
+                    })
+                });
+            let inbound_messages =
+                self.gateway
+                    .fetch_direct_messages(&credentials, &contact, since_seq)?;
+            for inbound in inbound_messages {
+                if inbound.from_tinode_user_id == credentials.tinode_user_id {
+                    self.last_direct_seq_by_contact
+                        .insert(contact.key.clone(), inbound.seq);
+                    continue;
+                }
+                let message_id = format!("tinode:{}:{}", inbound.topic, inbound.seq);
+                if self
+                    .direct_messages
+                    .get(&contact.key)
+                    .map(|messages| {
+                        messages
+                            .iter()
+                            .any(|message| message.message_id == message_id)
+                    })
+                    .unwrap_or(false)
+                {
+                    self.last_direct_seq_by_contact
+                        .insert(contact.key.clone(), inbound.seq);
+                    continue;
+                }
+
+                let message = TinodeMessageRecord {
+                    message_id: message_id.clone(),
+                    contact_key: contact.key.clone(),
+                    direction: "inbound".to_string(),
+                    text: inbound.text.clone(),
+                    created_at_ms: now_millis(),
+                    seq: Some(inbound.seq),
+                };
+                self.direct_messages
+                    .entry(contact.key.clone())
+                    .or_default()
+                    .push(message.clone());
+                self.last_direct_seq_by_contact
+                    .insert(contact.key.clone(), inbound.seq);
+                self.unread_message_ids.insert(message_id.clone());
+
+                let inbox_record = InboxRecord {
+                    message_id: message_id.clone(),
+                    contact_key: contact.key.clone(),
+                    conversation_type: "direct".to_string(),
+                    from_tinode_user_id: inbound.from_tinode_user_id.clone(),
+                    from_display_name: contact.display_name.clone(),
+                    text: inbound.text.clone(),
+                    created_at_ms: message.created_at_ms,
+                    requires_attention: true,
+                };
+                self.inbox_recent.push(inbox_record.clone());
+                events.push(ConnectorInboundEvent {
+                    event_type: "message.received".to_string(),
+                    path: format!("contacts/{}/messages.res.jsonl", contact.key),
+                    content: Some(inbox_record.to_event_content(&profile_id)),
+                    error: None,
+                });
+                events.push(ConnectorInboundEvent {
+                    event_type: "inbox.updated".to_string(),
+                    path: "inbox/unread.res.jsonl".to_string(),
+                    content: Some(json!({
+                        "message_id": message_id,
+                        "conversation_type": "direct",
+                        "contact_key": contact.key,
+                        "unread_count": self.unread_message_ids.len(),
+                    })),
+                    error: None,
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    fn submit_refresh_inbox(
+        &mut self,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let events = self.drain_inbound_for_ctx(ctx)?;
+        let mut content = json!({
+            "ok": true,
+            "refreshed": true,
+            "event_count": events.len(),
+            "unread_count": self.unread_message_ids.len(),
+        });
+        for event in events {
+            add_side_event_with_path(
+                &mut content,
+                &event.event_type,
+                &event.path,
+                event.content,
+                true,
+            );
+        }
+        Ok(completed_response(ctx, content))
+    }
+
+    fn submit_mark_read(
+        &mut self,
+        request: SubmitActionRequest,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let mark_all = request
+            .payload
+            .get("all")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let message_id = request
+            .payload
+            .get("message_id")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let mut cleared = Vec::new();
+        if mark_all {
+            cleared.extend(self.unread_message_ids.drain());
+        } else if let Some(message_id) = message_id {
+            if self.unread_message_ids.remove(&message_id) {
+                cleared.push(message_id);
+            }
+        } else {
+            return Err(connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode inbox/mark_read.act requires `all=true` or a non-empty `message_id`",
+                false,
+            ));
+        }
+
+        let mut content = json!({
+            "ok": true,
+            "cleared": cleared,
+            "unread_count": self.unread_message_ids.len(),
+        });
+        let cleared_for_event = content.get("cleared").cloned().unwrap_or_else(|| json!([]));
+        add_side_event_with_path(
+            &mut content,
+            "message.read",
+            "inbox/unread.res.jsonl",
+            Some(json!({
+                "cleared": cleared_for_event,
+                "unread_count": self.unread_message_ids.len(),
+            })),
+            true,
+        );
+        Ok(completed_response(ctx, content))
+    }
 }
 
 impl AppConnector for TinodeConnector {
@@ -625,6 +824,7 @@ impl AppConnector for TinodeConnector {
                 "skeleton_tree".to_string(),
                 "credential_policy:auto-create".to_string(),
                 "direct_message".to_string(),
+                "inbound_inbox".to_string(),
             ],
         })
     }
@@ -711,11 +911,13 @@ impl AppConnector for TinodeConnector {
             "_app/ensure_credentials.act" => self.submit_ensure_credentials(ctx),
             "contacts/resolve.act" => self.submit_resolve_contact(request, ctx),
             "contacts/send_message.act" => self.submit_send_message(request, ctx),
-            "_app/refresh_structure.act" | "_app/refresh_inbox.act" => Ok(completed_response(
+            "_app/refresh_inbox.act" => self.submit_refresh_inbox(ctx),
+            "_app/refresh_structure.act" => Ok(completed_response(
                 ctx,
                 json!({ "ok": true, "refreshed": false, "reason": "no-op in Tinode connector v0" }),
             )),
-            "groups/create_group.act" | "inbox/mark_read.act" => Err(connector_err(
+            "inbox/mark_read.act" => self.submit_mark_read(request, ctx),
+            "groups/create_group.act" => Err(connector_err(
                 connector_error_codes::NOT_SUPPORTED,
                 format!("Tinode action is not implemented yet: {}", request.path),
                 false,
@@ -729,6 +931,13 @@ impl AppConnector for TinodeConnector {
                 false,
             )),
         }
+    }
+
+    fn drain_inbound_events(
+        &mut self,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<Vec<ConnectorInboundEvent>, ConnectorError> {
+        self.drain_inbound_for_ctx(ctx)
     }
 
     fn get_app_structure(
@@ -791,6 +1000,13 @@ trait TinodeGateway: Send {
         text: &str,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError>;
+
+    fn fetch_direct_messages(
+        &mut self,
+        credentials: &TinodeCredentials,
+        contact: &TinodeContact,
+        since_seq: Option<i64>,
+    ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError>;
 }
 
 #[derive(Debug, Clone)]
@@ -845,6 +1061,14 @@ struct TinodeSendReceipt {
 }
 
 #[derive(Debug, Clone)]
+struct TinodeInboundMessage {
+    topic: String,
+    seq: i64,
+    from_tinode_user_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
 struct TinodeMessageRecord {
     message_id: String,
     contact_key: String,
@@ -863,6 +1087,48 @@ impl TinodeMessageRecord {
             "text": self.text,
             "created_at_ms": self.created_at_ms,
             "seq": self.seq,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InboxRecord {
+    message_id: String,
+    contact_key: String,
+    conversation_type: String,
+    from_tinode_user_id: String,
+    from_display_name: Option<String>,
+    text: String,
+    created_at_ms: u128,
+    requires_attention: bool,
+}
+
+impl InboxRecord {
+    fn to_resource_line(&self, unread: bool) -> JsonValue {
+        json!({
+            "message_id": self.message_id,
+            "conversation_type": self.conversation_type,
+            "contact_key": self.contact_key,
+            "from_tinode_user_id": self.from_tinode_user_id,
+            "from_display_name": self.from_display_name,
+            "text": self.text,
+            "text_preview": text_preview(&self.text),
+            "created_at_ms": self.created_at_ms,
+            "requires_attention": self.requires_attention,
+            "unread": unread,
+        })
+    }
+
+    fn to_event_content(&self, profile_id: &str) -> JsonValue {
+        json!({
+            "profile_id": profile_id,
+            "conversation_type": self.conversation_type,
+            "contact_key": self.contact_key,
+            "message_id": self.message_id,
+            "from_tinode_user_id": self.from_tinode_user_id,
+            "from_display_name": self.from_display_name,
+            "text_preview": text_preview(&self.text),
+            "requires_attention": self.requires_attention,
         })
     }
 }
@@ -947,6 +1213,16 @@ impl TinodeGateway for WebSocketTinodeGateway {
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
         self.client_mut(credentials)?
             .send_direct_message(contact, text, client_token)
+    }
+
+    fn fetch_direct_messages(
+        &mut self,
+        credentials: &TinodeCredentials,
+        contact: &TinodeContact,
+        since_seq: Option<i64>,
+    ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
+        self.client_mut(credentials)?
+            .fetch_direct_messages(contact, since_seq)
     }
 }
 
@@ -1134,6 +1410,33 @@ impl TinodeWsClient {
         })
     }
 
+    fn fetch_direct_messages(
+        &mut self,
+        contact: &TinodeContact,
+        since_seq: Option<i64>,
+    ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
+        let suffix = self.next_suffix();
+        let _ = self.request(
+            "sub",
+            json!({ "topic": contact.tinode_user_id }),
+            &format!("sub-inbox-{suffix}"),
+        );
+        let mut payload = json!({
+            "topic": contact.tinode_user_id,
+            "what": "data",
+            "limit": 50,
+        });
+        if let Some(since_seq) = since_seq {
+            payload["since"] = json!(since_seq.saturating_add(1));
+        }
+        self.request_data(
+            "get",
+            payload,
+            &format!("get-data-{suffix}"),
+            &contact.tinode_user_id,
+        )
+    }
+
     fn request(
         &mut self,
         kind: &str,
@@ -1199,6 +1502,51 @@ impl TinodeWsClient {
                 true,
             )
         })
+    }
+
+    fn request_data(
+        &mut self,
+        kind: &str,
+        payload: JsonValue,
+        id: &str,
+        topic: &str,
+    ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
+        let mut object = payload.as_object().cloned().ok_or_else(|| {
+            connector_err(
+                connector_error_codes::INVALID_PAYLOAD,
+                "Tinode data request payload must be a JSON object",
+                false,
+            )
+        })?;
+        object.insert("id".to_string(), json!(id));
+        self.send_packet(json!({ kind: object }))?;
+
+        let mut messages = Vec::new();
+        for _ in 0..400 {
+            let msg = self.read_message_json()?;
+            if let Some(data) = msg.get("data") {
+                if data.get("topic").and_then(JsonValue::as_str) == Some(topic) {
+                    if let Some(message) = inbound_message_from_data(data) {
+                        messages.push(message);
+                    }
+                }
+                continue;
+            }
+            if let Some(ctrl) = msg.get("ctrl") {
+                if ctrl.get("id").and_then(JsonValue::as_str) == Some(id) {
+                    let code = ctrl.get("code").and_then(JsonValue::as_i64).unwrap_or(200);
+                    if code >= 400 {
+                        return Err(tinode_ctrl_error(kind, ctrl));
+                    }
+                    return Ok(messages);
+                }
+            }
+        }
+        Err(connector_err(
+            connector_error_codes::TIMEOUT,
+            format!("Tinode did not return ctrl for {kind} id={id}"),
+            true,
+        ))
     }
 
     fn wait_for_ctrl(
@@ -1633,6 +1981,37 @@ fn contact_from_search_entry(login: &str, entry: &JsonValue) -> Option<TinodeCon
     })
 }
 
+fn inbound_message_from_data(data: &JsonValue) -> Option<TinodeInboundMessage> {
+    let topic = data
+        .get("topic")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let seq = data.get("seq").and_then(JsonValue::as_i64)?;
+    let from_tinode_user_id = data
+        .get("from")
+        .or_else(|| data.get("from_user_id"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let content = data.get("content")?;
+    let text = content
+        .get("txt")
+        .or_else(|| content.get("text"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(TinodeInboundMessage {
+        topic,
+        seq,
+        from_tinode_user_id,
+        text,
+    })
+}
+
 fn add_side_event(
     content: &mut JsonValue,
     event_type: &str,
@@ -1653,6 +2032,34 @@ fn add_side_event(
     };
     let mut event = JsonMap::new();
     event.insert("type".to_string(), json!(event_type));
+    if let Some(content) = event_content {
+        event.insert("content".to_string(), content);
+    }
+    events.push(JsonValue::Object(event));
+}
+
+fn add_side_event_with_path(
+    content: &mut JsonValue,
+    event_type: &str,
+    event_path: &str,
+    event_content: Option<JsonValue>,
+    include: bool,
+) {
+    if !include {
+        return;
+    }
+    let Some(object) = content.as_object_mut() else {
+        return;
+    };
+    let events = object
+        .entry(CONNECTOR_SIDE_EVENTS_FIELD)
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(events) = events.as_array_mut() else {
+        return;
+    };
+    let mut event = JsonMap::new();
+    event.insert("type".to_string(), json!(event_type));
+    event.insert("path".to_string(), json!(event_path));
     if let Some(content) = event_content {
         event.insert("content".to_string(), content);
     }
@@ -1737,7 +2144,8 @@ fn connector_err(code: &str, message: impl Into<String>, retryable: bool) -> Con
 mod tests {
     use super::{
         TinodeAccount, TinodeAccountRequest, TinodeConnector, TinodeConnectorConfig, TinodeContact,
-        TinodeCredentials, TinodeGateway, TinodeSendReceipt, CONNECTOR_SIDE_EVENTS_FIELD,
+        TinodeCredentials, TinodeGateway, TinodeInboundMessage, TinodeSendReceipt,
+        CONNECTOR_SIDE_EVENTS_FIELD,
     };
     use crate::{
         connector_error_codes, ActionExecutionMode, AppConnector, AppStructureSyncResult,
@@ -1769,6 +2177,8 @@ mod tests {
         created: Vec<TinodeAccountRequest>,
         resolved: Vec<String>,
         sent: Vec<(String, String, Option<String>)>,
+        inbound: Vec<TinodeInboundMessage>,
+        fetched_since: Vec<Option<i64>>,
         fail_resolve: bool,
     }
 
@@ -1840,6 +2250,23 @@ mod tests {
                 message_id: format!("tinode:{}:1", contact.tinode_user_id),
                 seq: Some(1),
             })
+        }
+
+        fn fetch_direct_messages(
+            &mut self,
+            _credentials: &TinodeCredentials,
+            _contact: &TinodeContact,
+            since_seq: Option<i64>,
+        ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
+            let mut state = self.state.lock().expect("mock state");
+            state.fetched_since.push(since_seq);
+            let since_seq = since_seq.unwrap_or(0);
+            Ok(state
+                .inbound
+                .iter()
+                .filter(|message| message.seq > since_seq)
+                .cloned()
+                .collect())
         }
     }
 
@@ -2114,5 +2541,183 @@ mod tests {
             .line
             .to_string()
             .contains("secret-token"));
+    }
+
+    #[test]
+    fn inbound_direct_messages_become_events_and_inbox_records() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"outbound"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed contact");
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "reply from user".to_string(),
+            });
+
+        let events = connector
+            .drain_inbound_events(&ctx())
+            .expect("drain inbound");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "message.received");
+        assert_eq!(events[0].path, "contacts/zhangsan/messages.res.jsonl");
+        assert_eq!(
+            events[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.get("text_preview"))
+                .and_then(JsonValue::as_str),
+            Some("reply from user")
+        );
+        assert_eq!(events[1].event_type, "inbox.updated");
+
+        let unread = connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/inbox/unread.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("unread inbox");
+        assert_eq!(unread.records.len(), 1);
+        assert_eq!(unread.records[0].line["text"], "reply from user");
+        assert_eq!(unread.records[0].line["unread"], true);
+
+        let messages = connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/contacts/zhangsan/messages.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("messages");
+        assert_eq!(messages.records.len(), 2);
+        assert_eq!(messages.records[1].line["direction"], "inbound");
+
+        let duplicate = connector
+            .drain_inbound_events(&ctx())
+            .expect("second drain");
+        assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn refresh_inbox_action_returns_side_events_for_inbound_messages() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"outbound"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed contact");
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "refresh reply".to_string(),
+            });
+
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/_app/refresh_inbox.act".to_string(),
+                        payload: json!({}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("refresh inbox"),
+        );
+        assert_eq!(content["event_count"], 2);
+        let side_events = content
+            .get(CONNECTOR_SIDE_EVENTS_FIELD)
+            .and_then(JsonValue::as_array)
+            .expect("side events");
+        assert_eq!(side_events[0]["type"], "message.received");
+        assert_eq!(
+            side_events[0]["path"],
+            "contacts/zhangsan/messages.res.jsonl"
+        );
+    }
+
+    #[test]
+    fn mark_read_clears_unread_inbox_without_upstream_receipts() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"outbound"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed contact");
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "reply".to_string(),
+            });
+        connector
+            .drain_inbound_events(&ctx())
+            .expect("drain inbound");
+
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/inbox/mark_read.act".to_string(),
+                        payload: json!({"all": true}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("mark read"),
+        );
+        assert_eq!(content["unread_count"], 0);
+
+        let unread = connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/inbox/unread.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("unread inbox");
+        assert!(unread.records.is_empty());
     }
 }

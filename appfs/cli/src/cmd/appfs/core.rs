@@ -1,10 +1,10 @@
 use agentfs_sdk::{
     connector_error_codes, ActionExecutionMode, AgentFS as SdkAgentFS, AgentFSOptions,
     AppAdapterV1, AppConnector, AppStructureSyncReason, AuthStatus, ConnectorContext,
-    ConnectorCredentialSummary, ConnectorError, ConnectorInfo, ConnectorTransport,
-    DemoAppConnector, FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
-    FetchSnapshotChunkResponse, HealthStatus, SnapshotMeta, SubmitActionOutcome,
-    SubmitActionRequest, SubmitActionResponse, TinodeConnector,
+    ConnectorCredentialSummary, ConnectorError, ConnectorInboundEvent, ConnectorInfo,
+    ConnectorTransport, DemoAppConnector, FetchLivePageRequest, FetchLivePageResponse,
+    FetchSnapshotChunkRequest, FetchSnapshotChunkResponse, HealthStatus, SnapshotMeta,
+    SubmitActionOutcome, SubmitActionRequest, SubmitActionResponse, TinodeConnector,
 };
 use anyhow::{Context, Result};
 use serde_json::Value as JsonValue;
@@ -487,8 +487,57 @@ impl AppfsAdapter {
         Ok(())
     }
 
+    fn drain_connector_inbound_events(&mut self) -> Result<()> {
+        let request_id = Self::new_request_id();
+        let request_ctx = ConnectorContext {
+            app_id: self.app_id.clone(),
+            session_id: self.session_id.clone(),
+            request_id: request_id.clone(),
+            client_token: None,
+            trace_id: None,
+            principal_id: self.principal_id.clone(),
+            profile_id: self.profile_id.clone(),
+        };
+
+        match self.connector.drain_inbound_events(&request_ctx) {
+            Ok(events) => {
+                for event in events {
+                    self.emit_connector_inbound_event(&request_id, event)?;
+                }
+            }
+            Err(ConnectorError {
+                code,
+                message,
+                retryable,
+                ..
+            }) => {
+                eprintln!(
+                    "AppFS adapter ignored inbound drain failure for app {}: code={code} message={message} retryable={retryable}",
+                    self.app_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_connector_inbound_event(
+        &mut self,
+        request_id: &str,
+        event: ConnectorInboundEvent,
+    ) -> Result<()> {
+        self.emit_event(
+            &event.path,
+            request_id,
+            &event.event_type,
+            event.content,
+            event.error,
+            None,
+        )
+    }
+
     pub(super) fn poll_once(&mut self) -> Result<()> {
         self.drain_streaming_jobs()?;
+        self.drain_connector_inbound_events()?;
 
         let mut actions = self.collect_action_files()?;
         actions.sort();
@@ -879,8 +928,9 @@ impl AppfsAdapter {
             }) => {
                 let (content, side_events) = split_connector_side_events(content);
                 for event in side_events {
+                    let event_path = event.path.as_deref().unwrap_or(&normalized_path);
                     self.emit_event(
-                        &normalized_path,
+                        event_path,
                         &request_id,
                         &event.event_type,
                         event.content,
@@ -1149,6 +1199,7 @@ pub(super) fn build_app_connector(
 
 struct ConnectorSideEvent {
     event_type: String,
+    path: Option<String>,
     content: Option<JsonValue>,
     error: Option<JsonValue>,
 }
@@ -1175,6 +1226,12 @@ fn split_connector_side_events(mut content: JsonValue) -> (JsonValue, Vec<Connec
                 .to_string();
             Some(ConnectorSideEvent {
                 event_type,
+                path: raw
+                    .get("path")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
                 content: raw.get("content").cloned(),
                 error: raw.get("error").cloned(),
             })
@@ -2607,7 +2664,7 @@ mod tests {
         let (content, events) = super::split_connector_side_events(json!({
             "ok": true,
             "_appfs_events": [
-                {"type": "message.sent", "content": {"message_id": "m1"}},
+                {"type": "message.sent", "path": "contacts/zhangsan/messages.res.jsonl", "content": {"message_id": "m1"}},
                 {"type": "action.accepted", "content": {"ok": true}},
                 {"content": {"ignored": true}}
             ]
@@ -2617,6 +2674,10 @@ mod tests {
         assert!(content.get("_appfs_events").is_none());
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "message.sent");
+        assert_eq!(
+            events[0].path.as_deref(),
+            Some("contacts/zhangsan/messages.res.jsonl")
+        );
         assert_eq!(
             events[0]
                 .content

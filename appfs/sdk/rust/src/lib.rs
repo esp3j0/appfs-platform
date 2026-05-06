@@ -36,12 +36,12 @@ pub use appfs_adapter_testkit::{
 pub use appfs_connector::{
     connector_error_codes, ActionExecutionMode, ActionStreamingPlan, AppConnector,
     AppStructureNode, AppStructureNodeKind, AppStructureSnapshot, AppStructureSyncReason,
-    AppStructureSyncResult, AuthStatus, ConnectorContext, ConnectorError, ConnectorInfo,
-    ConnectorTransport, FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
-    FetchSnapshotChunkResponse, GetAppStructureRequest, GetAppStructureResponse, HealthStatus,
-    LiveMode, LivePageInfo, RefreshAppStructureRequest, RefreshAppStructureResponse, SnapshotMeta,
-    SnapshotRecord, SnapshotResume, SubmitActionOutcome, SubmitActionRequest, SubmitActionResponse,
-    APPFS_CONNECTOR_SDK_VERSION,
+    AppStructureSyncResult, AuthStatus, ConnectorContext, ConnectorError, ConnectorInboundEvent,
+    ConnectorInfo, ConnectorTransport, FetchLivePageRequest, FetchLivePageResponse,
+    FetchSnapshotChunkRequest, FetchSnapshotChunkResponse, GetAppStructureRequest,
+    GetAppStructureResponse, HealthStatus, LiveMode, LivePageInfo, RefreshAppStructureRequest,
+    RefreshAppStructureResponse, SnapshotMeta, SnapshotRecord, SnapshotResume, SubmitActionOutcome,
+    SubmitActionRequest, SubmitActionResponse, APPFS_CONNECTOR_SDK_VERSION,
 };
 pub use appfs_demo_adapter::{DemoAppAdapterV1, DemoAppConnector};
 pub use bulk_materialize::{BulkMaterializeEntry, BulkMaterializePlan};
