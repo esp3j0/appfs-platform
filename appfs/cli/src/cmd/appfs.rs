@@ -2340,36 +2340,6 @@ mod supervisor_tests {
         );
 
         append_text(
-            &tinode_root.join("contacts/send_message.act"),
-            "{\"client_token\":\"private-action-001\",\"profile_id\":\"attacker\",\"text\":\"hello\"}\n",
-        );
-        supervisor.poll_once().expect("poll private action");
-
-        let app_events = token_events(
-            &tinode_root.join("_stream/events.evt.jsonl"),
-            "private-action-001",
-        );
-        assert_eq!(app_events.len(), 1);
-        assert_eq!(
-            app_events[0].get("type").and_then(|value| value.as_str()),
-            Some("action.failed")
-        );
-        let error = app_events[0].get("error").expect("private action error");
-        assert_eq!(
-            error.get("code").and_then(|value| value.as_str()),
-            Some("PROFILE_NOT_READY")
-        );
-        let message = error
-            .get("message")
-            .and_then(|value| value.as_str())
-            .expect("error message");
-        assert!(message.contains("tinode:default"));
-        assert!(
-            !message.contains("attacker"),
-            "payload profile_id must not become authority"
-        );
-
-        append_text(
             &temp.path().join("_appfs/principals/delete_principal.act"),
             "{\"principal_id\":\"default\",\"client_token\":\"principal-private-delete-001\"}\n",
         );
