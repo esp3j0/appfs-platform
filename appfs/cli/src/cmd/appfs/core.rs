@@ -877,6 +877,17 @@ impl AppfsAdapter {
                 outcome: SubmitActionOutcome::Completed { content },
                 ..
             }) => {
+                let (content, side_events) = split_connector_side_events(content);
+                for event in side_events {
+                    self.emit_event(
+                        &normalized_path,
+                        &request_id,
+                        &event.event_type,
+                        event.content,
+                        event.error,
+                        client_token.clone(),
+                    )?;
+                }
                 self.emit_event(
                     &normalized_path,
                     &request_id,
@@ -1134,6 +1145,43 @@ pub(super) fn build_app_connector(
         );
     }
     Ok(connector)
+}
+
+struct ConnectorSideEvent {
+    event_type: String,
+    content: Option<JsonValue>,
+    error: Option<JsonValue>,
+}
+
+fn split_connector_side_events(mut content: JsonValue) -> (JsonValue, Vec<ConnectorSideEvent>) {
+    let Some(object) = content.as_object_mut() else {
+        return (content, Vec::new());
+    };
+    let Some(raw_events) = object.remove("_appfs_events") else {
+        return (content, Vec::new());
+    };
+    let Some(raw_events) = raw_events.as_array() else {
+        return (content, Vec::new());
+    };
+
+    let events = raw_events
+        .iter()
+        .filter_map(|raw| {
+            let event_type = raw
+                .get("type")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            Some(ConnectorSideEvent {
+                event_type,
+                content: raw.get("content").cloned(),
+                error: raw.get("error").cloned(),
+            })
+        })
+        .collect();
+
+    (content, events)
 }
 
 pub(super) fn parse_manifest_contract_json(
@@ -2552,6 +2600,31 @@ mod tests {
             .filter(|line| line.contains(token))
             .map(|line| serde_json::from_str(line).expect("event json"))
             .collect()
+    }
+
+    #[test]
+    fn connector_side_events_are_split_and_reserved_field_is_hidden() {
+        let (content, events) = super::split_connector_side_events(json!({
+            "ok": true,
+            "_appfs_events": [
+                {"type": "message.sent", "content": {"message_id": "m1"}},
+                {"type": "action.accepted", "content": {"ok": true}},
+                {"content": {"ignored": true}}
+            ]
+        }));
+
+        assert_eq!(content["ok"], true);
+        assert!(content.get("_appfs_events").is_none());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "message.sent");
+        assert_eq!(
+            events[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.get("message_id"))
+                .and_then(|value| value.as_str()),
+            Some("m1")
+        );
     }
 
     #[test]
