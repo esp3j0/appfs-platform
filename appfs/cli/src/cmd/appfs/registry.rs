@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub(crate) const APPFS_REGISTRY_VERSION: u32 = 1;
 pub(crate) const APPFS_REGISTRY_REL_PATH: &str = "_appfs/apps.registry.json";
 pub(crate) const APPFS_APP_POLICY_REGISTRY_REL_PATH: &str = "_appfs/app-policies.registry.json";
+pub(crate) const APPFS_PRINCIPAL_REGISTRY_REL_PATH: &str = "_appfs/principals.registry.json";
+pub(crate) const APPFS_DEFAULT_PRINCIPAL_ID: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AppfsAppsRegistryDoc {
@@ -122,6 +124,16 @@ pub(crate) fn app_policy_registry_path(root: &Path) -> PathBuf {
     root.join(APPFS_APP_POLICY_REGISTRY_REL_PATH.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
+pub(crate) fn principal_registry_path(root: &Path) -> PathBuf {
+    root.join(APPFS_PRINCIPAL_REGISTRY_REL_PATH.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
+pub(crate) fn principal_record_path(root: &Path, principal_id: &str) -> PathBuf {
+    root.join("_appfs")
+        .join("principals")
+        .join(format!("{principal_id}.res.json"))
+}
+
 pub(crate) fn parse_app_registry_bytes(bytes: &[u8]) -> Result<AppfsAppsRegistryDoc> {
     let doc: AppfsAppsRegistryDoc =
         serde_json::from_slice(bytes).context("failed to parse AppFS app registry JSON")?;
@@ -139,77 +151,75 @@ pub(crate) fn read_app_registry(root: &Path) -> Result<Option<AppfsAppsRegistryD
     parse_app_registry_bytes(&bytes).map(Some)
 }
 
+pub(crate) fn read_principal_registry(root: &Path) -> Result<Option<PrincipalRegistryDoc>> {
+    let path = principal_registry_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read AppFS principal registry {}", path.display()))?;
+    let doc: PrincipalRegistryDoc =
+        serde_json::from_slice(&bytes).context("failed to parse AppFS principal registry JSON")?;
+    validate_principal_registry(&doc)?;
+    Ok(Some(doc))
+}
+
+pub(crate) fn write_principal_registry(root: &Path, doc: &PrincipalRegistryDoc) -> Result<()> {
+    validate_principal_registry(doc)?;
+    let path = principal_registry_path(root);
+    write_pretty_json_file(&path, doc, "AppFS principal registry")
+}
+
+pub(crate) fn write_principal_record_view(root: &Path, record: &PrincipalRecord) -> Result<()> {
+    let path = principal_record_path(root, &record.principal_id);
+    write_pretty_json_file(&path, record, "AppFS principal record")
+}
+
+pub(crate) fn delete_principal_record_view(root: &Path, principal_id: &str) -> Result<()> {
+    let path = principal_record_path(root, principal_id);
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to remove AppFS principal record view {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn write_app_policy_registry(
     root: &Path,
     doc: &AppfsAppPolicyRegistryDoc,
 ) -> Result<()> {
     validate_app_policy_registry(doc)?;
     let path = app_policy_registry_path(root);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid registry path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create AppFS policy registry directory {}",
-            parent.display()
-        )
-    })?;
-    let tmp_path = path.with_extension("json.tmp");
-    let bytes =
-        serde_json::to_vec_pretty(doc).context("failed to serialize AppFS app policy registry")?;
-    fs::write(&tmp_path, bytes).with_context(|| {
-        format!(
-            "failed to write temporary AppFS app policy registry {}",
-            tmp_path.display()
-        )
-    })?;
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| {
-            format!(
-                "failed to replace existing AppFS app policy registry {}",
-                path.display()
-            )
-        })?;
-    }
-    fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "failed to publish AppFS app policy registry {}",
-            path.display()
-        )
-    })?;
-    Ok(())
+    write_pretty_json_file(&path, doc, "AppFS app policy registry")
 }
 
 pub(crate) fn write_app_registry(root: &Path, doc: &AppfsAppsRegistryDoc) -> Result<()> {
     validate_app_registry(doc)?;
     let path = app_registry_path(root);
+    write_pretty_json_file(&path, doc, "AppFS app registry")
+}
+
+fn write_pretty_json_file<T: Serialize>(path: &Path, doc: &T, label: &str) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid registry path {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create AppFS registry directory {}",
-            parent.display()
-        )
-    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {label} directory {}", parent.display()))?;
     let tmp_path = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(doc).context("failed to serialize AppFS app registry")?;
-    fs::write(&tmp_path, bytes).with_context(|| {
-        format!(
-            "failed to write temporary AppFS registry {}",
-            tmp_path.display()
-        )
-    })?;
+    let bytes =
+        serde_json::to_vec_pretty(doc).with_context(|| format!("failed to serialize {label}"))?;
+    fs::write(&tmp_path, bytes)
+        .with_context(|| format!("failed to write temporary {label} {}", tmp_path.display()))?;
     if path.exists() {
-        fs::remove_file(&path).with_context(|| {
-            format!(
-                "failed to replace existing AppFS registry {}",
-                path.display()
-            )
-        })?;
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to replace existing {label} {}", path.display()))?;
     }
     fs::rename(&tmp_path, &path)
-        .with_context(|| format!("failed to publish AppFS registry {}", path.display()))?;
+        .with_context(|| format!("failed to publish {label} {}", path.display()))?;
     Ok(())
 }
 
@@ -456,6 +466,62 @@ fn validate_app_policy_registry(doc: &AppfsAppPolicyRegistryDoc) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_principal_registry(doc: &PrincipalRegistryDoc) -> Result<()> {
+    if doc.version != APPFS_REGISTRY_VERSION {
+        anyhow::bail!(
+            "unsupported AppFS principal registry version {} (expected {})",
+            doc.version,
+            APPFS_REGISTRY_VERSION
+        );
+    }
+    validate_principal_id(&doc.default_principal_id)?;
+    let mut seen = HashMap::new();
+    for principal in &doc.principals {
+        validate_principal_id(&principal.principal_id)?;
+        if principal.display_name.trim().is_empty() {
+            anyhow::bail!(
+                "principal {} display_name cannot be empty",
+                principal.principal_id
+            );
+        }
+        if principal.kind.trim().is_empty() {
+            anyhow::bail!("principal {} kind cannot be empty", principal.principal_id);
+        }
+        if principal.created_at.trim().is_empty() || principal.updated_at.trim().is_empty() {
+            anyhow::bail!(
+                "principal {} timestamps cannot be empty",
+                principal.principal_id
+            );
+        }
+        if seen.insert(principal.principal_id.clone(), ()).is_some() {
+            anyhow::bail!("duplicate principal_id {}", principal.principal_id);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_principal_id(principal_id: &str) -> Result<()> {
+    if principal_id.trim() != principal_id || principal_id.is_empty() {
+        anyhow::bail!("principal_id cannot be empty or contain leading/trailing whitespace");
+    }
+    if principal_id == "." || principal_id == ".." {
+        anyhow::bail!("principal_id cannot be . or ..");
+    }
+    if principal_id.len() > 120 {
+        anyhow::bail!("principal_id cannot exceed 120 bytes");
+    }
+    if principal_id.contains(['/', '\\', '\0', ':']) {
+        anyhow::bail!("principal_id cannot contain path separators, NUL, or drive separators");
+    }
+    if !principal_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        anyhow::bail!("principal_id can only contain ASCII letters, digits, _ and -");
     }
     Ok(())
 }

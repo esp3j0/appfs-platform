@@ -50,6 +50,27 @@ pub(super) struct UnregisterAppRequest {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct CreatePrincipalRequest {
+    pub(super) principal_id: String,
+    pub(super) display_name: String,
+    pub(super) description: Option<String>,
+    pub(super) kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UpdatePrincipalRequest {
+    pub(super) principal_id: String,
+    pub(super) display_name: Option<String>,
+    pub(super) description: Option<String>,
+    pub(super) kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeletePrincipalRequest {
+    pub(super) principal_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum DispatchRoute {
     PagingFetchNext(PagingRequest),
     PagingClose(PagingRequest),
@@ -313,4 +334,102 @@ pub(super) fn parse_list_apps_request(payload: &str) -> std::result::Result<(), 
     } else {
         Err(ERR_INVALID_ARGUMENT)
     }
+}
+
+pub(super) fn parse_create_principal_request(
+    payload: &str,
+) -> std::result::Result<CreatePrincipalRequest, &'static str> {
+    let object = parse_json_object(payload)?;
+    let principal_id = required_principal_id(&object, "principal_id")?;
+    let display_name = required_string(&object, "display_name")?;
+    let description = optional_string(&object, "description")?;
+    let kind = optional_string(&object, "kind")?.unwrap_or_else(|| "agent".to_string());
+    Ok(CreatePrincipalRequest {
+        principal_id,
+        display_name,
+        description,
+        kind,
+    })
+}
+
+pub(super) fn parse_update_principal_request(
+    payload: &str,
+) -> std::result::Result<UpdatePrincipalRequest, &'static str> {
+    let object = parse_json_object(payload)?;
+    let principal_id = required_principal_id(&object, "principal_id")?;
+    Ok(UpdatePrincipalRequest {
+        principal_id,
+        display_name: optional_string(&object, "display_name")?,
+        description: optional_string(&object, "description")?,
+        kind: optional_string(&object, "kind")?,
+    })
+}
+
+pub(super) fn parse_delete_principal_request(
+    payload: &str,
+) -> std::result::Result<DeletePrincipalRequest, &'static str> {
+    let object = parse_json_object(payload)?;
+    let principal_id = required_principal_id(&object, "principal_id")?;
+    Ok(DeletePrincipalRequest { principal_id })
+}
+
+fn parse_json_object(
+    payload: &str,
+) -> std::result::Result<serde_json::Map<String, JsonValue>, &'static str> {
+    let json = serde_json::from_str::<JsonValue>(payload).map_err(|_| ERR_INVALID_ARGUMENT)?;
+    json.as_object().cloned().ok_or(ERR_INVALID_ARGUMENT)
+}
+
+fn required_string(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<String, &'static str> {
+    object
+        .get(field_name)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or(ERR_INVALID_ARGUMENT)
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<String>, &'static str> {
+    object
+        .get(field_name)
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or(ERR_INVALID_ARGUMENT)
+        })
+        .transpose()
+}
+
+fn required_principal_id(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<String, &'static str> {
+    let principal_id = required_string(object, field_name)?;
+    if is_safe_principal_id(&principal_id) {
+        Ok(principal_id)
+    } else {
+        Err(ERR_INVALID_ARGUMENT)
+    }
+}
+
+fn is_safe_principal_id(value: &str) -> bool {
+    if value == "." || value == ".." || value.len() > 120 {
+        return false;
+    }
+    if value.contains(['/', '\\', '\0', ':']) {
+        return false;
+    }
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }

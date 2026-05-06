@@ -1,9 +1,11 @@
 use serde_json::Value;
 
 use super::action_dispatcher::{
-    parse_action_line, parse_enter_scope_request, parse_list_apps_request, parse_paging_request,
+    parse_action_line, parse_create_principal_request, parse_delete_principal_request,
+    parse_enter_scope_request, parse_list_apps_request, parse_paging_request,
     parse_register_app_request, parse_snapshot_refresh_request, parse_structure_refresh_request,
-    parse_unregister_app_request, validate_submit_payload as validate_payload,
+    parse_unregister_app_request, parse_update_principal_request,
+    validate_submit_payload as validate_payload,
 };
 use super::errors::{ERR_INVALID_ARGUMENT, ERR_INVALID_PAYLOAD};
 use super::registry::AppfsRegistryTransportKind;
@@ -308,6 +310,56 @@ fn parse_unregister_app_request_requires_app_id() {
 fn parse_list_apps_request_requires_json_object() {
     assert!(parse_list_apps_request(r#"{}"#).is_ok());
     assert!(parse_list_apps_request(r#"[]"#).is_err());
+}
+
+#[test]
+fn parse_create_principal_request_requires_safe_principal_id() {
+    let req = parse_create_principal_request(
+        r#"{"principal_id":"incident-reporter","display_name":"Incident reporter","description":"Summarizes incidents.","kind":"agent"}"#,
+    )
+    .expect("valid principal create request");
+    assert_eq!(req.principal_id, "incident-reporter");
+    assert_eq!(req.display_name, "Incident reporter");
+    assert_eq!(req.description.as_deref(), Some("Summarizes incidents."));
+    assert_eq!(req.kind, "agent");
+
+    assert!(parse_create_principal_request(
+        r#"{"principal_id":"","display_name":"Default agent"}"#
+    )
+    .is_err());
+    assert!(parse_create_principal_request(
+        r#"{"principal_id":"../default","display_name":"Default agent"}"#
+    )
+    .is_err());
+    assert!(parse_create_principal_request(
+        r#"{"principal_id":"default\\evil","display_name":"Default agent"}"#
+    )
+    .is_err());
+    assert!(parse_create_principal_request(
+        r#"{"principal_id":".","display_name":"Default agent"}"#
+    )
+    .is_err());
+    assert!(parse_create_principal_request(
+        r#"{"principal_id":"default:ads","display_name":"Default agent"}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn parse_update_and_delete_principal_requests_require_principal_id() {
+    let req = parse_update_principal_request(
+        r#"{"principal_id":"default","display_name":"Default agent v2"}"#,
+    )
+    .expect("valid principal update request");
+    assert_eq!(req.principal_id, "default");
+    assert_eq!(req.display_name.as_deref(), Some("Default agent v2"));
+
+    let req = parse_delete_principal_request(r#"{"principal_id":"default"}"#)
+        .expect("valid principal delete request");
+    assert_eq!(req.principal_id, "default");
+
+    assert!(parse_update_principal_request(r#"{}"#).is_err());
+    assert!(parse_delete_principal_request(r#"{"principal_id":".."}"#).is_err());
 }
 
 #[test]
