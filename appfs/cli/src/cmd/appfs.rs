@@ -1571,6 +1571,12 @@ mod supervisor_tests {
         }
     }
 
+    fn configure_tinode_env_for_tests() {
+        std::env::set_var("APPFS_TINODE_ENDPOINT", "http://127.0.0.1:6060");
+        std::env::set_var("APPFS_TINODE_LOGIN_PREFIX", "appfs_test");
+        std::env::set_var("APPFS_TINODE_CREDENTIAL_POLICY", "auto-create");
+    }
+
     #[test]
     fn appfs_up_builds_managed_mount_args() {
         let args = super::AppfsUpArgs {
@@ -2230,8 +2236,9 @@ mod supervisor_tests {
     }
 
     #[test]
-    fn runtime_supervisor_materializes_private_apps_for_created_principal() {
+    fn runtime_supervisor_materializes_private_tinode_skeleton_for_created_principal() {
         let temp = TempDir::new().expect("tempdir");
+        configure_tinode_env_for_tests();
         registry::write_app_policy_registry(
             temp.path(),
             &registry::AppfsAppPolicyRegistryDoc {
@@ -2274,11 +2281,38 @@ mod supervisor_tests {
         supervisor.poll_once().expect("poll create principal");
 
         assert!(supervisor.runtimes.contains_key("tinode--default"));
-        assert!(temp.path().join("private/default/tinode").exists());
-        assert!(temp
-            .path()
-            .join("private/default/tinode/_meta/manifest.res.json")
-            .exists());
+        let tinode_root = temp.path().join("private/default/tinode");
+        assert!(tinode_root.exists());
+        assert!(tinode_root.join("_meta/manifest.res.json").exists());
+        assert!(tinode_root.join("_stream/events.evt.jsonl").exists());
+        for expected in [
+            "_app/self.res.json",
+            "_app/ensure_credentials.act",
+            "_app/refresh_structure.act",
+            "_app/refresh_inbox.act",
+            "contacts/index.res.jsonl",
+            "contacts/send_message.act",
+            "contacts/resolve.act",
+            "contacts/search_results.res.jsonl",
+            "groups/index.res.jsonl",
+            "groups/create_group.act",
+            "inbox/recent.res.jsonl",
+            "inbox/unread.res.jsonl",
+            "inbox/mark_read.act",
+            "topics/index.res.jsonl",
+        ] {
+            assert!(tinode_root.join(expected).exists(), "missing {expected}");
+        }
+        let self_doc: JsonValue =
+            serde_json::from_slice(&fs::read(tinode_root.join("_app/self.res.json")).unwrap())
+                .expect("parse tinode self");
+        assert_eq!(self_doc["credential_status"], "missing");
+        assert_eq!(self_doc["principal_id"], "default");
+        assert_eq!(self_doc["profile_id"], "tinode:default");
+        let self_rendered = self_doc.to_string();
+        for forbidden in ["token", "refresh_token", "password", "secret", "cookie"] {
+            assert!(!self_rendered.contains(forbidden));
+        }
 
         let stored = registry::read_app_registry(temp.path())
             .expect("read app registry")
@@ -2306,37 +2340,33 @@ mod supervisor_tests {
         );
 
         append_text(
-            &temp
-                .path()
-                .join("private/default/tinode/contacts/zhangsan/send_message.act"),
+            &tinode_root.join("contacts/send_message.act"),
             "{\"client_token\":\"private-action-001\",\"profile_id\":\"attacker\",\"text\":\"hello\"}\n",
         );
         supervisor.poll_once().expect("poll private action");
 
         let app_events = token_events(
-            &temp
-                .path()
-                .join("private/default/tinode/_stream/events.evt.jsonl"),
+            &tinode_root.join("_stream/events.evt.jsonl"),
             "private-action-001",
         );
         assert_eq!(app_events.len(), 1);
-        let content = app_events[0]
-            .get("content")
-            .expect("private action content");
         assert_eq!(
-            content.get("principal_id").and_then(|value| value.as_str()),
-            Some("default")
+            app_events[0].get("type").and_then(|value| value.as_str()),
+            Some("action.failed")
         );
+        let error = app_events[0].get("error").expect("private action error");
         assert_eq!(
-            content.get("profile_id").and_then(|value| value.as_str()),
-            Some("tinode:default")
+            error.get("code").and_then(|value| value.as_str()),
+            Some("PROFILE_NOT_READY")
         );
-        assert_eq!(
-            content
-                .get("echo")
-                .and_then(|value| value.get("profile_id"))
-                .and_then(|value| value.as_str()),
-            Some("attacker")
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .expect("error message");
+        assert!(message.contains("tinode:default"));
+        assert!(
+            !message.contains("attacker"),
+            "payload profile_id must not become authority"
         );
 
         append_text(

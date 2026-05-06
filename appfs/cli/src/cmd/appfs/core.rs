@@ -4,7 +4,7 @@ use agentfs_sdk::{
     ConnectorCredentialSummary, ConnectorError, ConnectorInfo, ConnectorTransport,
     DemoAppConnector, FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
     FetchSnapshotChunkResponse, HealthStatus, SnapshotMeta, SubmitActionOutcome,
-    SubmitActionRequest, SubmitActionResponse,
+    SubmitActionRequest, SubmitActionResponse, TinodeConnector,
 };
 use anyhow::{Context, Result};
 use serde_json::Value as JsonValue;
@@ -1111,6 +1111,14 @@ pub(super) fn build_app_connector(
             Duration::from_millis(bridge_config.adapter_http_timeout_ms.max(1)),
             bridge_config.runtime_options,
         ))
+    } else if app_id == "tinode" {
+        Box::new(TinodeConnector::from_env().map_err(|err| {
+            anyhow::anyhow!(
+                "failed to initialize Tinode connector: {}: {}",
+                err.code,
+                err.message
+            )
+        })?)
     } else {
         Box::new(DemoAppConnector::new(app_id.to_string()))
     };
@@ -1834,10 +1842,10 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let adapter = AppfsAdapter::new_with_mount_path(
             temp.path().to_path_buf(),
-            "tinode".to_string(),
-            "private/default/tinode".to_string(),
+            "demo-private".to_string(),
+            "private/default/demo-private".to_string(),
             Some("default".to_string()),
-            Some("tinode:default".to_string()),
+            Some("demo-private:default".to_string()),
             "sess-test".to_string(),
             bridge_config(),
             None,
@@ -2587,7 +2595,7 @@ mod tests {
 
         append_text(
             &action_path,
-            "{\"client_token\":\"ensure-001\",\"expected_profile_id\":\"tinode:default\"}\n",
+            "{\"client_token\":\"ensure-001\",\"expected_profile_id\":\"demo-private:default\"}\n",
         );
         adapter.poll_once().expect("poll ensure credentials");
 
@@ -2606,17 +2614,17 @@ mod tests {
         );
         assert_eq!(
             content.get("profile_id").and_then(|value| value.as_str()),
-            Some("tinode:default")
+            Some("demo-private:default")
         );
         assert_eq!(
             content
                 .get("upstream_user_id")
                 .and_then(|value| value.as_str()),
-            Some("demo-user-tinode:default")
+            Some("demo-user-demo-private:default")
         );
         assert_eq!(
             content.get("login").and_then(|value| value.as_str()),
-            Some("demo-tinode:default")
+            Some("demo-demo-private:default")
         );
         assert!(content.get("token").is_none());
         assert!(!content.to_string().contains("demo-secret-token"));
@@ -2632,7 +2640,7 @@ mod tests {
 
         append_text(
             &action_path,
-            "{\"client_token\":\"ensure-mismatch-001\",\"expected_profile_id\":\"tinode:attacker\"}\n",
+            "{\"client_token\":\"ensure-mismatch-001\",\"expected_profile_id\":\"demo-private:attacker\"}\n",
         );
         adapter
             .poll_once()

@@ -9,6 +9,7 @@ pub mod error;
 pub mod filesystem;
 pub mod kvstore;
 pub mod schema;
+pub mod tinode_connector;
 pub mod toolcalls;
 
 use error::{Error, Result};
@@ -58,6 +59,7 @@ pub use filesystem::{
 };
 pub use kvstore::KvStore;
 pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION};
+pub use tinode_connector::{TinodeConnector, TinodeConnectorConfig};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
 /// Directory containing agentfs databases
