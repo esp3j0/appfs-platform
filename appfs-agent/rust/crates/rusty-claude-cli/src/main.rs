@@ -59,8 +59,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
     execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
-    should_inject_model_facing_skill_listing, sync_model_facing_skill_listing,
-    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    should_inject_model_facing_skill_listing, sync_model_facing_skill_listing, GlobalToolRegistry,
+    RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -220,8 +220,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // prompter may invoke CliPermissionPrompter::decide(), stdin
                 // must remain available for interactive approval; otherwise the
                 // prompter's read_line() would hit EOF and deny every request.
-                let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess)
-                {
+                let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
                     read_piped_stdin()
                 } else {
                     None
@@ -5152,6 +5151,7 @@ fn status_json_value(
                     "mount_root": environment.mount_root,
                     "runtime_session_id": environment.runtime_session_id,
                     "attach_id": environment.attach_id,
+                    "principal_id": environment.principal_id,
                     "attach_role": environment.attach_role,
                     "multi_agent_mode": environment.multi_agent_mode,
                     "manifest_path": environment.manifest_path,
@@ -5165,6 +5165,7 @@ fn status_json_value(
                     "current_app_root": environment.current_app_root,
                     "current_app_events_path": environment.current_app_events_path,
                     "registered_apps": environment.registered_apps,
+                    "known_principals": environment.known_principals,
                     "warnings": environment.warnings,
                 })
             },
@@ -5338,8 +5339,8 @@ fn format_appfs_report(environment: Option<&runtime::AppfsEnvironment>) -> Strin
             .iter()
             .map(|app| {
                 app.active_scope.as_ref().map_or_else(
-                    || app.app_id.clone(),
-                    |scope| format!("{} (scope {scope})", app.app_id),
+                    || format!("{} [{}]", app.app_id, app.path),
+                    |scope| format!("{} [{}] (scope {scope})", app.app_id, app.path),
                 )
             })
             .collect::<Vec<_>>()
@@ -5359,6 +5360,7 @@ fn format_appfs_report(environment: Option<&runtime::AppfsEnvironment>) -> Strin
   Mount root        {}
   Runtime session   {}
   Attach id         {}
+  Principal id      {}
   Attach role       {}
   Multi-agent mode  {}
   Control plane     {}
@@ -5373,6 +5375,7 @@ fn format_appfs_report(environment: Option<&runtime::AppfsEnvironment>) -> Strin
             .as_deref()
             .unwrap_or("<unknown>"),
         environment.attach_id,
+        environment.principal_id,
         environment.attach_role.as_deref().unwrap_or("<none>"),
         environment.multi_agent_mode,
         environment
@@ -10898,6 +10901,7 @@ mod tests {
                     mount_root: PathBuf::from("/mnt/appfs"),
                     runtime_session_id: Some("rt-shared-01".to_string()),
                     attach_id: "agent-planner".to_string(),
+                    principal_id: "default".to_string(),
                     attach_role: Some("planner".to_string()),
                     multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
                     manifest_path: Some(PathBuf::from("/mnt/appfs/.well-known/appfs/runtime.json")),
@@ -10918,14 +10922,32 @@ mod tests {
                     )),
                     registered_apps: vec![
                         runtime::AppfsRegisteredApp {
+                            instance_id: "aiim".to_string(),
                             app_id: "aiim".to_string(),
+                            visibility: runtime::AppfsRegisteredAppVisibility::Public,
+                            parent_app_id: None,
+                            principal_id: None,
+                            profile_id: None,
+                            path: "aiim".to_string(),
                             active_scope: Some("chat-long".to_string()),
                         },
                         runtime::AppfsRegisteredApp {
+                            instance_id: "notion".to_string(),
                             app_id: "notion".to_string(),
+                            visibility: runtime::AppfsRegisteredAppVisibility::Public,
+                            parent_app_id: None,
+                            principal_id: None,
+                            profile_id: None,
+                            path: "notion".to_string(),
                             active_scope: None,
                         },
                     ],
+                    known_principals: vec![runtime::AppfsPrincipalSummary {
+                        principal_id: "default".to_string(),
+                        display_name: Some("Default agent".to_string()),
+                        description: Some("The default project agent.".to_string()),
+                        kind: Some("agent".to_string()),
+                    }],
                     warnings: Vec::new(),
                 }),
             },
@@ -10953,6 +10975,7 @@ mod tests {
         assert!(status.contains("Attach source     manifest"));
         assert!(status.contains("Runtime session   rt-shared-01"));
         assert!(status.contains("Attach id         agent-planner"));
+        assert!(status.contains("Principal id      default"));
         assert!(status.contains("Attach role       planner"));
         assert!(status.contains("Multi-agent mode  shared_mount_distinct_attach"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
@@ -10995,6 +11018,7 @@ mod tests {
                     mount_root: PathBuf::from("/mnt/appfs"),
                     runtime_session_id: Some("rt-shared-09".to_string()),
                     attach_id: "agent-reviewer".to_string(),
+                    principal_id: "incident-reporter".to_string(),
                     attach_role: Some("reviewer".to_string()),
                     multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
                     manifest_path: Some(PathBuf::from("/mnt/appfs/.well-known/appfs/runtime.json")),
@@ -11014,8 +11038,20 @@ mod tests {
                         "/mnt/appfs/aiim/_stream/events.evt.jsonl",
                     )),
                     registered_apps: vec![runtime::AppfsRegisteredApp {
+                        instance_id: "aiim".to_string(),
                         app_id: "aiim".to_string(),
+                        visibility: runtime::AppfsRegisteredAppVisibility::Public,
+                        parent_app_id: None,
+                        principal_id: None,
+                        profile_id: None,
+                        path: "aiim".to_string(),
                         active_scope: Some("chat-long".to_string()),
+                    }],
+                    known_principals: vec![runtime::AppfsPrincipalSummary {
+                        principal_id: "incident-reporter".to_string(),
+                        display_name: Some("Incident reporter".to_string()),
+                        description: None,
+                        kind: Some("agent".to_string()),
                     }],
                     warnings: vec!["env mount root mismatch".to_string()],
                 }),
@@ -11030,6 +11066,7 @@ mod tests {
             json!("rt-shared-09")
         );
         assert_eq!(payload["appfs"]["attach_id"], json!("agent-reviewer"));
+        assert_eq!(payload["appfs"]["principal_id"], json!("incident-reporter"));
         assert_eq!(payload["appfs"]["attach_role"], json!("reviewer"));
         assert_eq!(
             payload["appfs"]["multi_agent_mode"],
