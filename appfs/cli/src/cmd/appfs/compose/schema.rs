@@ -98,6 +98,17 @@ pub(crate) struct AppfsComposeApp {
     pub(crate) connector: String,
     pub(crate) session_id: Option<String>,
     pub(crate) transport: AppfsComposeAppTransport,
+    pub(crate) visibility: AppfsComposeAppVisibility,
+    pub(crate) path: Option<String>,
+    pub(crate) path_template: Option<String>,
+    pub(crate) profile_template: Option<String>,
+    pub(crate) credential_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppfsComposeAppVisibility {
+    Public,
+    Private,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,14 +379,27 @@ fn normalize_apps(
             .entry(connector.clone())
             .or_default()
             .push(app_id.clone());
-        apps.insert(
-            app_id,
-            AppfsComposeApp {
-                connector,
-                session_id,
-                transport: normalize_app_transport(raw_app.transport),
-            },
-        );
+        let app = AppfsComposeApp {
+            connector,
+            session_id,
+            transport: normalize_app_transport(raw_app.transport),
+            visibility: normalize_app_visibility(raw_app.visibility)?,
+            path: normalize_app_path_field(raw_app.path, &format!("apps.{app_id}.path"))?,
+            path_template: normalize_app_path_field(
+                raw_app.path_template,
+                &format!("apps.{app_id}.path_template"),
+            )?,
+            profile_template: normalize_optional_string(
+                raw_app.profile_template,
+                format!("apps.{app_id}.profile_template"),
+            )?,
+            credential_policy: normalize_optional_string(
+                raw_app.credential_policy,
+                format!("apps.{app_id}.credential_policy"),
+            )?,
+        };
+        validate_app_visibility_fields(&app, &format!("apps.{app_id}"))?;
+        apps.insert(app_id, app);
     }
     for (connector, app_ids) in connector_usage {
         if app_ids.len() > 1 {
@@ -387,6 +411,37 @@ fn normalize_apps(
         }
     }
     Ok(apps)
+}
+
+fn validate_app_visibility_fields(app: &AppfsComposeApp, field_prefix: &str) -> Result<()> {
+    match app.visibility {
+        AppfsComposeAppVisibility::Public => {
+            if app.path_template.is_some() {
+                anyhow::bail!("{field_prefix}.path_template is only valid for private apps");
+            }
+        }
+        AppfsComposeAppVisibility::Private => {
+            if app.path.is_some() {
+                anyhow::bail!("{field_prefix}.path is only valid for public apps");
+            }
+            let path_template = app.path_template.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("{field_prefix}.path_template is required for private apps")
+            })?;
+            if !path_template.contains("{principal_id}") {
+                anyhow::bail!(
+                    "{field_prefix}.path_template must contain {{principal_id}} for private apps"
+                );
+            }
+            if let Some(profile_template) = app.profile_template.as_deref() {
+                if !profile_template.contains("{principal_id}") {
+                    anyhow::bail!(
+                        "{field_prefix}.profile_template must contain {{principal_id}} for private apps"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_app_transport(raw: RawAppfsComposeAppTransport) -> AppfsComposeAppTransport {
@@ -444,6 +499,23 @@ fn normalize_optional_string(
         )?)),
         None => Ok(None),
     }
+}
+
+fn normalize_app_path_field(raw: Option<String>, field_name: &str) -> Result<Option<String>> {
+    let Some(value) = normalize_optional_string(raw, field_name)? else {
+        return Ok(None);
+    };
+    let rendered = value.replace('\\', "/");
+    if rendered.starts_with('/') {
+        anyhow::bail!("{field_name} must be relative to the AppFS mount root");
+    }
+    if rendered
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        anyhow::bail!("{field_name} must not contain empty, . or .. path segments");
+    }
+    Ok(Some(rendered))
 }
 
 fn normalize_map_key(raw: &str, entity_name: &str) -> Result<String> {
@@ -541,6 +613,15 @@ fn normalize_transport_kind(
     Ok(match raw {
         RawAppfsComposeTransportKind::Http => AppfsComposeTransportKind::Http,
         RawAppfsComposeTransportKind::Grpc => AppfsComposeTransportKind::Grpc,
+    })
+}
+
+fn normalize_app_visibility(
+    raw: Option<RawAppfsComposeAppVisibility>,
+) -> Result<AppfsComposeAppVisibility> {
+    Ok(match raw.unwrap_or(RawAppfsComposeAppVisibility::Public) {
+        RawAppfsComposeAppVisibility::Public => AppfsComposeAppVisibility::Public,
+        RawAppfsComposeAppVisibility::Private => AppfsComposeAppVisibility::Private,
     })
 }
 
@@ -674,6 +755,23 @@ struct RawAppfsComposeApp {
     session_id: Option<String>,
     #[serde(default)]
     transport: RawAppfsComposeAppTransport,
+    #[serde(default)]
+    visibility: Option<RawAppfsComposeAppVisibility>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    path_template: Option<String>,
+    #[serde(default)]
+    profile_template: Option<String>,
+    #[serde(default)]
+    credential_policy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawAppfsComposeAppVisibility {
+    Public,
+    Private,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -702,8 +800,8 @@ const fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_compose_doc, AppfsComposeConnectorMode, AppfsComposeInitMode,
-        AppfsComposeTransportKind,
+        parse_compose_doc, AppfsComposeAppVisibility, AppfsComposeConnectorMode,
+        AppfsComposeInitMode, AppfsComposeTransportKind,
     };
     use std::path::PathBuf;
 
@@ -780,6 +878,89 @@ apps:
             doc.apps.get("aiim").expect("app").transport.http_timeout_ms,
             5000
         );
+        assert_eq!(
+            doc.apps.get("aiim").expect("app").visibility,
+            AppfsComposeAppVisibility::Public
+        );
+    }
+
+    #[test]
+    fn parses_public_and_private_app_visibility_fields() {
+        let doc = parse_compose_doc(
+            r#"
+version: 1
+runtime:
+  db: .agentfs/demo.db
+  mountpoint: ./mnt/appfs
+  backend: fuse
+connectors:
+  aiim-http:
+    mode: external
+    transport: http
+    endpoint: http://127.0.0.1:8080
+  tinode-http:
+    mode: external
+    transport: http
+    endpoint: http://127.0.0.1:6061
+apps:
+  aiim:
+    connector: aiim-http
+    visibility: public
+    path: public/aiim
+  tinode:
+    connector: tinode-http
+    visibility: private
+    path_template: private/{principal_id}/tinode
+    profile_template: tinode:{principal_id}
+    credential_policy: auto-create
+"#,
+            PathBuf::from("/tmp/appfs-compose.yaml"),
+        )
+        .expect("compose should parse");
+
+        let aiim = doc.apps.get("aiim").expect("aiim app");
+        assert_eq!(aiim.visibility, AppfsComposeAppVisibility::Public);
+        assert_eq!(aiim.path.as_deref(), Some("public/aiim"));
+        assert_eq!(aiim.path_template, None);
+
+        let tinode = doc.apps.get("tinode").expect("tinode app");
+        assert_eq!(tinode.visibility, AppfsComposeAppVisibility::Private);
+        assert_eq!(
+            tinode.path_template.as_deref(),
+            Some("private/{principal_id}/tinode")
+        );
+        assert_eq!(
+            tinode.profile_template.as_deref(),
+            Some("tinode:{principal_id}")
+        );
+        assert_eq!(tinode.credential_policy.as_deref(), Some("auto-create"));
+    }
+
+    #[test]
+    fn rejects_private_apps_without_principal_path_template() {
+        let err = parse_compose_doc(
+            r#"
+version: 1
+runtime:
+  db: .agentfs/demo.db
+  mountpoint: ./mnt/appfs
+  backend: fuse
+connectors:
+  tinode-http:
+    mode: external
+    transport: http
+    endpoint: http://127.0.0.1:6061
+apps:
+  tinode:
+    connector: tinode-http
+    visibility: private
+    path_template: private/tinode
+"#,
+            PathBuf::from("/tmp/appfs-compose.yaml"),
+        )
+        .expect_err("compose should fail");
+
+        assert!(err.to_string().contains("must contain {principal_id}"));
     }
 
     #[test]

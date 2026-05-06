@@ -47,7 +47,13 @@ pub(super) fn register_request_to_runtime(
     let doc = registry::AppfsAppsRegistryDoc {
         version: registry::APPFS_REGISTRY_VERSION,
         apps: vec![registry::AppfsRegisteredAppDoc {
-            app_id: request.app_id,
+            instance_id: request.app_id.clone(),
+            app_id: request.app_id.clone(),
+            visibility: registry::AppfsRegisteredAppVisibility::Public,
+            parent_app_id: None,
+            principal_id: None,
+            profile_id: None,
+            path: request.app_id.clone(),
             transport: request.transport,
             session_id: session_id.clone(),
             registered_at: chrono::Utc::now().to_rfc3339(),
