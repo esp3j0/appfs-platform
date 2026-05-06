@@ -1,6 +1,7 @@
 use super::schema::{
-    AppfsComposeAppTransport, AppfsComposeConnector, AppfsComposeConnectorHealthcheck,
-    AppfsComposeConnectorMode, AppfsComposeDoc, AppfsComposeTransportKind,
+    AppfsComposeAppTransport, AppfsComposeAppVisibility, AppfsComposeConnector,
+    AppfsComposeConnectorHealthcheck, AppfsComposeConnectorMode, AppfsComposeDoc,
+    AppfsComposeTransportKind,
 };
 use crate::cmd::appfs::core::build_app_connector;
 use crate::cmd::appfs::{build_appfs_bridge_config, AppfsBridgeCliArgs};
@@ -35,6 +36,11 @@ pub(crate) struct ResolvedComposeApp {
     pub(crate) endpoint: String,
     pub(crate) session_id: Option<String>,
     pub(crate) transport: AppfsComposeAppTransport,
+    pub(crate) visibility: AppfsComposeAppVisibility,
+    pub(crate) path: Option<String>,
+    pub(crate) path_template: Option<String>,
+    pub(crate) profile_template: Option<String>,
+    pub(crate) credential_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +143,11 @@ impl ComposeConnectorSupervisor {
             endpoint: connector.endpoint.clone(),
             session_id: app.session_id.clone(),
             transport: app.transport.clone(),
+            visibility: app.visibility,
+            path: app.path.clone(),
+            path_template: app.path_template.clone(),
+            profile_template: app.profile_template.clone(),
+            credential_policy: app.credential_policy.clone(),
         })
     }
 }
@@ -371,6 +382,11 @@ apps:
                 endpoint: server.endpoint(),
                 session_id: None,
                 transport: Default::default(),
+                visibility: crate::cmd::appfs::compose::schema::AppfsComposeAppVisibility::Public,
+                path: None,
+                path_template: None,
+                profile_template: None,
+                credential_policy: None,
             }
         );
     }

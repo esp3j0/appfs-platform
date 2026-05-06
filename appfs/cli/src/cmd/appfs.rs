@@ -2048,7 +2048,13 @@ mod supervisor_tests {
         let existing = registry::AppfsAppsRegistryDoc {
             version: registry::APPFS_REGISTRY_VERSION,
             apps: vec![registry::AppfsRegisteredAppDoc {
+                instance_id: "aiim".to_string(),
                 app_id: "aiim".to_string(),
+                visibility: registry::AppfsRegisteredAppVisibility::Public,
+                parent_app_id: None,
+                principal_id: None,
+                profile_id: None,
+                path: "aiim".to_string(),
                 transport: registry::AppfsRegistryTransportDoc {
                     kind: registry::AppfsRegistryTransportKind::InProcess,
                     endpoint: None,
