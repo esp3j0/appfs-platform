@@ -38,6 +38,11 @@ pub(super) struct StructureRefreshRequest {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct EnsureCredentialsRequest {
+    pub(super) expected_profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct RegisterAppRequest {
     pub(super) app_id: String,
     pub(super) session_id: Option<String>,
@@ -77,6 +82,7 @@ pub(super) enum DispatchRoute {
     SnapshotRefresh(SnapshotRefreshRequest),
     EnterScope(EnterScopeRequest),
     StructureRefresh(StructureRefreshRequest),
+    EnsureCredentials(EnsureCredentialsRequest),
     BusinessSubmit,
 }
 
@@ -87,6 +93,7 @@ pub(super) enum DispatchRouteParseError {
     SnapshotRefresh,
     EnterScope,
     StructureRefresh,
+    EnsureCredentials,
 }
 
 pub(super) fn normalize_actionline_payload(
@@ -127,6 +134,11 @@ pub(super) fn route_action(
         return parse_structure_refresh_request(payload)
             .map(DispatchRoute::StructureRefresh)
             .map_err(|_| DispatchRouteParseError::StructureRefresh);
+    }
+    if normalized_path == "/_app/ensure_credentials.act" {
+        return parse_ensure_credentials_request(payload)
+            .map(DispatchRoute::EnsureCredentials)
+            .map_err(|_| DispatchRouteParseError::EnsureCredentials);
     }
 
     Ok(DispatchRoute::BusinessSubmit)
@@ -278,6 +290,15 @@ pub(super) fn parse_structure_refresh_request(
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
     Ok(StructureRefreshRequest { target_scope })
+}
+
+pub(super) fn parse_ensure_credentials_request(
+    payload: &str,
+) -> std::result::Result<EnsureCredentialsRequest, &'static str> {
+    let object = parse_json_object(payload)?;
+    Ok(EnsureCredentialsRequest {
+        expected_profile_id: optional_string(&object, "expected_profile_id")?,
+    })
 }
 
 pub(super) fn parse_register_app_request(

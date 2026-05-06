@@ -2338,6 +2338,38 @@ mod supervisor_tests {
                 .and_then(|value| value.as_str()),
             Some("attacker")
         );
+
+        append_text(
+            &temp.path().join("_appfs/principals/delete_principal.act"),
+            "{\"principal_id\":\"default\",\"client_token\":\"principal-private-delete-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll delete principal");
+        let events = control_events(&temp, "principal-private-delete-001");
+        assert_eq!(events.len(), 1);
+        let content = events[0].get("content").expect("delete content");
+        assert_eq!(
+            content
+                .get("credentials_cleanup")
+                .and_then(|value| value.as_str()),
+            Some("requested")
+        );
+        let cleanup = content
+            .get("credential_cleanup_requests")
+            .and_then(|value| value.as_array())
+            .expect("cleanup requests");
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(
+            cleanup[0]
+                .get("instance_id")
+                .and_then(|value| value.as_str()),
+            Some("tinode--default")
+        );
+        assert_eq!(
+            cleanup[0]
+                .get("profile_id")
+                .and_then(|value| value.as_str()),
+            Some("tinode:default")
+        );
     }
 
     #[test]

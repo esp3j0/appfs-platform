@@ -391,6 +391,24 @@ impl AppfsRuntimeSupervisor {
             )?;
             return Ok(());
         }
+        let credential_cleanup_requests = self
+            .runtimes
+            .values()
+            .filter(|entry| {
+                entry.registry_metadata.principal_id.as_deref()
+                    == Some(request.principal_id.as_str())
+            })
+            .filter_map(|entry| {
+                let profile_id = entry.registry_metadata.profile_id.as_ref()?;
+                Some(serde_json::json!({
+                    "instance_id": entry.registry_metadata.instance_id.as_str(),
+                    "app_id": entry.runtime.app_id.as_str(),
+                    "principal_id": request.principal_id.as_str(),
+                    "profile_id": profile_id,
+                    "status": "requested",
+                }))
+            })
+            .collect::<Vec<_>>();
         registry::write_principal_registry(&self.root, &doc)?;
         registry::delete_principal_record_view(&self.root, &request.principal_id)?;
         self.control_plane.emit_completed(
@@ -400,7 +418,8 @@ impl AppfsRuntimeSupervisor {
                 "principal_event": "principal.deleted",
                 "principal_id": request.principal_id,
                 "deleted": true,
-                "credentials_cleanup": "not_implemented",
+                "credentials_cleanup": "requested",
+                "credential_cleanup_requests": credential_cleanup_requests,
             }),
             client_token,
         )?;

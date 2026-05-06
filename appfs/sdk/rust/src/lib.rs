@@ -4,6 +4,7 @@ pub mod appfs_connector;
 pub mod appfs_demo_adapter;
 pub mod bulk_materialize;
 pub mod connection_pool;
+pub mod credential_store;
 pub mod error;
 pub mod filesystem;
 pub mod kvstore;
@@ -43,6 +44,10 @@ pub use appfs_connector::{
 };
 pub use appfs_demo_adapter::{DemoAppAdapterV1, DemoAppConnector};
 pub use bulk_materialize::{BulkMaterializeEntry, BulkMaterializePlan};
+pub use credential_store::{
+    connector_credentials_key, ConnectorCredentialRecord, ConnectorCredentialStatus,
+    ConnectorCredentialStore, ConnectorCredentialSummary,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
