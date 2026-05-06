@@ -225,6 +225,8 @@ fn probe_connector_once(
         request_id: format!("compose-health-{}", Uuid::new_v4().simple()),
         client_token: None,
         trace_id: None,
+        principal_id: None,
+        profile_id: None,
     };
     let health = connector_client
         .health(&ctx)

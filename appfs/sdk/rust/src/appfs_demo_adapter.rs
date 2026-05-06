@@ -769,13 +769,20 @@ impl AppConnector for DemoAppConnector {
         }
 
         let outcome = match request.execution_mode {
-            ActionExecutionMode::Inline => SubmitActionOutcome::Completed {
-                content: json!({
+            ActionExecutionMode::Inline => {
+                let mut content = json!({
                     "ok": true,
                     "path": request.path,
                     "echo": request.payload,
-                }),
-            },
+                });
+                if let Some(principal_id) = ctx.principal_id.as_deref() {
+                    content["principal_id"] = json!(principal_id);
+                }
+                if let Some(profile_id) = ctx.profile_id.as_deref() {
+                    content["profile_id"] = json!(profile_id);
+                }
+                SubmitActionOutcome::Completed { content }
+            }
             ActionExecutionMode::Streaming => SubmitActionOutcome::Streaming {
                 plan: ActionStreamingPlan {
                     accepted_content: Some(json!({"state":"accepted"})),
@@ -872,6 +879,8 @@ mod tests {
             request_id: "req-connector-1".to_string(),
             client_token: Some("tok-connector-1".to_string()),
             trace_id: trace_id.map(|v| v.to_string()),
+            principal_id: None,
+            profile_id: None,
         }
     }
 
@@ -1268,6 +1277,35 @@ mod tests {
             .expect_err("invalid payload should return mapped error");
         assert_eq!(err.code, "INVALID_PAYLOAD");
         assert!(!err.retryable);
+    }
+
+    #[test]
+    fn demo_connector_echoes_effective_principal_context() {
+        let mut connector = DemoAppConnector::new("tinode".to_string());
+        let mut ctx = connector_ctx(None);
+        ctx.app_id = "tinode".to_string();
+        ctx.principal_id = Some("default".to_string());
+        ctx.profile_id = Some("tinode:default".to_string());
+
+        let response = connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/zhangsan/send_message.act".to_string(),
+                    payload: serde_json::json!({"profile_id":"attacker"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx,
+            )
+            .expect("inline submit should succeed");
+
+        match response.outcome {
+            SubmitActionOutcome::Completed { content } => {
+                assert_eq!(content["principal_id"], "default");
+                assert_eq!(content["profile_id"], "tinode:default");
+                assert_eq!(content["echo"]["profile_id"], "attacker");
+            }
+            _ => panic!("expected completed outcome"),
+        }
     }
 
     #[test]

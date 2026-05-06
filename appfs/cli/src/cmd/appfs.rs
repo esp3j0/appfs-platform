@@ -1222,6 +1222,8 @@ pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> R
             &agent,
             &resolved_app.app_id,
             &session_id,
+            None,
+            None,
             &bridge_config,
         )
         .await?;
@@ -1518,6 +1520,8 @@ struct ActionCursorDoc {
 struct AppfsAdapter {
     app_id: String,
     session_id: String,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     app_dir: PathBuf,
     direct_db_path: Option<String>,
     action_specs: Vec<ActionSpec>,
@@ -2299,6 +2303,40 @@ mod supervisor_tests {
                 .and_then(|value| value.as_array())
                 .map(|instances| instances.len()),
             Some(1)
+        );
+
+        append_text(
+            &temp
+                .path()
+                .join("private/default/tinode/contacts/zhangsan/send_message.act"),
+            "{\"client_token\":\"private-action-001\",\"profile_id\":\"attacker\",\"text\":\"hello\"}\n",
+        );
+        supervisor.poll_once().expect("poll private action");
+
+        let app_events = token_events(
+            &temp
+                .path()
+                .join("private/default/tinode/_stream/events.evt.jsonl"),
+            "private-action-001",
+        );
+        assert_eq!(app_events.len(), 1);
+        let content = app_events[0]
+            .get("content")
+            .expect("private action content");
+        assert_eq!(
+            content.get("principal_id").and_then(|value| value.as_str()),
+            Some("default")
+        );
+        assert_eq!(
+            content.get("profile_id").and_then(|value| value.as_str()),
+            Some("tinode:default")
+        );
+        assert_eq!(
+            content
+                .get("echo")
+                .and_then(|value| value.get("profile_id"))
+                .and_then(|value| value.as_str()),
+            Some("attacker")
         );
     }
 

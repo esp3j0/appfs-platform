@@ -46,6 +46,8 @@ pub(super) fn build_runtime_entry_with_metadata(
         root.to_path_buf(),
         runtime.app_id.clone(),
         metadata.path.clone(),
+        metadata.principal_id.clone(),
+        metadata.profile_id.clone(),
         runtime.session_id.clone(),
         build_appfs_bridge_config(runtime.bridge.clone()),
         startup_bootstrap,

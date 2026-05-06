@@ -297,6 +297,8 @@ impl AppfsAdapter {
             root,
             app_id.clone(),
             app_id,
+            None,
+            None,
             session_id,
             bridge_config,
             startup_bootstrap,
@@ -307,6 +309,8 @@ impl AppfsAdapter {
         root: PathBuf,
         app_id: String,
         app_mount_path: String,
+        principal_id: Option<String>,
+        profile_id: Option<String>,
         session_id: String,
         bridge_config: AppfsBridgeConfig,
         startup_bootstrap: Option<AppRuntimeStartupBootstrap>,
@@ -316,6 +320,8 @@ impl AppfsAdapter {
                 &root,
                 &app_id,
                 &app_mount_path,
+                principal_id.clone(),
+                profile_id.clone(),
                 &session_id,
                 &bridge_config,
             )?;
@@ -397,6 +403,8 @@ impl AppfsAdapter {
         let mut adapter = Self {
             app_id,
             session_id,
+            principal_id,
+            profile_id,
             app_dir,
             direct_db_path: startup_bootstrap
                 .as_ref()
@@ -829,6 +837,8 @@ impl AppfsAdapter {
             request_id: request_id.clone(),
             client_token: client_token.clone(),
             trace_id: None,
+            principal_id: self.principal_id.clone(),
+            profile_id: self.profile_id.clone(),
         };
         let execution_mode = match spec.execution_mode {
             ExecutionMode::Inline => ActionExecutionMode::Inline,
@@ -1408,6 +1418,8 @@ impl AppfsAdapter {
         if let Some(db_path) = self.direct_db_path.clone() {
             let app_id = self.app_id.clone();
             let session_id = self.session_id.clone();
+            let principal_id = self.principal_id.clone();
+            let profile_id = self.profile_id.clone();
             let connector = &mut self.connector;
             return crate::get_runtime().block_on(async move {
                 let agent = SdkAgentFS::open(AgentFSOptions::with_path(db_path)).await?;
@@ -1415,6 +1427,8 @@ impl AppfsAdapter {
                     &agent,
                     &app_id,
                     &session_id,
+                    principal_id,
+                    profile_id,
                     &mut **connector,
                     reason,
                     target_scope,
@@ -1432,6 +1446,8 @@ impl AppfsAdapter {
             root,
             &self.app_id,
             &self.session_id,
+            self.principal_id.clone(),
+            self.profile_id.clone(),
             &mut *self.connector,
             reason,
             target_scope,
@@ -1528,6 +1544,8 @@ mod tests {
             request_id: "req-1".to_string(),
             client_token: None,
             trace_id: None,
+            principal_id: None,
+            profile_id: None,
         }
     }
 
