@@ -198,11 +198,11 @@ Add structs for:
 - `AppPolicyRecord`
 - extended app instance record fields: `instance_id`, `visibility`, `principal_id`, `profile_id`, `parent_app_id`, `path`
 
-Keep deserialization backward compatible with current `apps.registry.json`.
+Only the new format is supported. The software has not shipped, so there is no legacy format to preserve. If an old-format `apps.registry.json` is found, treat it as a data error.
 
 **Step 4: Render app policies during compose bootstrap**
 
-`bootstrap_registry_from_resolved_apps` should still write current `apps.registry.json` behavior for public apps. Add a separate render path for `/_appfs/app-policies.registry.json`, but do not yet wire it into runtime boot if that would make the PR too large.
+`bootstrap_registry_from_resolved_apps` should write the new app-instance `apps.registry.json` format for public apps. Add a separate render path for `/_appfs/app-policies.registry.json`, but do not yet wire it into runtime boot if that would make the PR too large.
 
 **Step 5: Run tests**
 
@@ -447,11 +447,6 @@ If runtime adapter creation for private instances is too large, first persist th
 }
 ```
 
-Backward compatibility:
-
-- old contexts without these fields still deserialize;
-- fields are optional for public apps.
-
 **Step 2: Extend `ConnectorContext`**
 
 Add:
@@ -459,6 +454,8 @@ Add:
 - `principal_id: Option<String>`
 - `profile_id: Option<String>`
 - optionally `instance_id: Option<String>` if app instance routing needs it
+
+These fields are optional because public apps may not have a principal/profile binding. Do not treat missing `principal_id` or `profile_id` as a legacy migration path for private apps; private app instances must get these values from the new app instance registry.
 
 **Step 3: Fill context from app instance registry**
 
@@ -532,7 +529,7 @@ Extend `AppfsEnvironment` with:
 
 **Step 3: Extend registered app loading**
 
-Update `AppfsRegisteredApp` to parse extended registry fields while staying compatible with old `{ app_id, active_scope }`.
+Update `AppfsRegisteredApp` to parse the new registry fields (`instance_id`, `app_id`, `visibility`, `principal_id`, `profile_id`, `path`, `active_scope`).
 
 Visibility filter:
 
@@ -878,14 +875,15 @@ If contact resolution is unstable, support explicit `basic:<login>` recipient in
 - Modify: appfs-agent event reminder tests if event shape changes
 - Test: Tinode inbound smoke tests
 
-**Step 1: Implement inbound polling/subscription**
+**Step 1: Implement connector-side inbound handling**
 
-Depending on Tinode API support:
+Tinode connector maintains an internal WebSocket connection to the Tinode server. Received `{data}` and `{pres}` messages are translated into AppFS events and resource updates directly inside the connector:
 
-- prefer connector-side stream/subscription;
-- fallback to periodic connector poll with low frequency.
+- write new messages to `contacts/<key>/messages.res.jsonl` or `groups/<key>/messages.res.jsonl`;
+- append to `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl`;
+- emit `message.received` event to `_stream/events.evt.jsonl`.
 
-Keep this inside Tinode connector; do not add OS file watchers.
+Inbound handling does not go through the `AppConnector` trait in v0. The adapter poll loop continues to drive `.act` file processing; connector-internal WebSocket runs alongside it. Do not add OS file watchers.
 
 **Step 2: Update resources**
 
@@ -937,7 +935,7 @@ node integration\scripts\tinode-smoke.mjs inbound
 
 **Rollback Point:**
 
-If live inbound is hard, implement `refresh_inbox.act` and event emission from refresh first. Keep the tree unchanged.
+If the internal Tinode WebSocket is unstable, fall back to periodic polling of `{get what="data"}` inside the connector. The connector still writes events and resources directly; only the data source changes. Do not add new actions or trait methods.
 
 ## PR 10: Principal Fork and Multi-Agent Tinode
 
@@ -1065,13 +1063,13 @@ Do not make ordinary CI depend on a fragile external Tinode server unless the ru
 
 ## Risk Register
 
-### Risk: Compose schema breaks existing files
+### Risk: Compose schema change breaks existing files
 
 Mitigation:
 
-- default `visibility` to `public`;
-- keep old `apps.<id>.connector` syntax;
-- add tests using current AIIM compose.
+- add the new fields (`visibility`, `path`, `path_template`, `credential_policy`, `profile_template`) as optional additions to the compose schema;
+- update existing compose YAML files (AIIM, Huoyan) to include the new fields in the same PR;
+- add tests parsing the updated compose files.
 
 ### Risk: `apps.registry.json` becomes ambiguous
 
