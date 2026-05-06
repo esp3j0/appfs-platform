@@ -199,6 +199,16 @@ pub struct SubmitActionResponse {
     pub outcome: SubmitActionOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorInboundEvent {
+    pub event_type: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonValue>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error("{code}: {message}")]
 pub struct ConnectorError {
@@ -338,6 +348,13 @@ pub trait AppConnector: Send {
         request: SubmitActionRequest,
         ctx: &ConnectorContext,
     ) -> std::result::Result<SubmitActionResponse, ConnectorError>;
+
+    fn drain_inbound_events(
+        &mut self,
+        _ctx: &ConnectorContext,
+    ) -> std::result::Result<Vec<ConnectorInboundEvent>, ConnectorError> {
+        Ok(Vec::new())
+    }
 
     fn get_app_structure(
         &mut self,
