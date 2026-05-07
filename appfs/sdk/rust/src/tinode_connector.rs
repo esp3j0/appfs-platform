@@ -2339,18 +2339,29 @@ impl TinodeWsClient {
         since_seq: Option<i64>,
     ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
         let suffix = self.next_suffix();
-        let _ = self.request(
+        let mut messages = self.request_data(
             "sub",
-            json!({ "topic": contact.tinode_user_id }),
+            tinode_sub_data_payload(&contact.tinode_user_id, since_seq, 50),
             &format!("sub-inbox-{suffix}"),
+            &contact.tinode_user_id,
         );
+        if messages.is_err() {
+            let _ = self.request(
+                "sub",
+                json!({ "topic": contact.tinode_user_id }),
+                &format!("sub-inbox-fallback-{suffix}"),
+            );
+            messages = Ok(Vec::new());
+        }
         let payload = tinode_get_data_payload(&contact.tinode_user_id, since_seq, 50);
-        self.request_data(
+        let mut fetched = self.request_data(
             "get",
             payload,
             &format!("get-data-{suffix}"),
             &contact.tinode_user_id,
-        )
+        )?;
+        fetched.extend(messages?);
+        Ok(dedupe_tinode_inbound_messages(fetched))
     }
 
     fn create_group(
@@ -3225,15 +3236,29 @@ fn tinode_text_plain_content(text: &str) -> JsonValue {
     json!(text)
 }
 
-fn tinode_get_data_payload(topic: &str, since_seq: Option<i64>, limit: i64) -> JsonValue {
+fn tinode_get_data_options(since_seq: Option<i64>, limit: i64) -> JsonValue {
     let mut data = json!({ "limit": limit });
     if let Some(since_seq) = since_seq {
         data["since"] = json!(since_seq.saturating_add(1));
     }
+    data
+}
+
+fn tinode_get_data_payload(topic: &str, since_seq: Option<i64>, limit: i64) -> JsonValue {
     json!({
         "topic": topic,
         "what": "data",
-        "data": data,
+        "data": tinode_get_data_options(since_seq, limit),
+    })
+}
+
+fn tinode_sub_data_payload(topic: &str, since_seq: Option<i64>, limit: i64) -> JsonValue {
+    json!({
+        "topic": topic,
+        "get": {
+            "what": "data",
+            "data": tinode_get_data_options(since_seq, limit),
+        },
     })
 }
 
@@ -3260,6 +3285,22 @@ fn inbound_messages_from_meta(meta: &JsonValue, fallback_topic: &str) -> Vec<Tin
             }
         })
         .collect()
+}
+
+fn dedupe_tinode_inbound_messages(
+    messages: Vec<TinodeInboundMessage>,
+) -> Vec<TinodeInboundMessage> {
+    let mut seen = HashSet::new();
+    let mut deduped = messages
+        .into_iter()
+        .filter(|message| seen.insert((message.topic.clone(), message.seq)))
+        .collect::<Vec<_>>();
+    deduped.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then_with(|| left.seq.cmp(&right.seq))
+    });
+    deduped
 }
 
 fn add_side_event(
@@ -4376,6 +4417,35 @@ mod tests {
     }
 
     #[test]
+    fn tinode_inbound_messages_are_deduped_after_sub_and_get() {
+        let messages = super::dedupe_tinode_inbound_messages(vec![
+            TinodeInboundMessage {
+                topic: "usrA".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usrA".to_string(),
+                text: "two".to_string(),
+            },
+            TinodeInboundMessage {
+                topic: "usrA".to_string(),
+                seq: 1,
+                from_tinode_user_id: "usrA".to_string(),
+                text: "one".to_string(),
+            },
+            TinodeInboundMessage {
+                topic: "usrA".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usrA".to_string(),
+                text: "two duplicate".to_string(),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].seq, 1);
+        assert_eq!(messages[1].seq, 2);
+        assert_eq!(messages[1].text, "two");
+    }
+
+    #[test]
     fn tinode_get_data_payload_uses_nested_data_options() {
         let payload = super::tinode_get_data_payload("usrCode", Some(7), 50);
 
@@ -4385,6 +4455,12 @@ mod tests {
         assert_eq!(payload["data"]["limit"], 50);
         assert!(payload.get("since").is_none());
         assert!(payload.get("limit").is_none());
+
+        let sub = super::tinode_sub_data_payload("usrCode", Some(7), 50);
+        assert_eq!(sub["topic"], "usrCode");
+        assert_eq!(sub["get"]["what"], "data");
+        assert_eq!(sub["get"]["data"]["since"], 8);
+        assert_eq!(sub["get"]["data"]["limit"], 50);
     }
 
     #[test]
