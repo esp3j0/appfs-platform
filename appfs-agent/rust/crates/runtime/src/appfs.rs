@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::{AttachmentKind, ConversationMessage, Session, SessionError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -150,6 +152,30 @@ pub struct AppfsEnvironment {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsPrincipalCreateRequest {
+    pub principal_id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsPrincipalCreateStatus {
+    Created,
+    Exists,
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsPrincipalCreateOutcome {
+    pub principal_id: String,
+    pub status: AppfsPrincipalCreateStatus,
+    pub action_path: PathBuf,
+    pub registry_path: PathBuf,
+    pub visible_private_apps: Vec<AppfsRegisteredApp>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AppfsPromptControlDoc {
     app_id: String,
@@ -239,6 +265,64 @@ pub fn detect_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
 #[must_use]
 pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
     resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+}
+
+pub fn create_appfs_principal(
+    cwd: &Path,
+    request: AppfsPrincipalCreateRequest,
+) -> Result<AppfsPrincipalCreateOutcome, String> {
+    let principal_id = request.principal_id.trim();
+    if !is_safe_principal_id(principal_id) {
+        return Err(
+            "principal_id must use ASCII letters, digits, '.', '_' or '-' and cannot be empty"
+                .to_string(),
+        );
+    }
+
+    let environment = detect_appfs_environment(cwd)
+        .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
+    let control_dir = environment
+        .control_dir
+        .clone()
+        .ok_or_else(|| "AppFS control directory was not detected".to_string())?;
+    let principal_dir = control_dir.join("principals");
+    let action_path = principal_dir.join("create_principal.act");
+    let registry_path = control_dir.join(PRINCIPALS_FILE);
+
+    if environment
+        .known_principals
+        .iter()
+        .any(|principal| principal.principal_id == principal_id)
+    {
+        return Ok(principal_create_outcome_from_environment(
+            principal_id,
+            AppfsPrincipalCreateStatus::Exists,
+            action_path,
+            registry_path,
+            &environment,
+        ));
+    }
+
+    fs::create_dir_all(&principal_dir).map_err(|err| {
+        format!(
+            "failed to create AppFS principal control directory {}: {err}",
+            principal_dir.display()
+        )
+    })?;
+    append_create_principal_action(&action_path, principal_id, &request)?;
+
+    let status = wait_for_principal_registry(&registry_path, principal_id)
+        .map_or(AppfsPrincipalCreateStatus::Submitted, |_| {
+            AppfsPrincipalCreateStatus::Created
+        });
+    let refreshed = detect_appfs_environment(cwd).unwrap_or(environment);
+    Ok(principal_create_outcome_from_environment(
+        principal_id,
+        status,
+        action_path,
+        registry_path,
+        &refreshed,
+    ))
 }
 
 #[must_use]
@@ -1192,12 +1276,102 @@ fn load_principal_summaries(registry_path: &Path) -> Vec<AppfsPrincipalSummary> 
         .collect()
 }
 
-fn generate_ephemeral_attach_id() -> String {
-    let seq = ATTACH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    let now = SystemTime::now()
+fn append_create_principal_action(
+    action_path: &Path,
+    principal_id: &str,
+    request: &AppfsPrincipalCreateRequest,
+) -> Result<(), String> {
+    let client_token = format!("principal-create-{}", now_millis());
+    let payload = serde_json::json!({
+        "principal_id": principal_id,
+        "display_name": request
+            .display_name
+            .as_deref()
+            .unwrap_or(principal_id),
+        "description": request.description.as_deref(),
+        "kind": request.kind.as_deref().unwrap_or("agent"),
+        "client_token": client_token,
+    });
+    let mut line = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to encode principal create action: {err}"))?;
+    line.push('\n');
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(action_path)
+        .map_err(|err| {
+            format!(
+                "failed to open AppFS principal create action {}: {err}",
+                action_path.display()
+            )
+        })?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        format!(
+            "failed to append AppFS principal create action {}: {err}",
+            action_path.display()
+        )
+    })
+}
+
+fn wait_for_principal_registry(
+    registry_path: &Path,
+    principal_id: &str,
+) -> Option<AppfsPrincipalSummary> {
+    for _ in 0..40 {
+        if let Some(principal) = load_principal_summaries(registry_path)
+            .into_iter()
+            .find(|principal| principal.principal_id == principal_id)
+        {
+            return Some(principal);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn principal_create_outcome_from_environment(
+    principal_id: &str,
+    status: AppfsPrincipalCreateStatus,
+    action_path: PathBuf,
+    registry_path: PathBuf,
+    environment: &AppfsEnvironment,
+) -> AppfsPrincipalCreateOutcome {
+    let visible_private_apps =
+        load_registered_apps_from_paths(environment.registry_path.as_deref(), principal_id)
+            .into_iter()
+            .filter(|app| {
+                app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                    && app.principal_id.as_deref() == Some(principal_id)
+            })
+            .collect();
+    AppfsPrincipalCreateOutcome {
+        principal_id: principal_id.to_string(),
+        status,
+        action_path,
+        registry_path,
+        visible_private_apps,
+    }
+}
+
+fn is_safe_principal_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
+        .as_millis()
+}
+
+fn generate_ephemeral_attach_id() -> String {
+    let seq = ATTACH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_millis();
     format!("attach-{now:x}-{}-{seq:x}", process::id())
 }
 

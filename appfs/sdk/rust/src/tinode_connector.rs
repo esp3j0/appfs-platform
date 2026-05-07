@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
@@ -185,6 +186,18 @@ impl TinodeConnectorConfig {
     }
 }
 
+#[derive(Default)]
+struct TinodeSharedState {
+    credentials: HashMap<String, ConnectorCredentialRecord>,
+    principal_profiles: HashMap<String, String>,
+}
+
+static TINODE_SHARED_STATE: OnceLock<Mutex<TinodeSharedState>> = OnceLock::new();
+
+fn tinode_shared_state() -> &'static Mutex<TinodeSharedState> {
+    TINODE_SHARED_STATE.get_or_init(|| Mutex::new(TinodeSharedState::default()))
+}
+
 /// Tinode AppFS connector.
 ///
 /// PR8 adds the first real business path: auto-create connector-private
@@ -192,10 +205,13 @@ impl TinodeConnectorConfig {
 /// root `contacts/send_message.act` action.
 pub struct TinodeConnector {
     config: TinodeConnectorConfig,
+    shared_namespace: String,
     credential_create_attempts: u64,
     credentials: HashMap<String, ConnectorCredentialRecord>,
     contacts: HashMap<String, TinodeContact>,
     direct_messages: HashMap<String, Vec<TinodeMessageRecord>>,
+    groups: HashMap<String, TinodeGroupRecord>,
+    group_messages: HashMap<String, Vec<TinodeGroupMessageRecord>>,
     inbox_recent: Vec<InboxRecord>,
     unread_message_ids: HashSet<String>,
     last_direct_seq_by_contact: HashMap<String, i64>,
@@ -209,12 +225,16 @@ impl TinodeConnector {
     }
 
     fn new_with_gateway(config: TinodeConnectorConfig, gateway: Box<dyn TinodeGateway>) -> Self {
+        let shared_namespace = shared_state_namespace(&config);
         Self {
             config,
+            shared_namespace,
             credential_create_attempts: 0,
             credentials: HashMap::new(),
             contacts: HashMap::new(),
             direct_messages: HashMap::new(),
+            groups: HashMap::new(),
+            group_messages: HashMap::new(),
             inbox_recent: Vec::new(),
             unread_message_ids: HashSet::new(),
             last_direct_seq_by_contact: HashMap::new(),
@@ -260,8 +280,9 @@ impl TinodeConnector {
             .map(|record| credential_status_label(record.credential_status))
             .unwrap_or("missing");
         format!(
-            "{TINODE_STRUCTURE_REVISION}-contacts{}-inbox{}-{credential_status}",
+            "{TINODE_STRUCTURE_REVISION}-contacts{}-groups{}-inbox{}-{credential_status}",
             self.contacts.len(),
+            self.groups.len(),
             self.inbox_recent.len()
         )
     }
@@ -297,6 +318,21 @@ impl TinodeConnector {
                 "contacts/{key}/messages.res.jsonl"
             )));
             nodes.push(action(&format!("contacts/{key}/send_message.act")));
+        }
+
+        let mut group_keys = self.groups.keys().cloned().collect::<Vec<_>>();
+        group_keys.sort();
+        for key in group_keys {
+            if let Some(group) = self.groups.get(&key) {
+                nodes.push(dir(&format!("groups/{key}")));
+                nodes.push(static_json(
+                    &format!("groups/{key}/group.res.json"),
+                    group.to_resource_line(),
+                ));
+                nodes.push(snapshot_jsonl(&format!("groups/{key}/messages.res.jsonl")));
+                nodes.push(action(&format!("groups/{key}/send_message.act")));
+                nodes.push(action(&format!("groups/{key}/invite_members.act")));
+            }
         }
 
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -356,14 +392,17 @@ impl TinodeConnector {
 
         let records = match normalized.as_str() {
             "contacts/index.res.jsonl" => self.contact_index_records(),
+            "groups/index.res.jsonl" => self.group_index_records(),
             "inbox/recent.res.jsonl" => self.inbox_records(false),
             "inbox/unread.res.jsonl" => self.inbox_records(true),
-            "contacts/search_results.res.jsonl"
-            | "groups/index.res.jsonl"
-            | "topics/index.res.jsonl" => Vec::new(),
+            "contacts/search_results.res.jsonl" | "topics/index.res.jsonl" => Vec::new(),
             path if contact_messages_key(path).is_some() => {
                 let key = contact_messages_key(path).expect("checked contact messages path");
                 self.contact_message_records(key)
+            }
+            path if group_messages_key(path).is_some() => {
+                let key = group_messages_key(path).expect("checked group messages path");
+                self.group_message_records(key)
             }
             _ => Vec::new(),
         };
@@ -413,6 +452,33 @@ impl TinodeConnector {
             .collect()
     }
 
+    fn group_index_records(&self) -> Vec<SnapshotRecord> {
+        let mut groups = self.groups.values().cloned().collect::<Vec<_>>();
+        groups.sort_by(|a, b| a.key.cmp(&b.key));
+        groups
+            .into_iter()
+            .map(|group| SnapshotRecord {
+                record_key: group.key.clone(),
+                ordering_key: group.created_at_ms.to_string(),
+                line: group.to_resource_line(),
+            })
+            .collect()
+    }
+
+    fn group_message_records(&self, group_key: &str) -> Vec<SnapshotRecord> {
+        self.group_messages
+            .get(group_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| SnapshotRecord {
+                record_key: message.message_id.clone(),
+                ordering_key: message.created_at_ms.to_string(),
+                line: message.to_resource_line(),
+            })
+            .collect()
+    }
+
     fn inbox_records(&self, unread_only: bool) -> Vec<SnapshotRecord> {
         self.inbox_recent
             .iter()
@@ -431,14 +497,22 @@ impl TinodeConnector {
         ctx: &ConnectorContext,
     ) -> std::result::Result<(ConnectorCredentialRecord, bool), ConnectorError> {
         let profile_id = effective_profile_id(ctx)?;
+        let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
         if let Some(record) = self.credentials.get(&profile_id) {
             if record.credential_status == ConnectorCredentialStatus::Ready {
+                self.remember_principal_profile(principal_id, record);
                 return Ok((record.clone(), false));
+            }
+        }
+        if let Some(record) = self.shared_credential(&profile_id) {
+            if record.credential_status == ConnectorCredentialStatus::Ready {
+                self.credentials.insert(profile_id.clone(), record.clone());
+                self.remember_principal_profile(principal_id, &record);
+                return Ok((record, false));
             }
         }
 
         self.credential_create_attempts += 1;
-        let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
         let login = login_for_profile(&self.config, principal_id, &profile_id);
         let display_name = display_name_for_principal(principal_id);
         let request = TinodeAccountRequest {
@@ -468,7 +542,38 @@ impl TinodeConnector {
             })),
         };
         self.credentials.insert(profile_id, record.clone());
+        self.store_shared_credential(principal_id, &record);
         Ok((record, true))
+    }
+
+    fn shared_credential(&self, profile_id: &str) -> Option<ConnectorCredentialRecord> {
+        let state = tinode_shared_state().lock().ok()?;
+        state
+            .credentials
+            .get(&shared_credential_key(&self.shared_namespace, profile_id))
+            .cloned()
+    }
+
+    fn store_shared_credential(&self, principal_id: &str, record: &ConnectorCredentialRecord) {
+        if let Ok(mut state) = tinode_shared_state().lock() {
+            state.credentials.insert(
+                shared_credential_key(&self.shared_namespace, &record.profile_id),
+                record.clone(),
+            );
+            state.principal_profiles.insert(
+                shared_principal_key(&self.shared_namespace, principal_id),
+                record.profile_id.clone(),
+            );
+        }
+    }
+
+    fn remember_principal_profile(&self, principal_id: &str, record: &ConnectorCredentialRecord) {
+        if let Ok(mut state) = tinode_shared_state().lock() {
+            state.principal_profiles.insert(
+                shared_principal_key(&self.shared_namespace, principal_id),
+                record.profile_id.clone(),
+            );
+        }
     }
 
     fn resolve_recipient(
@@ -493,7 +598,82 @@ impl TinodeConnector {
                     false,
                 )
             }),
+            RecipientRef::TinodeUser(tinode_user_id) => Ok(TinodeContact {
+                key: contact_key_from_tinode_user(&tinode_user_id),
+                tinode_user_id,
+                basic_login: None,
+                display_name: None,
+            }),
+            RecipientRef::Principal(principal_id) => self.resolve_principal_contact(&principal_id),
         }
+    }
+
+    fn resolve_principal_contact(
+        &self,
+        principal_id: &str,
+    ) -> std::result::Result<TinodeContact, ConnectorError> {
+        let member = self.resolve_principal_group_member(principal_id)?;
+        Ok(TinodeContact {
+            key: sanitize_path_key(principal_id),
+            tinode_user_id: member.tinode_user_id,
+            basic_login: member.basic_login,
+            display_name: member.display_name,
+        })
+    }
+
+    fn resolve_principal_group_member(
+        &self,
+        principal_id: &str,
+    ) -> std::result::Result<TinodeGroupMember, ConnectorError> {
+        let state = tinode_shared_state().lock().map_err(|_| {
+            connector_err(
+                connector_error_codes::INTERNAL,
+                "Tinode shared credential state is poisoned",
+                true,
+            )
+        })?;
+        let principal_key = shared_principal_key(&self.shared_namespace, principal_id);
+        let profile_id = state
+            .principal_profiles
+            .get(&principal_key)
+            .cloned()
+            .ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::PROFILE_NOT_READY,
+                    format!(
+                        "Tinode profile for principal:{principal_id} is not ready; start that agent and run _app/ensure_credentials.act first"
+                    ),
+                    true,
+                )
+            })?;
+        let record = state
+            .credentials
+            .get(&shared_credential_key(&self.shared_namespace, &profile_id))
+            .ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::PROFILE_NOT_READY,
+                    format!(
+                        "Tinode credentials for principal:{principal_id} profile {profile_id} are not ready"
+                    ),
+                    true,
+                )
+            })?;
+        let tinode_user_id = record.upstream_user_id.clone().ok_or_else(|| {
+            connector_err(
+                connector_error_codes::PROFILE_NOT_READY,
+                format!("Tinode credentials for principal:{principal_id} have no upstream user id"),
+                true,
+            )
+        })?;
+        Ok(TinodeGroupMember {
+            kind: "principal".to_string(),
+            principal_id: Some(principal_id.to_string()),
+            profile_id: Some(profile_id),
+            contact_key: None,
+            tinode_user_id,
+            basic_login: record.login.clone(),
+            display_name: record.display_name.clone(),
+        })
     }
 
     fn submit_ensure_credentials(
@@ -627,6 +807,295 @@ impl TinodeConnector {
         );
 
         Ok(completed_response(ctx, content))
+    }
+
+    fn submit_create_group(
+        &mut self,
+        request: SubmitActionRequest,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let title = group_title_from_payload(&request.payload)?;
+        let group_key = group_key_from_payload(&request.payload, &title);
+        let member_refs = group_member_refs_from_payload(&request.payload)?;
+        let initial_message = request
+            .payload
+            .get("initial_message")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let (record, created_credentials) = self.ensure_credentials(ctx)?;
+        let credentials = credentials_from_record(&record)?;
+        let members = self.resolve_group_members(&credentials, member_refs)?;
+        let receipt = self.gateway.create_group(
+            &credentials,
+            &title,
+            &members,
+            ctx.client_token.as_deref(),
+        )?;
+        let created_at_ms = now_millis();
+        let group = TinodeGroupRecord {
+            key: group_key.clone(),
+            title: title.clone(),
+            topic_id: receipt.topic.clone(),
+            members: members.clone(),
+            created_at_ms,
+            last_message_at_ms: None,
+        };
+        self.groups.insert(group_key.clone(), group.clone());
+
+        let mut sent_initial = None;
+        if let Some(text) = initial_message {
+            let receipt = self.gateway.send_group_message(
+                &credentials,
+                &group,
+                &text,
+                ctx.client_token.as_deref(),
+            )?;
+            let message = TinodeGroupMessageRecord::outbound(&group, receipt, text);
+            sent_initial = Some(message.message_id.clone());
+            self.group_messages
+                .entry(group_key.clone())
+                .or_default()
+                .push(message);
+            if let Some(group) = self.groups.get_mut(&group_key) {
+                group.last_message_at_ms = Some(now_millis());
+            }
+        }
+
+        let safe_summary = record.safe_summary();
+        let mut content = json!({
+            "ok": true,
+            "conversation_type": "group",
+            "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+            "profile_id": safe_summary.profile_id,
+            "group_key": group_key,
+            "topic": group.topic_id,
+            "title": group.title,
+            "member_count": group.members.len(),
+            "initial_message_id": sent_initial,
+            "structure_changed": true,
+        });
+        add_side_event(
+            &mut content,
+            "action.accepted",
+            Some(json!({
+                "conversation_type": "group",
+                "path": request.path,
+                "profile_id": safe_summary.profile_id,
+            })),
+            true,
+        );
+        add_side_event(
+            &mut content,
+            "profile.credentials.ready",
+            Some(serde_json::to_value(safe_summary.clone()).map_err(|err| {
+                connector_err(
+                    connector_error_codes::INTERNAL,
+                    format!("failed to encode credential summary: {err}"),
+                    true,
+                )
+            })?),
+            created_credentials,
+        );
+        add_side_event(
+            &mut content,
+            "group.created",
+            Some(json!({
+                "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+                "profile_id": safe_summary.profile_id,
+                "path": format!("groups/{}/group.res.json", group.key),
+                "group_key": group.key,
+                "topic": group.topic_id,
+                "title": group.title,
+                "member_count": group.members.len(),
+            })),
+            true,
+        );
+        Ok(completed_response(ctx, content))
+    }
+
+    fn submit_invite_group_members(
+        &mut self,
+        request: SubmitActionRequest,
+        ctx: &ConnectorContext,
+        group_key: &str,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let member_refs = group_member_refs_from_payload(&request.payload)?;
+        let (record, created_credentials) = self.ensure_credentials(ctx)?;
+        let credentials = credentials_from_record(&record)?;
+        let members = self.resolve_group_members(&credentials, member_refs)?;
+        let group = self.groups.get(group_key).cloned().ok_or_else(|| {
+            connector_err(
+                connector_error_codes::PROFILE_NOT_FOUND,
+                format!("Tinode group `{group_key}` is not known yet"),
+                false,
+            )
+        })?;
+        self.gateway
+            .invite_group_members(&credentials, &group, &members)?;
+        if let Some(stored) = self.groups.get_mut(group_key) {
+            for member in members {
+                if !stored
+                    .members
+                    .iter()
+                    .any(|existing| existing.tinode_user_id == member.tinode_user_id)
+                {
+                    stored.members.push(member);
+                }
+            }
+        }
+        let safe_summary = record.safe_summary();
+        let mut content = json!({
+            "ok": true,
+            "conversation_type": "group",
+            "group_key": group_key,
+            "topic": group.topic_id,
+            "profile_id": safe_summary.profile_id,
+            "structure_changed": true,
+        });
+        add_side_event(
+            &mut content,
+            "profile.credentials.ready",
+            Some(serde_json::to_value(safe_summary.clone()).map_err(|err| {
+                connector_err(
+                    connector_error_codes::INTERNAL,
+                    format!("failed to encode credential summary: {err}"),
+                    true,
+                )
+            })?),
+            created_credentials,
+        );
+        add_side_event(
+            &mut content,
+            "group.members.invited",
+            Some(json!({
+                "profile_id": safe_summary.profile_id,
+                "group_key": group_key,
+                "topic": group.topic_id,
+            })),
+            true,
+        );
+        Ok(completed_response(ctx, content))
+    }
+
+    fn submit_send_group_message(
+        &mut self,
+        request: SubmitActionRequest,
+        ctx: &ConnectorContext,
+        group_key: &str,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let text = text_from_payload(&request.payload, "Tinode group send_message")?;
+        let (record, created_credentials) = self.ensure_credentials(ctx)?;
+        let credentials = credentials_from_record(&record)?;
+        let group = self.groups.get(group_key).cloned().ok_or_else(|| {
+            connector_err(
+                connector_error_codes::PROFILE_NOT_FOUND,
+                format!("Tinode group `{group_key}` is not known yet"),
+                false,
+            )
+        })?;
+        let receipt = self.gateway.send_group_message(
+            &credentials,
+            &group,
+            &text,
+            ctx.client_token.as_deref(),
+        )?;
+        let message = TinodeGroupMessageRecord::outbound(&group, receipt.clone(), text.clone());
+        self.group_messages
+            .entry(group_key.to_string())
+            .or_default()
+            .push(message.clone());
+        if let Some(group) = self.groups.get_mut(group_key) {
+            group.last_message_at_ms = Some(now_millis());
+        }
+
+        let safe_summary = record.safe_summary();
+        let mut content = json!({
+            "ok": true,
+            "conversation_type": "group",
+            "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+            "profile_id": safe_summary.profile_id,
+            "group_key": group_key,
+            "topic": group.topic_id,
+            "message_id": receipt.message_id,
+            "text_preview": text_preview(&text),
+        });
+        add_side_event(
+            &mut content,
+            "profile.credentials.ready",
+            Some(serde_json::to_value(safe_summary.clone()).map_err(|err| {
+                connector_err(
+                    connector_error_codes::INTERNAL,
+                    format!("failed to encode credential summary: {err}"),
+                    true,
+                )
+            })?),
+            created_credentials,
+        );
+        add_side_event(
+            &mut content,
+            "message.sent",
+            Some(json!({
+                "conversation_type": "group",
+                "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+                "profile_id": safe_summary.profile_id,
+                "path": request.path,
+                "group_key": group_key,
+                "topic": group.topic_id,
+                "message_id": message.message_id,
+                "text_preview": text_preview(&text),
+                "client_token": ctx.client_token,
+            })),
+            true,
+        );
+
+        Ok(completed_response(ctx, content))
+    }
+
+    fn resolve_group_members(
+        &mut self,
+        credentials: &TinodeCredentials,
+        refs: Vec<RecipientRef>,
+    ) -> std::result::Result<Vec<TinodeGroupMember>, ConnectorError> {
+        let mut members = Vec::new();
+        let mut seen = HashSet::new();
+        for reference in refs {
+            let member = self.resolve_group_member(credentials, reference)?;
+            if seen.insert(member.tinode_user_id.clone()) {
+                members.push(member);
+            }
+        }
+        Ok(members)
+    }
+
+    fn resolve_group_member(
+        &mut self,
+        credentials: &TinodeCredentials,
+        reference: RecipientRef,
+    ) -> std::result::Result<TinodeGroupMember, ConnectorError> {
+        match reference {
+            RecipientRef::Principal(principal_id) => {
+                self.resolve_principal_group_member(&principal_id)
+            }
+            RecipientRef::ContactKey(key) => {
+                let contact = self.resolve_recipient(credentials, RecipientRef::ContactKey(key))?;
+                Ok(TinodeGroupMember::from_contact("contact", contact))
+            }
+            RecipientRef::Basic(login) => {
+                let contact = self.resolve_recipient(credentials, RecipientRef::Basic(login))?;
+                Ok(TinodeGroupMember::from_contact("basic", contact))
+            }
+            RecipientRef::TinodeUser(tinode_user_id) => Ok(TinodeGroupMember::from_contact(
+                "tinode_user",
+                TinodeContact {
+                    key: contact_key_from_tinode_user(&tinode_user_id),
+                    tinode_user_id,
+                    basic_login: None,
+                    display_name: None,
+                },
+            )),
+        }
     }
 
     fn drain_inbound_for_ctx(
@@ -917,11 +1386,15 @@ impl AppConnector for TinodeConnector {
                 json!({ "ok": true, "refreshed": false, "reason": "no-op in Tinode connector v0" }),
             )),
             "inbox/mark_read.act" => self.submit_mark_read(request, ctx),
-            "groups/create_group.act" => Err(connector_err(
-                connector_error_codes::NOT_SUPPORTED,
-                format!("Tinode action is not implemented yet: {}", request.path),
-                false,
-            )),
+            "groups/create_group.act" => self.submit_create_group(request, ctx),
+            path if group_send_message_key(path).is_some() => {
+                let group_key = group_send_message_key(path).expect("checked group send path");
+                self.submit_send_group_message(request, ctx, group_key)
+            }
+            path if group_invite_members_key(path).is_some() => {
+                let group_key = group_invite_members_key(path).expect("checked group invite path");
+                self.submit_invite_group_members(request, ctx, group_key)
+            }
             path if contact_send_message_key(path).is_some() => {
                 self.submit_send_message(request, ctx)
             }
@@ -1007,6 +1480,29 @@ trait TinodeGateway: Send {
         contact: &TinodeContact,
         since_seq: Option<i64>,
     ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError>;
+
+    fn create_group(
+        &mut self,
+        credentials: &TinodeCredentials,
+        title: &str,
+        members: &[TinodeGroupMember],
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeGroupReceipt, ConnectorError>;
+
+    fn invite_group_members(
+        &mut self,
+        credentials: &TinodeCredentials,
+        group: &TinodeGroupRecord,
+        members: &[TinodeGroupMember],
+    ) -> std::result::Result<(), ConnectorError>;
+
+    fn send_group_message(
+        &mut self,
+        credentials: &TinodeCredentials,
+        group: &TinodeGroupRecord,
+        text: &str,
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeSendReceipt, ConnectorError>;
 }
 
 #[derive(Debug, Clone)]
@@ -1058,6 +1554,115 @@ struct TinodeSendReceipt {
     topic: String,
     message_id: String,
     seq: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct TinodeGroupReceipt {
+    topic: String,
+}
+
+#[derive(Debug, Clone)]
+struct TinodeGroupMember {
+    kind: String,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
+    contact_key: Option<String>,
+    tinode_user_id: String,
+    basic_login: Option<String>,
+    display_name: Option<String>,
+}
+
+impl TinodeGroupMember {
+    fn from_contact(kind: &str, contact: TinodeContact) -> Self {
+        Self {
+            kind: kind.to_string(),
+            principal_id: None,
+            profile_id: None,
+            contact_key: Some(contact.key),
+            tinode_user_id: contact.tinode_user_id,
+            basic_login: contact.basic_login,
+            display_name: contact.display_name,
+        }
+    }
+
+    fn to_resource_line(&self) -> JsonValue {
+        json!({
+            "kind": self.kind,
+            "principal_id": self.principal_id,
+            "profile_id": self.profile_id,
+            "contact_key": self.contact_key,
+            "tinode_user_id": self.tinode_user_id,
+            "basic_login": self.basic_login,
+            "display_name": self.display_name,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TinodeGroupRecord {
+    key: String,
+    title: String,
+    topic_id: String,
+    members: Vec<TinodeGroupMember>,
+    created_at_ms: u128,
+    last_message_at_ms: Option<u128>,
+}
+
+impl TinodeGroupRecord {
+    fn to_resource_line(&self) -> JsonValue {
+        json!({
+            "group_key": self.key,
+            "title": self.title,
+            "topic_id": self.topic_id,
+            "path": format!("groups/{}", self.key),
+            "members": self
+                .members
+                .iter()
+                .map(TinodeGroupMember::to_resource_line)
+                .collect::<Vec<_>>(),
+            "member_count": self.members.len(),
+            "created_at_ms": self.created_at_ms,
+            "last_message_at_ms": self.last_message_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TinodeGroupMessageRecord {
+    message_id: String,
+    group_key: String,
+    topic_id: String,
+    direction: String,
+    text: String,
+    created_at_ms: u128,
+    seq: Option<i64>,
+}
+
+impl TinodeGroupMessageRecord {
+    fn outbound(group: &TinodeGroupRecord, receipt: TinodeSendReceipt, text: String) -> Self {
+        Self {
+            message_id: receipt.message_id,
+            group_key: group.key.clone(),
+            topic_id: group.topic_id.clone(),
+            direction: "outbound".to_string(),
+            text,
+            created_at_ms: now_millis(),
+            seq: receipt.seq,
+        }
+    }
+
+    fn to_resource_line(&self) -> JsonValue {
+        json!({
+            "message_id": self.message_id,
+            "conversation_type": "group",
+            "group_key": self.group_key,
+            "topic_id": self.topic_id,
+            "direction": self.direction,
+            "text": self.text,
+            "created_at_ms": self.created_at_ms,
+            "seq": self.seq,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1137,6 +1742,8 @@ impl InboxRecord {
 enum RecipientRef {
     Basic(String),
     ContactKey(String),
+    TinodeUser(String),
+    Principal(String),
 }
 
 struct WebSocketTinodeGateway {
@@ -1223,6 +1830,38 @@ impl TinodeGateway for WebSocketTinodeGateway {
     ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
         self.client_mut(credentials)?
             .fetch_direct_messages(contact, since_seq)
+    }
+
+    fn create_group(
+        &mut self,
+        credentials: &TinodeCredentials,
+        title: &str,
+        members: &[TinodeGroupMember],
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeGroupReceipt, ConnectorError> {
+        self.client_mut(credentials)?
+            .create_group(title, members, client_token)
+    }
+
+    fn invite_group_members(
+        &mut self,
+        credentials: &TinodeCredentials,
+        group: &TinodeGroupRecord,
+        members: &[TinodeGroupMember],
+    ) -> std::result::Result<(), ConnectorError> {
+        self.client_mut(credentials)?
+            .invite_group_members(group, members)
+    }
+
+    fn send_group_message(
+        &mut self,
+        credentials: &TinodeCredentials,
+        group: &TinodeGroupRecord,
+        text: &str,
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
+        self.client_mut(credentials)?
+            .send_group_message(group, text, client_token)
     }
 }
 
@@ -1435,6 +2074,117 @@ impl TinodeWsClient {
             &format!("get-data-{suffix}"),
             &contact.tinode_user_id,
         )
+    }
+
+    fn create_group(
+        &mut self,
+        title: &str,
+        members: &[TinodeGroupMember],
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeGroupReceipt, ConnectorError> {
+        let suffix = self.next_suffix();
+        let ctrl = self.request(
+            "sub",
+            json!({
+                "topic": "new",
+                "set": {
+                    "desc": {
+                        "public": { "fn": title },
+                        "defacs": {
+                            "auth": "JRWPA",
+                            "anon": "N"
+                        }
+                    },
+                    "tags": [sanitize_path_key(title), "appfs-agent-group"]
+                }
+            }),
+            client_token.unwrap_or(&format!("sub-group-{suffix}")),
+        )?;
+        let topic = ctrl
+            .get("topic")
+            .and_then(JsonValue::as_str)
+            .or_else(|| {
+                ctrl.get("params")
+                    .and_then(|params| params.get("topic"))
+                    .and_then(JsonValue::as_str)
+            })
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::UPSTREAM_UNAVAILABLE,
+                    "Tinode group creation did not return a topic",
+                    true,
+                )
+            })?;
+        let record = TinodeGroupRecord {
+            key: sanitize_path_key(title),
+            title: title.to_string(),
+            topic_id: topic.clone(),
+            members: Vec::new(),
+            created_at_ms: now_millis(),
+            last_message_at_ms: None,
+        };
+        self.invite_group_members(&record, members)?;
+        Ok(TinodeGroupReceipt { topic })
+    }
+
+    fn invite_group_members(
+        &mut self,
+        group: &TinodeGroupRecord,
+        members: &[TinodeGroupMember],
+    ) -> std::result::Result<(), ConnectorError> {
+        for member in members {
+            self.request(
+                "set",
+                json!({
+                    "topic": group.topic_id,
+                    "sub": {
+                        "user": member.tinode_user_id,
+                        "mode": "JRWPA"
+                    }
+                }),
+                &format!("invite-{}-{}", group.topic_id, member.tinode_user_id),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn send_group_message(
+        &mut self,
+        group: &TinodeGroupRecord,
+        text: &str,
+        client_token: Option<&str>,
+    ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
+        let suffix = self.next_suffix();
+        let _ = self.request(
+            "sub",
+            json!({ "topic": group.topic_id }),
+            &format!("sub-group-send-{suffix}"),
+        );
+        let ctrl = self.request(
+            "pub",
+            json!({
+                "topic": group.topic_id,
+                "noecho": false,
+                "head": {
+                    "mime": "text/plain"
+                },
+                "content": {
+                    "txt": text
+                }
+            }),
+            client_token.unwrap_or(&format!("pub-group-{suffix}")),
+        )?;
+        let params = ctrl.get("params").cloned().unwrap_or_else(|| json!({}));
+        let seq = params.get("seq").and_then(JsonValue::as_i64);
+        let message_id = seq
+            .map(|seq| format!("tinode:{}:{seq}", group.topic_id))
+            .unwrap_or_else(|| format!("tinode:{}:{suffix}", group.topic_id));
+        Ok(TinodeSendReceipt {
+            topic: group.topic_id.clone(),
+            message_id,
+            seq,
+        })
     }
 
     fn request(
@@ -1724,6 +2474,7 @@ fn is_tinode_snapshot_resource(path: &str) -> bool {
             | "inbox/unread.res.jsonl"
             | "topics/index.res.jsonl"
     ) || contact_messages_key(&normalized).is_some()
+        || group_messages_key(&normalized).is_some()
 }
 
 fn contact_send_message_key(path: &str) -> Option<&str> {
@@ -1740,6 +2491,34 @@ fn contact_messages_key(path: &str) -> Option<&str> {
     let mut parts = path.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("contacts"), Some(key), Some("messages.res.jsonl"), None) if !key.is_empty() => {
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
+fn group_send_message_key(path: &str) -> Option<&str> {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("groups"), Some(key), Some("send_message.act"), None) if !key.is_empty() => Some(key),
+        _ => None,
+    }
+}
+
+fn group_invite_members_key(path: &str) -> Option<&str> {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("groups"), Some(key), Some("invite_members.act"), None) if !key.is_empty() => {
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
+fn group_messages_key(path: &str) -> Option<&str> {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("groups"), Some(key), Some("messages.res.jsonl"), None) if !key.is_empty() => {
             Some(key)
         }
         _ => None,
@@ -1790,6 +2569,18 @@ fn login_for_profile(
         config.login_prefix,
         profile_id.replace(':', "_")
     ))
+}
+
+fn shared_state_namespace(config: &TinodeConnectorConfig) -> String {
+    format!("{}|{}", config.endpoint, config.login_prefix)
+}
+
+fn shared_credential_key(namespace: &str, profile_id: &str) -> String {
+    format!("{namespace}|profile:{profile_id}")
+}
+
+fn shared_principal_key(namespace: &str, principal_id: &str) -> String {
+    format!("{namespace}|principal:{principal_id}")
 }
 
 fn sanitize_tinode_login(value: &str) -> String {
@@ -1887,19 +2678,7 @@ fn message_target_and_text(
     normalized_path: &str,
     payload: &JsonValue,
 ) -> std::result::Result<(RecipientRef, String), ConnectorError> {
-    let text = payload
-        .get("text")
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            connector_err(
-                connector_error_codes::INVALID_ARGUMENT,
-                "Tinode send_message payload requires non-empty `text`",
-                false,
-            )
-        })?;
+    let text = text_from_payload(payload, "Tinode send_message")?;
 
     let reference = if normalized_path == "contacts/send_message.act" {
         recipient_ref_from_payload(payload)?
@@ -1916,6 +2695,74 @@ fn message_target_and_text(
     Ok((reference, text))
 }
 
+fn text_from_payload(
+    payload: &JsonValue,
+    label: &str,
+) -> std::result::Result<String, ConnectorError> {
+    payload
+        .get("text")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                format!("{label} payload requires non-empty `text`"),
+                false,
+            )
+        })
+}
+
+fn group_title_from_payload(payload: &JsonValue) -> std::result::Result<String, ConnectorError> {
+    payload
+        .get("title")
+        .or_else(|| payload.get("display_name"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode create_group payload requires non-empty `title` or `display_name`",
+                false,
+            )
+        })
+}
+
+fn group_key_from_payload(payload: &JsonValue, title: &str) -> String {
+    payload
+        .get("group_key")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_path_key)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| sanitize_path_key(title))
+}
+
+fn group_member_refs_from_payload(
+    payload: &JsonValue,
+) -> std::result::Result<Vec<RecipientRef>, ConnectorError> {
+    let Some(members) = payload.get("members").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    members
+        .iter()
+        .map(|member| {
+            let value = member.as_str().ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::INVALID_ARGUMENT,
+                    "Tinode group members must be strings",
+                    false,
+                )
+            })?;
+            parse_recipient_ref(value)
+        })
+        .collect()
+}
+
 fn parse_recipient_ref(value: &str) -> std::result::Result<RecipientRef, ConnectorError> {
     let value = value.trim();
     if let Some(login) = value.strip_prefix("basic:") {
@@ -1929,15 +2776,49 @@ fn parse_recipient_ref(value: &str) -> std::result::Result<RecipientRef, Connect
         }
         return Ok(RecipientRef::Basic(login.to_string()));
     }
+    if let Some(user_id) = value.strip_prefix("tinode_user:") {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Err(connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode user recipient cannot be empty",
+                false,
+            ));
+        }
+        return Ok(RecipientRef::TinodeUser(user_id.to_string()));
+    }
+    if let Some(principal_id) = value.strip_prefix("principal:") {
+        let principal_id = principal_id.trim();
+        if !is_safe_principal_ref(principal_id) {
+            return Err(connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode principal recipient must use a safe AppFS principal id",
+                false,
+            ));
+        }
+        return Ok(RecipientRef::Principal(principal_id.to_string()));
+    }
     Err(connector_err(
         connector_error_codes::INVALID_ARGUMENT,
-        "Tinode v0 supports explicit recipients in the form basic:<login>",
+        "Tinode v0 supports explicit recipients in the form basic:<login>, tinode_user:<usr-id>, or principal:<principal-id>",
         false,
     ))
 }
 
 fn contact_key_from_basic_login(login: &str) -> String {
     sanitize_path_key(login)
+}
+
+fn contact_key_from_tinode_user(user_id: &str) -> String {
+    sanitize_path_key(user_id)
+}
+
+fn is_safe_principal_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn sanitize_path_key(value: &str) -> String {
@@ -2144,8 +3025,8 @@ fn connector_err(code: &str, message: impl Into<String>, retryable: bool) -> Con
 mod tests {
     use super::{
         TinodeAccount, TinodeAccountRequest, TinodeConnector, TinodeConnectorConfig, TinodeContact,
-        TinodeCredentials, TinodeGateway, TinodeInboundMessage, TinodeSendReceipt,
-        CONNECTOR_SIDE_EVENTS_FIELD,
+        TinodeCredentials, TinodeGateway, TinodeGroupMember, TinodeGroupReceipt, TinodeGroupRecord,
+        TinodeInboundMessage, TinodeSendReceipt, CONNECTOR_SIDE_EVENTS_FIELD,
     };
     use crate::{
         connector_error_codes, ActionExecutionMode, AppConnector, AppStructureSyncResult,
@@ -2153,11 +3034,19 @@ mod tests {
         SnapshotResume, SubmitActionOutcome, SubmitActionRequest,
     };
     use serde_json::{json, Value as JsonValue};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    static TEST_PREFIX_SEQ: AtomicUsize = AtomicUsize::new(0);
+
     fn config() -> TinodeConnectorConfig {
-        TinodeConnectorConfig::new("http://127.0.0.1:6060", "auto-create", "appfs")
-            .expect("tinode config")
+        let seq = TEST_PREFIX_SEQ.fetch_add(1, Ordering::Relaxed);
+        TinodeConnectorConfig::new(
+            "http://127.0.0.1:6060",
+            "auto-create",
+            format!("appfs{seq}"),
+        )
+        .expect("tinode config")
     }
 
     fn ctx() -> ConnectorContext {
@@ -2177,6 +3066,9 @@ mod tests {
         created: Vec<TinodeAccountRequest>,
         resolved: Vec<String>,
         sent: Vec<(String, String, Option<String>)>,
+        groups_created: Vec<(String, Vec<String>, Option<String>)>,
+        group_invites: Vec<(String, Vec<String>)>,
+        group_sent: Vec<(String, String, Option<String>)>,
         inbound: Vec<TinodeInboundMessage>,
         fetched_since: Vec<Option<i64>>,
         fail_resolve: bool,
@@ -2268,10 +3160,72 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        fn create_group(
+            &mut self,
+            _credentials: &TinodeCredentials,
+            title: &str,
+            members: &[TinodeGroupMember],
+            client_token: Option<&str>,
+        ) -> std::result::Result<TinodeGroupReceipt, ConnectorError> {
+            self.state.lock().expect("mock state").groups_created.push((
+                title.to_string(),
+                members
+                    .iter()
+                    .map(|member| member.tinode_user_id.clone())
+                    .collect(),
+                client_token.map(ToOwned::to_owned),
+            ));
+            Ok(TinodeGroupReceipt {
+                topic: format!("grp-{}", super::sanitize_path_key(title)),
+            })
+        }
+
+        fn invite_group_members(
+            &mut self,
+            _credentials: &TinodeCredentials,
+            group: &TinodeGroupRecord,
+            members: &[TinodeGroupMember],
+        ) -> std::result::Result<(), ConnectorError> {
+            self.state.lock().expect("mock state").group_invites.push((
+                group.topic_id.clone(),
+                members
+                    .iter()
+                    .map(|member| member.tinode_user_id.clone())
+                    .collect(),
+            ));
+            Ok(())
+        }
+
+        fn send_group_message(
+            &mut self,
+            _credentials: &TinodeCredentials,
+            group: &TinodeGroupRecord,
+            text: &str,
+            client_token: Option<&str>,
+        ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
+            self.state.lock().expect("mock state").group_sent.push((
+                group.topic_id.clone(),
+                text.to_string(),
+                client_token.map(ToOwned::to_owned),
+            ));
+            Ok(TinodeSendReceipt {
+                topic: group.topic_id.clone(),
+                message_id: format!("tinode:{}:1", group.topic_id),
+                seq: Some(1),
+            })
+        }
     }
 
     fn connector_with_mock(state: Arc<Mutex<MockGatewayState>>) -> TinodeConnector {
         TinodeConnector::new_with_gateway(config(), Box::new(MockTinodeGateway::new(state)))
+    }
+
+    fn connector_with_mock_config(
+        config: TinodeConnectorConfig,
+        state: Arc<Mutex<MockGatewayState>>,
+    ) -> TinodeConnector {
+        TinodeConnector::new_with_gateway(config, Box::new(MockTinodeGateway::new(state)))
     }
 
     fn completed_content(response: crate::SubmitActionResponse) -> JsonValue {
@@ -2719,5 +3673,164 @@ mod tests {
             )
             .expect("unread inbox");
         assert!(unread.records.is_empty());
+    }
+
+    #[test]
+    fn direct_message_can_target_ready_principal_without_guessing_login() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut incident_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        let mut incident_ctx = ctx();
+        incident_ctx.principal_id = Some("incident-reporter".to_string());
+        incident_ctx.profile_id = Some("tinode:incident-reporter".to_string());
+        incident_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &incident_ctx,
+            )
+            .expect("incident credentials");
+
+        let content = completed_content(
+            default_connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/contacts/send_message.act".to_string(),
+                        payload: json!({
+                            "to": "principal:incident-reporter",
+                            "text": "hello incident agent"
+                        }),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("principal direct message"),
+        );
+
+        assert_eq!(content["ok"], true);
+        assert_eq!(content["conversation_type"], "direct");
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.sent.len(), 1);
+        assert!(state.sent[0].0.contains("incident_reporter"));
+        assert!(
+            state.resolved.is_empty(),
+            "principal ref must not use basic search"
+        );
+    }
+
+    #[test]
+    fn group_create_invite_and_send_support_basic_and_principal_members() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut incident_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        let mut incident_ctx = ctx();
+        incident_ctx.principal_id = Some("incident-reporter".to_string());
+        incident_ctx.profile_id = Some("tinode:incident-reporter".to_string());
+        incident_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &incident_ctx,
+            )
+            .expect("incident credentials");
+
+        let create = completed_content(
+            default_connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/groups/create_group.act".to_string(),
+                        payload: json!({
+                            "title": "Incident Room",
+                            "members": ["basic:zhangsan", "principal:incident-reporter"],
+                            "initial_message": "group boot"
+                        }),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("create group"),
+        );
+        assert_eq!(create["ok"], true);
+        assert_eq!(create["group_key"], "incidentroom");
+        assert_eq!(create["member_count"], 2);
+
+        let send = completed_content(
+            default_connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/groups/incidentroom/send_message.act".to_string(),
+                        payload: json!({"text":"follow up"}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("send group"),
+        );
+        assert_eq!(send["conversation_type"], "group");
+
+        let groups = default_connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/groups/index.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("groups index");
+        assert_eq!(groups.records.len(), 1);
+        assert_eq!(groups.records[0].line["member_count"], 2);
+        assert_eq!(groups.records[0].line["group_key"], "incidentroom");
+
+        let messages = default_connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/groups/incidentroom/messages.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("group messages");
+        assert_eq!(messages.records.len(), 2);
+        assert_eq!(messages.records[1].line["text"], "follow up");
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.groups_created.len(), 1);
+        assert_eq!(state.groups_created[0].1.len(), 2);
+        assert_eq!(state.group_sent.len(), 2);
+        assert_eq!(state.resolved, vec!["zhangsan"]);
+    }
+
+    #[test]
+    fn principal_group_member_requires_ready_credentials() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(state);
+        let err = connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/groups/create_group.act".to_string(),
+                    payload: json!({
+                        "title": "Incident Room",
+                        "members": ["principal:missing-agent"]
+                    }),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect_err("missing principal should fail");
+
+        assert_eq!(err.code, connector_error_codes::PROFILE_NOT_READY);
+        assert!(err.message.contains("principal:missing-agent"));
     }
 }

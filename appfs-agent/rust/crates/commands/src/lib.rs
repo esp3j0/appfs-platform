@@ -307,6 +307,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "principal",
+        aliases: &[],
+        summary: "List or create AppFS semantic principals",
+        argument_hint: Some("[list|create <principal-id> [description]]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
         summary: "Manage Claw Code plugins",
@@ -1183,6 +1190,11 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Principal {
+        action: Option<String>,
+        target: Option<String>,
+        description: Option<String>,
+    },
     Plugins {
         action: Option<String>,
         target: Option<String>,
@@ -1392,6 +1404,7 @@ pub fn validate_slash_command_input(
         }
         "export" => SlashCommand::Export { path: remainder },
         "session" => parse_session_command(&args)?,
+        "principal" => parse_principal_command(&args)?,
         "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
@@ -1658,6 +1671,41 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             ),
             "session",
             "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        )),
+    }
+}
+
+fn parse_principal_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] | ["list"] => Ok(SlashCommand::Principal {
+            action: Some("list".to_string()),
+            target: None,
+            description: None,
+        }),
+        ["list", ..] => Err(usage_error(
+            "principal",
+            "[list|create <principal-id> [description]]",
+        )),
+        ["create"] => Err(usage_error(
+            "principal create",
+            "<principal-id> [description]",
+        )),
+        ["create", target] => Ok(SlashCommand::Principal {
+            action: Some("create".to_string()),
+            target: Some((*target).to_string()),
+            description: None,
+        }),
+        ["create", target, description @ ..] => Ok(SlashCommand::Principal {
+            action: Some("create".to_string()),
+            target: Some((*target).to_string()),
+            description: Some(description.join(" ")),
+        }),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /principal action '{action}'. Use list or create <principal-id> [description]."
+            ),
+            "principal",
+            "/principal [list|create <principal-id> [description]]",
         )),
     }
 }
@@ -5005,6 +5053,7 @@ where
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Principal { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
@@ -5673,6 +5722,22 @@ mod tests {
             Ok(Some(SlashCommand::Session {
                 action: Some("fork".to_string()),
                 target: Some("incident-review".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/principal list"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("list".to_string()),
+                target: None,
+                description: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/principal create incident-reporter handles incident updates"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("create".to_string()),
+                target: Some("incident-reporter".to_string()),
+                description: Some("handles incident updates".to_string()),
             }))
         );
     }
