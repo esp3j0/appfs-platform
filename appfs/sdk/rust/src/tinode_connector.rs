@@ -1511,8 +1511,12 @@ impl AppConnector for TinodeConnector {
     fn fetch_snapshot_chunk(
         &mut self,
         request: FetchSnapshotChunkRequest,
-        _ctx: &ConnectorContext,
+        ctx: &ConnectorContext,
     ) -> std::result::Result<FetchSnapshotChunkResponse, ConnectorError> {
+        let normalized = normalize_path(&request.resource_path);
+        if tinode_snapshot_read_should_refresh_inbound(&normalized) {
+            self.drain_inbound_for_ctx(ctx)?;
+        }
         self.fetch_snapshot_response(request)
     }
 
@@ -2702,6 +2706,13 @@ fn is_tinode_snapshot_resource(path: &str) -> bool {
             | "topics/index.res.jsonl"
     ) || contact_messages_key(&normalized).is_some()
         || group_messages_key(&normalized).is_some()
+}
+
+fn tinode_snapshot_read_should_refresh_inbound(normalized_path: &str) -> bool {
+    matches!(
+        normalized_path,
+        "inbox/recent.res.jsonl" | "inbox/unread.res.jsonl"
+    ) || contact_messages_key(normalized_path).is_some()
 }
 
 fn contact_send_message_key(path: &str) -> Option<&str> {
@@ -4133,6 +4144,74 @@ mod tests {
             Some("default")
         );
         assert!(code_connector.contacts.contains_key("default"));
+    }
+
+    #[test]
+    fn principal_receiver_inbox_read_through_discovers_ready_sender() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        default_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        let default_login = state
+            .lock()
+            .expect("mock state")
+            .created
+            .iter()
+            .find(|request| request.profile_id == "tinode:default")
+            .expect("default account request")
+            .login
+            .clone();
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: format!("usr-{default_login}"),
+                seq: 1,
+                from_tinode_user_id: format!("usr-{default_login}"),
+                text: "read-through hello".to_string(),
+            });
+
+        let inbox = code_connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/inbox/recent.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &code_ctx,
+            )
+            .expect("inbox read-through");
+
+        assert_eq!(inbox.records.len(), 1);
+        assert_eq!(inbox.records[0].line["contact_key"], "default");
+        assert_eq!(inbox.records[0].line["text"], "read-through hello");
     }
 
     #[test]
