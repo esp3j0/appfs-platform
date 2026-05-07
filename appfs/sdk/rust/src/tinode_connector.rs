@@ -2513,6 +2513,14 @@ impl TinodeWsClient {
                 }
                 continue;
             }
+            if let Some(meta) = msg.get("meta") {
+                let id_matches = meta.get("id").and_then(JsonValue::as_str) == Some(id);
+                let topic_matches = meta.get("topic").and_then(JsonValue::as_str) == Some(topic);
+                if id_matches || topic_matches {
+                    messages.extend(inbound_messages_from_meta(meta, topic));
+                }
+                continue;
+            }
             if let Some(ctrl) = msg.get("ctrl") {
                 if ctrl.get("id").and_then(JsonValue::as_str) == Some(id) {
                     let code = ctrl.get("code").and_then(JsonValue::as_i64).unwrap_or(200);
@@ -3160,6 +3168,31 @@ fn inbound_message_from_data(data: &JsonValue) -> Option<TinodeInboundMessage> {
         from_tinode_user_id,
         text,
     })
+}
+
+fn inbound_messages_from_meta(meta: &JsonValue, fallback_topic: &str) -> Vec<TinodeInboundMessage> {
+    let topic = meta
+        .get("topic")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_topic);
+    meta.get("data")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            if entry.get("topic").is_some() {
+                inbound_message_from_data(entry)
+            } else {
+                let mut entry = entry.clone();
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("topic".to_string(), json!(topic));
+                }
+                inbound_message_from_data(&entry)
+            }
+        })
+        .collect()
 }
 
 fn add_side_event(
@@ -4212,6 +4245,29 @@ mod tests {
         assert_eq!(inbox.records.len(), 1);
         assert_eq!(inbox.records[0].line["contact_key"], "default");
         assert_eq!(inbox.records[0].line["text"], "read-through hello");
+    }
+
+    #[test]
+    fn inbound_messages_parse_from_tinode_meta_data_payloads() {
+        let messages = super::inbound_messages_from_meta(
+            &json!({
+                "topic": "usrDefault",
+                "data": [
+                    {
+                        "seq": 7,
+                        "from": "usrCode",
+                        "content": { "txt": "hello from meta" }
+                    }
+                ]
+            }),
+            "usrFallback",
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].topic, "usrDefault");
+        assert_eq!(messages[0].seq, 7);
+        assert_eq!(messages[0].from_tinode_user_id, "usrCode");
+        assert_eq!(messages[0].text, "hello from meta");
     }
 
     #[test]
