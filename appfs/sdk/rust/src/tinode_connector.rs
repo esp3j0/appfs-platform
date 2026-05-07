@@ -1993,7 +1993,13 @@ impl TinodeGateway for WebSocketTinodeGateway {
         request: TinodeAccountRequest,
     ) -> std::result::Result<TinodeAccount, ConnectorError> {
         let mut client = TinodeWsClient::connect(&self.config, &request.profile_id)?;
-        let account = client.create_account(&request)?;
+        let account = match client.create_account(&request) {
+            Ok(account) => account,
+            Err(err) if is_tinode_duplicate_credential_error(&err) => {
+                client.login_with_basic_account(&request)?
+            }
+            Err(err) => return Err(err),
+        };
         self.clients.insert(request.profile_id, client);
         Ok(account)
     }
@@ -2193,6 +2199,55 @@ impl TinodeWsClient {
             &format!("sub-me-token-{suffix}"),
         )?;
         Ok(())
+    }
+
+    fn login_with_basic_account(
+        &mut self,
+        request: &TinodeAccountRequest,
+    ) -> std::result::Result<TinodeAccount, ConnectorError> {
+        let secret = BASE64_STANDARD.encode(format!("{}:{}", request.login, request.password));
+        let ctrl = self.request(
+            "login",
+            json!({
+                "scheme": "basic",
+                "secret": secret,
+            }),
+            &format!("login-basic-{}", request.login),
+        )?;
+        let params = ctrl.get("params").cloned().unwrap_or_else(|| json!({}));
+        let user_id = params
+            .get("user")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::UPSTREAM_UNAVAILABLE,
+                    "Tinode basic login did not return params.user",
+                    true,
+                )
+            })?;
+        let token = params
+            .get("token")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_default();
+
+        self.user_id = Some(user_id.clone());
+        self.token = Some(token.clone());
+        self.request(
+            "sub",
+            json!({
+                "topic": "me",
+                "get": { "what": "desc sub" },
+            }),
+            &format!("sub-me-basic-{}", request.login),
+        )?;
+        Ok(TinodeAccount {
+            tinode_user_id: user_id,
+            login: request.login.clone(),
+            display_name: request.display_name.clone(),
+            token,
+        })
     }
 
     fn search_basic_user(
@@ -3329,6 +3384,15 @@ fn tinode_ctrl_error(label: &str, ctrl: &JsonValue) -> ConnectorError {
     )
 }
 
+fn is_tinode_duplicate_credential_error(err: &ConnectorError) -> bool {
+    err.code == connector_error_codes::CREDENTIALS_FAILED
+        && err.message.contains("code=409")
+        && err
+            .message
+            .to_ascii_lowercase()
+            .contains("duplicate credential")
+}
+
 fn is_tinode_session_reconnectable(err: &ConnectorError) -> bool {
     err.retryable
         && (err.code == connector_error_codes::UPSTREAM_UNAVAILABLE
@@ -3614,6 +3678,20 @@ mod tests {
 
         assert_eq!(err.code, connector_error_codes::CREDENTIALS_FAILED);
         assert!(!err.retryable);
+    }
+
+    #[test]
+    fn tinode_duplicate_credential_can_be_reused_by_basic_login() {
+        let err = super::tinode_ctrl_error(
+            "acc",
+            &json!({
+                "code": 409,
+                "text": "duplicate credential"
+            }),
+        );
+
+        assert_eq!(err.code, connector_error_codes::CREDENTIALS_FAILED);
+        assert!(super::is_tinode_duplicate_credential_error(&err));
     }
 
     #[test]
