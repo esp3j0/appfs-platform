@@ -43,15 +43,16 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, detect_appfs_environment,
+    check_base_commit, clear_oauth_credentials, create_appfs_principal, detect_appfs_environment,
     format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
     load_oauth_credentials, load_system_prompt_with_appfs, parse_oauth_callback_request_target,
     pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
-    set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    set_shell_if_windows, ApiClient, ApiRequest, AppfsPrincipalCreateRequest,
+    AppfsPrincipalCreateStatus, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
     RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutionResult, ToolExecutor,
     UsageTracker,
 };
@@ -3134,6 +3135,7 @@ where
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Principal { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -4063,6 +4065,15 @@ impl LiveCli {
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Principal {
+                action,
+                target,
+                description,
+            } => self.handle_principal_command(
+                action.as_deref(),
+                target.as_deref(),
+                description.as_deref(),
+            )?,
             SlashCommand::Plugins { action, target } => {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
@@ -4612,6 +4623,102 @@ impl LiveCli {
             Some(other) => {
                 println!(
                     "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn handle_principal_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        match action.unwrap_or("list") {
+            "list" => {
+                let cwd = env::current_dir()?;
+                let Some(environment) = detect_appfs_environment(&cwd) else {
+                    println!("AppFS principals\n  Detected          no");
+                    return Ok(false);
+                };
+                let principals = if environment.known_principals.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    environment
+                        .known_principals
+                        .iter()
+                        .map(|principal| {
+                            let name = principal.display_name.as_deref().unwrap_or("<unnamed>");
+                            principal.description.as_ref().map_or_else(
+                                || format!("{} ({name})", principal.principal_id),
+                                |description| {
+                                    format!("{} ({name}) - {description}", principal.principal_id)
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "AppFS principals\n  Current principal {}\n  Registry          {}\n  Principals        {}",
+                    environment.principal_id,
+                    environment
+                        .control_dir
+                        .as_ref()
+                        .map(|path| path.join("principals.registry.json"))
+                        .map_or_else(|| "<unknown>".to_string(), |path| path.display().to_string()),
+                    principals
+                );
+                Ok(false)
+            }
+            "create" => {
+                let Some(principal_id) = target else {
+                    println!("Usage: /principal create <principal-id> [description]");
+                    return Ok(false);
+                };
+                let cwd = env::current_dir()?;
+                let outcome = create_appfs_principal(
+                    &cwd,
+                    AppfsPrincipalCreateRequest {
+                        principal_id: principal_id.to_string(),
+                        display_name: Some(principal_id.to_string()),
+                        description: description.map(ToOwned::to_owned),
+                        kind: Some("agent".to_string()),
+                    },
+                )
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+                let status = match outcome.status {
+                    AppfsPrincipalCreateStatus::Created => "created",
+                    AppfsPrincipalCreateStatus::Exists => "already exists",
+                    AppfsPrincipalCreateStatus::Submitted => {
+                        "submitted (registry update not visible yet)"
+                    }
+                };
+                let private_apps = if outcome.visible_private_apps.is_empty() {
+                    "<none visible yet>".to_string()
+                } else {
+                    outcome
+                        .visible_private_apps
+                        .iter()
+                        .map(|app| format!("{} [{}]", app.app_id, app.path))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "AppFS principal {status}\n  Principal id      {}\n  Action            {}\n  Registry          {}\n  Private apps      {}\n  Manual launch     $env:{}=\"{}\"; claw",
+                    outcome.principal_id,
+                    outcome.action_path.display(),
+                    outcome.registry_path.display(),
+                    private_apps,
+                    runtime::APPFS_PRINCIPAL_ID_ENV,
+                    outcome.principal_id
+                );
+                Ok(false)
+            }
+            other => {
+                println!(
+                    "Unknown /principal action '{other}'. Use /principal list or /principal create <principal-id> [description]."
                 );
                 Ok(false)
             }

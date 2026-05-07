@@ -49,10 +49,12 @@ mod windows_shell;
 pub mod worker_boot;
 
 pub use appfs::{
-    detect_appfs_environment, resolve_appfs_environment, AppfsAttachSource, AppfsEnvironment,
-    AppfsPrincipalSummary, AppfsRegisteredApp, AppfsRegisteredAppVisibility, AppfsRuntimeManifest,
-    AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane, APPFS_DEFAULT_PRINCIPAL_ID,
-    APPFS_MULTI_AGENT_MODE_SHARED, APPFS_PRINCIPAL_ID_ENV, APPFS_RUNTIME_MANIFEST_REL_PATH,
+    create_appfs_principal, detect_appfs_environment, resolve_appfs_environment, AppfsAttachSource,
+    AppfsEnvironment, AppfsPrincipalCreateOutcome, AppfsPrincipalCreateRequest,
+    AppfsPrincipalCreateStatus, AppfsPrincipalSummary, AppfsRegisteredApp,
+    AppfsRegisteredAppVisibility, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
+    AppfsRuntimeManifestControlPlane, APPFS_DEFAULT_PRINCIPAL_ID, APPFS_MULTI_AGENT_MODE_SHARED,
+    APPFS_PRINCIPAL_ID_ENV, APPFS_RUNTIME_MANIFEST_REL_PATH,
 };
 pub use bash::{
     execute_bash, prepare_background_shell_output, prepare_shell_command_output,
