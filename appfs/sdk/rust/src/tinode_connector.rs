@@ -2289,14 +2289,7 @@ impl TinodeWsClient {
             json!({ "topic": contact.tinode_user_id }),
             &format!("sub-inbox-{suffix}"),
         );
-        let mut payload = json!({
-            "topic": contact.tinode_user_id,
-            "what": "data",
-            "limit": 50,
-        });
-        if let Some(since_seq) = since_seq {
-            payload["since"] = json!(since_seq.saturating_add(1));
-        }
+        let payload = tinode_get_data_payload(&contact.tinode_user_id, since_seq, 50);
         self.request_data(
             "get",
             payload,
@@ -3175,6 +3168,18 @@ fn tinode_text_from_content(content: &JsonValue) -> Option<&str> {
 
 fn tinode_text_plain_content(text: &str) -> JsonValue {
     json!(text)
+}
+
+fn tinode_get_data_payload(topic: &str, since_seq: Option<i64>, limit: i64) -> JsonValue {
+    let mut data = json!({ "limit": limit });
+    if let Some(since_seq) = since_seq {
+        data["since"] = json!(since_seq.saturating_add(1));
+    }
+    json!({
+        "topic": topic,
+        "what": "data",
+        "data": data,
+    })
 }
 
 fn inbound_messages_from_meta(meta: &JsonValue, fallback_topic: &str) -> Vec<TinodeInboundMessage> {
@@ -4290,6 +4295,18 @@ mod tests {
         }))
         .expect("plain text inbound");
         assert_eq!(inbound.text, "hello plain text");
+    }
+
+    #[test]
+    fn tinode_get_data_payload_uses_nested_data_options() {
+        let payload = super::tinode_get_data_payload("usrCode", Some(7), 50);
+
+        assert_eq!(payload["topic"], "usrCode");
+        assert_eq!(payload["what"], "data");
+        assert_eq!(payload["data"]["since"], 8);
+        assert_eq!(payload["data"]["limit"], 50);
+        assert!(payload.get("since").is_none());
+        assert!(payload.get("limit").is_none());
     }
 
     #[test]
