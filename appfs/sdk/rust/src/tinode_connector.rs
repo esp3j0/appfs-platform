@@ -26,7 +26,10 @@ const DEFAULT_TINODE_PROTOCOL_VERSION: &str = "0.25";
 const DEFAULT_TINODE_TIMEOUT_MS: u64 = 10_000;
 const CONNECTOR_SIDE_EVENTS_FIELD: &str = "_appfs_events";
 const TINODE_LOGIN_MIN_LEN: usize = 4;
-const TINODE_LOGIN_MAX_LEN: usize = 32;
+// Tinode's basic authenticator allows 32 runes, but the MySQL-backed auth
+// record stores `basic:<login>` in a 32-byte unique key. Keep generated logins
+// conservative so account creation does not surface as a server-side 500.
+const TINODE_LOGIN_MAX_LEN: usize = 26;
 const TINODE_LOGIN_HASH_LEN: usize = 8;
 
 type TinodeSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -3402,8 +3405,8 @@ mod tests {
         let code_login =
             super::login_for_profile(&config, "code-implementer", "tinode:code-implementer");
 
-        assert!(default_login.len() <= 32, "{default_login}");
-        assert!(code_login.len() <= 32, "{code_login}");
+        assert!(default_login.len() <= 26, "{default_login}");
+        assert!(code_login.len() <= 26, "{code_login}");
         assert_ne!(default_login, code_login);
         for login in [default_login, code_login] {
             assert!(login.len() >= 4, "{login}");
