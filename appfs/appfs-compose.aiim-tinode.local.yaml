@@ -7,7 +7,7 @@ runtime:
   backend: winfsp
   init: if_missing
   reset: true
-  poll_ms: 0
+  poll_ms: 1000
 
 connectors:
   aiim-http:

@@ -690,6 +690,57 @@ impl TinodeConnector {
         }
     }
 
+    fn remember_shared_principal_contacts(
+        &mut self,
+        credentials: &TinodeCredentials,
+        current_principal_id: Option<&str>,
+    ) -> std::result::Result<(), ConnectorError> {
+        let state = tinode_shared_state().lock().map_err(|_| {
+            connector_err(
+                connector_error_codes::INTERNAL,
+                "Tinode shared credential state is poisoned",
+                true,
+            )
+        })?;
+        let principal_prefix = format!("{}|principal:", self.shared_namespace);
+        let mut contacts = Vec::new();
+        for (principal_key, profile_id) in &state.principal_profiles {
+            let Some(principal_id) = principal_key.strip_prefix(&principal_prefix) else {
+                continue;
+            };
+            if current_principal_id == Some(principal_id) || profile_id == &credentials.profile_id {
+                continue;
+            }
+            let Some(record) = state
+                .credentials
+                .get(&shared_credential_key(&self.shared_namespace, profile_id))
+            else {
+                continue;
+            };
+            if record.credential_status != ConnectorCredentialStatus::Ready {
+                continue;
+            }
+            let Some(tinode_user_id) = record.upstream_user_id.clone() else {
+                continue;
+            };
+            if tinode_user_id == credentials.tinode_user_id {
+                continue;
+            }
+            contacts.push(TinodeContact {
+                key: sanitize_path_key(principal_id),
+                tinode_user_id,
+                basic_login: record.login.clone(),
+                display_name: record.display_name.clone(),
+            });
+        }
+        drop(state);
+
+        for contact in contacts {
+            self.contacts.entry(contact.key.clone()).or_insert(contact);
+        }
+        Ok(())
+    }
+
     fn resolve_recipient(
         &mut self,
         credentials: &TinodeCredentials,
@@ -1226,6 +1277,7 @@ impl TinodeConnector {
             return Ok(Vec::new());
         }
         let credentials = credentials_from_record(&record)?;
+        self.remember_shared_principal_contacts(&credentials, ctx.principal_id.as_deref())?;
         let contacts = self.contacts.values().cloned().collect::<Vec<_>>();
         if contacts.is_empty() {
             return Ok(Vec::new());
@@ -1873,10 +1925,10 @@ impl WebSocketTinodeGateway {
         }
     }
 
-    fn client_mut(
+    fn ensure_client(
         &mut self,
         credentials: &TinodeCredentials,
-    ) -> std::result::Result<&mut TinodeWsClient, ConnectorError> {
+    ) -> std::result::Result<(), ConnectorError> {
         if credentials.tinode_user_id.is_empty()
             || credentials.login.is_empty()
             || credentials.token.is_empty()
@@ -1888,21 +1940,46 @@ impl WebSocketTinodeGateway {
             ));
         }
         if !self.clients.contains_key(&credentials.profile_id) {
-            return Err(connector_err(
-                connector_error_codes::AUTH_EXPIRED,
-                "Tinode websocket session is not available for this profile; re-run ensure_credentials",
-                true,
-            ));
+            let mut client = TinodeWsClient::connect(&self.config, &credentials.profile_id)?;
+            client.login_with_token(credentials)?;
+            self.clients.insert(credentials.profile_id.clone(), client);
         }
-        self.clients
-            .get_mut(&credentials.profile_id)
-            .ok_or_else(|| {
+        Ok(())
+    }
+
+    fn with_client<T>(
+        &mut self,
+        credentials: &TinodeCredentials,
+        mut op: impl FnMut(&mut TinodeWsClient) -> std::result::Result<T, ConnectorError>,
+    ) -> std::result::Result<T, ConnectorError> {
+        self.ensure_client(credentials)?;
+        let profile_id = credentials.profile_id.clone();
+        let first = {
+            let client = self.clients.get_mut(&profile_id).ok_or_else(|| {
                 connector_err(
                     connector_error_codes::INTERNAL,
                     "missing Tinode client",
                     true,
                 )
-            })
+            })?;
+            op(client)
+        };
+        if let Err(err) = first {
+            if is_tinode_session_reconnectable(&err) {
+                self.clients.remove(&profile_id);
+                self.ensure_client(credentials)?;
+                let client = self.clients.get_mut(&profile_id).ok_or_else(|| {
+                    connector_err(
+                        connector_error_codes::INTERNAL,
+                        "missing Tinode client after reconnect",
+                        true,
+                    )
+                })?;
+                return op(client);
+            }
+            return Err(err);
+        }
+        first
     }
 }
 
@@ -1922,7 +1999,7 @@ impl TinodeGateway for WebSocketTinodeGateway {
         credentials: &TinodeCredentials,
         login: &str,
     ) -> std::result::Result<TinodeContact, ConnectorError> {
-        self.client_mut(credentials)?.search_basic_user(login)
+        self.with_client(credentials, |client| client.search_basic_user(login))
     }
 
     fn send_direct_message(
@@ -1932,8 +2009,9 @@ impl TinodeGateway for WebSocketTinodeGateway {
         text: &str,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
-        self.client_mut(credentials)?
-            .send_direct_message(contact, text, client_token)
+        self.with_client(credentials, |client| {
+            client.send_direct_message(contact, text, client_token)
+        })
     }
 
     fn fetch_direct_messages(
@@ -1942,8 +2020,9 @@ impl TinodeGateway for WebSocketTinodeGateway {
         contact: &TinodeContact,
         since_seq: Option<i64>,
     ) -> std::result::Result<Vec<TinodeInboundMessage>, ConnectorError> {
-        self.client_mut(credentials)?
-            .fetch_direct_messages(contact, since_seq)
+        self.with_client(credentials, |client| {
+            client.fetch_direct_messages(contact, since_seq)
+        })
     }
 
     fn create_group(
@@ -1953,8 +2032,9 @@ impl TinodeGateway for WebSocketTinodeGateway {
         members: &[TinodeGroupMember],
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeGroupReceipt, ConnectorError> {
-        self.client_mut(credentials)?
-            .create_group(title, members, client_token)
+        self.with_client(credentials, |client| {
+            client.create_group(title, members, client_token)
+        })
     }
 
     fn invite_group_members(
@@ -1963,8 +2043,9 @@ impl TinodeGateway for WebSocketTinodeGateway {
         group: &TinodeGroupRecord,
         members: &[TinodeGroupMember],
     ) -> std::result::Result<(), ConnectorError> {
-        self.client_mut(credentials)?
-            .invite_group_members(group, members)
+        self.with_client(credentials, |client| {
+            client.invite_group_members(group, members)
+        })
     }
 
     fn send_group_message(
@@ -1974,8 +2055,9 @@ impl TinodeGateway for WebSocketTinodeGateway {
         text: &str,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
-        self.client_mut(credentials)?
-            .send_group_message(group, text, client_token)
+        self.with_client(credentials, |client| {
+            client.send_group_message(group, text, client_token)
+        })
     }
 }
 
@@ -2076,6 +2158,37 @@ impl TinodeWsClient {
             display_name: request.display_name.clone(),
             token,
         })
+    }
+
+    fn login_with_token(
+        &mut self,
+        credentials: &TinodeCredentials,
+    ) -> std::result::Result<(), ConnectorError> {
+        let suffix = self.next_suffix();
+        let ctrl = self.request(
+            "login",
+            json!({
+                "scheme": "token",
+                "secret": credentials.token,
+            }),
+            &format!("login-token-{suffix}"),
+        )?;
+        let params = ctrl.get("params").cloned().unwrap_or_else(|| json!({}));
+        self.user_id = Some(credentials.tinode_user_id.clone());
+        self.token = params
+            .get("token")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(credentials.token.clone()));
+        self.request(
+            "sub",
+            json!({
+                "topic": "me",
+                "get": { "what": "desc sub" },
+            }),
+            &format!("sub-me-token-{suffix}"),
+        )?;
+        Ok(())
     }
 
     fn search_basic_user(
@@ -3160,6 +3273,12 @@ fn tinode_ctrl_error(label: &str, ctrl: &JsonValue) -> ConnectorError {
     )
 }
 
+fn is_tinode_session_reconnectable(err: &ConnectorError) -> bool {
+    err.retryable
+        && (err.code == connector_error_codes::UPSTREAM_UNAVAILABLE
+            || err.code == connector_error_codes::TIMEOUT)
+}
+
 fn connector_err(code: &str, message: impl Into<String>, retryable: bool) -> ConnectorError {
     ConnectorError {
         code: code.to_string(),
@@ -3940,6 +4059,80 @@ mod tests {
             state.resolved.is_empty(),
             "principal ref must not use basic search"
         );
+    }
+
+    #[test]
+    fn principal_receiver_discovers_ready_sender_for_inbox_drain() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        default_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        assert!(
+            code_connector.contacts.is_empty(),
+            "receiver should not need an explicit local contact"
+        );
+        let default_login = state
+            .lock()
+            .expect("mock state")
+            .created
+            .iter()
+            .find(|request| request.profile_id == "tinode:default")
+            .expect("default account request")
+            .login
+            .clone();
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: format!("usr-{default_login}"),
+                seq: 1,
+                from_tinode_user_id: format!("usr-{default_login}"),
+                text: "hello from default".to_string(),
+            });
+
+        let events = code_connector
+            .drain_inbound_events(&code_ctx)
+            .expect("drain principal inbound");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "message.received");
+        assert_eq!(events[0].path, "contacts/default/messages.res.jsonl");
+        assert_eq!(
+            events[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.get("contact_key"))
+                .and_then(JsonValue::as_str),
+            Some("default")
+        );
+        assert!(code_connector.contacts.contains_key("default"));
     }
 
     #[test]
