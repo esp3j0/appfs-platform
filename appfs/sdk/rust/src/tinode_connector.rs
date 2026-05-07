@@ -3139,12 +3139,15 @@ fn tinode_ctrl_error(label: &str, ctrl: &JsonValue) -> ConnectorError {
         .and_then(JsonValue::as_str)
         .unwrap_or("Tinode request failed");
     let code = ctrl.get("code").and_then(JsonValue::as_i64).unwrap_or(500);
+    let credential_creation_server_error = label == "acc" && code >= 500;
     let appfs_code = if code == 401 || code == 403 {
         connector_error_codes::AUTH_EXPIRED
     } else if code == 404 {
         connector_error_codes::PROFILE_NOT_FOUND
     } else if code == 429 {
         connector_error_codes::RATE_LIMITED
+    } else if credential_creation_server_error {
+        connector_error_codes::CREDENTIALS_FAILED
     } else if code >= 500 {
         connector_error_codes::UPSTREAM_UNAVAILABLE
     } else {
@@ -3153,7 +3156,7 @@ fn tinode_ctrl_error(label: &str, ctrl: &JsonValue) -> ConnectorError {
     connector_err(
         appfs_code,
         format!("{label} failed in Tinode: code={code} text={text}"),
-        code >= 500 || code == 429,
+        (code >= 500 || code == 429) && !credential_creation_server_error,
     )
 }
 
@@ -3422,6 +3425,20 @@ mod tests {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'));
         }
+    }
+
+    #[test]
+    fn tinode_account_server_error_is_terminal_credentials_failure() {
+        let err = super::tinode_ctrl_error(
+            "acc",
+            &json!({
+                "code": 500,
+                "text": "internal error"
+            }),
+        );
+
+        assert_eq!(err.code, connector_error_codes::CREDENTIALS_FAILED);
+        assert!(!err.retryable);
     }
 
     #[test]
