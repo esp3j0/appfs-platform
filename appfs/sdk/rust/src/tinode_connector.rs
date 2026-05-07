@@ -612,18 +612,8 @@ impl TinodeConnector {
     ) -> std::result::Result<(ConnectorCredentialRecord, bool), ConnectorError> {
         let profile_id = effective_profile_id(ctx)?;
         let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
-        if let Some(record) = self.credentials.get(&profile_id) {
-            if record.credential_status == ConnectorCredentialStatus::Ready {
-                self.remember_principal_profile(principal_id, record);
-                return Ok((record.clone(), false));
-            }
-        }
-        if let Some(record) = self.shared_credential(&profile_id) {
-            if record.credential_status == ConnectorCredentialStatus::Ready {
-                self.credentials.insert(profile_id.clone(), record.clone());
-                self.remember_principal_profile(principal_id, &record);
-                return Ok((record, false));
-            }
+        if let Some(record) = self.ready_credential_record_for_profile(&profile_id, principal_id) {
+            return Ok((record, false));
         }
 
         self.credential_create_attempts += 1;
@@ -658,6 +648,28 @@ impl TinodeConnector {
         self.credentials.insert(profile_id, record.clone());
         self.store_shared_credential(principal_id, &record);
         Ok((record, true))
+    }
+
+    fn ready_credential_record_for_profile(
+        &mut self,
+        profile_id: &str,
+        principal_id: &str,
+    ) -> Option<ConnectorCredentialRecord> {
+        if let Some(record) = self.credentials.get(profile_id).cloned() {
+            if record.credential_status == ConnectorCredentialStatus::Ready {
+                self.remember_principal_profile(principal_id, &record);
+                return Some(record);
+            }
+        }
+        if let Some(record) = self.shared_credential(profile_id) {
+            if record.credential_status == ConnectorCredentialStatus::Ready {
+                self.credentials
+                    .insert(profile_id.to_string(), record.clone());
+                self.remember_principal_profile(principal_id, &record);
+                return Some(record);
+            }
+        }
+        None
     }
 
     fn shared_credential(&self, profile_id: &str) -> Option<ConnectorCredentialRecord> {
@@ -1270,14 +1282,16 @@ impl TinodeConnector {
         let Ok(profile_id) = effective_profile_id(ctx) else {
             return Ok(Vec::new());
         };
-        let Some(record) = self.credentials.get(&profile_id).cloned() else {
+        let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
+        let Some(record) = self.ready_credential_record_for_profile(&profile_id, principal_id)
+        else {
             return Ok(Vec::new());
         };
         if record.credential_status != ConnectorCredentialStatus::Ready {
             return Ok(Vec::new());
         }
         let credentials = credentials_from_record(&record)?;
-        self.remember_shared_principal_contacts(&credentials, ctx.principal_id.as_deref())?;
+        self.remember_shared_principal_contacts(&credentials, Some(principal_id))?;
         let contacts = self.contacts.values().cloned().collect::<Vec<_>>();
         if contacts.is_empty() {
             return Ok(Vec::new());
@@ -4376,6 +4390,88 @@ mod tests {
         assert_eq!(inbox.records.len(), 1);
         assert_eq!(inbox.records[0].line["contact_key"], "default");
         assert_eq!(inbox.records[0].line["text"], "read-through hello");
+    }
+
+    #[test]
+    fn principal_receiver_inbox_read_through_uses_shared_credentials_for_fresh_connector() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_runtime_connector =
+            connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_runtime_connector =
+            connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut fresh_read_through_connector =
+            connector_with_mock_config(config, Arc::clone(&state));
+
+        default_runtime_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_runtime_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        let default_login = state
+            .lock()
+            .expect("mock state")
+            .created
+            .iter()
+            .find(|request| request.profile_id == "tinode:default")
+            .expect("default account request")
+            .login
+            .clone();
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: format!("usr-{default_login}"),
+                seq: 1,
+                from_tinode_user_id: format!("usr-{default_login}"),
+                text: "fresh connector hello".to_string(),
+            });
+
+        assert!(
+            fresh_read_through_connector.credentials.is_empty(),
+            "mount read-through starts as a fresh connector instance"
+        );
+        let inbox = fresh_read_through_connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/inbox/recent.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &code_ctx,
+            )
+            .expect("fresh connector inbox read-through");
+
+        assert_eq!(inbox.records.len(), 1);
+        assert_eq!(inbox.records[0].line["contact_key"], "default");
+        assert_eq!(inbox.records[0].line["text"], "fresh connector hello");
+        assert!(
+            fresh_read_through_connector
+                .credentials
+                .contains_key("tinode:code-implementer"),
+            "fresh read-through connector should hydrate its credential from shared state"
+        );
     }
 
     #[test]
