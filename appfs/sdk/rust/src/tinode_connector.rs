@@ -25,6 +25,9 @@ const DEFAULT_TINODE_ACCOUNT_PASSWORD: &str = "TinodeSmoke123!";
 const DEFAULT_TINODE_PROTOCOL_VERSION: &str = "0.25";
 const DEFAULT_TINODE_TIMEOUT_MS: u64 = 10_000;
 const CONNECTOR_SIDE_EVENTS_FIELD: &str = "_appfs_events";
+const TINODE_LOGIN_MIN_LEN: usize = 4;
+const TINODE_LOGIN_MAX_LEN: usize = 32;
+const TINODE_LOGIN_HASH_LEN: usize = 8;
 
 type TinodeSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -2669,14 +2672,14 @@ fn login_for_profile(
 ) -> String {
     let raw = format!("{}_{}", config.login_prefix, principal_id);
     let sanitized = sanitize_tinode_login(&raw);
-    if sanitized.len() >= 3 {
-        return sanitized;
+    if sanitized.len() >= TINODE_LOGIN_MIN_LEN {
+        return constrain_tinode_login(&sanitized);
     }
-    sanitize_tinode_login(&format!(
+    constrain_tinode_login(&sanitize_tinode_login(&format!(
         "{}_{}",
         config.login_prefix,
         profile_id.replace(':', "_")
-    ))
+    )))
 }
 
 fn shared_state_namespace(config: &TinodeConnectorConfig) -> String {
@@ -2708,13 +2711,44 @@ fn sanitize_tinode_login(value: &str) -> String {
     while out.starts_with(['_', '.']) {
         out.remove(0);
     }
+    while out.ends_with(['_', '.']) {
+        out.pop();
+    }
     if out.is_empty() {
         out = "appfsagent".to_string();
     }
-    if out.len() > 48 {
-        out.truncate(48);
-    }
     out
+}
+
+fn constrain_tinode_login(value: &str) -> String {
+    let mut login = value.to_string();
+    if login.len() > TINODE_LOGIN_MAX_LEN {
+        let hash = stable_login_hash(&login);
+        let prefix_len = TINODE_LOGIN_MAX_LEN
+            .saturating_sub(1)
+            .saturating_sub(TINODE_LOGIN_HASH_LEN);
+        let mut prefix = login.chars().take(prefix_len).collect::<String>();
+        while prefix.ends_with(['_', '.']) {
+            prefix.pop();
+        }
+        if prefix.len() < TINODE_LOGIN_MIN_LEN {
+            prefix = "appfsagent".to_string();
+        }
+        login = format!("{prefix}_{hash}");
+    }
+    while login.len() < TINODE_LOGIN_MIN_LEN {
+        login.push('0');
+    }
+    login
+}
+
+fn stable_login_hash(value: &str) -> String {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
 }
 
 fn display_name_for_principal(principal_id: &str) -> String {
@@ -3353,6 +3387,38 @@ mod tests {
             TinodeConnectorConfig::new("http://127.0.0.1:6060", "auto-create", "bad prefix")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn tinode_generated_basic_login_respects_server_policy() {
+        let config = TinodeConnectorConfig::new(
+            "http://127.0.0.1:6060",
+            "auto-create",
+            "appfsmanual20260507082331",
+        )
+        .expect("tinode config");
+
+        let default_login = super::login_for_profile(&config, "default", "tinode:default");
+        let code_login =
+            super::login_for_profile(&config, "code-implementer", "tinode:code-implementer");
+
+        assert!(default_login.len() <= 32, "{default_login}");
+        assert!(code_login.len() <= 32, "{code_login}");
+        assert_ne!(default_login, code_login);
+        for login in [default_login, code_login] {
+            assert!(login.len() >= 4, "{login}");
+            assert!(login
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric()));
+            assert!(login
+                .chars()
+                .last()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric()));
+            assert!(login
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'));
+        }
     }
 
     #[test]
