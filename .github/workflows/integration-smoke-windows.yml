@@ -11,6 +11,16 @@ on:
         required: false
         type: boolean
         default: false
+      run_tinode:
+        description: "Also run the external Tinode multi-agent AppFS smoke"
+        required: false
+        type: boolean
+        default: false
+      tinode_endpoint:
+        description: "Tinode HTTP endpoint for the optional multi-agent smoke"
+        required: false
+        type: string
+        default: "http://101.34.216.193:6060"
 
 jobs:
   appfs-agent-windows-smoke:
@@ -76,3 +86,14 @@ jobs:
             $args += "-RunPrompt"
           }
           ./integration/scripts/test-windows-appfs-agent-smoke.ps1 @args
+
+      - name: Run Tinode multi-agent smoke test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tinode }}
+        shell: powershell
+        env:
+          APPFS_TINODE_ENDPOINT: ${{ inputs.tinode_endpoint }}
+          APPFS_TINODE_API_KEY: ${{ secrets.APPFS_TINODE_API_KEY }}
+          APPFS_TINODE_ACCOUNT_PASSWORD: ${{ secrets.APPFS_TINODE_ACCOUNT_PASSWORD }}
+        run: |
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE $env:CHECKOUT_PATH)
+          ./integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1

@@ -1272,11 +1272,13 @@ fn bridge_args_from_resolved_compose_app(
     AppfsBridgeCliArgs {
         adapter_http_endpoint: match app.transport_kind {
             compose::schema::AppfsComposeTransportKind::Http => Some(app.endpoint.clone()),
-            compose::schema::AppfsComposeTransportKind::Grpc => None,
+            compose::schema::AppfsComposeTransportKind::Grpc
+            | compose::schema::AppfsComposeTransportKind::InProcess => None,
         },
         adapter_http_timeout_ms: app.transport.http_timeout_ms,
         adapter_grpc_endpoint: match app.transport_kind {
-            compose::schema::AppfsComposeTransportKind::Http => None,
+            compose::schema::AppfsComposeTransportKind::Http
+            | compose::schema::AppfsComposeTransportKind::InProcess => None,
             compose::schema::AppfsComposeTransportKind::Grpc => Some(app.endpoint.clone()),
         },
         adapter_grpc_timeout_ms: app.transport.grpc_timeout_ms,
@@ -1575,6 +1577,36 @@ mod supervisor_tests {
         std::env::set_var("APPFS_TINODE_ENDPOINT", "http://127.0.0.1:6060");
         std::env::set_var("APPFS_TINODE_LOGIN_PREFIX", "appfs_test");
         std::env::set_var("APPFS_TINODE_CREDENTIAL_POLICY", "auto-create");
+    }
+
+    fn write_tinode_private_policy(root: &std::path::Path) {
+        registry::write_app_policy_registry(
+            root,
+            &registry::AppfsAppPolicyRegistryDoc {
+                version: registry::APPFS_REGISTRY_VERSION,
+                apps: vec![registry::AppfsAppPolicyRecord {
+                    app_id: "tinode".to_string(),
+                    visibility: registry::AppfsAppPolicyVisibility::Private,
+                    connector: "tinode-in-process".to_string(),
+                    transport: registry::AppfsRegistryTransportDoc {
+                        kind: registry::AppfsRegistryTransportKind::InProcess,
+                        endpoint: None,
+                        http_timeout_ms: 5000,
+                        grpc_timeout_ms: 5000,
+                        bridge_max_retries: 2,
+                        bridge_initial_backoff_ms: 100,
+                        bridge_max_backoff_ms: 1000,
+                        bridge_circuit_breaker_failures: 5,
+                        bridge_circuit_breaker_cooldown_ms: 3000,
+                    },
+                    path: None,
+                    path_template: Some("private/{principal_id}/tinode".to_string()),
+                    profile_template: Some("tinode:{principal_id}".to_string()),
+                    credential_policy: Some("auto-create".to_string()),
+                }],
+            },
+        )
+        .expect("write tinode private policy");
     }
 
     #[test]
@@ -2239,33 +2271,7 @@ mod supervisor_tests {
     fn runtime_supervisor_materializes_private_tinode_skeleton_for_created_principal() {
         let temp = TempDir::new().expect("tempdir");
         configure_tinode_env_for_tests();
-        registry::write_app_policy_registry(
-            temp.path(),
-            &registry::AppfsAppPolicyRegistryDoc {
-                version: registry::APPFS_REGISTRY_VERSION,
-                apps: vec![registry::AppfsAppPolicyRecord {
-                    app_id: "tinode".to_string(),
-                    visibility: registry::AppfsAppPolicyVisibility::Private,
-                    connector: "tinode-in-process".to_string(),
-                    transport: registry::AppfsRegistryTransportDoc {
-                        kind: registry::AppfsRegistryTransportKind::InProcess,
-                        endpoint: None,
-                        http_timeout_ms: 5000,
-                        grpc_timeout_ms: 5000,
-                        bridge_max_retries: 2,
-                        bridge_initial_backoff_ms: 100,
-                        bridge_max_backoff_ms: 1000,
-                        bridge_circuit_breaker_failures: 5,
-                        bridge_circuit_breaker_cooldown_ms: 3000,
-                    },
-                    path: None,
-                    path_template: Some("private/{principal_id}/tinode".to_string()),
-                    profile_template: Some("tinode:{principal_id}".to_string()),
-                    credential_policy: Some("auto-create".to_string()),
-                }],
-            },
-        )
-        .expect("write policy registry");
+        write_tinode_private_policy(temp.path());
 
         let mut supervisor =
             AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None)
@@ -2286,7 +2292,10 @@ mod supervisor_tests {
         assert!(tinode_root.join("_meta/manifest.res.json").exists());
         assert!(tinode_root.join("_stream/events.evt.jsonl").exists());
         for expected in [
+            "_app/actions.res.json",
+            "_app/control.res.json",
             "_app/self.res.json",
+            "_app/skill.res.json",
             "_app/ensure_credentials.act",
             "_app/refresh_structure.act",
             "_app/refresh_inbox.act",
@@ -2333,10 +2342,17 @@ mod supervisor_tests {
         assert_eq!(
             events[0]
                 .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.exists")
+        );
+        assert_eq!(
+            events[0]
+                .get("content")
                 .and_then(|value| value.get("app_instances"))
                 .and_then(|value| value.as_array())
                 .map(|instances| instances.len()),
-            Some(1)
+            Some(0)
         );
 
         append_text(
@@ -2370,6 +2386,39 @@ mod supervisor_tests {
                 .and_then(|value| value.as_str()),
             Some("tinode:default")
         );
+    }
+
+    #[test]
+    fn runtime_supervisor_backfills_private_apps_for_existing_principals() {
+        let temp = TempDir::new().expect("tempdir");
+        configure_tinode_env_for_tests();
+
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/create_principal.act"),
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"kind\":\"agent\",\"client_token\":\"principal-before-policy-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll create principal");
+        assert!(!supervisor.runtimes.contains_key("tinode--default"));
+
+        write_tinode_private_policy(temp.path());
+        supervisor.poll_once().expect("poll backfill private app");
+
+        assert!(supervisor.runtimes.contains_key("tinode--default"));
+        let tinode_root = temp.path().join("private/default/tinode");
+        assert!(tinode_root.join("_app/skill.res.json").exists());
+        let stored = registry::read_app_registry(temp.path())
+            .expect("read app registry")
+            .expect("app registry exists");
+        assert!(stored.apps.iter().any(|app| {
+            app.instance_id == "tinode--default"
+                && app.profile_id.as_deref() == Some("tinode:default")
+        }));
     }
 
     #[test]

@@ -64,12 +64,14 @@ pub(crate) enum AppfsComposeConnectorMode {
     External,
     Command,
     ExternalOrCommand,
+    InProcess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppfsComposeTransportKind {
     Http,
     Grpc,
+    InProcess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,10 +216,19 @@ fn normalize_connector(
 ) -> Result<AppfsComposeConnector> {
     let mode = normalize_connector_mode(raw.mode)?;
     let transport = normalize_transport_kind(raw.transport)?;
-    let endpoint = normalize_required_string(
-        raw.endpoint,
-        &format!("connectors.{connector_name}.endpoint"),
-    )?;
+    let endpoint = match transport {
+        AppfsComposeTransportKind::Http | AppfsComposeTransportKind::Grpc => {
+            normalize_required_string(
+                raw.endpoint,
+                &format!("connectors.{connector_name}.endpoint"),
+            )?
+        }
+        AppfsComposeTransportKind::InProcess => normalize_optional_string(
+            raw.endpoint,
+            format!("connectors.{connector_name}.endpoint"),
+        )?
+        .unwrap_or_default(),
+    };
 
     let command = raw
         .command
@@ -225,6 +236,12 @@ fn normalize_connector(
         .transpose()?;
     match mode {
         AppfsComposeConnectorMode::External => {
+            if transport == AppfsComposeTransportKind::InProcess {
+                anyhow::bail!(
+                    "compose connector {} with transport=in_process must use mode=in_process",
+                    connector_name
+                );
+            }
             if command.is_some() {
                 anyhow::bail!(
                     "compose connector {} in external mode cannot define command",
@@ -233,11 +250,37 @@ fn normalize_connector(
             }
         }
         AppfsComposeConnectorMode::Command | AppfsComposeConnectorMode::ExternalOrCommand => {
+            if transport == AppfsComposeTransportKind::InProcess {
+                anyhow::bail!(
+                    "compose connector {} with transport=in_process must use mode=in_process",
+                    connector_name
+                );
+            }
             if command.is_none() {
                 anyhow::bail!(
                     "compose connector {} in {} mode requires command",
                     connector_name,
                     connector_mode_label(mode)
+                );
+            }
+        }
+        AppfsComposeConnectorMode::InProcess => {
+            if transport != AppfsComposeTransportKind::InProcess {
+                anyhow::bail!(
+                    "compose connector {} in in_process mode must use transport=in_process",
+                    connector_name
+                );
+            }
+            if command.is_some() {
+                anyhow::bail!(
+                    "compose connector {} in in_process mode cannot define command",
+                    connector_name
+                );
+            }
+            if !endpoint.trim().is_empty() {
+                anyhow::bail!(
+                    "compose connector {} in in_process mode cannot define endpoint",
+                    connector_name
                 );
             }
         }
@@ -249,6 +292,14 @@ fn normalize_connector(
 
     match transport {
         AppfsComposeTransportKind::Http | AppfsComposeTransportKind::Grpc => {}
+        AppfsComposeTransportKind::InProcess => {
+            if healthcheck.is_some() {
+                anyhow::bail!(
+                    "compose connector {} with transport=in_process cannot define healthcheck",
+                    connector_name
+                );
+            }
+        }
     }
 
     Ok(AppfsComposeConnector {
@@ -596,6 +647,7 @@ fn normalize_connector_mode(
         RawAppfsComposeConnectorMode::ExternalOrCommand => {
             AppfsComposeConnectorMode::ExternalOrCommand
         }
+        RawAppfsComposeConnectorMode::InProcess => AppfsComposeConnectorMode::InProcess,
     })
 }
 
@@ -604,6 +656,7 @@ fn connector_mode_label(mode: AppfsComposeConnectorMode) -> &'static str {
         AppfsComposeConnectorMode::External => "external",
         AppfsComposeConnectorMode::Command => "command",
         AppfsComposeConnectorMode::ExternalOrCommand => "external_or_command",
+        AppfsComposeConnectorMode::InProcess => "in_process",
     }
 }
 
@@ -613,6 +666,7 @@ fn normalize_transport_kind(
     Ok(match raw {
         RawAppfsComposeTransportKind::Http => AppfsComposeTransportKind::Http,
         RawAppfsComposeTransportKind::Grpc => AppfsComposeTransportKind::Grpc,
+        RawAppfsComposeTransportKind::InProcess => AppfsComposeTransportKind::InProcess,
     })
 }
 
@@ -707,6 +761,7 @@ enum RawAppfsComposeConnectorMode {
     External,
     Command,
     ExternalOrCommand,
+    InProcess,
 }
 
 #[derive(Debug, Deserialize)]
@@ -714,6 +769,7 @@ enum RawAppfsComposeConnectorMode {
 enum RawAppfsComposeTransportKind {
     Http,
     Grpc,
+    InProcess,
 }
 
 #[derive(Debug, Deserialize)]
@@ -899,9 +955,8 @@ connectors:
     transport: http
     endpoint: http://127.0.0.1:8080
   tinode-http:
-    mode: external
-    transport: http
-    endpoint: http://127.0.0.1:6061
+    mode: in_process
+    transport: in_process
 apps:
   aiim:
     connector: aiim-http
@@ -934,6 +989,13 @@ apps:
             Some("tinode:{principal_id}")
         );
         assert_eq!(tinode.credential_policy.as_deref(), Some("auto-create"));
+        let tinode_connector = doc.connectors.get("tinode-http").expect("tinode connector");
+        assert_eq!(tinode_connector.mode, AppfsComposeConnectorMode::InProcess);
+        assert_eq!(
+            tinode_connector.transport,
+            AppfsComposeTransportKind::InProcess
+        );
+        assert_eq!(tinode_connector.endpoint, "");
     }
 
     #[test]

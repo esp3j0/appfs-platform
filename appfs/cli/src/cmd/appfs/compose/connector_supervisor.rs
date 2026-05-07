@@ -134,6 +134,7 @@ impl ComposeConnectorSupervisor {
                     });
                 }
             }
+            AppfsComposeConnectorMode::InProcess => {}
         }
 
         Ok(ResolvedComposeApp {
@@ -254,11 +255,11 @@ fn build_health_bridge_config(
     build_appfs_bridge_config(AppfsBridgeCliArgs {
         adapter_http_endpoint: match connector.transport {
             AppfsComposeTransportKind::Http => Some(connector.endpoint.clone()),
-            AppfsComposeTransportKind::Grpc => None,
+            AppfsComposeTransportKind::Grpc | AppfsComposeTransportKind::InProcess => None,
         },
         adapter_http_timeout_ms: timeout_ms.max(1),
         adapter_grpc_endpoint: match connector.transport {
-            AppfsComposeTransportKind::Http => None,
+            AppfsComposeTransportKind::Http | AppfsComposeTransportKind::InProcess => None,
             AppfsComposeTransportKind::Grpc => Some(connector.endpoint.clone()),
         },
         adapter_grpc_timeout_ms: timeout_ms.max(1),

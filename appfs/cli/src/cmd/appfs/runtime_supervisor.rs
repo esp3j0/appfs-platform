@@ -55,6 +55,8 @@ impl AppfsRuntimeSupervisor {
 
     pub(super) fn prepare_action_sinks(&mut self) -> Result<()> {
         self.control_plane.prepare_action_sinks()?;
+        self.ensure_default_principal_for_private_policies()?;
+        self.materialize_private_apps_for_existing_principals()?;
         for entry in self.runtimes.values_mut() {
             entry.adapter.prepare_action_sinks()?;
         }
@@ -66,6 +68,7 @@ impl AppfsRuntimeSupervisor {
         for invocation in invocations {
             self.handle_control_invocation(invocation)?;
         }
+        self.materialize_private_apps_for_existing_principals()?;
         for entry in self.runtimes.values_mut() {
             entry.adapter.poll_once()?;
         }
@@ -282,6 +285,7 @@ impl AppfsRuntimeSupervisor {
             .cloned()
         {
             registry::write_principal_record_view(&self.root, &existing)?;
+            let materialized = self.materialize_private_apps_for_principal(&existing)?;
             self.control_plane.emit_completed(
                 "/_appfs/principals/create_principal.act",
                 request_id,
@@ -290,6 +294,7 @@ impl AppfsRuntimeSupervisor {
                     "principal_id": existing.principal_id,
                     "created": false,
                     "exists": true,
+                    "app_instances": materialized,
                 }),
                 client_token,
             )?;
@@ -434,6 +439,49 @@ impl AppfsRuntimeSupervisor {
                 principals: Vec::new(),
             },
         ))
+    }
+
+    fn ensure_default_principal_for_private_policies(&mut self) -> Result<()> {
+        let Some(policy_doc) = registry::read_app_policy_registry(&self.root)? else {
+            return Ok(());
+        };
+        if !policy_doc
+            .apps
+            .iter()
+            .any(|policy| policy.visibility == registry::AppfsAppPolicyVisibility::Private)
+        {
+            return Ok(());
+        }
+
+        let mut doc = self.load_principal_registry()?;
+        if doc
+            .principals
+            .iter()
+            .any(|principal| principal.principal_id == registry::APPFS_DEFAULT_PRINCIPAL_ID)
+        {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = registry::PrincipalRecord {
+            principal_id: registry::APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
+            display_name: "Default agent".to_string(),
+            description: Some("The default AppFS agent principal.".to_string()),
+            kind: "agent".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        doc.principals.push(record.clone());
+        registry::write_principal_registry(&self.root, &doc)?;
+        registry::write_principal_record_view(&self.root, &record)
+    }
+
+    fn materialize_private_apps_for_existing_principals(&mut self) -> Result<()> {
+        let doc = self.load_principal_registry()?;
+        for principal in doc.principals {
+            self.materialize_private_apps_for_principal(&principal)?;
+        }
+        Ok(())
     }
 
     fn materialize_private_apps_for_principal(
