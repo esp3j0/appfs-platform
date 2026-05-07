@@ -290,6 +290,9 @@ impl TinodeConnector {
     fn structure_nodes(&self, ctx: &ConnectorContext) -> Vec<AppStructureNode> {
         let mut nodes = vec![
             dir("_app"),
+            static_json("_app/actions.res.json", self.actions_resource()),
+            static_json("_app/control.res.json", self.control_resource()),
+            static_json("_app/skill.res.json", self.skill_resource()),
             static_json("_app/self.res.json", self.self_resource(ctx)),
             action("_app/ensure_credentials.act"),
             action("_app/refresh_structure.act"),
@@ -337,6 +340,111 @@ impl TinodeConnector {
 
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
         nodes
+    }
+
+    fn skill_resource(&self) -> JsonValue {
+        json!({
+            "app_id": TINODE_APP_ID,
+            "description": "Tinode private chat app for the current AppFS principal.",
+            "when_to_use": [
+                "Use when the user wants to send messages through Tinode to a person or another agent.",
+                "Use when the user wants to inspect the current principal's Tinode inbox, contacts, or groups.",
+                "Load this skill before performing Tinode private-app action-file operations."
+            ],
+            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
+            "allowed_tools": ["bash", "read_file", "glob_search"],
+            "include_generated_sections": {
+                "scope_summary": false,
+                "control_actions": true,
+                "recommended_actions": true,
+                "contact_routing": true
+            }
+        })
+    }
+
+    fn control_resource(&self) -> JsonValue {
+        json!({
+            "app_id": TINODE_APP_ID,
+            "description": "Private Tinode chat control plane for the active AppFS principal.",
+            "events_path": "_stream/events.evt.jsonl",
+            "actions": [
+                {
+                    "name": "ensure_credentials",
+                    "path": "_app/ensure_credentials.act",
+                    "summary": "Create or reuse the current principal's Tinode credentials without exposing secrets.",
+                    "example_payload": {
+                        "expected_profile_id": "tinode:default",
+                        "client_token": "ensure-tinode-default"
+                    },
+                    "use_when": [
+                        "Tinode reports PROFILE_NOT_READY or the user asks to initialize the current agent's Tinode identity."
+                    ]
+                },
+                {
+                    "name": "refresh_inbox",
+                    "path": "_app/refresh_inbox.act",
+                    "summary": "Refresh inbox resources for the current Tinode profile.",
+                    "example_payload": {
+                        "client_token": "refresh-inbox-001"
+                    },
+                    "use_when": [
+                        "Inbox resources look stale and no AppFS event reminder has arrived."
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn actions_resource(&self) -> JsonValue {
+        json!({
+            "app_id": TINODE_APP_ID,
+            "recommended_actions": [
+                {
+                    "name": "send_direct_message",
+                    "path": "contacts/send_message.act",
+                    "summary": "Send a Tinode direct message. Use `to` with `basic:<login>`, `tinode_user:<usr-id>`, or `principal:<principal-id>`.",
+                    "example_payload": {
+                        "to": "principal:code-implementer",
+                        "text": "请接手实现这个任务。",
+                        "client_token": "msg-to-agent-001"
+                    },
+                    "use_when": [
+                        "The user asks to message another agent or a Tinode contact and the exact contact path is unknown.",
+                        "The user asks default to delegate work to a forked principal such as code-implementer."
+                    ]
+                },
+                {
+                    "name": "create_group",
+                    "path": "groups/create_group.act",
+                    "summary": "Create a Tinode group and invite members.",
+                    "example_payload": {
+                        "title": "multi-agent-smoke",
+                        "members": ["principal:code-implementer"],
+                        "client_token": "grp-multi-agent-001"
+                    },
+                    "use_when": [
+                        "The user wants multiple agents or contacts to collaborate in one Tinode group."
+                    ]
+                },
+                {
+                    "name": "mark_inbox_read",
+                    "path": "inbox/mark_read.act",
+                    "summary": "Mark inbox messages as read for the current principal.",
+                    "example_payload": {
+                        "client_token": "mark-read-001"
+                    },
+                    "use_when": [
+                        "The user asks to acknowledge or clear read state for Tinode inbox messages."
+                    ]
+                }
+            ],
+            "contact_routes": [
+                {
+                    "mention_tokens": ["another agent", "其他 agent", "code-implementer", "principal:<principal-id>"],
+                    "send_message_path": "contacts/send_message.act"
+                }
+            ]
+        })
     }
 
     fn self_resource(&self, ctx: &ConnectorContext) -> JsonValue {
@@ -3269,7 +3377,10 @@ mod tests {
             .map(|node| node.path.as_str())
             .collect::<Vec<_>>();
         for expected in [
+            "_app/actions.res.json",
+            "_app/control.res.json",
             "_app/self.res.json",
+            "_app/skill.res.json",
             "_app/ensure_credentials.act",
             "_app/refresh_structure.act",
             "_app/refresh_inbox.act",
@@ -3287,6 +3398,28 @@ mod tests {
             assert!(paths.contains(&expected), "missing {expected}");
         }
         assert!(!paths.contains(&"_stream/events.evt.jsonl"));
+        let skill_doc = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.path == "_app/skill.res.json")
+            .and_then(|node| node.seed_content.as_ref())
+            .expect("tinode skill seed content");
+        assert_eq!(skill_doc["app_id"], "tinode");
+        assert_eq!(
+            skill_doc["description"],
+            "Tinode private chat app for the current AppFS principal."
+        );
+        let actions_doc = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.path == "_app/actions.res.json")
+            .and_then(|node| node.seed_content.as_ref())
+            .expect("tinode actions seed content");
+        assert!(actions_doc["recommended_actions"]
+            .as_array()
+            .expect("recommended actions")
+            .iter()
+            .any(|action| action["path"] == "contacts/send_message.act"));
     }
 
     #[test]

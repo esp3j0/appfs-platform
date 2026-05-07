@@ -138,10 +138,17 @@ fn registry_transport_from_resolved_app(
         super::schema::AppfsComposeTransportKind::Grpc => {
             registry::AppfsRegistryTransportKind::Grpc
         }
+        super::schema::AppfsComposeTransportKind::InProcess => {
+            registry::AppfsRegistryTransportKind::InProcess
+        }
     };
     registry::AppfsRegistryTransportDoc {
         kind,
-        endpoint: Some(app.endpoint.clone()),
+        endpoint: match app.transport_kind {
+            super::schema::AppfsComposeTransportKind::Http
+            | super::schema::AppfsComposeTransportKind::Grpc => Some(app.endpoint.clone()),
+            super::schema::AppfsComposeTransportKind::InProcess => None,
+        },
         http_timeout_ms: app.transport.http_timeout_ms,
         grpc_timeout_ms: app.transport.grpc_timeout_ms,
         bridge_max_retries: app.transport.bridge_max_retries,
@@ -366,9 +373,9 @@ mod tests {
             "tinode".to_string(),
             resolved_app(
                 "tinode",
-                "tinode-http",
-                AppfsComposeTransportKind::Http,
-                "http://127.0.0.1:6061",
+                "tinode-in-process",
+                AppfsComposeTransportKind::InProcess,
+                "",
                 None,
                 AppfsComposeAppVisibility::Private,
                 None,
@@ -393,6 +400,11 @@ mod tests {
             tinode.visibility,
             registry::AppfsAppPolicyVisibility::Private
         );
+        assert_eq!(
+            tinode.transport.kind,
+            registry::AppfsRegistryTransportKind::InProcess
+        );
+        assert_eq!(tinode.transport.endpoint, None);
         assert_eq!(
             tinode.path_template.as_deref(),
             Some("private/{principal_id}/tinode")
