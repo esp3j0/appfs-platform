@@ -309,8 +309,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "principal",
         aliases: &[],
-        summary: "List or create AppFS semantic principals",
-        argument_hint: Some("[list|create <principal-id> [description]]"),
+        summary: "List, create, or fork AppFS semantic principals",
+        argument_hint: Some(
+            "[list|create <principal-id> [description]|fork <principal-id> [task]]",
+        ),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1684,7 +1686,7 @@ fn parse_principal_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPa
         }),
         ["list", ..] => Err(usage_error(
             "principal",
-            "[list|create <principal-id> [description]]",
+            "[list|create <principal-id> [description]|fork <principal-id> [task]]",
         )),
         ["create"] => Err(usage_error(
             "principal create",
@@ -1700,12 +1702,23 @@ fn parse_principal_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPa
             target: Some((*target).to_string()),
             description: Some(description.join(" ")),
         }),
+        ["fork"] => Err(usage_error("principal fork", "<principal-id> [task]")),
+        ["fork", target] => Ok(SlashCommand::Principal {
+            action: Some("fork".to_string()),
+            target: Some((*target).to_string()),
+            description: None,
+        }),
+        ["fork", target, description @ ..] => Ok(SlashCommand::Principal {
+            action: Some("fork".to_string()),
+            target: Some((*target).to_string()),
+            description: Some(description.join(" ")),
+        }),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /principal action '{action}'. Use list or create <principal-id> [description]."
+                "Unknown /principal action '{action}'. Use list, create <principal-id> [description], or fork <principal-id> [task]."
             ),
             "principal",
-            "/principal [list|create <principal-id> [description]]",
+            "/principal [list|create <principal-id> [description]|fork <principal-id> [task]]",
         )),
     }
 }
@@ -5740,6 +5753,14 @@ mod tests {
                 description: Some("handles incident updates".to_string()),
             }))
         );
+        assert_eq!(
+            SlashCommand::parse("/principal fork code-implementer implement the plan"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("fork".to_string()),
+                target: Some("code-implementer".to_string()),
+                description: Some("implement the plan".to_string()),
+            }))
+        );
     }
 
     #[test]
@@ -6190,6 +6211,9 @@ mod tests {
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session"), "help must mention /session");
+        assert!(help.contains(
+            "/principal [list|create <principal-id> [description]|fork <principal-id> [task]]"
+        ));
         assert!(help.contains("/sandbox"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
@@ -6197,7 +6221,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help]"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

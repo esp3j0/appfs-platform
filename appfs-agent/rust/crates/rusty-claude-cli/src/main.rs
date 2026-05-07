@@ -95,6 +95,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowedTools",
     "--allowed-tools",
     "--resume",
+    "--session",
     "--print",
     "--compact",
     "--base-commit",
@@ -249,12 +250,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
+            session_path,
             ..
         } => run_repl(
             model,
             allowed_tools,
             permission_mode,
             base_commit.as_deref(),
+            session_path.as_deref(),
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -337,6 +340,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Repl {
+        session_path: Option<PathBuf>,
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
@@ -388,6 +392,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut allowed_tool_values = Vec::new();
     let mut compact = false;
     let mut base_commit: Option<String> = None;
+    let mut session_path: Option<PathBuf> = None;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -454,6 +459,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
+                if session_path.is_some() {
+                    return Err("--session cannot be combined with -p prompt mode".to_string());
+                }
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
@@ -484,6 +492,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             flag if rest.is_empty() && flag.starts_with("--resume=") => {
                 rest.push("--resume".to_string());
                 rest.push(flag[9..].to_string());
+                index += 1;
+            }
+            "--session" if rest.is_empty() => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if rest.is_empty() && flag.starts_with("--session=") => {
+                session_path = Some(PathBuf::from(&flag[10..]));
                 index += 1;
             }
             "--allowedTools" | "--allowed-tools" => {
@@ -521,9 +540,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
+    if session_path.is_some() && !rest.is_empty() {
+        return Err("--session can only be used to start an interactive REPL".to_string());
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
+            session_path,
             model,
             allowed_tools,
             permission_mode,
@@ -2609,6 +2633,90 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
     )
 }
 
+fn fork_session_for_principal(
+    source: &Session,
+    parent_principal_id: &str,
+    child_principal_id: &str,
+    task: Option<&str>,
+) -> Session {
+    let mut forked = source.fork(Some(format!("principal-{child_principal_id}")));
+    forked
+        .invoked_skills
+        .retain(|skill| !is_appfs_generated_invoked_skill(skill));
+    forked
+        .appfs_event_cursors
+        .retain(|stream_id, _| !stream_id.starts_with("app:"));
+    let bootstrap = format_principal_fork_bootstrap_message(
+        &source.session_id,
+        parent_principal_id,
+        child_principal_id,
+        task,
+    );
+    forked
+        .push_message(ConversationMessage::user_text(bootstrap))
+        .expect("in-memory principal fork bootstrap should not fail");
+    forked
+}
+
+fn is_appfs_generated_invoked_skill(skill: &runtime::InvokedSkill) -> bool {
+    skill
+        .path
+        .as_deref()
+        .is_some_and(|path| path.starts_with("generated://appfs-"))
+        || skill.skill.starts_with("appfs-")
+        || skill
+            .resolved_name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("appfs-"))
+}
+
+fn format_principal_fork_bootstrap_message(
+    parent_session_id: &str,
+    parent_principal_id: &str,
+    child_principal_id: &str,
+    task: Option<&str>,
+) -> String {
+    let task = task
+        .map(str::trim)
+        .filter(|task| !task.is_empty())
+        .unwrap_or("Continue from the inherited context and ask for clarification if the next implementation step is ambiguous.");
+    format!(
+        "<system-reminder>\n\
+This session was forked from parent session `{parent_session_id}` under AppFS principal `{parent_principal_id}`.\n\
+You are intended to run as AppFS principal `{child_principal_id}`. Verify `/status` if identity-sensitive work depends on private AppFS apps.\n\
+Your delegated task: {task}\n\
+The parent principal remains responsible for overall coordination; focus on the delegated implementation/details.\n\
+Reload AppFS generated skills as needed. Parent AppFS generated skill cache and app event cursors were intentionally cleared for this principal fork.\n\
+</system-reminder>"
+    )
+}
+
+fn format_principal_fork_launch_command(principal_id: &str, session_path: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "$env:{}={}; claw --session {}",
+            runtime::APPFS_PRINCIPAL_ID_ENV,
+            quote_powershell(principal_id),
+            quote_powershell(&session_path.display().to_string())
+        )
+    } else {
+        format!(
+            "{}={} claw --session {}",
+            runtime::APPFS_PRINCIPAL_ID_ENV,
+            quote_posix_shell(principal_id),
+            quote_posix_shell(&session_path.display().to_string())
+        )
+    }
+}
+
+fn quote_powershell(value: &str) -> String {
+    format!("\"{}\"", value.replace('`', "``").replace('"', "`\""))
+}
+
+fn quote_posix_shell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn render_resume_usage() -> String {
     format!(
         "Resume
@@ -3196,10 +3304,21 @@ fn run_repl(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     base_commit: Option<&str>,
+    session_path: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_stale_base_preflight(base_commit);
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = if let Some(session_path) = session_path {
+        LiveCli::new_from_session(
+            resolved_model,
+            true,
+            allowed_tools,
+            permission_mode,
+            session_path,
+        )?
+    } else {
+        LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?
+    };
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -3222,10 +3341,14 @@ fn run_repl(
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
                         }
+                        editor.push_history(input);
+                        continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
+                        editor.push_history(input);
+                        continue;
                     }
                 }
                 editor.push_history(input);
@@ -3759,6 +3882,44 @@ impl LiveCli {
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            enable_tools,
+            true,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+        )?;
+        let cli = Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+            prompt_history: Vec::new(),
+        };
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    fn new_from_session(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        session_reference: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let system_prompt = build_system_prompt()?;
+        let handle = resolve_session_path_or_reference(session_reference)?;
+        let session_state = Session::load_from_path(&handle.path)?;
+        let session = SessionHandle {
+            id: session_state.session_id.clone(),
+            path: handle.path,
+        };
+        let runtime = build_runtime(
+            session_state,
             &session.id,
             model.clone(),
             system_prompt.clone(),
@@ -4716,9 +4877,83 @@ impl LiveCli {
                 );
                 Ok(false)
             }
+            "fork" => {
+                let Some(principal_id) = target else {
+                    println!("Usage: /principal fork <principal-id> [task]");
+                    return Ok(false);
+                };
+                let cwd = env::current_dir()?;
+                let Some(environment) = detect_appfs_environment(&cwd) else {
+                    println!("AppFS principal fork\n  Detected          no");
+                    return Ok(false);
+                };
+                if principal_id == environment.principal_id {
+                    println!(
+                        "AppFS principal fork\n  Result           skipped\n  Reason           target principal is already active\n  Use              /session fork [branch-name]"
+                    );
+                    return Ok(false);
+                }
+
+                let outcome = create_appfs_principal(
+                    &cwd,
+                    AppfsPrincipalCreateRequest {
+                        principal_id: principal_id.to_string(),
+                        display_name: Some(principal_id.to_string()),
+                        description: description.map(ToOwned::to_owned),
+                        kind: Some("agent".to_string()),
+                    },
+                )
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+                let principal_status = match outcome.status {
+                    AppfsPrincipalCreateStatus::Created => "created",
+                    AppfsPrincipalCreateStatus::Exists => "already exists",
+                    AppfsPrincipalCreateStatus::Submitted => {
+                        "submitted (registry update not visible yet)"
+                    }
+                };
+                let mut forked = fork_session_for_principal(
+                    self.runtime.session(),
+                    &environment.principal_id,
+                    &outcome.principal_id,
+                    description,
+                );
+                let parent_session_id = self.session.id.clone();
+                let branch_name = forked
+                    .fork
+                    .as_ref()
+                    .and_then(|fork| fork.branch_name.clone())
+                    .unwrap_or_else(|| format!("principal-{}", outcome.principal_id));
+                let handle = create_managed_session_handle(&forked.session_id)?;
+                let message_count = forked.messages.len();
+                forked = forked.with_persistence_path(handle.path.clone());
+                forked.save_to_path(&handle.path)?;
+                let private_apps = if outcome.visible_private_apps.is_empty() {
+                    "<none visible yet>".to_string()
+                } else {
+                    outcome
+                        .visible_private_apps
+                        .iter()
+                        .map(|app| format!("{} [{}]", app.app_id, app.path))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "AppFS principal fork\n  Principal         {} ({principal_status})\n  Parent principal  {}\n  Parent session    {}\n  Child session     {}\n  Branch            {}\n  File              {}\n  Messages          {}\n  Private apps      {}\n  Launch            {}",
+                    outcome.principal_id,
+                    environment.principal_id,
+                    parent_session_id,
+                    handle.id,
+                    branch_name,
+                    handle.path.display(),
+                    message_count,
+                    private_apps,
+                    format_principal_fork_launch_command(&outcome.principal_id, &handle.path),
+                );
+                Ok(false)
+            }
             other => {
                 println!(
-                    "Unknown /principal action '{other}'. Use /principal list or /principal create <principal-id> [description]."
+                    "Unknown /principal action '{other}'. Use /principal list, /principal create <principal-id> [description], or /principal fork <principal-id> [task]."
                 );
                 Ok(false)
             }
@@ -4885,6 +5120,19 @@ fn create_managed_session_handle(
     let id = session_id.to_string();
     let path = sessions_dir()?.join(format!("{id}.{PRIMARY_SESSION_EXTENSION}"));
     Ok(SessionHandle { id, path })
+}
+
+fn resolve_session_path_or_reference(
+    reference: &Path,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    if reference.exists() {
+        let session = Session::load_from_path(reference)?;
+        return Ok(SessionHandle {
+            id: session.session_id,
+            path: reference.to_path_buf(),
+        });
+    }
+    resolve_session_reference(&reference.display().to_string())
 }
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
@@ -8730,6 +8978,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
+    writeln!(out, "  claw --session SESSION.jsonl")?;
+    writeln!(
+        out,
+        "      Start the interactive REPL from an existing session file or id"
+    )?;
     writeln!(out, "  claw help")?;
     writeln!(out, "      Alias for --help")?;
     writeln!(out, "  claw version")?;
@@ -8822,6 +9075,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  Use --session SESSION.jsonl to continue a saved session in a new interactive process"
+    )?;
+    writeln!(
+        out,
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
@@ -8836,6 +9093,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
     writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(out, "  claw --session {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
@@ -8876,20 +9134,22 @@ mod tests {
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle,
         delete_merged_local_branches_in, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_git_worktrees, parse_history_count, parse_hook_args, parse_recent_commits,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_hook_list_report_for,
-        render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        fork_session_for_principal, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_principal_fork_launch_command, format_resume_report, format_status_report,
+        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, git_ref_exists_in, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
+        parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_hook_list_report_for, render_memory_report,
+        render_merged_runtime_config_json, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command,
         run_resume_command_with_compactor, short_tool_id,
@@ -8906,8 +9166,9 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole, OAuthConfig,
-        PermissionMode, PermissionPromptDecision, PermissionRequest, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InvokedSkill, MessageRole,
+        OAuthConfig, PermissionMode, PermissionPromptDecision, PermissionRequest, Session,
+        ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -9302,6 +9563,7 @@ mod tests {
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
+                session_path: None,
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9756,6 +10018,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
+                session_path: None,
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
@@ -9763,6 +10026,113 @@ mod tests {
                 reasoning_effort: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_session_flag_for_interactive_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--session".to_string(), "session-child.jsonl".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                session_path: Some(PathBuf::from("session-child.jsonl")),
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_session_flag_with_prompt_mode() {
+        let error = parse_args(&[
+            "--session".to_string(),
+            "session-child.jsonl".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("session flag should be interactive-only");
+        assert!(error.contains("--session"));
+    }
+
+    #[test]
+    fn principal_fork_session_inherits_context_but_clears_appfs_runtime_state() {
+        let mut session = Session::new();
+        let parent_session_id = session.session_id.clone();
+        session
+            .push_message(ConversationMessage::user_text("讨论过的需求上下文"))
+            .expect("push source message");
+        session.invoked_skills.push(InvokedSkill {
+            skill: "appfs-aiim".to_string(),
+            resolved_name: Some("appfs-aiim".to_string()),
+            path: Some("generated://appfs-aiim".to_string()),
+            description: Some("AIIM".to_string()),
+            args: None,
+            prompt: "Base directory for this skill: C:\\mnt\\private\\default\\aiim".to_string(),
+        });
+        session.invoked_skills.push(InvokedSkill {
+            skill: "remember".to_string(),
+            resolved_name: Some("remember".to_string()),
+            path: Some("C:\\skills\\remember\\SKILL.md".to_string()),
+            description: Some("Memory skill".to_string()),
+            args: None,
+            prompt: "remember prompt".to_string(),
+        });
+        session
+            .appfs_event_cursors
+            .insert("app:tinode--default".to_string(), 7);
+        session
+            .appfs_event_cursors
+            .insert("platform".to_string(), 3);
+
+        let forked = fork_session_for_principal(
+            &session,
+            "default",
+            "code-implementer",
+            Some("负责实现代码"),
+        );
+
+        assert_ne!(forked.session_id, parent_session_id);
+        assert_eq!(
+            forked
+                .fork
+                .as_ref()
+                .map(|fork| fork.parent_session_id.as_str()),
+            Some(parent_session_id.as_str())
+        );
+        assert_eq!(
+            forked
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.branch_name.as_deref()),
+            Some("principal-code-implementer")
+        );
+        assert!(forked
+            .messages
+            .iter()
+            .any(|message| matches!(&message.blocks[..], [ContentBlock::Text { text }] if text.contains("负责实现代码") && text.contains("code-implementer"))));
+        assert_eq!(forked.invoked_skills.len(), 1);
+        assert_eq!(forked.invoked_skills[0].skill, "remember");
+        assert_eq!(forked.appfs_event_cursors.get("platform"), Some(&3));
+        assert!(!forked
+            .appfs_event_cursors
+            .contains_key("app:tinode--default"));
+    }
+
+    #[test]
+    fn principal_fork_launch_command_sets_principal_and_session() {
+        let command = format_principal_fork_launch_command(
+            "code-implementer",
+            Path::new("C:\\tmp\\session-child.jsonl"),
+        );
+
+        assert!(command.contains("APPFS_PRINCIPAL_ID"));
+        assert!(command.contains("code-implementer"));
+        assert!(command.contains("--session"));
+        assert!(command.contains("session-child.jsonl"));
     }
 
     #[test]
@@ -9776,6 +10146,7 @@ mod tests {
         assert_eq!(
             parsed,
             CliAction::Repl {
+                session_path: None,
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9827,6 +10198,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
+                session_path: None,
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
@@ -11787,8 +12159,11 @@ UU conflicted.rs",
         assert!(help.contains("claw hook list"));
         assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("claw --session SESSION.jsonl"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
+        assert!(help.contains("Use --session SESSION.jsonl"));
         assert!(help.contains("claw --resume latest"));
+        assert!(help.contains("claw --session latest"));
         assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
     }
 
