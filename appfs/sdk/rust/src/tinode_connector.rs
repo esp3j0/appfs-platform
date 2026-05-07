@@ -2262,9 +2262,7 @@ impl TinodeWsClient {
                 "head": {
                     "mime": "text/plain"
                 },
-                "content": {
-                    "txt": text
-                }
+                "content": tinode_text_plain_content(text)
             }),
             client_token.unwrap_or(&format!("pub-direct-{suffix}")),
         )?;
@@ -2400,9 +2398,7 @@ impl TinodeWsClient {
                 "head": {
                     "mime": "text/plain"
                 },
-                "content": {
-                    "txt": text
-                }
+                "content": tinode_text_plain_content(text)
             }),
             client_token.unwrap_or(&format!("pub-group-{suffix}")),
         )?;
@@ -3154,20 +3150,31 @@ fn inbound_message_from_data(data: &JsonValue) -> Option<TinodeInboundMessage> {
         .map(str::trim)
         .filter(|value| !value.is_empty())?
         .to_string();
-    let content = data.get("content")?;
-    let text = content
-        .get("txt")
-        .or_else(|| content.get("text"))
-        .and_then(JsonValue::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
+    let text = tinode_text_from_content(data.get("content")?)?
+        .trim()
         .to_string();
+    if text.is_empty() {
+        return None;
+    }
     Some(TinodeInboundMessage {
         topic,
         seq,
         from_tinode_user_id,
         text,
     })
+}
+
+fn tinode_text_from_content(content: &JsonValue) -> Option<&str> {
+    content.as_str().or_else(|| {
+        content
+            .get("txt")
+            .or_else(|| content.get("text"))
+            .and_then(JsonValue::as_str)
+    })
+}
+
+fn tinode_text_plain_content(text: &str) -> JsonValue {
+    json!(text)
 }
 
 fn inbound_messages_from_meta(meta: &JsonValue, fallback_topic: &str) -> Vec<TinodeInboundMessage> {
@@ -4268,6 +4275,21 @@ mod tests {
         assert_eq!(messages[0].seq, 7);
         assert_eq!(messages[0].from_tinode_user_id, "usrCode");
         assert_eq!(messages[0].text, "hello from meta");
+    }
+
+    #[test]
+    fn tinode_text_plain_content_is_sent_as_string_and_read_back() {
+        let content = super::tinode_text_plain_content("hello plain text");
+        assert_eq!(content, json!("hello plain text"));
+
+        let inbound = super::inbound_message_from_data(&json!({
+            "topic": "usrDefault",
+            "seq": 8,
+            "from": "usrCode",
+            "content": "hello plain text"
+        }))
+        .expect("plain text inbound");
+        assert_eq!(inbound.text, "hello plain text");
     }
 
     #[test]
