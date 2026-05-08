@@ -318,6 +318,7 @@ function Build-TestBinaries {
     Initialize-WindowsRustBuildEnv
 
     Invoke-WithWindowsIntegrationBuildLock {
+        Clear-WindowsIntegrationCargoTargetIfLowSpace -CacheRoot $script:CargoCacheRoot
         Clear-WindowsIntegrationExecutableTargets -ExecutablePaths @(
             $script:AppfsExe,
             $script:ClawExe
