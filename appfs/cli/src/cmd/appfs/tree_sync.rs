@@ -41,13 +41,15 @@ pub(super) fn ensure_app_structure_initialized(
     session_id: &str,
     bridge_config: &AppfsBridgeConfig,
 ) -> Result<()> {
-    ensure_app_structure_initialized_at(root, app_id, app_id, session_id, bridge_config)
+    ensure_app_structure_initialized_at(root, app_id, app_id, None, None, session_id, bridge_config)
 }
 
 pub(super) fn ensure_app_structure_initialized_at(
     root: &Path,
     app_id: &str,
     app_mount_path: &str,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     session_id: &str,
     bridge_config: &AppfsBridgeConfig,
 ) -> Result<()> {
@@ -65,6 +67,8 @@ pub(super) fn ensure_app_structure_initialized_at(
         root.to_path_buf(),
         app_id.to_string(),
         app_mount_path.to_string(),
+        principal_id,
+        profile_id,
         session_id.to_string(),
     );
     service.sync_initial(&mut *connector)?;
@@ -75,6 +79,8 @@ pub(super) async fn ensure_app_structure_initialized_in_db(
     agent: &SdkAgentFS,
     app_id: &str,
     session_id: &str,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     bridge_config: &AppfsBridgeConfig,
 ) -> Result<()> {
     let state = load_state_from_agentfs(agent, app_id).await?;
@@ -84,6 +90,8 @@ pub(super) async fn ensure_app_structure_initialized_in_db(
         request_id: "structure-init".to_string(),
         client_token: None,
         trace_id: None,
+        principal_id,
+        profile_id,
     };
     let mut connector = build_app_connector(app_id, bridge_config)?;
     eprintln!(
@@ -151,6 +159,8 @@ pub(super) async fn refresh_app_structure_in_db(
     agent: &SdkAgentFS,
     app_id: &str,
     session_id: &str,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     connector: &mut dyn AppConnector,
     reason: AppStructureSyncReason,
     target_scope: Option<String>,
@@ -163,6 +173,8 @@ pub(super) async fn refresh_app_structure_in_db(
         request_id: "structure-refresh".to_string(),
         client_token: None,
         trace_id: None,
+        principal_id,
+        profile_id,
     };
     eprintln!(
         "[structure.sync] op=refresh_app_structure app={} reason={} target_scope={} trigger_action_path={} known_revision={}",
@@ -247,6 +259,8 @@ pub(super) fn refresh_app_structure(
     root: &Path,
     app_id: &str,
     session_id: &str,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     connector: &mut dyn AppConnector,
     reason: AppStructureSyncReason,
     target_scope: Option<String>,
@@ -255,6 +269,8 @@ pub(super) fn refresh_app_structure(
     let mut service = AppTreeSyncService::new(
         root.to_path_buf(),
         app_id.to_string(),
+        principal_id,
+        profile_id,
         session_id.to_string(),
     );
     service.refresh(connector, reason, target_scope, trigger_action_path)
@@ -264,24 +280,43 @@ struct AppTreeSyncService {
     root: PathBuf,
     app_id: String,
     app_mount_path: String,
+    principal_id: Option<String>,
+    profile_id: Option<String>,
     session_id: String,
 }
 
 impl AppTreeSyncService {
-    fn new(root: PathBuf, app_id: String, session_id: String) -> Self {
-        Self::new_with_mount_path(root, app_id.clone(), app_id, session_id)
+    fn new(
+        root: PathBuf,
+        app_id: String,
+        principal_id: Option<String>,
+        profile_id: Option<String>,
+        session_id: String,
+    ) -> Self {
+        Self::new_with_mount_path(
+            root,
+            app_id.clone(),
+            app_id,
+            principal_id,
+            profile_id,
+            session_id,
+        )
     }
 
     fn new_with_mount_path(
         root: PathBuf,
         app_id: String,
         app_mount_path: String,
+        principal_id: Option<String>,
+        profile_id: Option<String>,
         session_id: String,
     ) -> Self {
         Self {
             root,
             app_id,
             app_mount_path,
+            principal_id,
+            profile_id,
             session_id,
         }
     }
@@ -593,6 +628,8 @@ impl AppTreeSyncService {
             request_id: request_id.to_string(),
             client_token: None,
             trace_id: None,
+            principal_id: self.principal_id.clone(),
+            profile_id: self.profile_id.clone(),
         }
     }
 
@@ -1061,6 +1098,8 @@ mod tests {
         let mut service = AppTreeSyncService::new(
             temp.path().to_path_buf(),
             "aiim".to_string(),
+            None,
+            None,
             "sess-test".to_string(),
         );
         let mut connector = DemoAppConnector::new("aiim".to_string());
@@ -1086,6 +1125,8 @@ mod tests {
         let mut service = AppTreeSyncService::new(
             temp.path().to_path_buf(),
             "aiim".to_string(),
+            None,
+            None,
             "sess-test".to_string(),
         );
         let mut connector = DemoAppConnector::new("aiim".to_string());
@@ -1124,6 +1165,8 @@ mod tests {
         let mut service = AppTreeSyncService::new(
             temp.path().to_path_buf(),
             "aiim".to_string(),
+            None,
+            None,
             "sess-test".to_string(),
         );
         let mut connector = DemoAppConnector::new("aiim".to_string());
@@ -1187,9 +1230,16 @@ mod tests {
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
         });
 
-        super::ensure_app_structure_initialized_in_db(&agent, "aiim", "sess-test", &bridge)
-            .await
-            .expect("db structure init");
+        super::ensure_app_structure_initialized_in_db(
+            &agent,
+            "aiim",
+            "sess-test",
+            None,
+            None,
+            &bridge,
+        )
+        .await
+        .expect("db structure init");
 
         assert!(agent
             .fs
@@ -1261,9 +1311,16 @@ mod tests {
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
         });
 
-        super::ensure_app_structure_initialized_in_db(&agent, "aiim", "sess-test", &bridge)
-            .await
-            .expect("db structure init");
+        super::ensure_app_structure_initialized_in_db(
+            &agent,
+            "aiim",
+            "sess-test",
+            None,
+            None,
+            &bridge,
+        )
+        .await
+        .expect("db structure init");
         let before_cursor = agent
             .fs
             .read_file("/aiim/_stream/cursor.res.json")
@@ -1276,6 +1333,8 @@ mod tests {
             &agent,
             "aiim",
             "sess-test",
+            None,
+            None,
             &mut *connector,
             agentfs_sdk::AppStructureSyncReason::EnterScope,
             Some("chat-long".to_string()),

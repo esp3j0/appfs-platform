@@ -155,6 +155,8 @@ impl MountSnapshotRuntime {
             request_id: request_id.to_string(),
             client_token: None,
             trace_id: None,
+            principal_id: None,
+            profile_id: None,
         }
     }
 }

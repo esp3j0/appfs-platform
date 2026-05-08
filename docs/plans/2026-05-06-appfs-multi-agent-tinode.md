@@ -441,11 +441,13 @@ If runtime adapter creation for private instances is too large, first persist th
   "session_id": "sess-1",
   "app_id": "tinode",
   "request_id": "req-1",
-  "path": "/contacts/send_message.act",
   "principal_id": "default",
   "profile_id": "tinode:default"
 }
 ```
+
+The action or resource path remains on the typed request (`SubmitActionRequest`,
+`FetchSnapshotChunkRequest`, and similar), not on `ConnectorContext`.
 
 **Step 2: Extend `ConnectorContext`**
 
