@@ -307,6 +307,15 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "principal",
+        aliases: &[],
+        summary: "List, create, or fork AppFS semantic principals",
+        argument_hint: Some(
+            "[list|create <principal-id> [description]|fork <principal-id> [task]]",
+        ),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
         summary: "Manage Claw Code plugins",
@@ -1183,6 +1192,11 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Principal {
+        action: Option<String>,
+        target: Option<String>,
+        description: Option<String>,
+    },
     Plugins {
         action: Option<String>,
         target: Option<String>,
@@ -1392,6 +1406,7 @@ pub fn validate_slash_command_input(
         }
         "export" => SlashCommand::Export { path: remainder },
         "session" => parse_session_command(&args)?,
+        "principal" => parse_principal_command(&args)?,
         "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
@@ -1658,6 +1673,52 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
             ),
             "session",
             "/session [list|switch <session-id>|fork [branch-name]|delete <session-id> [--force]]",
+        )),
+    }
+}
+
+fn parse_principal_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] | ["list"] => Ok(SlashCommand::Principal {
+            action: Some("list".to_string()),
+            target: None,
+            description: None,
+        }),
+        ["list", ..] => Err(usage_error(
+            "principal",
+            "[list|create <principal-id> [description]|fork <principal-id> [task]]",
+        )),
+        ["create"] => Err(usage_error(
+            "principal create",
+            "<principal-id> [description]",
+        )),
+        ["create", target] => Ok(SlashCommand::Principal {
+            action: Some("create".to_string()),
+            target: Some((*target).to_string()),
+            description: None,
+        }),
+        ["create", target, description @ ..] => Ok(SlashCommand::Principal {
+            action: Some("create".to_string()),
+            target: Some((*target).to_string()),
+            description: Some(description.join(" ")),
+        }),
+        ["fork"] => Err(usage_error("principal fork", "<principal-id> [task]")),
+        ["fork", target] => Ok(SlashCommand::Principal {
+            action: Some("fork".to_string()),
+            target: Some((*target).to_string()),
+            description: None,
+        }),
+        ["fork", target, description @ ..] => Ok(SlashCommand::Principal {
+            action: Some("fork".to_string()),
+            target: Some((*target).to_string()),
+            description: Some(description.join(" ")),
+        }),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /principal action '{action}'. Use list, create <principal-id> [description], or fork <principal-id> [task]."
+            ),
+            "principal",
+            "/principal [list|create <principal-id> [description]|fork <principal-id> [task]]",
         )),
     }
 }
@@ -3313,9 +3374,14 @@ fn generated_appfs_skill_summaries(cwd: &Path) -> Vec<SkillSummary> {
 
     let mut candidates = BTreeMap::<String, PathBuf>::new();
     for app in &environment.registered_apps {
-        candidates
-            .entry(app.app_id.clone())
-            .or_insert_with(|| environment.mount_root.join(&app.app_id));
+        candidates.entry(app.app_id.clone()).or_insert_with(|| {
+            let trimmed = app.path.trim().trim_start_matches(['/', '\\']);
+            if trimmed.is_empty() {
+                environment.mount_root.clone()
+            } else {
+                environment.mount_root.join(trimmed)
+            }
+        });
     }
 
     if let (Some(app_id), Some(app_root)) = (
@@ -5000,6 +5066,7 @@ where
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Principal { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
@@ -5069,8 +5136,8 @@ mod tests {
         render_resolved_skill_prompt, render_skills_report, render_slash_command_help,
         render_slash_command_help_detail, resolve_skill, resolve_skill_path,
         resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
-        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
-        SlashCommand,
+        validate_slash_command_input, DefinitionSource, ResolvedSkillSource, SkillOrigin,
+        SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -5212,6 +5279,42 @@ mod tests {
         )
         .expect("write scopes");
         app_root
+    }
+
+    fn seed_appfs_private_skill_mount(root: &Path) -> PathBuf {
+        let mount_root = root.join("mnt");
+        let aiim_root = mount_root.join("aiim");
+        let tinode_root = mount_root.join("private").join("default").join("tinode");
+        let secret_root = mount_root
+            .join("private")
+            .join("incident-reporter")
+            .join("secret");
+        fs::create_dir_all(mount_root.join("_appfs")).expect("control dir");
+        fs::create_dir_all(aiim_root.join("_app")).expect("aiim control dir");
+        fs::create_dir_all(tinode_root.join("_app")).expect("tinode control dir");
+        fs::create_dir_all(secret_root.join("_app")).expect("secret control dir");
+        fs::write(mount_root.join("_appfs").join("register_app.act"), "").expect("register act");
+        fs::write(
+            mount_root.join("_appfs").join("apps.registry.json"),
+            r#"{"version":1,"apps":[{"instance_id":"aiim","app_id":"aiim","visibility":"public","path":"aiim","session_id":"sess-aiim","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}},{"instance_id":"tinode--default","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"default","profile_id":"tinode:default","path":"private/default/tinode","session_id":"sess-tinode-default","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}},{"instance_id":"secret--incident-reporter","app_id":"secret","visibility":"private_instance","parent_app_id":"secret","principal_id":"incident-reporter","profile_id":"secret:incident-reporter","path":"private/incident-reporter/secret","session_id":"sess-secret-incident","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
+        )
+        .expect("write registry");
+        fs::write(
+            aiim_root.join("_app").join("skill.res.json"),
+            r#"{"app_id":"aiim","description":"AIIM public chat app.","when_to_use":"Use for public AIIM chat."}"#,
+        )
+        .expect("write aiim skill");
+        fs::write(
+            tinode_root.join("_app").join("skill.res.json"),
+            r#"{"app_id":"tinode","description":"Tinode private chat app.","when_to_use":"Use for the current principal's Tinode chat."}"#,
+        )
+        .expect("write tinode skill");
+        fs::write(
+            secret_root.join("_app").join("skill.res.json"),
+            r#"{"app_id":"secret","description":"Incident-only private app.","when_to_use":"Use only for incident reporter."}"#,
+        )
+        .expect("write secret skill");
+        mount_root
     }
 
     fn seed_control_only_appfs_skill_mount(root: &Path) -> PathBuf {
@@ -5379,6 +5482,31 @@ mod tests {
         assert!(listing.contains("- appfs-aiim:"));
         assert!(listing.contains("一个 AI 专用的聊天软件，用于收发消息。"));
         assert!(listing.contains("当用户想要向某人发送消息、查看聊天记录"));
+    }
+
+    #[test]
+    fn generated_appfs_skills_filter_private_apps_by_current_principal() {
+        let workspace = temp_dir("model-facing-skill-listing-private");
+        let mount_root = seed_appfs_private_skill_mount(&workspace);
+
+        let listing = super::render_model_facing_skill_listing_with_budget(&mount_root, 8_000)
+            .expect("listing should render")
+            .expect("listing should exist");
+
+        assert!(listing.contains("- appfs-aiim: AIIM public chat app."));
+        assert!(listing.contains("- appfs-tinode: Tinode private chat app."));
+        assert!(!listing.contains("appfs-secret"));
+
+        let resolved = resolve_skill(&mount_root, "appfs-tinode").expect("generated tinode skill");
+        assert_eq!(
+            resolved.source,
+            ResolvedSkillSource::Generated {
+                id: "appfs-tinode".to_string(),
+                base_dir: Some(mount_root.join("private").join("default").join("tinode")),
+            }
+        );
+        let prompt = render_resolved_skill_prompt(&resolved, None);
+        assert!(prompt.contains("Tinode private chat app."));
     }
 
     #[test]
@@ -5607,6 +5735,30 @@ mod tests {
             Ok(Some(SlashCommand::Session {
                 action: Some("fork".to_string()),
                 target: Some("incident-review".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/principal list"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("list".to_string()),
+                target: None,
+                description: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/principal create incident-reporter handles incident updates"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("create".to_string()),
+                target: Some("incident-reporter".to_string()),
+                description: Some("handles incident updates".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/principal fork code-implementer implement the plan"),
+            Ok(Some(SlashCommand::Principal {
+                action: Some("fork".to_string()),
+                target: Some("code-implementer".to_string()),
+                description: Some("implement the plan".to_string()),
             }))
         );
     }
@@ -6059,6 +6211,9 @@ mod tests {
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session"), "help must mention /session");
+        assert!(help.contains(
+            "/principal [list|create <principal-id> [description]|fork <principal-id> [task]]"
+        ));
         assert!(help.contains("/sandbox"));
         assert!(help.contains(
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
@@ -6066,7 +6221,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help]"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

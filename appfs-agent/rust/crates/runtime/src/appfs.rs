@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::{AttachmentKind, ConversationMessage, Session, SessionError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -15,6 +17,8 @@ const REGISTER_APP_ACTION: &str = "register_app.act";
 const UNREGISTER_APP_ACTION: &str = "unregister_app.act";
 const LIST_APPS_ACTION: &str = "list_apps.act";
 const REGISTRY_FILE: &str = "apps.registry.json";
+const PRINCIPALS_FILE: &str = "principals.registry.json";
+const APP_POLICIES_FILE: &str = "app-policies.registry.json";
 const APP_CONTROL_DIR_NAME: &str = "_app";
 const APP_STREAM_DIR_NAME: &str = "_stream";
 const EVENTS_FILE: &str = "events.evt.jsonl";
@@ -27,8 +31,10 @@ pub const APPFS_RUNTIME_MANIFEST_ENV: &str = "APPFS_RUNTIME_MANIFEST";
 pub const APPFS_MOUNT_ROOT_ENV: &str = "APPFS_MOUNT_ROOT";
 pub const APPFS_RUNTIME_SESSION_ID_ENV: &str = "APPFS_RUNTIME_SESSION_ID";
 pub const APPFS_ATTACH_ID_ENV: &str = "APPFS_ATTACH_ID";
+pub const APPFS_PRINCIPAL_ID_ENV: &str = "APPFS_PRINCIPAL_ID";
 pub const APPFS_AGENT_ROLE_ENV: &str = "APPFS_AGENT_ROLE";
 pub const APPFS_MULTI_AGENT_MODE_SHARED: &str = "shared_mount_distinct_attach";
+pub const APPFS_DEFAULT_PRINCIPAL_ID: &str = "default";
 pub const APPFS_RUNTIME_KIND: &str = "appfs";
 pub const APPFS_SCHEMA_VERSION: u32 = 1;
 
@@ -55,8 +61,40 @@ impl AppfsAttachSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppfsRegisteredApp {
+    pub instance_id: String,
     pub app_id: String,
+    pub visibility: AppfsRegisteredAppVisibility,
+    pub parent_app_id: Option<String>,
+    pub principal_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub path: String,
     pub active_scope: Option<String>,
+}
+
+impl AppfsRegisteredApp {
+    fn app_root(&self, mount_root: &Path) -> PathBuf {
+        absolute_mount_path(mount_root, &self.path)
+    }
+
+    #[must_use]
+    pub fn is_public(&self) -> bool {
+        self.visibility == AppfsRegisteredAppVisibility::Public
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppfsRegisteredAppVisibility {
+    Public,
+    PrivateInstance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppfsPrincipalSummary {
+    pub principal_id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +135,7 @@ pub struct AppfsEnvironment {
     pub mount_root: PathBuf,
     pub runtime_session_id: Option<String>,
     pub attach_id: String,
+    pub principal_id: String,
     pub attach_role: Option<String>,
     pub multi_agent_mode: String,
     pub manifest_path: Option<PathBuf>,
@@ -110,7 +149,32 @@ pub struct AppfsEnvironment {
     pub current_app_root: Option<PathBuf>,
     pub current_app_events_path: Option<PathBuf>,
     pub registered_apps: Vec<AppfsRegisteredApp>,
+    pub known_principals: Vec<AppfsPrincipalSummary>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsPrincipalCreateRequest {
+    pub principal_id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsPrincipalCreateStatus {
+    Created,
+    Exists,
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsPrincipalCreateOutcome {
+    pub principal_id: String,
+    pub status: AppfsPrincipalCreateStatus,
+    pub action_path: PathBuf,
+    pub registry_path: PathBuf,
+    pub visible_private_apps: Vec<AppfsRegisteredApp>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +216,7 @@ struct AppfsAttachEnv {
     mount_root: Option<PathBuf>,
     runtime_session_id: Option<String>,
     attach_id: Option<String>,
+    principal_id: Option<String>,
     attach_role: Option<String>,
 }
 
@@ -162,6 +227,7 @@ impl AppfsAttachEnv {
             || self.mount_root.is_some()
             || self.runtime_session_id.is_some()
             || self.attach_id.is_some()
+            || self.principal_id.is_some()
             || self.attach_role.is_some()
     }
 }
@@ -179,6 +245,7 @@ struct HeuristicDetection {
     current_app_root: Option<PathBuf>,
     current_app_events_path: Option<PathBuf>,
     registered_apps: Vec<AppfsRegisteredApp>,
+    known_principals: Vec<AppfsPrincipalSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -198,7 +265,99 @@ pub fn detect_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
 
 #[must_use]
 pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
-    resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+    let attach_env = load_attach_env();
+    let environment = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())?;
+    if should_auto_create_default_principal(&environment) {
+        if let Some(control_dir) = environment.control_dir.as_deref() {
+            if has_pending_default_principal_create_action(control_dir) {
+                let _ = wait_for_principal_ready(
+                    control_dir,
+                    &control_dir.join(PRINCIPALS_FILE),
+                    environment.registry_path.as_deref(),
+                    APPFS_DEFAULT_PRINCIPAL_ID,
+                );
+            } else {
+                let request = AppfsPrincipalCreateRequest {
+                    principal_id: APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
+                    display_name: Some("Default agent".to_string()),
+                    description: Some("The default AppFS agent principal.".to_string()),
+                    kind: Some("agent".to_string()),
+                };
+                let _ = create_appfs_principal_from_environment(request, environment.clone());
+            }
+        }
+        return resolve_appfs_environment_with_attach_env(cwd, attach_env).or(Some(environment));
+    }
+    Some(environment)
+}
+
+pub fn create_appfs_principal(
+    cwd: &Path,
+    request: AppfsPrincipalCreateRequest,
+) -> Result<AppfsPrincipalCreateOutcome, String> {
+    let environment = resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+        .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
+    create_appfs_principal_from_environment(request, environment)
+}
+
+fn create_appfs_principal_from_environment(
+    request: AppfsPrincipalCreateRequest,
+    environment: AppfsEnvironment,
+) -> Result<AppfsPrincipalCreateOutcome, String> {
+    let principal_id = request.principal_id.trim();
+    if !is_safe_principal_id(principal_id) {
+        return Err(
+            "principal_id must use ASCII letters, digits, '.', '_' or '-' and cannot be empty"
+                .to_string(),
+        );
+    }
+
+    let control_dir = environment
+        .control_dir
+        .clone()
+        .ok_or_else(|| "AppFS control directory was not detected".to_string())?;
+    let principal_dir = control_dir.join("principals");
+    let action_path = principal_dir.join("create_principal.act");
+    let registry_path = control_dir.join(PRINCIPALS_FILE);
+
+    if environment
+        .known_principals
+        .iter()
+        .any(|principal| principal.principal_id == principal_id)
+    {
+        return Ok(principal_create_outcome_from_environment(
+            principal_id,
+            AppfsPrincipalCreateStatus::Exists,
+            action_path,
+            registry_path,
+            &environment,
+        ));
+    }
+
+    fs::create_dir_all(&principal_dir).map_err(|err| {
+        format!(
+            "failed to create AppFS principal control directory {}: {err}",
+            principal_dir.display()
+        )
+    })?;
+    append_create_principal_action(&action_path, principal_id, &request)?;
+
+    let status = wait_for_principal_ready(
+        &control_dir,
+        &registry_path,
+        environment.registry_path.as_deref(),
+        principal_id,
+    )
+    .map_or(AppfsPrincipalCreateStatus::Submitted, |_| {
+        AppfsPrincipalCreateStatus::Created
+    });
+    Ok(principal_create_outcome_from_environment(
+        principal_id,
+        status,
+        action_path,
+        registry_path,
+        &environment,
+    ))
 }
 
 #[must_use]
@@ -311,18 +470,15 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
     }
 
     for app in &environment.registered_apps {
+        let app_root = app.app_root(&environment.mount_root);
         push_appfs_event_stream(
             &mut streams,
             &mut seen,
             AppfsEventStream {
-                stream_id: format!("app:{}", app.app_id),
-                label: format!("AppFS app `{}`", app.app_id),
+                stream_id: format!("app:{}", app.instance_id),
+                label: app_event_label(app),
                 app_id: Some(app.app_id.clone()),
-                path: environment
-                    .mount_root
-                    .join(&app.app_id)
-                    .join(APP_STREAM_DIR_NAME)
-                    .join(EVENTS_FILE),
+                path: app_root.join(APP_STREAM_DIR_NAME).join(EVENTS_FILE),
             },
         );
     }
@@ -331,19 +487,30 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
         environment.current_app_id.as_ref(),
         environment.current_app_events_path.as_ref(),
     ) {
-        push_appfs_event_stream(
-            &mut streams,
-            &mut seen,
-            AppfsEventStream {
-                stream_id: format!("app:{app_id}"),
-                label: format!("AppFS app `{app_id}`"),
-                app_id: Some(app_id.clone()),
-                path: path.clone(),
-            },
-        );
+        if !streams.iter().any(|stream| stream.path == *path) {
+            push_appfs_event_stream(
+                &mut streams,
+                &mut seen,
+                AppfsEventStream {
+                    stream_id: format!("app:{app_id}"),
+                    label: format!("AppFS app `{app_id}`"),
+                    app_id: Some(app_id.clone()),
+                    path: path.clone(),
+                },
+            );
+        }
     }
 
     streams
+}
+
+fn app_event_label(app: &AppfsRegisteredApp) -> String {
+    match (app.visibility, app.principal_id.as_deref()) {
+        (AppfsRegisteredAppVisibility::PrivateInstance, Some(principal_id)) => {
+            format!("AppFS app `{}` for principal `{principal_id}`", app.app_id)
+        }
+        _ => format!("AppFS app `{}`", app.app_id),
+    }
 }
 
 fn push_appfs_event_stream(
@@ -696,6 +863,7 @@ fn build_env_environment(
         .attach_id
         .clone()
         .unwrap_or_else(generate_ephemeral_attach_id);
+    let principal_id = effective_principal_id(attach_env.principal_id.as_deref());
     let multi_agent_mode = manifest.map_or_else(
         || APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
         |doc| doc.multi_agent_mode.clone(),
@@ -704,12 +872,17 @@ fn build_env_environment(
         .map(|doc| resolve_control_plane_paths(&mount_root, &doc.control_plane))
         .or_else(|| heuristic.map(control_plane_from_heuristic))
         .unwrap_or_default();
-    let current_detection = detect_current_app(&mount_root, cwd);
     let registered_apps = load_registered_apps_from_paths(
         control_paths
             .registry_path
             .as_deref()
             .or_else(|| heuristic.as_ref().map(|d| d.registry_path.as_path())),
+        &principal_id,
+    );
+    let current_detection = detect_current_registered_app(&mount_root, cwd, &registered_apps)
+        .unwrap_or_else(|| detect_current_app(&mount_root, cwd));
+    let known_principals = load_principal_summaries_from_paths(
+        principal_registry_path_from_control_paths(&control_paths).as_deref(),
     );
 
     Some(AppfsEnvironment {
@@ -717,6 +890,7 @@ fn build_env_environment(
         mount_root,
         runtime_session_id,
         attach_id,
+        principal_id,
         attach_role: attach_env.attach_role,
         multi_agent_mode,
         manifest_path,
@@ -730,6 +904,7 @@ fn build_env_environment(
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
         registered_apps,
+        known_principals,
         warnings,
     })
 }
@@ -747,14 +922,21 @@ fn build_manifest_environment(
     }
 
     let control_paths = resolve_control_plane_paths(&mount_root, &manifest.control_plane);
-    let current_detection = detect_current_app(&mount_root, cwd);
-    let registered_apps = load_registered_apps_from_paths(control_paths.registry_path.as_deref());
+    let principal_id = APPFS_DEFAULT_PRINCIPAL_ID.to_string();
+    let registered_apps =
+        load_registered_apps_from_paths(control_paths.registry_path.as_deref(), &principal_id);
+    let current_detection = detect_current_registered_app(&mount_root, cwd, &registered_apps)
+        .unwrap_or_else(|| detect_current_app(&mount_root, cwd));
+    let known_principals = load_principal_summaries_from_paths(
+        principal_registry_path_from_control_paths(&control_paths).as_deref(),
+    );
 
     Some(AppfsEnvironment {
         attach_source: AppfsAttachSource::Manifest,
         mount_root,
         runtime_session_id: Some(manifest.runtime_session_id.clone()),
         attach_id: generate_ephemeral_attach_id(),
+        principal_id,
         attach_role: None,
         multi_agent_mode: manifest.multi_agent_mode.clone(),
         manifest_path,
@@ -768,6 +950,7 @@ fn build_manifest_environment(
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
         registered_apps,
+        known_principals,
         warnings,
     })
 }
@@ -781,6 +964,7 @@ fn build_heuristic_environment(
         mount_root: detection.mount_root,
         runtime_session_id: None,
         attach_id: generate_ephemeral_attach_id(),
+        principal_id: APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
         attach_role: None,
         multi_agent_mode: APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
         manifest_path: None,
@@ -794,6 +978,7 @@ fn build_heuristic_environment(
         current_app_root: detection.current_app_root,
         current_app_events_path: detection.current_app_events_path,
         registered_apps: detection.registered_apps,
+        known_principals: detection.known_principals,
         warnings,
     }
 }
@@ -832,6 +1017,32 @@ fn detect_current_app(mount_root: &Path, cwd: &Path) -> CurrentAppDetection {
     }
 }
 
+fn detect_current_registered_app(
+    mount_root: &Path,
+    cwd: &Path,
+    registered_apps: &[AppfsRegisteredApp],
+) -> Option<CurrentAppDetection> {
+    let mut matches = registered_apps
+        .iter()
+        .filter_map(|app| {
+            let app_root = app.app_root(mount_root);
+            cwd.strip_prefix(&app_root).ok()?;
+            let depth = app_root.components().count();
+            let events_path = app_root.join(APP_STREAM_DIR_NAME).join(EVENTS_FILE);
+            Some((
+                depth,
+                CurrentAppDetection {
+                    current_app_id: Some(app.app_id.clone()),
+                    current_app_root: Some(app_root),
+                    current_app_events_path: events_path.exists().then_some(events_path),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(depth, _)| *depth);
+    matches.pop().map(|(_, detection)| detection)
+}
+
 fn control_plane_from_heuristic(detection: &HeuristicDetection) -> ResolvedControlPlanePaths {
     ResolvedControlPlanePaths {
         control_dir: Some(detection.control_dir.clone()),
@@ -841,6 +1052,15 @@ fn control_plane_from_heuristic(detection: &HeuristicDetection) -> ResolvedContr
         unregister_app_path: Some(detection.unregister_app_path.clone()),
         list_apps_path: Some(detection.list_apps_path.clone()),
     }
+}
+
+fn principal_registry_path_from_control_paths(
+    control_paths: &ResolvedControlPlanePaths,
+) -> Option<PathBuf> {
+    control_paths
+        .control_dir
+        .as_ref()
+        .map(|control_dir| control_dir.join(PRINCIPALS_FILE))
 }
 
 fn resolve_control_plane_paths(
@@ -862,6 +1082,14 @@ fn resolve_control_plane_paths(
         unregister_app_path: Some(unregister_app_path),
         list_apps_path: Some(list_apps_path),
     }
+}
+
+fn effective_principal_id(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(APPFS_DEFAULT_PRINCIPAL_ID)
+        .to_string()
 }
 
 fn absolute_mount_path(mount_root: &Path, virtual_path: &str) -> PathBuf {
@@ -886,6 +1114,7 @@ fn load_attach_env() -> AppfsAttachEnv {
         mount_root: env::var_os(APPFS_MOUNT_ROOT_ENV).map(PathBuf::from),
         runtime_session_id: env::var(APPFS_RUNTIME_SESSION_ID_ENV).ok(),
         attach_id: env::var(APPFS_ATTACH_ID_ENV).ok(),
+        principal_id: env::var(APPFS_PRINCIPAL_ID_ENV).ok(),
         attach_role: env::var(APPFS_AGENT_ROLE_ENV).ok(),
     }
 }
@@ -926,7 +1155,13 @@ fn detect_heuristic_environment(cwd: &Path) -> Option<HeuristicDetection> {
     let unregister_app_path = control_dir.join(UNREGISTER_APP_ACTION);
     let list_apps_path = control_dir.join(LIST_APPS_ACTION);
     let control_events_path = control_dir.join(APP_STREAM_DIR_NAME).join(EVENTS_FILE);
-    let current_detection = detect_current_app(&mount_root, cwd);
+    let principal_id = APPFS_DEFAULT_PRINCIPAL_ID;
+    let registered_apps =
+        load_registered_apps_from_paths(Some(registry_path.as_path()), principal_id);
+    let current_detection = detect_current_registered_app(&mount_root, cwd, &registered_apps)
+        .unwrap_or_else(|| detect_current_app(&mount_root, cwd));
+    let known_principals =
+        load_principal_summaries_from_paths(Some(control_dir.join(PRINCIPALS_FILE).as_path()));
 
     Some(HeuristicDetection {
         mount_root,
@@ -939,7 +1174,8 @@ fn detect_heuristic_environment(cwd: &Path) -> Option<HeuristicDetection> {
         current_app_id: current_detection.current_app_id,
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
-        registered_apps: load_registered_apps_from_paths(Some(registry_path.as_path())),
+        registered_apps,
+        known_principals,
     })
 }
 
@@ -963,14 +1199,20 @@ fn looks_like_app_root(candidate: &Path) -> bool {
     candidate.join(APP_CONTROL_DIR_NAME).is_dir() || candidate.join(APP_STREAM_DIR_NAME).is_dir()
 }
 
-fn load_registered_apps_from_paths(registry_path: Option<&Path>) -> Vec<AppfsRegisteredApp> {
+fn load_registered_apps_from_paths(
+    registry_path: Option<&Path>,
+    principal_id: &str,
+) -> Vec<AppfsRegisteredApp> {
     let Some(registry_path) = registry_path else {
         return Vec::new();
     };
-    load_registered_apps(registry_path)
+    load_registered_apps(registry_path, principal_id)
 }
 
-fn load_registered_apps(registry_path: &Path) -> Vec<AppfsRegisteredApp> {
+fn load_registered_apps(
+    registry_path: &Path,
+    current_principal_id: &str,
+) -> Vec<AppfsRegisteredApp> {
     let Ok(contents) = fs::read_to_string(registry_path) else {
         return Vec::new();
     };
@@ -984,25 +1226,259 @@ fn load_registered_apps(registry_path: &Path) -> Vec<AppfsRegisteredApp> {
     apps.iter()
         .filter_map(|entry| {
             let object = entry.as_object()?;
+            let instance_id = object.get("instance_id")?.as_str()?.to_string();
             let app_id = object.get("app_id")?.as_str()?.to_string();
+            let visibility = match object.get("visibility")?.as_str()? {
+                "public" => AppfsRegisteredAppVisibility::Public,
+                "private_instance" => AppfsRegisteredAppVisibility::PrivateInstance,
+                _ => return None,
+            };
+            let parent_app_id = object
+                .get("parent_app_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let principal_id = object
+                .get("principal_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                && principal_id.as_deref() != Some(current_principal_id)
+            {
+                return None;
+            }
+            let profile_id = object
+                .get("profile_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let path = object.get("path")?.as_str()?.to_string();
             let active_scope = object
                 .get("active_scope")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             Some(AppfsRegisteredApp {
+                instance_id,
                 app_id,
+                visibility,
+                parent_app_id,
+                principal_id,
+                profile_id,
+                path,
                 active_scope,
             })
         })
         .collect()
 }
 
-fn generate_ephemeral_attach_id() -> String {
-    let seq = ATTACH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    let now = SystemTime::now()
+fn load_principal_summaries_from_paths(registry_path: Option<&Path>) -> Vec<AppfsPrincipalSummary> {
+    let Some(registry_path) = registry_path else {
+        return Vec::new();
+    };
+    load_principal_summaries(registry_path)
+}
+
+fn load_principal_summaries(registry_path: &Path) -> Vec<AppfsPrincipalSummary> {
+    let Ok(contents) = fs::read_to_string(registry_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(principals) = doc.get("principals").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    principals
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let principal_id = object.get("principal_id")?.as_str()?.to_string();
+            Some(AppfsPrincipalSummary {
+                principal_id,
+                display_name: object
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                description: object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                kind: object
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn append_create_principal_action(
+    action_path: &Path,
+    principal_id: &str,
+    request: &AppfsPrincipalCreateRequest,
+) -> Result<(), String> {
+    let client_token = format!("principal-create-{}", now_millis());
+    let payload = serde_json::json!({
+        "principal_id": principal_id,
+        "display_name": request
+            .display_name
+            .as_deref()
+            .unwrap_or(principal_id),
+        "description": request.description.as_deref(),
+        "kind": request.kind.as_deref().unwrap_or("agent"),
+        "client_token": client_token,
+    });
+    let mut line = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to encode principal create action: {err}"))?;
+    line.push('\n');
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(action_path)
+        .map_err(|err| {
+            format!(
+                "failed to open AppFS principal create action {}: {err}",
+                action_path.display()
+            )
+        })?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        format!(
+            "failed to append AppFS principal create action {}: {err}",
+            action_path.display()
+        )
+    })
+}
+
+fn wait_for_principal_ready(
+    control_dir: &Path,
+    registry_path: &Path,
+    apps_registry_path: Option<&Path>,
+    principal_id: &str,
+) -> Option<AppfsPrincipalSummary> {
+    let expected_private_apps = private_app_policy_count(&control_dir.join(APP_POLICIES_FILE));
+    let mut found_principal = None;
+    for _ in 0..40 {
+        if let Some(principal) = load_principal_summaries(registry_path)
+            .into_iter()
+            .find(|principal| principal.principal_id == principal_id)
+        {
+            found_principal = Some(principal);
+            if expected_private_apps == 0
+                || apps_registry_path
+                    .map(|path| private_app_count_for_principal(path, principal_id))
+                    .unwrap_or(0)
+                    >= expected_private_apps
+            {
+                return found_principal;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    found_principal
+}
+
+fn principal_create_outcome_from_environment(
+    principal_id: &str,
+    status: AppfsPrincipalCreateStatus,
+    action_path: PathBuf,
+    registry_path: PathBuf,
+    environment: &AppfsEnvironment,
+) -> AppfsPrincipalCreateOutcome {
+    let visible_private_apps =
+        load_registered_apps_from_paths(environment.registry_path.as_deref(), principal_id)
+            .into_iter()
+            .filter(|app| {
+                app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                    && app.principal_id.as_deref() == Some(principal_id)
+            })
+            .collect();
+    AppfsPrincipalCreateOutcome {
+        principal_id: principal_id.to_string(),
+        status,
+        action_path,
+        registry_path,
+        visible_private_apps,
+    }
+}
+
+fn should_auto_create_default_principal(environment: &AppfsEnvironment) -> bool {
+    environment.principal_id == APPFS_DEFAULT_PRINCIPAL_ID
+        && environment.control_dir.is_some()
+        && environment.known_principals.is_empty()
+}
+
+fn has_pending_default_principal_create_action(control_dir: &Path) -> bool {
+    fs::read_to_string(control_dir.join("principals").join("create_principal.act"))
+        .ok()
+        .is_some_and(|contents| contents.contains(r#""principal_id":"default""#))
+}
+
+fn private_app_policy_count(path: &Path) -> usize {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return 0;
+    };
+    doc.get("apps")
+        .and_then(Value::as_array)
+        .map(|apps| {
+            apps.iter()
+                .filter(|entry| {
+                    entry
+                        .get("visibility")
+                        .and_then(Value::as_str)
+                        .is_some_and(|visibility| visibility == "private")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn private_app_count_for_principal(path: &Path, principal_id: &str) -> usize {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return 0;
+    };
+    doc.get("apps")
+        .and_then(Value::as_array)
+        .map(|apps| {
+            apps.iter()
+                .filter(|entry| {
+                    entry
+                        .get("visibility")
+                        .and_then(Value::as_str)
+                        .is_some_and(|visibility| visibility == "private_instance")
+                        && entry
+                            .get("principal_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == principal_id)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn is_safe_principal_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
+        .as_millis()
+}
+
+fn generate_ephemeral_attach_id() -> String {
+    let seq = ATTACH_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_millis();
     format!("attach-{now:x}-{}-{seq:x}", process::id())
 }
 
@@ -1048,9 +1524,33 @@ fn summarize_registered_app_ids(environment: &AppfsEnvironment) -> Option<String
     let app_ids = environment
         .registered_apps
         .iter()
-        .map(|app| format!("`{}`", app.app_id))
+        .map(|app| match (app.visibility, app.principal_id.as_deref()) {
+            (AppfsRegisteredAppVisibility::PrivateInstance, Some(principal_id)) => format!(
+                "`{}` at `{}` (private for principal `{principal_id}`)",
+                app.app_id, app.path
+            ),
+            _ => format!("`{}` at `{}` (public)", app.app_id, app.path),
+        })
         .collect::<Vec<_>>();
     (!app_ids.is_empty()).then(|| app_ids.join(", "))
+}
+
+fn summarize_known_principals(environment: &AppfsEnvironment) -> Option<String> {
+    let principals = environment
+        .known_principals
+        .iter()
+        .map(|principal| {
+            let mut label = format!("`{}`", principal.principal_id);
+            if let Some(display_name) = principal.display_name.as_deref() {
+                label.push_str(&format!(" ({display_name})"));
+            }
+            if let Some(description) = principal.description.as_deref() {
+                label.push_str(&format!(": {description}"));
+            }
+            label
+        })
+        .collect::<Vec<_>>();
+    (!principals.is_empty()).then(|| principals.join("; "))
 }
 
 fn render_current_app_prompt_section(
@@ -1166,7 +1666,7 @@ fn render_appfs_overview_lines(
         "# AppFS workspace guidance".to_string(),
         "- AppFS mounts bridge-backed software into a filesystem. After an app implements the AppFS bridge contract, reading and writing inside the mount interacts with the underlying software."
             .to_string(),
-        "- Each mounted app appears as a directory under the AppFS mount root. The platform control plane lives under `/_appfs`."
+        "- Mounted apps appear as directories under the AppFS mount root. Public apps usually live at the root or under `public/`; private app instances live under `private/<principal-id>/`. The platform control plane lives under `/_appfs`."
             .to_string(),
         format!(
             "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation. Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; only inspect `{events_path}` manually for debugging or if no reminder appears."
@@ -1178,7 +1678,18 @@ fn render_appfs_overview_lines(
         "- Mounted app skills are listed separately in the skill listing attachment. Use the `Skill` tool to load the matching app skill before doing app-specific work."
             .to_string(),
         format!("- Current AppFS mount root: `{}`.", environment.mount_root.display()),
+        format!("- Current AppFS attach id: `{}`.", environment.attach_id),
+        format!(
+            "- Current AppFS principal id: `{}`. Treat this as your app-side identity.",
+            environment.principal_id
+        ),
     ];
+
+    if let Some(principals) = summarize_known_principals(environment) {
+        lines.push(format!(
+            "- Known AppFS principals in this project: {principals}."
+        ));
+    }
 
     if let (Some(app_id), Some(app_root)) = (current_app_id, current_app_root) {
         lines.push(format!(
@@ -1196,6 +1707,11 @@ fn render_appfs_overview_lines(
             ));
         }
     }
+
+    lines.push(format!(
+        "- Private apps for your current identity live under `private/{}/...`; avoid using another principal's private app unless the user explicitly asks for cross-agent coordination.",
+        environment.principal_id
+    ));
 
     if let Some(register_path) = register_path {
         lines.push(format!(
@@ -1232,9 +1748,10 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_appfs_prompt_section, detect_appfs_environment,
+        build_appfs_prompt_section, create_appfs_principal, detect_appfs_environment,
         resolve_appfs_environment_with_attach_env, sync_appfs_event_reminders, AppfsAttachEnv,
-        AppfsAttachSource, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
+        AppfsAttachSource, AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus,
+        AppfsRegisteredAppVisibility, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
         AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND,
         APPFS_RUNTIME_MANIFEST_REL_PATH, APPFS_SCHEMA_VERSION,
     };
@@ -1243,7 +1760,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TempDirGuard {
         path: PathBuf,
@@ -1285,10 +1803,90 @@ mod tests {
         fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
         fs::write(
             control_dir.join("apps.registry.json"),
-            r#"{"version":1,"apps":[{"app_id":"aiim","active_scope":"chat-long"},{"app_id":"notion"}]}"#,
+            r#"{"version":1,"apps":[{"instance_id":"aiim","app_id":"aiim","visibility":"public","path":"aiim","session_id":"sess-aiim","registered_at":"2026-04-07T00:00:00Z","active_scope":"chat-long","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}},{"instance_id":"notion","app_id":"notion","visibility":"public","path":"notion","session_id":"sess-notion","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
         )
         .expect("write registry");
+        fs::write(
+            control_dir.join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+        )
+        .expect("write principals registry");
         fs::write(app_root.join("_stream").join("events.evt.jsonl"), "").expect("write events");
+    }
+
+    fn seed_private_principal_mount(mount_root: &Path) {
+        let control_dir = mount_root.join("_appfs");
+        let aiim_root = mount_root.join("aiim");
+        let default_tinode_root = mount_root.join("private").join("default").join("tinode");
+        let incident_tinode_root = mount_root
+            .join("private")
+            .join("incident-reporter")
+            .join("tinode");
+        fs::create_dir_all(control_dir.join("_stream")).expect("create control stream");
+        for app_root in [&aiim_root, &default_tinode_root, &incident_tinode_root] {
+            fs::create_dir_all(app_root.join("_app")).expect("create app control dir");
+            fs::create_dir_all(app_root.join("_stream")).expect("create app stream dir");
+            fs::write(app_root.join("_stream").join("events.evt.jsonl"), "")
+                .expect("write app events");
+        }
+        fs::write(control_dir.join("register_app.act"), "").expect("write register action");
+        fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
+        fs::write(
+            control_dir.join("apps.registry.json"),
+            r#"{"version":1,"apps":[{"instance_id":"aiim","app_id":"aiim","visibility":"public","path":"aiim","session_id":"sess-aiim","registered_at":"2026-04-07T00:00:00Z","active_scope":"chat-long","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}},{"instance_id":"tinode--default","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"default","profile_id":"tinode:default","path":"private/default/tinode","session_id":"sess-tinode-default","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}},{"instance_id":"tinode--incident-reporter","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"incident-reporter","profile_id":"tinode:incident-reporter","path":"private/incident-reporter/tinode","session_id":"sess-tinode-incident","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
+        )
+        .expect("write registry");
+        fs::write(
+            control_dir.join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"},{"principal_id":"incident-reporter","display_name":"Incident reporter","description":"Summarizes incident updates.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+        )
+        .expect("write principals registry");
+    }
+
+    fn seed_mount_without_principals(mount_root: &Path) {
+        let control_dir = mount_root.join("_appfs");
+        fs::create_dir_all(control_dir.join("_stream")).expect("create control stream");
+        fs::write(control_dir.join("register_app.act"), "").expect("write register action");
+        fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
+        fs::write(
+            control_dir.join("app-policies.registry.json"),
+            r#"{"version":1,"apps":[{"app_id":"tinode","visibility":"private","connector":"tinode-in-process","path_template":"private/{principal_id}/tinode","profile_template":"tinode:{principal_id}","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
+        )
+        .expect("write app policy registry");
+        fs::write(
+            control_dir.join("apps.registry.json"),
+            r#"{"version":1,"apps":[]}"#,
+        )
+        .expect("write empty apps registry");
+    }
+
+    fn spawn_default_principal_supervisor_stub(mount_root: &Path) -> thread::JoinHandle<()> {
+        let control_dir = mount_root.join("_appfs");
+        let action_path = control_dir.join("principals").join("create_principal.act");
+        let principal_registry = control_dir.join("principals.registry.json");
+        let apps_registry = control_dir.join("apps.registry.json");
+        thread::spawn(move || {
+            for _ in 0..80 {
+                if fs::read_to_string(&action_path)
+                    .ok()
+                    .is_some_and(|contents| contents.contains(r#""principal_id":"default""#))
+                {
+                    fs::write(
+                        &principal_registry,
+                        r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+                    )
+                    .expect("write principal registry");
+                    thread::sleep(Duration::from_millis(150));
+                    fs::write(
+                        &apps_registry,
+                        r#"{"version":1,"apps":[{"instance_id":"tinode--default","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"default","profile_id":"tinode:default","path":"private/default/tinode","session_id":"sess-tinode-default","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
+                    )
+                    .expect("write apps registry");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        })
     }
 
     fn seed_aiim_prompt_files(app_root: &Path) {
@@ -1499,6 +2097,7 @@ mod tests {
                 mount_root: Some(override_root.clone()),
                 runtime_session_id: Some("rt-env-01".to_string()),
                 attach_id: Some("agent-a".to_string()),
+                principal_id: Some("incident-reporter".to_string()),
                 attach_role: Some("planner".to_string()),
             },
         )
@@ -1508,6 +2107,7 @@ mod tests {
         assert_eq!(detected.mount_root, override_root);
         assert_eq!(detected.runtime_session_id.as_deref(), Some("rt-env-01"));
         assert_eq!(detected.attach_id, "agent-a");
+        assert_eq!(detected.principal_id, "incident-reporter");
         assert_eq!(detected.attach_role.as_deref(), Some("planner"));
         assert!(detected
             .warnings
@@ -1535,6 +2135,7 @@ mod tests {
                 mount_root: None,
                 runtime_session_id: None,
                 attach_id: None,
+                principal_id: None,
                 attach_role: Some("planner".to_string()),
             },
         )
@@ -1543,6 +2144,7 @@ mod tests {
         assert_eq!(detected.attach_source, AppfsAttachSource::Env);
         assert_eq!(detected.runtime_session_id.as_deref(), Some("rt-shared-02"));
         assert!(detected.attach_id.starts_with("attach-"));
+        assert_eq!(detected.principal_id, "default");
         assert_eq!(detected.attach_role.as_deref(), Some("planner"));
     }
 
@@ -1560,6 +2162,7 @@ mod tests {
             mount_root: Some(mount_root),
             runtime_session_id: Some("rt-shared-03".to_string()),
             attach_id: None,
+            principal_id: Some("default".to_string()),
             attach_role: Some("worker".to_string()),
         };
         let detected_a = resolve_appfs_environment_with_attach_env(
@@ -1591,6 +2194,100 @@ mod tests {
     }
 
     #[test]
+    fn detect_appfs_environment_auto_creates_default_principal() {
+        let temp = TempDirGuard::new("appfs-auto-default-principal");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        let supervisor = spawn_default_principal_supervisor_stub(&mount_root);
+
+        let detected =
+            detect_appfs_environment(&mount_root).expect("expected appfs environment to be found");
+        supervisor.join().expect("supervisor stub should finish");
+
+        assert_eq!(detected.principal_id, "default");
+        assert!(detected
+            .known_principals
+            .iter()
+            .any(|principal| principal.principal_id == "default"));
+        assert!(detected.registered_apps.iter().any(|app| {
+            app.app_id == "tinode"
+                && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                && app.principal_id.as_deref() == Some("default")
+        }));
+        let create_action = fs::read_to_string(
+            mount_root
+                .join("_appfs")
+                .join("principals")
+                .join("create_principal.act"),
+        )
+        .expect("read create principal action");
+        assert!(create_action.contains(r#""principal_id":"default""#));
+    }
+
+    #[test]
+    fn detect_appfs_environment_waits_for_pending_default_principal_action() {
+        let temp = TempDirGuard::new("appfs-auto-default-principal-pending");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        let create_action_path = mount_root
+            .join("_appfs")
+            .join("principals")
+            .join("create_principal.act");
+        fs::create_dir_all(create_action_path.parent().expect("action path parent"))
+            .expect("create principals control dir");
+        fs::write(
+            &create_action_path,
+            r#"{"principal_id":"default","display_name":"Default agent"}"#,
+        )
+        .expect("write pending create principal action");
+        let supervisor = spawn_default_principal_supervisor_stub(&mount_root);
+
+        let detected =
+            detect_appfs_environment(&mount_root).expect("expected appfs environment to be found");
+        supervisor.join().expect("supervisor stub should finish");
+
+        assert!(detected
+            .registered_apps
+            .iter()
+            .any(|app| app.instance_id == "tinode--default"));
+        let create_action =
+            fs::read_to_string(create_action_path).expect("read create principal action");
+        assert_eq!(
+            create_action
+                .match_indices(r#""principal_id":"default""#)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn create_appfs_principal_waits_for_private_app_materialization() {
+        let temp = TempDirGuard::new("appfs-principal-create-waits");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        let supervisor = spawn_default_principal_supervisor_stub(&mount_root);
+
+        let outcome = create_appfs_principal(
+            &mount_root,
+            AppfsPrincipalCreateRequest {
+                principal_id: "default".to_string(),
+                display_name: Some("Default agent".to_string()),
+                description: Some("The default project agent.".to_string()),
+                kind: Some("agent".to_string()),
+            },
+        )
+        .expect("create default principal");
+        supervisor.join().expect("supervisor stub should finish");
+
+        assert_eq!(outcome.status, AppfsPrincipalCreateStatus::Created);
+        assert!(outcome.visible_private_apps.iter().any(|app| {
+            app.instance_id == "tinode--default"
+                && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                && app.principal_id.as_deref() == Some("default")
+        }));
+    }
+
+    #[test]
     fn heuristic_attach_falls_back_when_manifest_is_missing() {
         let temp = TempDirGuard::new("appfs-heuristic");
         let mount_root = temp.path().join("mnt");
@@ -1605,6 +2302,54 @@ mod tests {
         assert!(detected.runtime_session_id.is_none());
         assert!(detected.attach_id.starts_with("attach-"));
         assert_eq!(detected.current_app_id.as_deref(), Some("aiim"));
+    }
+
+    #[test]
+    fn principal_id_filters_private_apps_and_detects_nested_current_app() {
+        let temp = TempDirGuard::new("appfs-private-principal");
+        let mount_root = temp.path().join("mnt");
+        let cwd = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("workspace");
+        seed_private_principal_mount(&mount_root);
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let detected = resolve_appfs_environment_with_attach_env(
+            &cwd,
+            AppfsAttachEnv {
+                schema: Some("1".to_string()),
+                manifest_path: None,
+                mount_root: Some(mount_root.clone()),
+                runtime_session_id: Some("rt-private-01".to_string()),
+                attach_id: Some("agent-default".to_string()),
+                principal_id: Some("default".to_string()),
+                attach_role: Some("planner".to_string()),
+            },
+        )
+        .expect("expected appfs environment to be found");
+
+        assert_eq!(detected.principal_id, "default");
+        assert_eq!(detected.current_app_id.as_deref(), Some("tinode"));
+        let expected_app_root = mount_root.join("private").join("default").join("tinode");
+        assert_eq!(
+            detected.current_app_root.as_deref(),
+            Some(expected_app_root.as_path())
+        );
+        let visible_instances = detected
+            .registered_apps
+            .iter()
+            .map(|app| app.instance_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_instances, vec!["aiim", "tinode--default"]);
+        assert_eq!(detected.known_principals.len(), 2);
+
+        let prompt = build_appfs_prompt_section(&cwd).expect("expected prompt");
+        assert!(prompt.contains("Current AppFS principal id: `default`"));
+        assert!(prompt.contains("Known AppFS principals"));
+        assert!(prompt.contains("private/default/..."));
+        assert!(!prompt.contains("tinode--incident-reporter"));
     }
 
     #[test]
@@ -1667,9 +2412,9 @@ mod tests {
         assert!(prompt.contains(
             "You are inside an AppFS mount, but not currently inside a specific app root."
         ));
-        assert!(
-            prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`.")
-        );
+        assert!(prompt.contains(
+            "Mounted apps currently detected under this root: `aiim` at `aiim` (public), `notion` at `notion` (public)."
+        ));
         assert!(prompt.contains("Use the skill listing to load the matching `appfs-<app>` skill"));
         assert!(!prompt.contains("## Mounted apps"));
         assert!(!prompt.contains("`aiim` -> skill `appfs-aiim`"));
@@ -1802,6 +2547,91 @@ mod tests {
 
         sync_appfs_event_reminders(&mut session, &mount_root).expect("empty sync should succeed");
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn sync_appfs_event_reminders_filters_private_streams_by_principal() {
+        let temp = TempDirGuard::new("appfs-event-private-principal");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+
+        let write_cursor = |stream_dir: &Path, max_seq: i64| {
+            fs::write(
+                stream_dir.join("cursor.res.json"),
+                format!(r#"{{"min_seq":0,"max_seq":{max_seq},"retention_hint_sec":86400}}"#),
+            )
+            .expect("write stream cursor");
+        };
+
+        let default_stream = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream");
+        let incident_stream = mount_root
+            .join("private")
+            .join("incident-reporter")
+            .join("tinode")
+            .join("_stream");
+        fs::write(
+            default_stream.join("events.evt.jsonl"),
+            r#"{"seq":1,"app":"tinode","type":"action.completed","path":"/contacts/alice/send_message.act","request_id":"old-default"}"#,
+        )
+        .expect("write default baseline");
+        fs::write(
+            incident_stream.join("events.evt.jsonl"),
+            r#"{"seq":1,"app":"tinode","type":"action.completed","path":"/contacts/bob/send_message.act","request_id":"old-incident"}"#,
+        )
+        .expect("write incident baseline");
+        write_cursor(&default_stream, 1);
+        write_cursor(&incident_stream, 1);
+
+        let mut session = Session::new();
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("baseline should sync");
+        assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(1));
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--incident-reporter"),
+            None
+        );
+
+        fs::write(
+            default_stream.join("events.evt.jsonl"),
+            concat!(
+                r#"{"seq":1,"app":"tinode","type":"action.completed","path":"/contacts/alice/send_message.act","request_id":"old-default"}"#,
+                "\n",
+                r#"{"seq":2,"app":"tinode","type":"action.completed","path":"/contacts/alice/send_message.act","request_id":"new-default","content":{"ok":true,"message":"sent from default"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write default event");
+        fs::write(
+            incident_stream.join("events.evt.jsonl"),
+            concat!(
+                r#"{"seq":1,"app":"tinode","type":"action.completed","path":"/contacts/bob/send_message.act","request_id":"old-incident"}"#,
+                "\n",
+                r#"{"seq":2,"app":"tinode","type":"action.completed","path":"/contacts/bob/send_message.act","request_id":"new-incident","content":{"ok":true,"message":"sent from incident"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write incident event");
+        write_cursor(&default_stream, 2);
+        write_cursor(&incident_stream, 2);
+
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("new event should sync");
+
+        assert_eq!(session.messages.len(), 1);
+        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
+            panic!("expected text reminder");
+        };
+        assert!(text.contains("sent from default"));
+        assert!(text.contains("principal `default`"));
+        assert!(!text.contains("sent from incident"));
+        assert!(!text.contains("incident-reporter"));
+        assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(2));
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--incident-reporter"),
+            None
+        );
     }
 
     #[test]
