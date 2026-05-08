@@ -2130,6 +2130,98 @@ mod supervisor_tests {
     }
 
     #[test]
+    fn runtime_supervisor_can_create_update_and_delete_principal() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+
+        let create_action = temp.path().join("_appfs/principals/create_principal.act");
+        assert!(create_action.exists());
+        append_text(
+            &create_action,
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"description\":\"The default project agent.\",\"kind\":\"agent\",\"client_token\":\"principal-create-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll create principal");
+
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert_eq!(registry.default_principal_id, "default");
+        assert_eq!(registry.principals.len(), 1);
+        assert_eq!(registry.principals[0].principal_id, "default");
+        assert_eq!(registry.principals[0].display_name, "Default agent");
+        let view_path = temp.path().join("_appfs/principals/default.res.json");
+        assert!(view_path.exists());
+        let view: registry::PrincipalRecord =
+            serde_json::from_slice(&fs::read(&view_path).expect("read principal view"))
+                .expect("parse principal view");
+        assert_eq!(view, registry.principals[0]);
+
+        let events = control_events(&temp, "principal-create-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.created")
+        );
+
+        append_text(
+            &create_action,
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"client_token\":\"principal-create-002\"}\n",
+        );
+        supervisor
+            .poll_once()
+            .expect("poll duplicate create principal");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert_eq!(registry.principals.len(), 1);
+        let events = control_events(&temp, "principal-create-002");
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.exists")
+        );
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/update_principal.act"),
+            "{\"principal_id\":\"default\",\"display_name\":\"Default project agent\",\"client_token\":\"principal-update-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll update principal");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert_eq!(registry.principals[0].display_name, "Default project agent");
+
+        append_text(
+            &temp.path().join("_appfs/principals/delete_principal.act"),
+            "{\"principal_id\":\"default\",\"client_token\":\"principal-delete-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll delete principal");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert!(registry.principals.is_empty());
+        assert!(!view_path.exists());
+        let events = control_events(&temp, "principal-delete-001");
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.deleted")
+        );
+    }
+
+    #[test]
     fn supervisor_can_list_and_unregister_apps_without_deleting_tree() {
         let temp = TempDir::new().expect("tempdir");
         let runtime_args = build_runtime_cli_args(

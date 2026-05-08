@@ -132,6 +132,21 @@ impl AppfsRuntimeSupervisor {
                 request_id,
                 client_token,
             } => self.handle_list_apps(&request_id, client_token),
+            supervisor_control::SupervisorControlInvocation::CreatePrincipal {
+                request_id,
+                client_token,
+                request,
+            } => self.handle_create_principal(&request_id, client_token, request),
+            supervisor_control::SupervisorControlInvocation::UpdatePrincipal {
+                request_id,
+                client_token,
+                request,
+            } => self.handle_update_principal(&request_id, client_token, request),
+            supervisor_control::SupervisorControlInvocation::DeletePrincipal {
+                request_id,
+                client_token,
+                request,
+            } => self.handle_delete_principal(&request_id, client_token, request),
         }
     }
 
@@ -249,5 +264,152 @@ impl AppfsRuntimeSupervisor {
             client_token,
         )?;
         Ok(())
+    }
+
+    fn handle_create_principal(
+        &mut self,
+        request_id: &str,
+        client_token: Option<String>,
+        request: action_dispatcher::CreatePrincipalRequest,
+    ) -> Result<()> {
+        let mut doc = self.load_principal_registry()?;
+        if let Some(existing) = doc
+            .principals
+            .iter()
+            .find(|principal| principal.principal_id == request.principal_id)
+            .cloned()
+        {
+            registry::write_principal_record_view(&self.root, &existing)?;
+            self.control_plane.emit_completed(
+                "/_appfs/principals/create_principal.act",
+                request_id,
+                serde_json::json!({
+                    "principal_event": "principal.exists",
+                    "principal_id": existing.principal_id,
+                    "created": false,
+                    "exists": true,
+                }),
+                client_token,
+            )?;
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = registry::PrincipalRecord {
+            principal_id: request.principal_id,
+            display_name: request.display_name,
+            description: request.description,
+            kind: request.kind,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        doc.principals.push(record.clone());
+        registry::write_principal_registry(&self.root, &doc)?;
+        registry::write_principal_record_view(&self.root, &record)?;
+        self.control_plane.emit_completed(
+            "/_appfs/principals/create_principal.act",
+            request_id,
+            serde_json::json!({
+                "principal_event": "principal.created",
+                "principal_id": record.principal_id,
+                "created": true,
+            }),
+            client_token,
+        )?;
+        Ok(())
+    }
+
+    fn handle_update_principal(
+        &mut self,
+        request_id: &str,
+        client_token: Option<String>,
+        request: action_dispatcher::UpdatePrincipalRequest,
+    ) -> Result<()> {
+        let mut doc = self.load_principal_registry()?;
+        let Some(record) = doc
+            .principals
+            .iter_mut()
+            .find(|principal| principal.principal_id == request.principal_id)
+        else {
+            self.control_plane.emit_failed(
+                "/_appfs/principals/update_principal.act",
+                request_id,
+                "PRINCIPAL_NOT_FOUND",
+                &format!("principal {} is not registered", request.principal_id),
+                client_token,
+            )?;
+            return Ok(());
+        };
+
+        if let Some(display_name) = request.display_name {
+            record.display_name = display_name;
+        }
+        if let Some(description) = request.description {
+            record.description = Some(description);
+        }
+        if let Some(kind) = request.kind {
+            record.kind = kind;
+        }
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        let updated = record.clone();
+        registry::write_principal_registry(&self.root, &doc)?;
+        registry::write_principal_record_view(&self.root, &updated)?;
+        self.control_plane.emit_completed(
+            "/_appfs/principals/update_principal.act",
+            request_id,
+            serde_json::json!({
+                "principal_event": "principal.updated",
+                "principal_id": updated.principal_id,
+                "updated": true,
+            }),
+            client_token,
+        )?;
+        Ok(())
+    }
+
+    fn handle_delete_principal(
+        &mut self,
+        request_id: &str,
+        client_token: Option<String>,
+        request: action_dispatcher::DeletePrincipalRequest,
+    ) -> Result<()> {
+        let mut doc = self.load_principal_registry()?;
+        let before = doc.principals.len();
+        doc.principals
+            .retain(|principal| principal.principal_id != request.principal_id);
+        if doc.principals.len() == before {
+            self.control_plane.emit_failed(
+                "/_appfs/principals/delete_principal.act",
+                request_id,
+                "PRINCIPAL_NOT_FOUND",
+                &format!("principal {} is not registered", request.principal_id),
+                client_token,
+            )?;
+            return Ok(());
+        }
+        registry::write_principal_registry(&self.root, &doc)?;
+        registry::delete_principal_record_view(&self.root, &request.principal_id)?;
+        self.control_plane.emit_completed(
+            "/_appfs/principals/delete_principal.act",
+            request_id,
+            serde_json::json!({
+                "principal_event": "principal.deleted",
+                "principal_id": request.principal_id,
+                "deleted": true,
+                "credentials_cleanup": "not_implemented",
+            }),
+            client_token,
+        )?;
+        Ok(())
+    }
+
+    fn load_principal_registry(&self) -> Result<registry::PrincipalRegistryDoc> {
+        Ok(registry::read_principal_registry(&self.root)?.unwrap_or(
+            registry::PrincipalRegistryDoc {
+                version: registry::APPFS_REGISTRY_VERSION,
+                default_principal_id: registry::APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
+                principals: Vec::new(),
+            },
+        ))
     }
 }

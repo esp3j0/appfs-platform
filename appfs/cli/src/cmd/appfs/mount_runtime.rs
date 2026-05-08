@@ -1940,6 +1940,9 @@ mod tests {
     fn only_safe_action_paths_trigger_wake() {
         assert!(action_wake_is_relevant_path("_appfs/register_app.act"));
         assert!(action_wake_is_relevant_path(
+            "_appfs/principals/create_principal.act"
+        ));
+        assert!(action_wake_is_relevant_path(
             "contacts/zhangsan/send_message.act"
         ));
         assert!(!action_wake_is_relevant_path("workspace/notes.txt"));
