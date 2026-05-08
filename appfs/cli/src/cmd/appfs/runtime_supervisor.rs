@@ -2,7 +2,8 @@ use super::action_dispatcher;
 use super::registry;
 use super::registry_manager::{self, RegistryRuntimeSnapshot};
 use super::runtime_entry::{
-    build_runtime_entry, read_active_scope, transport_summary, AppRuntimeEntry,
+    build_runtime_entry, build_runtime_entry_with_metadata, read_active_scope, transport_summary,
+    AppRuntimeEntry, AppRuntimeRegistryMetadata,
 };
 use super::runtime_manifest;
 use super::supervisor_control;
@@ -108,6 +109,7 @@ impl AppfsRuntimeSupervisor {
             .map(|entry| RegistryRuntimeSnapshot {
                 runtime: entry.runtime.clone(),
                 app_dir: entry.adapter.app_dir.clone(),
+                metadata: entry.registry_metadata.clone(),
             })
             .collect::<Vec<_>>();
         registry_manager::persist_runtime_registry(&self.root, &snapshots, existing)
@@ -306,6 +308,7 @@ impl AppfsRuntimeSupervisor {
         doc.principals.push(record.clone());
         registry::write_principal_registry(&self.root, &doc)?;
         registry::write_principal_record_view(&self.root, &record)?;
+        let materialized = self.materialize_private_apps_for_principal(&record)?;
         self.control_plane.emit_completed(
             "/_appfs/principals/create_principal.act",
             request_id,
@@ -313,6 +316,7 @@ impl AppfsRuntimeSupervisor {
                 "principal_event": "principal.created",
                 "principal_id": record.principal_id,
                 "created": true,
+                "app_instances": materialized,
             }),
             client_token,
         )?;
@@ -412,4 +416,64 @@ impl AppfsRuntimeSupervisor {
             },
         ))
     }
+
+    fn materialize_private_apps_for_principal(
+        &mut self,
+        principal: &registry::PrincipalRecord,
+    ) -> Result<Vec<serde_json::Value>> {
+        let Some(policy_doc) = registry::read_app_policy_registry(&self.root)? else {
+            return Ok(Vec::new());
+        };
+        let mut materialized = Vec::new();
+        for policy in policy_doc
+            .apps
+            .iter()
+            .filter(|policy| policy.visibility == registry::AppfsAppPolicyVisibility::Private)
+        {
+            let instance_id = format!("{}--{}", policy.app_id, principal.principal_id);
+            if self.runtimes.contains_key(&instance_id) {
+                continue;
+            }
+            let path_template = policy.path_template.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("private app policy {} missing path_template", policy.app_id)
+            })?;
+            let path = render_principal_template(path_template, &principal.principal_id);
+            let profile_id = policy
+                .profile_template
+                .as_deref()
+                .map(|template| render_principal_template(template, &principal.principal_id))
+                .unwrap_or_else(|| format!("{}:{}", policy.app_id, principal.principal_id));
+            let runtime = ResolvedAppfsRuntimeCliArgs {
+                app_id: policy.app_id.clone(),
+                session_id: super::normalize_appfs_session_id(None),
+                bridge: registry::bridge_args_from_transport_doc(&policy.transport),
+            };
+            let metadata = AppRuntimeRegistryMetadata {
+                instance_id: instance_id.clone(),
+                visibility: registry::AppfsRegisteredAppVisibility::PrivateInstance,
+                parent_app_id: Some(policy.app_id.clone()),
+                principal_id: Some(principal.principal_id.clone()),
+                profile_id: Some(profile_id.clone()),
+                path: path.clone(),
+            };
+            let mut entry = build_runtime_entry_with_metadata(&self.root, runtime, metadata, None)?;
+            entry.adapter.prepare_action_sinks()?;
+            self.runtimes.insert(instance_id.clone(), entry);
+            materialized.push(serde_json::json!({
+                "instance_id": instance_id,
+                "app_id": policy.app_id,
+                "principal_id": principal.principal_id,
+                "profile_id": profile_id,
+                "path": path,
+            }));
+        }
+        if !materialized.is_empty() {
+            self.sync_registry_to_disk(None)?;
+        }
+        Ok(materialized)
+    }
+}
+
+fn render_principal_template(template: &str, principal_id: &str) -> String {
+    template.replace("{principal_id}", principal_id)
 }

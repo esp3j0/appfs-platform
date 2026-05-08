@@ -56,6 +56,7 @@ pub(crate) struct AppfsAppPolicyRecord {
     pub(crate) app_id: String,
     pub(crate) visibility: AppfsAppPolicyVisibility,
     pub(crate) connector: String,
+    pub(crate) transport: AppfsRegistryTransportDoc,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +165,23 @@ pub(crate) fn read_principal_registry(root: &Path) -> Result<Option<PrincipalReg
     Ok(Some(doc))
 }
 
+pub(crate) fn read_app_policy_registry(root: &Path) -> Result<Option<AppfsAppPolicyRegistryDoc>> {
+    let path = app_policy_registry_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| {
+        format!(
+            "failed to read AppFS app policy registry {}",
+            path.display()
+        )
+    })?;
+    let doc: AppfsAppPolicyRegistryDoc =
+        serde_json::from_slice(&bytes).context("failed to parse AppFS app policy registry JSON")?;
+    validate_app_policy_registry(&doc)?;
+    Ok(Some(doc))
+}
+
 pub(crate) fn write_principal_registry(root: &Path, doc: &PrincipalRegistryDoc) -> Result<()> {
     validate_principal_registry(doc)?;
     let path = principal_registry_path(root);
@@ -223,6 +241,7 @@ fn write_pretty_json_file<T: Serialize>(path: &Path, doc: &T, label: &str) -> Re
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_app_registry_doc(
     runtime_args: &[ResolvedAppfsRuntimeCliArgs],
     active_scopes: &HashMap<String, Option<String>>,
@@ -276,7 +295,9 @@ pub(crate) fn runtime_args_from_registry(
         .collect())
 }
 
-fn transport_doc_from_bridge_args(args: &AppfsBridgeCliArgs) -> AppfsRegistryTransportDoc {
+pub(crate) fn transport_doc_from_bridge_args(
+    args: &AppfsBridgeCliArgs,
+) -> AppfsRegistryTransportDoc {
     let (kind, endpoint) = if let Some(endpoint) = args.adapter_http_endpoint.clone() {
         (AppfsRegistryTransportKind::Http, Some(endpoint))
     } else if let Some(endpoint) = args.adapter_grpc_endpoint.clone() {
@@ -297,7 +318,9 @@ fn transport_doc_from_bridge_args(args: &AppfsBridgeCliArgs) -> AppfsRegistryTra
     }
 }
 
-fn bridge_args_from_transport_doc(doc: &AppfsRegistryTransportDoc) -> AppfsBridgeCliArgs {
+pub(crate) fn bridge_args_from_transport_doc(
+    doc: &AppfsRegistryTransportDoc,
+) -> AppfsBridgeCliArgs {
     let (adapter_http_endpoint, adapter_grpc_endpoint) = match doc.kind {
         AppfsRegistryTransportKind::InProcess => (None, None),
         AppfsRegistryTransportKind::Http => (doc.endpoint.clone(), None),

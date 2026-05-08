@@ -27,7 +27,7 @@ use super::shared::{
     MultilineRecoveryOutcome,
 };
 use super::tree_sync::{
-    ensure_app_structure_initialized, refresh_app_structure, refresh_app_structure_in_db,
+    ensure_app_structure_initialized_at, refresh_app_structure, refresh_app_structure_in_db,
 };
 use super::{
     ActionCursorDoc, ActionCursorState, ActionSpec, AppRuntimeStartupBootstrap, AppfsAdapter,
@@ -275,6 +275,7 @@ impl AppConnector for LegacyAdapterConnector {
 }
 
 impl AppfsAdapter {
+    #[allow(dead_code)]
     pub(super) fn new(
         root: PathBuf,
         app_id: String,
@@ -284,6 +285,7 @@ impl AppfsAdapter {
         Self::new_with_bootstrap(root, app_id, session_id, bridge_config, None)
     }
 
+    #[allow(dead_code)]
     pub(super) fn new_with_bootstrap(
         root: PathBuf,
         app_id: String,
@@ -291,10 +293,34 @@ impl AppfsAdapter {
         bridge_config: AppfsBridgeConfig,
         startup_bootstrap: Option<AppRuntimeStartupBootstrap>,
     ) -> Result<Self> {
+        Self::new_with_mount_path(
+            root,
+            app_id.clone(),
+            app_id,
+            session_id,
+            bridge_config,
+            startup_bootstrap,
+        )
+    }
+
+    pub(super) fn new_with_mount_path(
+        root: PathBuf,
+        app_id: String,
+        app_mount_path: String,
+        session_id: String,
+        bridge_config: AppfsBridgeConfig,
+        startup_bootstrap: Option<AppRuntimeStartupBootstrap>,
+    ) -> Result<Self> {
         if startup_bootstrap.is_none() {
-            ensure_app_structure_initialized(&root, &app_id, &session_id, &bridge_config)?;
+            ensure_app_structure_initialized_at(
+                &root,
+                &app_id,
+                &app_mount_path,
+                &session_id,
+                &bridge_config,
+            )?;
         }
-        let app_dir = root.join(&app_id);
+        let app_dir = root.join(&app_mount_path);
         let manifest_path = app_dir.join("_meta").join("manifest.res.json");
         let events_path = app_dir.join("_stream").join("events.evt.jsonl");
         let cursor_path = app_dir.join("_stream").join("cursor.res.json");

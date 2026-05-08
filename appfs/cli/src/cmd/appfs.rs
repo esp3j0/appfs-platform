@@ -1211,7 +1211,10 @@ pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> R
         &resolved_apps,
     )
     .await?;
-    for resolved_app in resolved_apps.values() {
+    for resolved_app in resolved_apps
+        .values()
+        .filter(|app| app.visibility == compose::schema::AppfsComposeAppVisibility::Public)
+    {
         let session_id = normalize_appfs_session_id(resolved_app.session_id.clone());
         let bridge_config =
             build_appfs_bridge_config(bridge_args_from_resolved_compose_app(resolved_app));
@@ -1223,8 +1226,9 @@ pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> R
         )
         .await?;
     }
-    let startup_app_ids = resolved_apps
-        .values()
+    let startup_app_ids = registry_doc
+        .apps
+        .iter()
         .map(|app| app.app_id.clone())
         .collect::<Vec<_>>();
     let startup_plan = build_managed_runtime_bootstrap_plan(&agent, &startup_app_ids).await?;
@@ -2218,6 +2222,83 @@ mod supervisor_tests {
                 .and_then(|value| value.get("principal_event"))
                 .and_then(|value| value.as_str()),
             Some("principal.deleted")
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_materializes_private_apps_for_created_principal() {
+        let temp = TempDir::new().expect("tempdir");
+        registry::write_app_policy_registry(
+            temp.path(),
+            &registry::AppfsAppPolicyRegistryDoc {
+                version: registry::APPFS_REGISTRY_VERSION,
+                apps: vec![registry::AppfsAppPolicyRecord {
+                    app_id: "tinode".to_string(),
+                    visibility: registry::AppfsAppPolicyVisibility::Private,
+                    connector: "tinode-in-process".to_string(),
+                    transport: registry::AppfsRegistryTransportDoc {
+                        kind: registry::AppfsRegistryTransportKind::InProcess,
+                        endpoint: None,
+                        http_timeout_ms: 5000,
+                        grpc_timeout_ms: 5000,
+                        bridge_max_retries: 2,
+                        bridge_initial_backoff_ms: 100,
+                        bridge_max_backoff_ms: 1000,
+                        bridge_circuit_breaker_failures: 5,
+                        bridge_circuit_breaker_cooldown_ms: 3000,
+                    },
+                    path: None,
+                    path_template: Some("private/{principal_id}/tinode".to_string()),
+                    profile_template: Some("tinode:{principal_id}".to_string()),
+                    credential_policy: Some("auto-create".to_string()),
+                }],
+            },
+        )
+        .expect("write policy registry");
+
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/create_principal.act"),
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"kind\":\"agent\",\"client_token\":\"principal-private-001\"}\n",
+        );
+
+        supervisor.poll_once().expect("poll create principal");
+
+        assert!(supervisor.runtimes.contains_key("tinode--default"));
+        assert!(temp.path().join("private/default/tinode").exists());
+        assert!(temp
+            .path()
+            .join("private/default/tinode/_meta/manifest.res.json")
+            .exists());
+
+        let stored = registry::read_app_registry(temp.path())
+            .expect("read app registry")
+            .expect("app registry exists");
+        assert_eq!(stored.apps.len(), 1);
+        assert_eq!(stored.apps[0].instance_id, "tinode--default");
+        assert_eq!(stored.apps[0].app_id, "tinode");
+        assert_eq!(
+            stored.apps[0].visibility,
+            registry::AppfsRegisteredAppVisibility::PrivateInstance
+        );
+        assert_eq!(stored.apps[0].principal_id.as_deref(), Some("default"));
+        assert_eq!(stored.apps[0].profile_id.as_deref(), Some("tinode:default"));
+        assert_eq!(stored.apps[0].path, "private/default/tinode");
+
+        let events = control_events(&temp, "principal-private-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("app_instances"))
+                .and_then(|value| value.as_array())
+                .map(|instances| instances.len()),
+            Some(1)
         );
     }
 

@@ -69,6 +69,7 @@ pub(crate) fn build_app_policy_registry_doc_from_resolved_apps(
                     app_id: app.app_id.clone(),
                     visibility,
                     connector: app.connector_name.clone(),
+                    transport: registry_transport_from_resolved_app(app),
                     path: match app.visibility {
                         super::schema::AppfsComposeAppVisibility::Public => {
                             Some(app.path.clone().unwrap_or_else(|| app.app_id.clone()))

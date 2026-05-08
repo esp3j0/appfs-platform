@@ -34,25 +34,37 @@ pub(super) struct StructureSyncOutcome {
     pub(super) manifest_json: Option<String>,
 }
 
+#[allow(dead_code)]
 pub(super) fn ensure_app_structure_initialized(
     root: &Path,
     app_id: &str,
     session_id: &str,
     bridge_config: &AppfsBridgeConfig,
 ) -> Result<()> {
-    let app_dir = root.join(app_id);
+    ensure_app_structure_initialized_at(root, app_id, app_id, session_id, bridge_config)
+}
+
+pub(super) fn ensure_app_structure_initialized_at(
+    root: &Path,
+    app_id: &str,
+    app_mount_path: &str,
+    session_id: &str,
+    bridge_config: &AppfsBridgeConfig,
+) -> Result<()> {
+    let app_dir = root.join(app_mount_path);
     let manifest_path = app_dir.join("_meta").join("manifest.res.json");
     let requires_bootstrap = !app_dir.exists() || !manifest_path.exists();
     if !requires_bootstrap {
-        bootstrap_runtime_scaffolding(root, app_id)?;
+        bootstrap_runtime_scaffolding(root, app_mount_path)?;
         return Ok(());
     }
 
     let mut connector = build_app_connector(app_id, bridge_config)?;
 
-    let mut service = AppTreeSyncService::new(
+    let mut service = AppTreeSyncService::new_with_mount_path(
         root.to_path_buf(),
         app_id.to_string(),
+        app_mount_path.to_string(),
         session_id.to_string(),
     );
     service.sync_initial(&mut *connector)?;
@@ -251,14 +263,25 @@ pub(super) fn refresh_app_structure(
 struct AppTreeSyncService {
     root: PathBuf,
     app_id: String,
+    app_mount_path: String,
     session_id: String,
 }
 
 impl AppTreeSyncService {
     fn new(root: PathBuf, app_id: String, session_id: String) -> Self {
+        Self::new_with_mount_path(root, app_id.clone(), app_id, session_id)
+    }
+
+    fn new_with_mount_path(
+        root: PathBuf,
+        app_id: String,
+        app_mount_path: String,
+        session_id: String,
+    ) -> Self {
         Self {
             root,
             app_id,
+            app_mount_path,
             session_id,
         }
     }
@@ -281,7 +304,7 @@ impl AppTreeSyncService {
 
         match response.result {
             AppStructureSyncResult::Unchanged { .. } => {
-                bootstrap_runtime_scaffolding(&self.root, &self.app_id)?;
+                bootstrap_runtime_scaffolding(&self.root, &self.app_mount_path)?;
                 eprintln!(
                     "[structure.sync] result app={} changed=false revision={} active_scope={}",
                     self.app_id,
@@ -391,7 +414,7 @@ impl AppTreeSyncService {
             active_scope: snapshot.active_scope,
             owned_paths: desired_owned_paths.into_iter().collect(),
         })?;
-        bootstrap_runtime_scaffolding(&self.root, &self.app_id)?;
+        bootstrap_runtime_scaffolding(&self.root, &self.app_mount_path)?;
         Ok(())
     }
 
@@ -597,7 +620,7 @@ impl AppTreeSyncService {
     }
 
     fn app_dir(&self) -> PathBuf {
-        self.root.join(&self.app_id)
+        self.root.join(&self.app_mount_path)
     }
 }
 
