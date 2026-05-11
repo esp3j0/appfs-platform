@@ -2,6 +2,10 @@
 
 > **For Codex:** implement this plan task-by-task. Do not skip the validation steps. If an implementation discovery changes the design, update the relevant design document in the same PR.
 
+**Implementation status:** the v0 foundation and Tinode vertical slice have landed on `main`. The implemented path covers principal/app-policy schema, principal control plane, private app auto-instantiation, connector principal/profile context, appfs-agent principal-aware skills/events, Tinode credential bootstrap, direct principal-to-principal messages, inbound inbox read-through, `/principal create`, `/principal fork`, and the Windows multi-agent Tinode smoke script.
+
+**Current smoke entrypoint:** `integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1` is the fastest way to validate the final cross-repo behavior. It starts AppFS compose, verifies `/private/default/tinode`, creates a second principal, checks appfs-agent views, ensures Tinode credentials, sends messages in both directions, and verifies receiver inbox read-through.
+
 **Goal:** Build the generic AppFS multi-agent identity and private-app visibility foundation, then add a real Tinode AppFS connector on top of it.
 
 **Architecture:** Implement the foundation in vertical slices. AppFS owns project-level principals, app policies, and app instance registries; appfs-agent owns the current process identity, model-visible prompt context, skill discovery, and event filtering; connectors own app-specific credential state keyed by `profile_id`. Tinode is introduced only after the generic identity and visibility layer can be tested without Tinode.

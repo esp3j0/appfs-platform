@@ -2,13 +2,26 @@
 
 ## Status
 
-Design is intentionally thin until the generic AppFS multi-agent identity layer is implemented.
+Implemented v0 vertical slice in `appfs-platform/main`.
 
 Tinode should be implemented as a new app/connector named `tinode`. The current `aiim` demo app should stay unchanged and continue serving as a stable integration-test fixture.
 
 Dependency:
 
 1. [AppFS Multi-Agent Identity And App Visibility v0 Design](./APPFS-multi-agent-identity-and-app-visibility-v0-design.md)
+
+Implemented scope:
+
+1. compose can declare `tinode` as a private app policy;
+2. AppFS materializes `/private/<principal-id>/tinode` per principal;
+3. `profile_id = tinode:<principal-id>` flows through `ConnectorContext`;
+4. Tinode credentials are stored in connector-private state, not AppFS files;
+5. credentials can be created through `_app/ensure_credentials.act` or lazily on first business action;
+6. direct principal-to-principal messages work through `contacts/send_message.act`;
+7. inbound/direct messages are exposed through `_stream/events.evt.jsonl` and `inbox/*.res.jsonl` read-through;
+8. appfs-agent lists `appfs-tinode` only for the current principal's private instance.
+
+Current v0 is a bridgeable agent-chat foundation, not a complete Tinode client.
 
 ## Goal
 

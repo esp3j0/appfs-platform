@@ -2,9 +2,20 @@
 
 ## Status
 
-Design proposal before implementing account-backed apps such as Tinode.
+Implemented v0 foundation as of the AppFS multi-agent Tinode merge into `appfs-platform/main`.
 
-This document is about the generic AppFS/appfs-agent identity, visibility, and app registration layer. It intentionally does not finalize the Tinode contact/message tree.
+This document describes the generic AppFS/appfs-agent identity, visibility, and app registration layer. It intentionally does not own the Tinode contact/message tree; Tinode paths are specified in [Tinode AppFS Tree v0 Design](./TINODE-APPFS-tree-v0-design.md).
+
+The implemented v0 behavior is:
+
+1. AppFS compose writes app policies and materialized public app instances.
+2. AppFS supervisor owns principal registry and private app auto-instantiation.
+3. `default` principal is created automatically when a private app policy exists.
+4. Private app instances are mounted under `/private/<principal-id>/<app-id>`.
+5. appfs-agent resolves `principal_id` from `APPFS_PRINCIPAL_ID` or `default`.
+6. appfs-agent filters generated skills and AppFS event reminders by current principal.
+7. `ConnectorContext` carries `principal_id` and `profile_id` to connectors.
+8. `/principal create` and `/principal fork` provide operator-facing workflows.
 
 ## Goals
 
@@ -25,35 +36,29 @@ This document is about the generic AppFS/appfs-agent identity, visibility, and a
 4. Do not claim strong OS security isolation between principals in v0.
 5. Do not replace current `aiim` tests while introducing `/public`.
 
-## Current Code Reality
+## Current Implementation Reality
 
-Current implemented pieces:
+Implemented pieces:
 
-1. `APPFS_ATTACH_ID` exists and is surfaced by appfs-agent status.
-2. `attach_id` may be explicit, but appfs-agent can also generate an ephemeral `attach-*`.
-3. `agentfs appfs launch` supports `--attach-id` and `--attach-role`.
-4. appfs-agent has `/session fork [branch-name]`, but this forks the session file, not a new AppFS principal or a new child process.
-5. appfs-agent tools include subagent/forked skill execution, but those workers are not yet wired to AppFS principal identity.
-6. Compose startup currently bootstraps `/_appfs/apps.registry.json` from declared apps.
-7. Runtime `register_app.act` can dynamically add an app instance, but callers must provide transport details.
-8. appfs-agent currently loads registered apps as `{ app_id, active_scope }` only.
-9. appfs-agent event reminder sync currently considers registered app event streams without principal-aware filtering.
-10. `ConnectorContext` currently carries app/request/session metadata, but not `principal_id` or `profile_id`.
-11. `SubmitActionRequest` currently carries the app-relative action path and payload.
-12. Connector error code `AUTH_EXPIRED` exists, but the credential lifecycle is not yet specified.
+1. `APPFS_ATTACH_ID` remains process-scoped and is surfaced by appfs-agent status.
+2. `APPFS_PRINCIPAL_ID` selects the stable app-side identity for the current appfs-agent process.
+3. Missing `APPFS_PRINCIPAL_ID` resolves to `default`.
+4. AppFS persists `/_appfs/principals.registry.json` and derived `/_appfs/principals/<principal-id>.res.json` views.
+5. AppFS compose persists `/_appfs/app-policies.registry.json`.
+6. AppFS compose materializes public apps into `/_appfs/apps.registry.json`.
+7. AppFS supervisor creates `default` automatically when at least one private policy exists.
+8. AppFS supervisor materializes private instances such as `tinode--default` from policy templates.
+9. appfs-agent generated skill listing includes public apps and only the current principal's private apps.
+10. appfs-agent AppFS event reminder sync includes platform events and only the current principal's private app event streams.
+11. `ConnectorContext` includes `principal_id` and `profile_id`; action payloads do not get to override those authoritative values.
+12. `/principal list`, `/principal create <id> [description]`, and `/principal fork <id> [task]` are available in appfs-agent.
 
-Missing pieces for this design:
+Still intentionally limited in v0:
 
-1. `APPFS_PRINCIPAL_ID`.
-2. principal registry.
-3. principal-aware system prompt and post-compaction identity context.
-4. `/public` and `/private/<principal-id>` namespace.
-5. app policy registry.
-6. private app auto-instantiation.
-7. principal management supervisor handlers.
-8. principal-aware fork/spawn integration.
-9. principal-aware event filtering.
-10. profile-aware connector context and credential lifecycle.
+1. Principal visibility is cooperative/prompt/tool policy, not OS-level access control.
+2. `/principal fork` creates a principal and a forked session file, then prints a launch command; it does not yet spawn a live child process by itself.
+3. `/session fork` remains same-principal conversation branching.
+4. `register_app.act` remains available, but private app instances should normally come from compose app policies plus principals.
 
 ## Identity Model
 
@@ -425,6 +430,88 @@ Use a filesystem-safe `instance_id`. Avoid using `:` in instance ids or path seg
 
 It should not be the normal path for daily private app instantiation. Private app instances should usually be derived from compose/app policies when a principal is created.
 
+## Operator Usage v0
+
+### Start A Compose Runtime With Private Apps
+
+Use compose to declare private app policies. Example:
+
+```yaml
+apps:
+  tinode:
+    connector: tinode-in-process
+    visibility: private
+    path_template: private/{principal_id}/tinode
+    profile_template: tinode:{principal_id}
+    credential_policy: auto-create
+```
+
+Start AppFS:
+
+```powershell
+cargo run --manifest-path appfs\cli\Cargo.toml --target-dir C:\tmp\appfs-local-target -- appfs compose up -f appfs\appfs-compose.aiim-tinode.local.yaml
+```
+
+When the runtime sees a private policy, it ensures the `default` principal exists and materializes:
+
+```text
+/private/default/tinode
+/_appfs/principals.registry.json
+/_appfs/apps.registry.json      # includes tinode--default
+```
+
+This can happen before any appfs-agent process starts. The principal registry is project state owned by AppFS, not a side effect of one agent process.
+
+### Run appfs-agent As A Principal
+
+Default identity:
+
+```powershell
+claw status
+```
+
+Explicit identity:
+
+```powershell
+$env:APPFS_PRINCIPAL_ID = "code-implementer"
+claw status
+claw --output-format json skills
+```
+
+Expected behavior:
+
+1. `/status` reports `Principal id      <principal-id>`.
+2. skills include public apps and private apps for that principal only.
+3. generated AppFS skills for another principal's private app do not appear.
+
+### Manage Principals From appfs-agent
+
+List project principals:
+
+```text
+/principal list
+```
+
+Create a principal and wait for private app materialization:
+
+```text
+/principal create code-implementer Implements code changes delegated by default.
+```
+
+Fork a principal-aware session:
+
+```text
+/principal fork code-implementer Implement the details from our current plan.
+```
+
+`/principal fork` creates or reuses the target principal, forks the current session file, clears stale AppFS app skill/event state from the child session, writes a bootstrap message explaining the parent/child principal split, and prints a launch command similar to:
+
+```powershell
+$env:APPFS_PRINCIPAL_ID="code-implementer"; claw --session <child-session-file>
+```
+
+Use `/session fork` instead when you want a same-principal branch of the conversation.
+
 ## Principal Registry
 
 ### No Global Current Identity File
@@ -517,12 +604,13 @@ There should be several ways to create or select a `principal_id`.
 
 ### Method 1. Automatic Default Principal
 
-When no principal exists:
+Implemented v0 behavior: when AppFS compose has at least one private app policy, the supervisor prepares `default` during mount startup, before any appfs-agent process has to run.
 
-1. create `default`;
+1. ensure `default` exists in `principals.registry.json`;
 2. set display name to `Default agent`;
 3. set description to `The default project agent`;
-4. launch current appfs-agent as `default`.
+4. materialize private app instances such as `/private/default/tinode`;
+5. let appfs-agent use `APPFS_PRINCIPAL_ID` when set, otherwise fallback to `default`.
 
 This covers normal single-agent usage.
 
@@ -587,7 +675,7 @@ Create semantics should be idempotent when the existing principal has the same d
 
 ### Method 4. appfs-agent Tool-Driven Principal Fork
 
-Add or adapt an appfs-agent tool/command that lets the current agent create a semantic child principal.
+appfs-agent exposes `/principal fork`, which lets the current agent create or reuse a semantic child principal and fork the current session for that child.
 
 Example user intent:
 
@@ -595,15 +683,17 @@ Example user intent:
 创建一个 agent 专门负责事故通知
 ```
 
-Expected model/tool behavior:
+Current command behavior:
 
 1. choose semantic `principal_id`, such as `incident-notifier`;
 2. write `/_appfs/principals/create_principal.act` or call a dedicated tool that does the same;
-3. fork or compact the current conversation if needed;
-4. start or schedule a child agent with `APPFS_PRINCIPAL_ID=incident-notifier`;
-5. give the child a task-specific system/user prompt.
+3. wait for the principal's private apps to be materialized;
+4. fork the current session file;
+5. clear stale AppFS app skill/event state from the child session;
+6. write a bootstrap message that tells the child its principal and task;
+7. print a launch command using `APPFS_PRINCIPAL_ID=<principal-id>` and `claw --session <child-session-file>`.
 
-Method 4 should build on Method 3. The tool-driven principal fork should create the principal through the same `create_principal.act` path before starting a child process, so registry state and process lifecycle use one consistent control-plane entry.
+Method 4 builds on Method 3. The principal fork creates the principal through the same `create_principal.act` path so registry state and private app materialization use one consistent control-plane entry. In v0 it does not spawn the child process by itself; the operator or a future launcher runs the printed command explicitly.
 
 ### Method 5. Manual Admin Creation
 
@@ -681,11 +771,11 @@ Examples:
 3. `code-reviewer`
 4. `research-assistant`
 
-Current code note:
+Current implementation note:
 
-1. `/session fork` already copies session state and lineage, but it does not create a new process or principal.
-2. subagent tools can spawn background work, but they do not yet attach a new AppFS principal.
-3. principal-aware fork should be new integration work on top of these existing primitives.
+1. `/session fork` copies session state and lineage under the same process identity.
+2. `/principal fork` creates/reuses a new principal, forks the session, writes a bootstrap message, and prints the child launch command.
+3. subagent tools remain same-principal work delegation unless they explicitly opt into principal-aware launch later.
 
 ## System Prompt Requirements
 
@@ -1132,11 +1222,11 @@ Longer term:
 ### P5. Add Principal-Aware Fork/Spawn
 
 1. Keep work forks as same-principal delegation.
-2. Build principal forks on existing `/session fork` and subagent spawn primitives.
-3. Create the principal through `create_principal.act` before starting the child process.
-4. Optionally compact inherited context.
-5. Start child agent with `APPFS_PRINCIPAL_ID`.
-6. Let launcher/fork lifecycle update `last_seen_at` and `active_attach_count` as best-effort runtime status.
+2. Build principal forks on existing session fork primitives.
+3. Create the principal through `create_principal.act`.
+4. Fork the session and write a bootstrap message for the child.
+5. Print a launch command that starts the child with `APPFS_PRINCIPAL_ID` and `claw --session`.
+6. Defer automatic child process spawning, compaction, and lifecycle counters to a later launcher-focused phase.
 
 ### P6. Add Private Account-Backed Apps
 
