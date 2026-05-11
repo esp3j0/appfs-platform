@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
-use crate::appfs::sync_appfs_event_reminders;
+use crate::appfs::collect_appfs_pending_inputs;
 use crate::compact::{
     build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
     select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
@@ -13,6 +13,10 @@ use crate::compact::{
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::input_router::{
+    render_pending_input_reminder, InputSource, PendingInput, PendingInputQueue,
+    SharedPendingInputQueue,
+};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -259,6 +263,9 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    pending_inputs: PendingInputQueue,
+    external_pending_inputs: Option<SharedPendingInputQueue>,
+    pending_appfs_event_cursor_updates: BTreeMap<String, i64>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -308,6 +315,9 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            pending_inputs: PendingInputQueue::default(),
+            external_pending_inputs: None,
+            pending_appfs_event_cursor_updates: BTreeMap::new(),
         }
     }
 
@@ -341,6 +351,21 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    #[must_use]
+    pub fn pending_input_count(&self) -> usize {
+        self.pending_inputs.len()
+    }
+
+    pub fn enqueue_pending_input(&mut self, input: PendingInput) {
+        self.pending_inputs.push(input);
+    }
+
+    #[must_use]
+    pub fn with_external_pending_inputs(mut self, queue: SharedPendingInputQueue) -> Self {
+        self.external_pending_inputs = Some(queue);
         self
     }
 
@@ -443,7 +468,7 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         self.record_turn_started(&user_input);
@@ -451,6 +476,22 @@ where
             .push_user_text(user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
+        self.run_model_tool_loop(prompter)
+    }
+
+    pub fn run_event_turn(
+        &mut self,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.record_turn_started("event-driven input");
+        self.run_model_tool_loop(prompter)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_model_tool_loop(
+        &mut self,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
@@ -467,7 +508,12 @@ where
                 return Err(error);
             }
 
-            if let Err(error) = self.sync_appfs_events_before_model_call() {
+            if let Err(error) = self.enqueue_appfs_events_before_model_call() {
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+
+            if let Err(error) = self.sync_pending_inputs_before_model_call() {
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
@@ -689,12 +735,94 @@ where
         Ok(summary)
     }
 
-    fn sync_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
+    fn enqueue_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
         let Ok(cwd) = env::current_dir() else {
             return Ok(());
         };
-        sync_appfs_event_reminders(&mut self.session, &cwd)
-            .map_err(|error| RuntimeError::new(format!("failed to sync AppFS events: {error}")))
+        let sync = collect_appfs_pending_inputs(&self.session, &cwd).map_err(|error| {
+            RuntimeError::new(format!("failed to collect AppFS events: {error}"))
+        })?;
+        if sync.pending_inputs.is_empty() {
+            if !sync.cursor_updates.is_empty() {
+                self.session
+                    .update_appfs_event_cursors(sync.cursor_updates)
+                    .map_err(|error| {
+                        RuntimeError::new(format!("failed to update AppFS event cursors: {error}"))
+                    })?;
+            }
+            return Ok(());
+        }
+        for pending_input in sync.pending_inputs {
+            self.pending_inputs.push(pending_input);
+        }
+        self.pending_appfs_event_cursor_updates
+            .extend(sync.cursor_updates);
+        Ok(())
+    }
+
+    fn sync_pending_inputs_before_model_call(&mut self) -> Result<(), RuntimeError> {
+        let local_pending_inputs = self.pending_inputs.drain_boundary_pending_inputs();
+        let external_pending_inputs = self
+            .external_pending_inputs
+            .as_ref()
+            .map(SharedPendingInputQueue::drain_boundary_pending_inputs)
+            .unwrap_or_default();
+        let mut pending_inputs =
+            Vec::with_capacity(local_pending_inputs.len() + external_pending_inputs.len());
+        pending_inputs.extend(local_pending_inputs.iter().cloned());
+        pending_inputs.extend(external_pending_inputs.iter().cloned());
+        pending_inputs
+            .sort_by_key(|input| Self::pending_input_source_priority(input.envelope.source));
+        if pending_inputs.is_empty() {
+            self.flush_pending_appfs_event_cursor_updates()?;
+            return Ok(());
+        }
+
+        let reminder = render_pending_input_reminder(&pending_inputs);
+        if let Err(error) = self
+            .session
+            .push_message(ConversationMessage::attachment_user_text(
+                reminder,
+                AttachmentKind::InputRouter,
+            ))
+        {
+            self.pending_inputs.restore_front(local_pending_inputs);
+            if let Some(queue) = &self.external_pending_inputs {
+                queue.restore_front(external_pending_inputs);
+            }
+            return Err(RuntimeError::new(format!(
+                "failed to sync pending routed inputs: {error}"
+            )));
+        }
+        self.flush_pending_appfs_event_cursor_updates()?;
+        Ok(())
+    }
+
+    fn flush_pending_appfs_event_cursor_updates(&mut self) -> Result<(), RuntimeError> {
+        if self.pending_appfs_event_cursor_updates.is_empty() {
+            return Ok(());
+        }
+        let cursor_updates = std::mem::take(&mut self.pending_appfs_event_cursor_updates);
+        if let Err(error) = self
+            .session
+            .update_appfs_event_cursors(cursor_updates.clone())
+        {
+            self.pending_appfs_event_cursor_updates = cursor_updates;
+            return Err(RuntimeError::new(format!(
+                "failed to update AppFS event cursors: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    fn pending_input_source_priority(source: InputSource) -> u8 {
+        match source {
+            InputSource::UserTerminal => 0,
+            InputSource::AppfsEvent => 1,
+            InputSource::AgentMessage => 2,
+            InputSource::System => 3,
+        }
     }
 
     pub fn compact(&mut self, config: CompactionConfig) -> Result<CompactionResult, RuntimeError> {
@@ -1112,13 +1240,16 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
+        assistant_text, build_assistant_message, parse_auto_compaction_threshold, ApiClient,
+        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
+        RuntimeError, StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::input_router::{
+        InputEnvelope, InputSource, PendingInput, PendingInputDelivery, SharedPendingInputQueue,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -1268,6 +1399,224 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn run_turn_injects_pending_inputs_before_model_call() {
+        #[derive(Clone)]
+        struct RecordingApiClient {
+            seen_request: Rc<RefCell<Option<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                *self.seen_request.borrow_mut() = Some(request);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ack".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let seen_request = Rc::new(RefCell::new(None));
+        let api_client = RecordingApiClient {
+            seen_request: seen_request.clone(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        runtime.enqueue_pending_input(PendingInput {
+            envelope: InputEnvelope::new(InputSource::UserTerminal, "user.guidance", "guide now"),
+            delivery: PendingInputDelivery::InjectAtNextBoundary,
+        });
+        runtime.enqueue_pending_input(PendingInput {
+            envelope: InputEnvelope::new(InputSource::System, "system.queued", "later"),
+            delivery: PendingInputDelivery::QueueAfterTurn,
+        });
+
+        let summary = runtime
+            .run_turn("main task", None)
+            .expect("turn should succeed");
+
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(runtime.pending_input_count(), 1);
+        let request = seen_request.borrow();
+        let request = request.as_ref().expect("request should be captured");
+        let user_index = request
+            .messages
+            .iter()
+            .position(|message| {
+                message.role == MessageRole::User
+                    && message.attachment_metadata.is_none()
+                    && assistant_text(message).is_some_and(|text| text.contains("main task"))
+            })
+            .expect("original user input should be present");
+        let pending_index = request
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .attachment_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.kind)
+                    == Some(AttachmentKind::InputRouter)
+            })
+            .expect("pending input attachment should be present");
+        assert!(user_index < pending_index);
+        let pending_text = assistant_text(&request.messages[pending_index])
+            .expect("pending input attachment should contain text");
+        assert!(pending_text.contains("[user_terminal]"));
+        assert!(pending_text.contains("type=user.guidance"));
+        assert!(pending_text.contains("guide now"));
+        assert!(!pending_text.contains("later"));
+    }
+
+    #[test]
+    fn run_turn_injects_external_pending_inputs_before_next_model_call() {
+        #[derive(Clone)]
+        struct RecordingApiClient {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let mut requests = self.requests.borrow_mut();
+                requests.push(request);
+                if requests.len() == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "enqueue_guidance".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("ack".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let api_client = RecordingApiClient {
+            requests: requests.clone(),
+        };
+        let external_queue = SharedPendingInputQueue::default();
+        let tool_queue = external_queue.clone();
+        let tool_executor = StaticToolExecutor::new().register("enqueue_guidance", move |_input| {
+            tool_queue.push(PendingInput {
+                envelope: InputEnvelope::new(
+                    InputSource::UserTerminal,
+                    "user.guidance",
+                    "guide from terminal",
+                ),
+                delivery: PendingInputDelivery::InjectAtNextBoundary,
+            });
+            Ok("queued".to_string())
+        });
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_external_pending_inputs(external_queue.clone());
+
+        let summary = runtime
+            .run_turn("main task", None)
+            .expect("turn should succeed");
+
+        assert_eq!(summary.iterations, 2);
+        assert!(external_queue.is_empty());
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        let second_request = &requests[1];
+        let pending_text = second_request
+            .messages
+            .iter()
+            .find_map(|message| {
+                (message
+                    .attachment_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.kind)
+                    == Some(AttachmentKind::InputRouter))
+                .then(|| assistant_text(message))
+                .flatten()
+            })
+            .expect("second request should include input-router attachment");
+        assert!(pending_text.contains("[user_terminal]"));
+        assert!(pending_text.contains("type=user.guidance"));
+        assert!(pending_text.contains("guide from terminal"));
+    }
+
+    #[test]
+    fn run_event_turn_does_not_append_synthetic_user_prompt() {
+        #[derive(Clone)]
+        struct RecordingApiClient {
+            seen_request: Rc<RefCell<Option<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                *self.seen_request.borrow_mut() = Some(request);
+                Ok(vec![
+                    AssistantEvent::TextDelta("received".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let seen_request = Rc::new(RefCell::new(None));
+        let api_client = RecordingApiClient {
+            seen_request: seen_request.clone(),
+        };
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::attachment_user_text(
+                "<system-reminder>\nmessage.received\n</system-reminder>",
+                AttachmentKind::InputRouter,
+            ))
+            .expect("append event reminder");
+        let mut runtime = ConversationRuntime::new(
+            session,
+            api_client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_event_turn(None)
+            .expect("event turn should succeed");
+
+        assert_eq!(summary.iterations, 1);
+        let request = seen_request.borrow();
+        let request = request.as_ref().expect("request should be captured");
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(
+            request.messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InputRouter)
+        );
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(
+            runtime.session().messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InputRouter)
+        );
+        assert_eq!(runtime.session().messages[1].role, MessageRole::Assistant);
     }
 
     #[test]

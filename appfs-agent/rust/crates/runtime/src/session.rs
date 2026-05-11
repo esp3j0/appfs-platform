@@ -56,6 +56,7 @@ pub enum AttachmentKind {
     SkillListing,
     InvokedSkills,
     AppfsEvents,
+    InputRouter,
     HookAdditionalContext,
 }
 
@@ -168,6 +169,7 @@ pub struct Session {
     pub prompt_history: Vec<SessionPromptEntry>,
     pub invoked_skills: Vec<InvokedSkill>,
     pub appfs_event_cursors: BTreeMap<String, i64>,
+    pub appfs_wake_event_cursors: BTreeMap<String, i64>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -184,6 +186,7 @@ impl PartialEq for Session {
             && self.prompt_history == other.prompt_history
             && self.invoked_skills == other.invoked_skills
             && self.appfs_event_cursors == other.appfs_event_cursors
+            && self.appfs_wake_event_cursors == other.appfs_wake_event_cursors
     }
 }
 
@@ -236,6 +239,7 @@ impl Session {
             prompt_history: Vec::new(),
             invoked_skills: Vec::new(),
             appfs_event_cursors: BTreeMap::new(),
+            appfs_wake_event_cursors: BTreeMap::new(),
             persistence: None,
         }
     }
@@ -393,6 +397,58 @@ impl Session {
     }
 
     #[must_use]
+    pub fn appfs_wake_event_cursor(&self, stream_id: &str) -> Option<i64> {
+        self.appfs_wake_event_cursors.get(stream_id).copied()
+    }
+
+    pub fn update_appfs_wake_event_cursors<I>(&mut self, updates: I) -> Result<(), SessionError>
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for (stream_id, seq) in &updates {
+            if stream_id.trim().is_empty() {
+                return Err(SessionError::Format(
+                    "appfs wake event cursor stream id cannot be empty".to_string(),
+                ));
+            }
+            if *seq < 0 {
+                return Err(SessionError::Format(format!(
+                    "appfs wake event cursor for {stream_id} cannot be negative"
+                )));
+            }
+        }
+        if updates.iter().all(|(stream_id, seq)| {
+            self.appfs_wake_event_cursors
+                .get(stream_id)
+                .is_some_and(|existing| existing == seq)
+        }) {
+            return Ok(());
+        }
+
+        let previous_updated_at_ms = self.updated_at_ms;
+        let previous_appfs_wake_event_cursors = self.appfs_wake_event_cursors.clone();
+        self.touch();
+        for (stream_id, seq) in updates {
+            self.appfs_wake_event_cursors.insert(stream_id, seq);
+        }
+
+        let persistence_path = self.persistence_path().map(Path::to_path_buf);
+        if let Some(path) = persistence_path {
+            if let Err(error) = self.append_persisted_meta_to_path(&path) {
+                self.updated_at_ms = previous_updated_at_ms;
+                self.appfs_wake_event_cursors = previous_appfs_wake_event_cursors;
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
     pub fn fork(&self, branch_name: Option<String>) -> Self {
         let now = current_time_millis();
         Self {
@@ -410,6 +466,7 @@ impl Session {
             prompt_history: self.prompt_history.clone(),
             invoked_skills: self.invoked_skills.clone(),
             appfs_event_cursors: self.appfs_event_cursors.clone(),
+            appfs_wake_event_cursors: self.appfs_wake_event_cursors.clone(),
             persistence: None,
         }
     }
@@ -481,6 +538,12 @@ impl Session {
                 appfs_event_cursors_to_json(&self.appfs_event_cursors),
             );
         }
+        if !self.appfs_wake_event_cursors.is_empty() {
+            object.insert(
+                "appfs_wake_event_cursors".to_string(),
+                appfs_event_cursors_to_json(&self.appfs_wake_event_cursors),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -545,6 +608,11 @@ impl Session {
             .map(appfs_event_cursors_from_json)
             .transpose()?
             .unwrap_or_default();
+        let appfs_wake_event_cursors = object
+            .get("appfs_wake_event_cursors")
+            .map(appfs_event_cursors_from_json)
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             version,
             session_id,
@@ -557,6 +625,7 @@ impl Session {
             prompt_history,
             invoked_skills,
             appfs_event_cursors,
+            appfs_wake_event_cursors,
             persistence: None,
         })
     }
@@ -573,6 +642,7 @@ impl Session {
         let mut prompt_history = Vec::new();
         let mut invoked_skills = Vec::new();
         let mut appfs_event_cursors = BTreeMap::new();
+        let mut appfs_wake_event_cursors = BTreeMap::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -616,6 +686,9 @@ impl Session {
                     }
                     if let Some(value) = object.get("appfs_event_cursors") {
                         appfs_event_cursors = appfs_event_cursors_from_json(value)?;
+                    }
+                    if let Some(value) = object.get("appfs_wake_event_cursors") {
+                        appfs_wake_event_cursors = appfs_event_cursors_from_json(value)?;
                     }
                 }
                 "message" => {
@@ -661,6 +734,7 @@ impl Session {
             prompt_history,
             invoked_skills,
             appfs_event_cursors,
+            appfs_wake_event_cursors,
             persistence: None,
         })
     }
@@ -793,6 +867,12 @@ impl Session {
             object.insert(
                 "appfs_event_cursors".to_string(),
                 appfs_event_cursors_to_json(&self.appfs_event_cursors),
+            );
+        }
+        if !self.appfs_wake_event_cursors.is_empty() {
+            object.insert(
+                "appfs_wake_event_cursors".to_string(),
+                appfs_event_cursors_to_json(&self.appfs_wake_event_cursors),
             );
         }
         Ok(JsonValue::Object(object))
@@ -1259,6 +1339,7 @@ impl AttachmentKind {
             Self::SkillListing => "skill_listing",
             Self::InvokedSkills => "invoked_skills",
             Self::AppfsEvents => "appfs_events",
+            Self::InputRouter => "input_router",
             Self::HookAdditionalContext => "hook_additional_context",
         }
     }
@@ -1274,6 +1355,7 @@ impl AttachmentKind {
             "skill_listing" => Ok(Self::SkillListing),
             "invoked_skills" => Ok(Self::InvokedSkills),
             "appfs_events" => Ok(Self::AppfsEvents),
+            "input_router" => Ok(Self::InputRouter),
             "hook_additional_context" => Ok(Self::HookAdditionalContext),
             other => Err(SessionError::Format(format!(
                 "unsupported attachment kind: {other}"
@@ -2202,6 +2284,35 @@ mod tests {
 
         assert_eq!(restored.appfs_event_cursor("platform"), Some(3));
         assert_eq!(restored.appfs_event_cursor("app:aiim"), Some(7));
+        assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[test]
+    fn persists_appfs_wake_event_cursors_separately_from_model_cursors() {
+        let path = temp_session_path("appfs-wake-event-cursors");
+        let mut session = Session::new().with_persistence_path(path.clone());
+        session
+            .push_user_text("watch appfs")
+            .expect("message should append");
+        session
+            .update_appfs_event_cursors([("app:tinode--default".to_string(), 7)])
+            .expect("model event cursor should persist");
+        session
+            .update_appfs_wake_event_cursors([("app:tinode--default".to_string(), 11)])
+            .expect("wake event cursor should persist");
+
+        let persisted = fs::read_to_string(&path).expect("session file should be readable");
+        assert!(persisted.contains("appfs_event_cursors"));
+        assert!(persisted.contains("appfs_wake_event_cursors"));
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.appfs_event_cursor("app:tinode--default"), Some(7));
+        assert_eq!(
+            restored.appfs_wake_event_cursor("app:tinode--default"),
+            Some(11)
+        );
         assert_eq!(restored.messages.len(), 1);
     }
 

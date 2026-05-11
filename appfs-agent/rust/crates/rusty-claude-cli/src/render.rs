@@ -275,6 +275,30 @@ impl TerminalRenderer {
         self.render_markdown(markdown)
     }
 
+    #[must_use]
+    pub fn markdown_to_ansi_stream_chunk(&self, markdown: &str) -> String {
+        let mut rendered = self.markdown_to_ansi(markdown);
+        if rendered.is_empty() {
+            return rendered;
+        }
+
+        // `render_markdown` trims trailing whitespace so normal rendering does
+        // not leave dangling blank lines. Streaming output is different: every
+        // flushed chunk must leave the cursor on the next line, otherwise the
+        // next chunk or the final spinner can overwrite the current line.
+        let desired_newlines = markdown
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '\n')
+            .count()
+            .clamp(1, 2);
+        let current_newlines = rendered.chars().rev().take_while(|ch| *ch == '\n').count();
+        for _ in current_newlines..desired_newlines {
+            rendered.push('\n');
+        }
+        rendered
+    }
+
     #[allow(clippy::too_many_lines)]
     fn render_event(
         &self,
@@ -588,11 +612,8 @@ impl TerminalRenderer {
     }
 
     pub fn stream_markdown(&self, markdown: &str, out: &mut impl Write) -> io::Result<()> {
-        let rendered_markdown = self.markdown_to_ansi(markdown);
+        let rendered_markdown = self.markdown_to_ansi_stream_chunk(markdown);
         write!(out, "{rendered_markdown}")?;
-        if !rendered_markdown.ends_with('\n') {
-            writeln!(out)?;
-        }
         out.flush()
     }
 }
@@ -609,7 +630,7 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        Some(renderer.markdown_to_ansi_stream_chunk(&ready))
     }
 
     #[must_use]
@@ -619,7 +640,7 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            Some(renderer.markdown_to_ansi_stream_chunk(&pending))
         }
     }
 }
@@ -991,6 +1012,54 @@ mod tests {
             .push(&renderer, "```\n")
             .expect("closed code fence flushes");
         assert!(strip_ansi(&code).contains("fn main()"));
+    }
+
+    #[test]
+    fn streaming_state_keeps_chunk_boundaries_visible() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        let first = state
+            .push(&renderer, "第一段\n\n")
+            .expect("first paragraph boundary flushes");
+        let second = state
+            .push(&renderer, "第二段\n\n")
+            .expect("second paragraph boundary flushes");
+        let plain_text = strip_ansi(&format!("{first}{second}"));
+
+        assert!(
+            plain_text.contains("第一段\n\n第二段"),
+            "streamed markdown chunks must not collapse paragraph boundaries: {plain_text:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_state_flush_terminates_final_line() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(state.push(&renderer, "最后一行没有换行"), None);
+        let rendered = state.flush(&renderer).expect("final pending text flushes");
+        let plain_text = strip_ansi(&rendered);
+
+        assert!(
+            plain_text.ends_with('\n'),
+            "final streamed text must leave the terminal cursor on a fresh line: {plain_text:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_markdown_preserves_list_intro_break() {
+        let renderer = TerminalRenderer::new();
+        let rendered =
+            renderer.markdown_to_ansi_stream_chunk("有 3 条未读消息：\n1. 第一条\n2. 第二条");
+        let plain_text = strip_ansi(&rendered);
+
+        assert!(
+            plain_text.contains("有 3 条未读消息：\n\n1. 第一条"),
+            "list intro newline was not preserved: {plain_text:?}"
+        );
+        assert!(plain_text.ends_with('\n'));
     }
 
     #[test]

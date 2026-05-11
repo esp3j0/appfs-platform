@@ -63,7 +63,9 @@ Collection directories use plural names:
 1. `contacts`
 2. `groups`
 3. `inbox`
-4. `topics`
+
+Connector-private topic mappings may still exist internally, but `topics/`
+is not part of the v0 model-facing tree.
 
 Action names use singular verbs:
 
@@ -95,6 +97,16 @@ Rules:
 
 This keeps paths friendly without making display names the source of truth.
 
+## Generated App Metadata
+
+The connector exposes three generated metadata files under `_app/`:
+
+1. `_app/skill.res.json` - safe skill metadata used by appfs-agent skill discovery.
+2. `_app/actions.res.json` - recommended action index for the model.
+3. `_app/control.res.json` - control-plane action index for credentials and inbox recovery.
+
+These are part of the v0 model-facing tree.
+
 ## Root Tree
 
 Recommended v0 tree:
@@ -102,8 +114,13 @@ Recommended v0 tree:
 ```text
 /private/<principal-id>/tinode/
   _app/
+    actions.res.json
+    control.res.json
+    skill.res.json
     self.res.json
+    message_layers.res.json
     ensure_credentials.act
+    forget_credentials.act
     refresh_structure.act
     refresh_inbox.act
   _stream/
@@ -112,9 +129,7 @@ Recommended v0 tree:
     index.res.jsonl
     send_message.act
     resolve.act
-    search_results.res.jsonl
     <contact-key>/
-      contact.res.json
       messages.res.jsonl
       send_message.act
   groups/
@@ -129,11 +144,11 @@ Recommended v0 tree:
     recent.res.jsonl
     unread.res.jsonl
     mark_read.act
-  topics/
-    index.res.jsonl
 ```
 
-`topics/` is a safe technical index for debugging and connector state inspection. The model should normally use `contacts/` and `groups/`.
+The v0 contract intentionally does not include a separate `topics/` tree. If an
+implementation keeps internal topic mappings or search placeholders, they should
+remain connector-private and not be treated as model-facing contract paths.
 
 ## Bootstrap Tree
 
@@ -142,21 +157,24 @@ Recommended v0 tree:
 Initial skeleton:
 
 ```text
+_app/actions.res.json
+_app/control.res.json
+_app/skill.res.json
 _app/self.res.json
+_app/message_layers.res.json
 _app/ensure_credentials.act
+_app/forget_credentials.act
 _app/refresh_structure.act
 _app/refresh_inbox.act
 _stream/events.evt.jsonl
 contacts/index.res.jsonl
 contacts/send_message.act
 contacts/resolve.act
-contacts/search_results.res.jsonl
 groups/index.res.jsonl
 groups/create_group.act
 inbox/recent.res.jsonl
 inbox/unread.res.jsonl
 inbox/mark_read.act
-topics/index.res.jsonl
 ```
 
 Dynamic directories such as `contacts/张三/` and `groups/事故同步群/` appear after the connector learns or creates them. The connector should bump app structure revision or otherwise request/allow structure refresh after contact resolution, first message, group creation, or group invitation.
@@ -227,6 +245,22 @@ Optional guardrail:
 
 If `expected_profile_id` is present, it must match connector context. It is not authority.
 
+## `_app/forget_credentials.act`
+
+Best-effort credential cleanup for the current principal's Tinode profile.
+
+Use this when the principal is being deleted, when an operator wants to reset a Tinode profile, or when a test needs to clear shared connector state before re-running a smoke flow.
+
+Payload:
+
+```json
+{
+  "client_token": "forget-tinode-default"
+}
+```
+
+The connector must remove the current profile's private credential record and forget any shared principal-to-profile mapping for that profile. It must not expose or require tokens, refresh tokens, or passwords.
+
 ## Contact Index
 
 `contacts/index.res.jsonl` lists known contacts and stable paths.
@@ -236,14 +270,9 @@ Each line:
 ```json
 {
   "contact_key": "张三",
-  "display_name": "张三",
-  "aliases": ["老张", "zhangsan", "Zhang San"],
   "tinode_user_id": "usrZhangSan",
-  "basic": "zhangsan",
-  "topic_id": "usrZhangSan",
-  "path": "contacts/张三",
-  "status": "ready",
-  "last_message_at": "2026-05-06T08:01:00Z"
+  "basic_login": "zhangsan",
+  "display_name": "张三"
 }
 ```
 
@@ -251,12 +280,11 @@ Fields:
 
 1. `contact_key`: canonical path key under `contacts/`.
 2. `display_name`: human-facing name.
-3. `aliases`: safe names the model may match from user text.
-4. `tinode_user_id`: safe upstream user id.
-5. `basic`: optional Tinode basic login without the `basic:` prefix.
-6. `topic_id`: direct chat topic id from current Tinode user's point of view.
-7. `path`: canonical relative path.
-8. `status`: `ready`, `unresolved`, `blocked`, or `error`.
+3. `tinode_user_id`: safe upstream user id.
+4. `basic_login`: optional Tinode basic login without the `basic:` prefix.
+
+In v0 the connector may keep richer contact metadata internally, but
+`contacts/index.res.jsonl` only needs the stable summary above.
 
 ## Direct Message Paths
 
@@ -276,24 +304,6 @@ contacts/张三/send_message.act
 
 The connector may expose `contacts/张三/` if `张三` is unique. If ambiguous, the path may be `contacts/张三--usrab12/`.
 
-## `contacts/<contact-key>/contact.res.json`
-
-Safe contact details:
-
-```json
-{
-  "contact_key": "张三",
-  "display_name": "张三",
-  "aliases": ["老张", "zhangsan", "Zhang San"],
-  "tinode_user_id": "usrZhangSan",
-  "basic": "zhangsan",
-  "topic_id": "usrZhangSan",
-  "path": "contacts/张三",
-  "created_at": "2026-05-06T08:00:00Z",
-  "last_message_at": "2026-05-06T08:01:00Z"
-}
-```
-
 ## `contacts/<contact-key>/messages.res.jsonl`
 
 Direct conversation messages.
@@ -303,38 +313,22 @@ Each line:
 ```json
 {
   "message_id": "tinode:usrZhangSan:42",
-  "conversation_type": "direct",
   "contact_key": "张三",
-  "topic_id": "usrZhangSan",
-  "seq": 42,
   "direction": "outbound",
-  "from": {
-    "kind": "self",
-    "display_name": "Default agent"
-  },
-  "to": {
-    "kind": "contact",
-    "contact_key": "张三",
-    "display_name": "张三"
-  },
   "text": "明天十点开会",
-  "client_token": "msg-001",
-  "status": "sent",
-  "ts": "2026-05-06T08:01:00Z"
+  "created_at_ms": 1778300000000,
+  "seq": 42
 }
 ```
 
-Allowed `direction` values:
+The v0 archive row is intentionally minimal:
 
-1. `inbound`
-2. `outbound`
-
-Allowed `status` values:
-
-1. `received`
-2. `sent`
-3. `failed`
-4. `pending`
+1. `message_id`
+2. `contact_key`
+3. `direction`
+4. `text`
+5. `created_at_ms`
+6. `seq`
 
 ## `contacts/<contact-key>/send_message.act`
 
@@ -439,7 +433,9 @@ Optional explicit search:
 }
 ```
 
-Results are written to `contacts/search_results.res.jsonl` and emitted as events.
+The connector should resolve the contact and emit `contact.resolved` or
+`contact.resolve.failed` events. If an implementation keeps a transient search
+buffer, it is connector-private and not part of the v0 model-facing tree.
 
 `basic:<username>` may appear in payloads and results because it is a Tinode search/ref format. It should not be used as a path layer.
 
@@ -455,8 +451,28 @@ Each line:
   "title": "事故同步群",
   "topic_id": "grpIncident001",
   "path": "groups/事故同步群",
+  "members": [
+    {
+      "kind": "self",
+      "display_name": "Default agent",
+      "profile_id": "tinode:default"
+    },
+    {
+      "kind": "contact",
+      "contact_key": "张三",
+      "display_name": "张三",
+      "tinode_user_id": "usrZhangSan"
+    },
+    {
+      "kind": "principal",
+      "principal_id": "incident-reporter",
+      "profile_id": "tinode:incident-reporter",
+      "tinode_user_id": "usrIncident"
+    }
+  ],
   "member_count": 3,
-  "last_message_at": "2026-05-06T09:00:00Z"
+  "created_at_ms": 1778300000000,
+  "last_message_at_ms": 1778300000000
 }
 ```
 
@@ -533,8 +549,9 @@ Safe group metadata:
       "tinode_user_id": "usrIncident"
     }
   ],
-  "created_at": "2026-05-06T09:00:00Z",
-  "last_message_at": "2026-05-06T09:01:00Z"
+  "member_count": 3,
+  "created_at_ms": 1778300000000,
+  "last_message_at_ms": 1778300000000
 }
 ```
 
@@ -578,16 +595,10 @@ The same member ref rules from `groups/create_group.act` apply.
   "conversation_type": "group",
   "group_key": "事故同步群",
   "topic_id": "grpIncident001",
-  "seq": 7,
   "direction": "inbound",
-  "from": {
-    "kind": "contact",
-    "display_name": "张三",
-    "tinode_user_id": "usrZhangSan"
-  },
   "text": "收到，我来处理。",
-  "status": "received",
-  "ts": "2026-05-06T09:01:00Z"
+  "created_at_ms": 1778300000000,
+  "seq": 7
 }
 ```
 
@@ -602,12 +613,15 @@ Recent messages across all conversations:
 ```json
 {
   "conversation_type": "direct",
-  "path": "contacts/张三/messages.res.jsonl",
-  "display_name": "张三",
+  "contact_key": "张三",
   "message_id": "tinode:usrZhangSan:42",
-  "direction": "inbound",
   "text": "收到",
-  "ts": "2026-05-06T08:02:00Z"
+  "created_at_ms": 1778300000000,
+  "from_tinode_user_id": "usrZhangSan",
+  "from_display_name": "张三",
+  "text_preview": "收到",
+  "requires_attention": true,
+  "unread": true
 }
 ```
 
@@ -618,12 +632,15 @@ Unread or not-yet-summarized inbound messages:
 ```json
 {
   "conversation_type": "group",
-  "path": "groups/事故同步群/messages.res.jsonl",
-  "display_name": "事故同步群",
+  "contact_key": "事故同步群",
   "message_id": "tinode:grpIncident001:7",
   "from_display_name": "张三",
   "text": "收到，我来处理。",
-  "ts": "2026-05-06T09:01:00Z"
+  "created_at_ms": 1778300000000,
+  "from_tinode_user_id": "usrZhangSan",
+  "text_preview": "收到，我来处理。",
+  "requires_attention": true,
+  "unread": true
 }
 ```
 
@@ -631,34 +648,88 @@ Unread or not-yet-summarized inbound messages:
 
 Mark messages as handled by the current principal.
 
-Payload:
+Supported payloads:
+
+Mark one or more message ids:
 
 ```json
 {
+  "scope": "message",
   "message_ids": ["tinode:grpIncident001:7"],
   "client_token": "mark-read-001"
 }
 ```
 
-`mark_read.act` only affects AppFS/connector-side unread state in v0. It does not need to map to Tinode read receipts.
-
-## Topics Index
-
-`topics/index.res.jsonl` is a technical mapping for debugging and connector recovery.
-
-Each line:
+Mark a whole direct conversation:
 
 ```json
 {
-  "topic_id": "grpIncident001",
-  "kind": "group",
-  "path": "groups/事故同步群",
-  "cursor": 7,
-  "last_synced_at": "2026-05-06T09:01:00Z"
+  "scope": "thread",
+  "contact_key": "张三",
+  "client_token": "mark-read-zhangsan"
 }
 ```
 
-The generated skill should not make `topics/` the primary interface.
+Mark a whole group conversation:
+
+```json
+{
+  "scope": "thread",
+  "group_key": "事故同步群",
+  "client_token": "mark-read-incident-group"
+}
+```
+
+Mark everything currently unread:
+
+```json
+{
+  "scope": "all",
+  "client_token": "mark-read-all"
+}
+```
+
+Compatibility payloads are also accepted:
+
+1. `{"all": true}` is equivalent to `{"scope": "all"}`.
+2. `{"message_id": "tinode:usrZhangSan:42"}` is equivalent to `{"scope": "message", "message_ids": ["tinode:usrZhangSan:42"]}`.
+
+`mark_read.act` only affects AppFS/connector-side unread state in v0. It does not need to map to Tinode read receipts.
+
+The action result should include:
+
+1. `cleared`: message ids removed from local unread state.
+2. `scope`: the effective scope.
+3. `unread_count`: remaining local unread count.
+
+## Message Layers
+
+Tinode uses three different layers for different jobs:
+
+1. `_stream/events.evt.jsonl` is the wake and reminder boundary. It carries concise `message.received`, `message.sent`, `action.completed`, and `action.failed` signals for the current principal.
+2. `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` are the operational summary layer. They are ideal for offline catch-up, attach-time summaries, and unread counts.
+3. `contacts/<contact-key>/messages.res.jsonl` and `groups/<group-key>/messages.res.jsonl` are the full history/archive layer. Read them only when the model needs conversation context.
+
+Practical rules:
+
+1. If the agent is online and attached, prefer event reminders over rereading inbox resources every turn.
+2. If the agent is offline or just attached, surface unread counts and recent inbox items first.
+3. Use full message history only when the current task needs prior context or a specific thread recap.
+4. `inbox.updated` is bookkeeping. It should not be treated as a standalone wake signal.
+5. `message.received` with `requires_attention=true` is the signal that should wake the agent.
+6. `delete_principal.act` may trigger `_app/forget_credentials.act` on affected private Tinode app instances so connector-private credential state is actually cleaned up, not merely requested.
+7. The model should treat `inbox/` as a summary and triage layer, not as the primary live input stream.
+8. The model should treat `messages.res.jsonl` as archive/history, not as a replacement for the event stream.
+
+## Operational Usage
+
+When you are actually using the tree:
+
+1. If the agent is online and attached, let `_stream/events.evt.jsonl` drive the current turn.
+2. If the agent has just attached or is catching up after being offline, read `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` first.
+3. If the task needs the full conversation, read `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl`.
+4. Treat `refresh_inbox.act` as a recovery/debug action, not the normal daily path.
+5. Treat `mark_read.act` as local AppFS unread-state bookkeeping in v0.
 
 ## Event Contract
 
@@ -734,7 +805,6 @@ Passive reads should not create credentials in v0:
 3. `_app/self.res.json`
 4. `contacts/index.res.jsonl`
 5. `groups/index.res.jsonl`
-6. `topics/index.res.jsonl`
 
 If credentials are missing, passive reads should return safe local/cache data and include `credential_status = missing` where useful.
 
@@ -747,9 +817,13 @@ The generated `appfs-tinode` skill should teach the model these rules:
 3. Do not write raw credentials into action files.
 4. For a known contact, append one JSON line to `contacts/<contact-key>/send_message.act`.
 5. If unsure which contact path to use, append one JSON line to `contacts/send_message.act` with `to` and `text`.
-6. For recent inbound messages, read `inbox/unread.res.jsonl` or `inbox/recent.res.jsonl`.
-7. For group creation, append one JSON line to `groups/create_group.act`.
-8. After any action, rely on AppFS event reminders or read `_stream/events.evt.jsonl` for debugging.
+6. For live attention and wakeups, rely on AppFS event reminders from `_stream/events.evt.jsonl`.
+7. If an AppFS reminder includes a `message.received` event with `requires_attention=true`, treat it as an active task to answer or act on in the current turn before asking for more context.
+8. For unread summaries after attach or reconnect, read `inbox/unread.res.jsonl` or `inbox/recent.res.jsonl`.
+9. For full conversation history, read `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl`.
+10. For group creation, append one JSON line to `groups/create_group.act`.
+11. To clear local unread state, use `inbox/mark_read.act` with `scope = message`, `thread`, or `all`.
+12. After any action, rely on AppFS event reminders or read `_stream/events.evt.jsonl` for debugging.
 
 Skill example for known contact:
 
@@ -842,11 +916,12 @@ Expected results:
 
 1. User sends a message to the agent from Tinode.
 2. Connector receives or polls Tinode data.
-3. Connector appends/updates `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl`.
-4. Connector appends to `inbox/unread.res.jsonl`.
-5. Connector emits `message.received`.
-6. appfs-agent injects the event reminder before the next model call.
-7. Model can answer, continue a workflow, or ask the user what to do.
+3. Connector appends/updates `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` as the archive.
+4. Connector appends summary state to `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl`.
+5. Connector emits `message.received` and `inbox.updated`.
+6. appfs-agent injects the event reminder before the next model call when the agent is online.
+7. If the agent was offline, the next attach can first show unread inbox summary and then read full history only if needed.
+8. Model can answer, continue a workflow, or ask the user what to do.
 
 ### Create Multi-Agent Group
 
@@ -880,7 +955,7 @@ Error event example:
   "path": "/contacts/send_message.act",
   "error_code": "RECIPIENT_AMBIGUOUS",
   "error": "Multiple contacts match 张三",
-  "hint": "Read contacts/search_results.res.jsonl and retry with contact_key"
+  "hint": "Read contacts/index.res.jsonl again or retry with contacts/send_message.act and an explicit to field"
 }
 ```
 
@@ -901,20 +976,31 @@ Error event example:
 
 The minimum useful implementation is:
 
-1. `_app/self.res.json`
-2. `_app/ensure_credentials.act`
-3. `_stream/events.evt.jsonl`
-4. `contacts/index.res.jsonl`
-5. `contacts/send_message.act`
-6. `contacts/<contact-key>/messages.res.jsonl`
-7. `contacts/<contact-key>/send_message.act`
-8. `inbox/recent.res.jsonl`
-9. `inbox/unread.res.jsonl`
-10. `groups/create_group.act`
-11. `groups/<group-key>/messages.res.jsonl`
-12. `groups/<group-key>/send_message.act`
+1. `_app/actions.res.json`
+2. `_app/control.res.json`
+3. `_app/skill.res.json`
+4. `_app/self.res.json`
+5. `_app/ensure_credentials.act`
+6. `_app/forget_credentials.act`
+7. `_app/message_layers.res.json`
+8. `_app/refresh_structure.act`
+9. `_app/refresh_inbox.act`
+10. `_stream/events.evt.jsonl`
+11. `contacts/index.res.jsonl`
+12. `contacts/send_message.act`
+13. `contacts/<contact-key>/messages.res.jsonl`
+14. `contacts/<contact-key>/send_message.act`
+15. `inbox/recent.res.jsonl`
+16. `inbox/unread.res.jsonl`
+17. `inbox/mark_read.act`
+18. `groups/index.res.jsonl`
+19. `groups/create_group.act`
+20. `groups/<group-key>/group.res.json`
+21. `groups/<group-key>/messages.res.jsonl`
+22. `groups/<group-key>/send_message.act`
+23. `groups/<group-key>/invite_members.act`
 
-If implementation pressure is high, group invitation and `topics/index.res.jsonl` may follow after direct messaging and inbound events work.
+If implementation pressure is high, the connector can keep extra internal indexes for search or topic recovery, but they should not expand the v0 model-facing tree.
 
 ## Acceptance Checklist
 

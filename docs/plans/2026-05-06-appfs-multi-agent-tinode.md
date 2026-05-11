@@ -597,7 +597,7 @@ cargo test --manifest-path appfs-agent\rust\Cargo.toml -p rusty-claude-cli appfs
 
 **Rollback Point:**
 
-If automatic default principal creation from appfs-agent is too risky, first implement read-only identity detection and a clear warning; wire creation in PR 6.
+If attach-time principal ensure is too risky, first implement read-only identity detection and a clear warning; wire the create/attach action path immediately after.
 
 ## PR 6: Credential Store Interface and Generic `ensure_credentials.act` Contract
 
@@ -673,7 +673,7 @@ The effective `profile_id` comes from connector context.
 
 **Step 5: Add principal deletion cleanup hook design**
 
-At minimum, emit cleanup request events. Full credential deletion can land with Tinode once credential store is real.
+Tinode now owns a concrete cleanup action (`/_app/forget_credentials.act`) and AppFS should invoke it best-effort when deleting an active principal. The control-plane event still reports cleanup status per affected runtime, but the connector-private credential record must actually be removed from shared state.
 
 **Step 6: Run tests**
 
@@ -720,22 +720,37 @@ Do not create Tinode accounts in `get_app_structure`.
 Tree must match `docs/TINODE-APPFS-tree-v0-design.md`:
 
 ```text
+_app/actions.res.json
+_app/control.res.json
+_app/skill.res.json
 _app/self.res.json
+_app/message_layers.res.json
 _app/ensure_credentials.act
+_app/forget_credentials.act
 _app/refresh_structure.act
 _app/refresh_inbox.act
 _stream/events.evt.jsonl
 contacts/index.res.jsonl
 contacts/send_message.act
 contacts/resolve.act
-contacts/search_results.res.jsonl
+contacts/<contact-key>/messages.res.jsonl
+contacts/<contact-key>/send_message.act
 groups/index.res.jsonl
 groups/create_group.act
+groups/<group-key>/group.res.json
+groups/<group-key>/messages.res.jsonl
+groups/<group-key>/send_message.act
+groups/<group-key>/invite_members.act
 inbox/recent.res.jsonl
 inbox/unread.res.jsonl
 inbox/mark_read.act
-topics/index.res.jsonl
 ```
+
+Do not treat `contacts/search_results.res.jsonl`, `topics/index.res.jsonl`,
+or `contacts/<contact-key>/contact.res.json` as part of the v0 model-facing
+contract. If the connector keeps search/topic helpers internally, they should
+remain implementation details until a later tree revision intentionally exposes
+them.
 
 **Step 3: Add connector config validation**
 
@@ -765,7 +780,8 @@ node integration\scripts\tinode-smoke.mjs
 
 **Acceptance:**
 
-- Compose can mount private Tinode skeleton for `default`.
+- AppFS compose registers the private Tinode policy without eagerly creating `default`.
+- appfs-agent attach creates/attaches the selected principal and materializes that principal's private Tinode skeleton.
 - `_app/self.res.json` says credentials are missing.
 - No Tinode account is created before a credential-required action.
 
@@ -791,18 +807,17 @@ On first credential-required action:
 - derive effective `profile_id` from connector context;
 - check credential store;
 - if missing, create or reuse Tinode account;
-- store token/refresh token privately;
+- store token material privately;
 - update safe `_app/self.res.json` summary;
 - emit `profile.credentials.ready`.
 
-**Step 2: Implement token refresh**
+**Step 2: Expose expired credentials**
 
-Before Tinode API calls:
+v0 does not require silent token refresh. Before or during Tinode API calls:
 
-- check expiry;
-- refresh if needed;
-- update private store;
-- on failure, return `AUTH_EXPIRED`.
+- surface upstream authentication rejection as `AUTH_EXPIRED`;
+- keep `_app/ensure_credentials.act` available as an explicit recovery/precheck path;
+- allow a later connector revision to add silent refresh without changing the AppFS tree contract.
 
 **Step 3: Implement contact resolution**
 
@@ -883,13 +898,19 @@ If contact resolution is unstable, support explicit `basic:<login>` recipient in
 
 **Step 1: Implement connector-side inbound handling**
 
-Tinode connector maintains an internal WebSocket connection to the Tinode server. Received `{data}` and `{pres}` messages are translated into AppFS events and resource updates directly inside the connector:
+Tinode inbound is connector-owned, not appfs-agent-owned. In v0 the connector
+may use periodic inbound polling (`apps.tinode.inbound_poll_ms`) or an internal
+subscription mode in the future. Either way, received Tinode data is translated
+into AppFS events and resource updates inside the connector:
 
 - write new messages to `contacts/<key>/messages.res.jsonl` or `groups/<key>/messages.res.jsonl`;
 - append to `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl`;
 - emit `message.received` event to `_stream/events.evt.jsonl`.
 
-Inbound handling does not go through the `AppConnector` trait in v0. The adapter poll loop continues to drive `.act` file processing; connector-internal WebSocket runs alongside it. Do not add OS file watchers.
+Inbound handling should not be triggered by appfs-agent directly reading Tinode.
+The adapter has a dedicated inbound timer separate from `.act` write wake and
+read-through. Do not add OS file watchers, and do not use the legacy full
+runtime fallback poll as the normal Tinode receive path.
 
 **Step 2: Update resources**
 
@@ -941,7 +962,10 @@ node integration\scripts\tinode-smoke.mjs inbound
 
 **Rollback Point:**
 
-If the internal Tinode WebSocket is unstable, fall back to periodic polling of `{get what="data"}` inside the connector. The connector still writes events and resources directly; only the data source changes. Do not add new actions or trait methods.
+If a future subscribe mode is unstable, fall back to periodic polling of
+`{get what="data"}` inside the connector. The connector still writes events and
+resources directly; only the data source changes. Do not add new actions or
+make appfs-agent read Tinode directly.
 
 ## PR 10: Principal Fork and Multi-Agent Tinode
 

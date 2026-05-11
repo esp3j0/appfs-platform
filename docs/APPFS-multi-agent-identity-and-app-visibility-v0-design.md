@@ -10,12 +10,12 @@ The implemented v0 behavior is:
 
 1. AppFS compose writes app policies and materialized public app instances.
 2. AppFS supervisor owns principal registry and private app auto-instantiation.
-3. `default` principal is created automatically when a private app policy exists.
-4. Private app instances are mounted under `/private/<principal-id>/<app-id>`.
+3. AppFS startup alone does not create `default`; appfs-agent attach or explicit principal actions ensure principals exist.
+4. Principal creation or attach materializes private app instances under `/private/<principal-id>/<app-id>`.
 5. appfs-agent resolves `principal_id` from `APPFS_PRINCIPAL_ID` or `default`.
 6. appfs-agent filters generated skills and AppFS event reminders by current principal.
 7. `ConnectorContext` carries `principal_id` and `profile_id` to connectors.
-8. `/principal create` and `/principal fork` provide operator-facing workflows.
+8. `/principal list`, `/principal create`, and `/principal fork` provide operator-facing workflows.
 
 ## Goals
 
@@ -45,13 +45,14 @@ Implemented pieces:
 3. Missing `APPFS_PRINCIPAL_ID` resolves to `default`.
 4. AppFS persists `/_appfs/principals.registry.json` and derived `/_appfs/principals/<principal-id>.res.json` views.
 5. AppFS compose persists `/_appfs/app-policies.registry.json`.
-6. AppFS compose materializes public apps into `/_appfs/apps.registry.json`.
-7. AppFS supervisor creates `default` automatically when at least one private policy exists.
-8. AppFS supervisor materializes private instances such as `tinode--default` from policy templates.
+6. AppFS compose materializes public apps into `/_appfs/apps.registry.json`; it does not materialize private instances by itself.
+7. appfs-agent attach ensure can create the selected principal, including fallback `default`, by appending `/_appfs/principals/create_principal.act`.
+8. AppFS supervisor materializes private instances such as `tinode--default` from policy templates when principals are created or attached.
 9. appfs-agent generated skill listing includes public apps and only the current principal's private apps.
 10. appfs-agent AppFS event reminder sync includes platform events and only the current principal's private app event streams.
 11. `ConnectorContext` includes `principal_id` and `profile_id`; action payloads do not get to override those authoritative values.
 12. `/principal list`, `/principal create <id> [description]`, and `/principal fork <id> [task]` are available in appfs-agent.
+13. Connector error code `AUTH_EXPIRED` exists as the v0 expired-auth surface; automatic token refresh is a future connector enhancement.
 
 Still intentionally limited in v0:
 
@@ -162,6 +163,27 @@ Owns current process declaration:
 5. reconstruct principal identity context after compaction;
 6. expose a tool or command for creating/forking principals.
 
+On attach, appfs-agent should also ensure the selected principal exists before
+building its system prompt, skill listing, or event cursor baseline:
+
+1. resolve `principal_id` from `APPFS_PRINCIPAL_ID`, falling back to `default`;
+2. if the principal is missing, append `/_appfs/principals/create_principal.act`;
+3. wait for `principals.registry.json` to contain the principal;
+4. wait for private app policies to materialize into `apps.registry.json`;
+5. re-detect the AppFS environment so prompt/skills/events see
+   `/private/<principal-id>/<app-id>`.
+6. append `/_appfs/principals/attach_principal.act` with the current `attach_id`;
+7. on normal process exit, append `/_appfs/principals/detach_principal.act`.
+
+This attach ensure step must not create app-specific upstream credentials. For
+example, Tinode account creation still belongs to the Tinode connector's
+credential action flow.
+
+AppFS startup should not create the `default` principal just because private app
+policies exist. Compose startup owns app definitions and public instances.
+Private instances are created only after a principal is explicitly created, most
+commonly by appfs-agent attach.
+
 ### AppFS runtime supervisor
 
 Owns project-level identity, app policy, and app instance state:
@@ -172,7 +194,8 @@ Owns project-level identity, app policy, and app instance state:
 4. materialize `/public` and `/private`;
 5. route private app instances by `principal_id`;
 6. consume principal management actions;
-7. auto-instantiate private app instances when principals are created.
+7. auto-instantiate private app instances when principals are created;
+8. track best-effort attach leases for running agent processes.
 
 Principal management is an AppFS internal control-plane transaction. It should be handled by the AppFS runtime supervisor, alongside `register_app.act`, `unregister_app.act`, and `list_apps.act`. It should not go through an app connector or bridge.
 
@@ -341,7 +364,8 @@ Triggers:
 
 1. compose bootstrap for public apps;
 2. `register_app.act` for dynamic public apps or admin-defined templates;
-3. `create_principal.act` for private per-principal app instances.
+3. `create_principal.act` for creating a principal;
+4. `attach_principal.act` for marking an appfs-agent process as attached to an existing principal and refreshing/materializing that principal's private app instances.
 
 When `create_principal.act` succeeds, the supervisor should:
 
@@ -359,6 +383,14 @@ When `create_principal.act` succeeds, the supervisor should:
 This keeps agents from needing to know connector endpoints, transport kinds, retry settings, or healthcheck policy.
 
 Private app instance materialization creates the AppFS instance and profile identity. It does not have to eagerly create upstream credentials. Account creation may be lazy and connector-specific, but it must be keyed by the materialized `profile_id`.
+
+Current v0 behavior:
+
+1. compose startup registers app policies and public app instances only;
+2. compose startup should not eagerly create `default` or materialize `/private/default/tinode`;
+3. appfs-agent attach/identity ensure creates the selected principal if needed;
+4. successful create/attach materializes that principal's private app instances;
+5. appfs-agent may then warm up credential-backed private apps through their generic `_app/ensure_credentials.act` when configured to do so.
 
 ### Layer 3. appfs-agent Filters Visible Apps
 
@@ -514,6 +546,29 @@ Use `/session fork` instead when you want a same-principal branch of the convers
 
 ## Principal Registry
 
+### Principal Lifecycle Actions
+
+The principal control plane lives under `/_appfs/principals/`:
+
+```text
+/_appfs/principals/create_principal.act
+/_appfs/principals/update_principal.act
+/_appfs/principals/delete_principal.act
+/_appfs/principals/attach_principal.act
+/_appfs/principals/detach_principal.act
+```
+
+`create_principal.act` records durable principal metadata. It is the path used
+by explicit `/principal create` and by appfs-agent attach when the selected
+principal does not exist.
+
+`attach_principal.act` and `detach_principal.act` record runtime leases for
+running appfs-agent processes. They update `active_attaches` and
+`active_attach_count` as best-effort runtime status. A successful attach also
+refreshes/materializes private app instances for that principal. Detach does
+not have to unmount or delete private app instances in v0; whether inactive
+private apps are later unloaded is a policy decision.
+
 ### No Global Current Identity File
 
 There should be no authoritative `/_appfs/current_identity.res.json` in v0.
@@ -554,19 +609,26 @@ This file lists all known principals, not only currently running ones.
       "display_name": "Default agent",
       "description": "The default project agent.",
       "kind": "agent",
-      "created_by": "system",
       "created_at": "2026-05-06T00:00:00Z",
-      "last_seen_at": null,
-      "active_attach_count": 0
+      "updated_at": "2026-05-06T00:01:00Z",
+      "active_attach_count": 1,
+      "active_attaches": [
+        {
+          "attach_id": "attach-1778300000-1234-1",
+          "role": "coordinator",
+          "session_id": "session-1778300000-0",
+          "attached_at": "2026-05-06T00:01:00Z",
+          "last_seen_at": "2026-05-06T00:01:00Z"
+        }
+      ]
     },
     {
       "principal_id": "incident-reporter",
       "display_name": "Incident reporter",
       "description": "Summarizes incidents and sends chat updates.",
       "kind": "agent",
-      "created_by": "default",
       "created_at": "2026-05-06T00:08:00Z",
-      "last_seen_at": null,
+      "updated_at": "2026-05-06T00:08:00Z",
       "active_attach_count": 0
     }
   ]
@@ -579,7 +641,10 @@ Do not store `private_root` as authoritative data. It is derived as:
 private_root = /private/<principal_id>
 ```
 
-In P1/P2, `active_attach_count` is informational and may remain `0`. Automatic updates should wait until the launcher/fork-spawn lifecycle can reliably increment on start and decrement on stop.
+`active_attach_count` is derived from `active_attaches.length`. It is
+best-effort runtime status, not a security boundary. If an agent crashes before
+writing `detach_principal.act`, the lease may remain stale until a future
+heartbeat/TTL cleanup pass removes it.
 
 ### `/_appfs/principals/<principal-id>.res.json`
 
@@ -714,18 +779,24 @@ Example:
 ```json
 {
   "principal_id": "incident-reporter",
-  "delete_private_data": false,
   "client_token": "delete-incident-reporter"
 }
 ```
 
-v0 deletion policy:
+Current v0 deletion policy:
 
-1. default behavior should mark the principal as deleted or archived in `principals.registry.json`;
-2. default behavior should not delete `/private/<principal-id>` data;
-3. `delete_private_data: true` may remove private app data if the implementation supports safe cleanup;
-4. deleting the currently active principal should require an explicit force flag in any future interactive UI;
-5. connector credential cleanup should be app-specific and may be deferred until the connector supports it.
+1. `delete_principal.act` removes the principal from `principals.registry.json`;
+2. it deletes the derived `principals/<principal-id>.res.json` view;
+3. it does not remove `/private/<principal-id>` filesystem data in v0;
+4. it best-effort asks affected private app instances to clean connector credentials through their app-specific cleanup action;
+5. deleting an actively attached principal is allowed by the current low-level action and is expected to be guarded by future interactive tooling.
+
+Not implemented in v0:
+
+1. `delete_private_data` flag;
+2. archived/tombstoned principal records;
+3. force checks for active principals;
+4. physical deletion of private app data.
 
 ## Fork Types
 
@@ -864,6 +935,70 @@ Rules:
 4. do not inject another principal's private app events into the current agent's `<system-reminder>`.
 
 This requires appfs-agent to understand app instance `visibility`, `principal_id`, and `path`.
+
+### appfs-agent Event Routing Status
+
+The earlier broad AppFS event loop MVP has been disabled. In practice it woke the
+model on every current-principal event, including self-generated receipts such
+as `message.sent` and `action.completed`, which could create duplicate turns
+after the model had already received the same receipt at a normal model-call
+boundary.
+
+The baseline behavior is still **model-call boundary injection**:
+
+1. connector inbound work brings upstream events into AppFS, for example Tinode
+   new messages become `_stream/events.evt.jsonl` records;
+2. before each model call, appfs-agent reads current principal-visible AppFS
+   event streams;
+3. new records are injected as normal AppFS event reminders in the current turn;
+4. context-only events such as action receipts are visible to the active turn
+   without automatically starting another turn while the agent is idle.
+
+The disabled command surfaces are:
+
+```text
+claw appfs-events watch ...
+claw --watch-appfs-events
+```
+
+Safe idle wake is reintroduced through an explicit opt-in surface:
+
+```text
+claw --appfs-idle-wake
+```
+
+This mode uses a separate wake cursor from the normal model-facing
+`appfs_event_cursors`. On first scan it baselines existing events so historical
+backlog does not wake a newly started agent. Subsequent scans classify events
+before delivery:
+
+1. `message.received` with `content.requires_attention=true` may wake an idle
+   agent;
+2. `message.sent`, `action.completed`, `action.failed`, and credential status
+   events remain context-only and are delivered at normal model-call boundaries;
+3. noisy bookkeeping events such as `inbox.updated` are skipped while still
+   advancing cursors;
+4. private app events remain filtered to the current `principal_id`.
+
+The v0 idle wake implementation runs at safe REPL idle boundaries. It is not a
+fully non-blocking terminal editor and does not interrupt an in-progress
+model/tool turn. It also does not replace connector inbound polling; Tinode still
+uses connector-side inbound polling to bring upstream messages into AppFS before
+appfs-agent can classify them.
+
+Current non-goals:
+
+1. appfs-agent still does not read Tinode directly;
+2. `_stream/events.evt.jsonl` remains an event stream, not a read-through resource;
+3. `apps.<app-id>.inbound_poll_ms` remains connector-side inbound polling;
+4. appfs-agent does not subscribe to another principal's private events;
+5. idle wake does not wake for self-generated receipts or every filesystem event;
+6. fully asynchronous user-input interruption is deferred to a later router phase.
+
+Follow-up design:
+
+1. `docs/plans/2026-05-09-appfs-agent-event-boundary-and-idle-wake.md`
+2. `docs/plans/2026-05-09-appfs-agent-unified-input-router-implementation.md`
 
 ## Connector Authentication Binding
 
@@ -1110,10 +1245,10 @@ Credential creation failure is reported as action failure with `AUTH_EXPIRED` or
 
 Refresh behavior:
 
-1. connector checks token expiry before `submit_action`, snapshot fetch, live fetch, and structure refresh;
-2. if refresh succeeds, connector updates private credential state and continues;
-3. if refresh fails but user action may recover it, connector returns or emits `AUTH_EXPIRED`;
-4. appfs-agent may then surface the failure and, if appropriate, call `_app/ensure_credentials.act` again.
+1. connector may return or emit `AUTH_EXPIRED` when upstream authentication is rejected;
+2. automatic silent token refresh is not implemented in the Tinode connector yet;
+3. appfs-agent may surface the failure and, if appropriate, call `_app/ensure_credentials.act` again or retry the original business action later;
+4. a future connector revision may add silent refresh before `submit_action`, snapshot fetch, live fetch, and structure refresh without changing the AppFS tree contract.
 
 Safe event examples:
 
@@ -1127,20 +1262,20 @@ Events must not include access tokens, refresh tokens, passwords, cookies, or AP
 
 ### Credential Cleanup
 
-`delete_principal.act` should define how connector credentials are handled.
+`delete_principal.act` defines best-effort connector credential cleanup.
 
-Default:
+Current v0 behavior:
 
-1. archive the principal in `principals.registry.json`;
-2. keep private app data and connector credential state unless explicit deletion is requested.
+1. AppFS removes the principal record from `principals.registry.json`;
+2. AppFS keeps `/private/<principal-id>` data in the mounted tree;
+3. AppFS finds affected private app runtime instances for that principal;
+4. AppFS invokes the app-specific cleanup action when available;
+5. cleanup failures are reported in the action result but do not roll back principal deletion.
 
-When `delete_private_data: true` is requested:
+For Tinode v0, the concrete cleanup action is `/_app/forget_credentials.act`, which removes connector-private state keyed by the current `profile_id` and clears the shared principal-to-profile mapping.
 
-1. AppFS may remove `/private/<principal-id>` data if safe;
-2. AppFS should ask affected private app connectors to delete or revoke credentials for that principal's profile ids;
-3. connector cleanup should be best-effort and emit safe completion or failure events.
-
-This likely needs a future connector lifecycle method or internal control action. It is not covered by the current connector trait.
+Future cleanup policy may add archived principal records, a `delete_private_data`
+flag, force checks for active principals, and physical private-data deletion.
 
 ## Compatibility With Current `aiim`
 
@@ -1165,6 +1300,18 @@ Longer term:
 
 ## Phased Implementation Plan
 
+### Current Implementation Status
+
+As of the current workspace state, P2 is not a fresh starting point anymore:
+
+1. P1 principal metadata is implemented: `APPFS_PRINCIPAL_ID`, default principal fallback, status output, `principals.registry.json`, and per-principal record views all exist.
+2. P2 principal management is implemented: `create_principal.act`, `update_principal.act`, `delete_principal.act`, `attach_principal.act`, `detach_principal.act`, supervisor handlers, idempotent create, and best-effort attach leases are present.
+3. P2.5 app policies and auto-instantiation are implemented: compose writes app policies, public app instances are materialized at compose startup, and private app instances are materialized when a principal is created or attached.
+4. P3 and P4 are mostly implemented in the current appfs-agent path: public/private app metadata is visible to appfs-agent, skill discovery filters to public apps plus the current principal's private apps, and event reminders filter private streams by current principal.
+5. P5 principal-aware fork exists as a CLI/session workflow, but process launching is still manual-guided rather than a fully managed launcher.
+6. P6 Tinode/private-account app support is the active area for product polish: the core direct-message, credential, inbound, inbox, and multi-agent smoke paths work. `AUTH_EXPIRED` exists as an error surface, but automatic token refresh is not yet implemented.
+7. `delete_principal.act` currently deletes the registry entry immediately and best-effort invokes connector credential cleanup. It does not yet implement archived principal records, `delete_private_data`, force checks, or physical private-data deletion.
+
 ### P0. Keep Existing Behavior Stable
 
 1. Keep `aiim` tests green.
@@ -1187,9 +1334,11 @@ Longer term:
 2. Add `/_appfs/principals/update_principal.act`.
 3. Add `/_appfs/principals/delete_principal.act`.
 4. Add AppFS supervisor handlers for those principal actions.
-5. Make default principal creation idempotent.
+5. Make principal creation idempotent.
 6. Materialize `/private/<principal-id>`.
-7. Keep `active_attach_count` best-effort or fixed at `0` until launcher lifecycle support exists.
+7. Add `/_appfs/principals/attach_principal.act`.
+8. Add `/_appfs/principals/detach_principal.act`.
+9. Keep `active_attach_count` derived from best-effort attach leases.
 
 ### P2.5. Add App Policies And Auto-Instantiation
 
@@ -1236,15 +1385,15 @@ Longer term:
 4. Implement `tinode` as a new private app.
 5. Bind Tinode credentials to `tinode:<principal-id>`.
 6. Store Tinode tokens in connector private state, not in the AppFS tree.
-7. Handle token refresh and `AUTH_EXPIRED`.
+7. Surface `AUTH_EXPIRED`; silent token refresh is a future connector enhancement.
 8. Design the Tinode app tree separately.
 
 **Acceptance test (Tinode first-message flow):**
 
 ```text
 Given: AppFS compose running with tinode as private app.
-       principal "default" has been created.
-       private/default/tinode has been auto-instantiated.
+       appfs-agent has attached as principal "default".
+       private/default/tinode has been materialized by create/attach.
        No Tinode credentials exist yet.
        Model skill listing includes appfs-tinode.
 

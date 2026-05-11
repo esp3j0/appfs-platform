@@ -41,6 +41,83 @@ Or authenticate via OAuth:
 claw login
 ```
 
+## AppFS Event Boundary Injection
+
+When `claw` runs from an AppFS mount, it automatically syncs current
+principal-visible AppFS event streams before each model call and injects fresh
+records as `<system-reminder>` context. This keeps same-turn action receipts
+such as `action.completed`, `action.failed`, and Tinode `message.received`
+available while the model is actively working.
+
+The earlier broad idle watcher commands remain disabled because they woke the
+model on every event, including self-generated receipts:
+
+- `cargo run -p rusty-claude-cli -- appfs-events watch ...`
+- `cargo run -p rusty-claude-cli -- --watch-appfs-events`
+
+For safe idle wake, use the new opt-in flag:
+
+```bash
+cargo run -p rusty-claude-cli -- --appfs-idle-wake
+```
+
+`--appfs-idle-wake` starts the normal interactive REPL and scans AppFS events at
+safe idle boundaries. It uses a separate wake cursor and only wakes the agent for
+attention-worthy events, such as Tinode `message.received` records with
+`requires_attention=true`. Status events, self-generated receipts such as
+`message.sent`, and action receipts such as `action.completed` remain available
+through normal model-call boundary injection but do not start a new idle turn by
+themselves.
+
+This is intentionally not a fully asynchronous terminal editor yet. The CLI
+checks for idle wake before and after safe REPL operations; it does not interrupt
+an in-progress model/tool turn or force a wake for every filesystem event.
+
+For experimental running-turn user guidance, combine idle wake with
+`--running-input`:
+
+```bash
+cargo run -p rusty-claude-cli -- --appfs-idle-wake --running-input
+```
+
+`--running-input` switches the interactive REPL to a minimal single-stdin-owner
+terminal controller. While the agent is running, submitted lines become
+`user.guidance` and are injected before the next safe model-call boundary. Use
+`/queue <text>` to defer a note until after the current turn. The default
+`rustyline` REPL remains unchanged unless this flag is set.
+
+Design notes:
+
+- `docs/plans/2026-05-09-appfs-agent-event-boundary-and-idle-wake.md`
+- `docs/plans/2026-05-09-appfs-agent-unified-input-router-implementation.md`
+- `docs/plans/2026-05-10-appfs-agent-pr7-running-guidance-input.md`
+
+## AppFS Attach Identity
+
+When the interactive CLI starts inside an AppFS mount, it now ensures the current
+AppFS principal exists before building the system prompt and skill listing. The
+principal comes from `APPFS_PRINCIPAL_ID`; when unset it defaults to `default`.
+This is attach-driven: starting `claw` inside the mounted AppFS tree is what
+creates the attach lease, principal ensure, and private-app warmup. AppFS
+startup alone does not create the identity or the private apps.
+
+If the principal is missing, `claw` appends to
+`/_appfs/principals/create_principal.act` and waits for AppFS to materialize that
+principal's private app instances, such as `private/<principal-id>/tinode`.
+
+After the principal is ready, `claw` appends to
+`/_appfs/principals/attach_principal.act` with its process `attach_id`. On normal
+process exit it appends to `/_appfs/principals/detach_principal.act`, allowing
+AppFS to keep `active_attach_count` and `active_attaches` as best-effort live
+status. Detach does not delete the principal, private app data, or credentials.
+
+This attach step prepares AppFS identity and private app visibility. After
+attach, `claw` also best-effort warms private apps that expose
+`_app/ensure_credentials.act` by appending a standard ensure request for the
+current principal. Long-lived credentials still belong to the connector; the
+agent only triggers the app-specific bootstrap path. If the attach is killed
+ungracefully, the detach lease may lag until the next lifecycle update.
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
@@ -124,6 +201,8 @@ Options:
   --permission-mode MODE           Set read-only, workspace-write, or danger-full-access
   --allowedTools TOOLS             Restrict enabled tools
   --output-format FORMAT           Output format (text or json)
+  --appfs-idle-wake                Wake idle REPL turns for attention-worthy AppFS events
+  --running-input                  Experimental: accept guidance while a turn is running
   --version, -V                    Print version info
 
 Commands:

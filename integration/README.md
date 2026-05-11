@@ -115,6 +115,61 @@ $env:ANTHROPIC_API_KEY="..."
 The repository also includes an opt-in workflow at `.github/workflows/integration-smoke-windows.yml`.
 It is designed for a self-hosted Windows runner with WinFsp installed, because GitHub-hosted Windows runners do not provide the mount dependency by default.
 
+## Tinode Multi-Agent Smoke
+
+For the current AppFS + Tinode multi-agent identity and messaging flow, use:
+
+```powershell
+./integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1
+```
+
+What it validates:
+
+1. start AppFS in Tinode-only compose mode;
+2. trigger principal attach through `claw status` for `default` and `code-implementer`;
+3. verify `private/default/tinode` and `private/code-implementer/tinode` are materialized by attach, not by AppFS startup alone;
+4. verify Tinode credential warmup and direct messages between the two principals;
+5. verify both inboxes receive the opposite principal's message.
+
+This smoke is local-only for now and is not yet wired into GitHub Actions.
+
+### Manual bring-up
+
+If you want to reproduce the same flow by hand, use this sequence:
+
+1. Reset the remote Tinode test server if you want a clean slate:
+
+```powershell
+ssh ubuntu@101.34.216.193 "/home/ubuntu/reset-appfs-tinode.sh --skip-backup"
+```
+
+2. Start AppFS with the Tinode-only compose file:
+
+```powershell
+cd C:\Users\esp3j\rep\appfs-platform
+$env:APPFS_TINODE_ENDPOINT="http://101.34.216.193:6060"
+$env:APPFS_TINODE_LOGIN_PREFIX="appfsmanual$(Get-Date -Format yyyyMMddHHmmss)"
+$env:APPFS_TINODE_CREDENTIAL_POLICY="auto-create"
+cargo run --manifest-path appfs\cli\Cargo.toml --target-dir C:\tmp\appfs-local-target -- appfs compose up -f appfs\appfs-compose.tinode.local.yaml
+```
+
+3. Start the default agent:
+
+```powershell
+cd C:\mnt\appfs-compose-tinode
+cargo run --manifest-path C:\Users\esp3j\rep\appfs-platform\appfs-agent\rust\Cargo.toml --target-dir C:\tmp\appfs-agent-local-target -p rusty-claude-cli -- --dangerously-skip-permissions --appfs-idle-wake --running-input
+```
+
+4. Start the second agent as `code-implementer`:
+
+```powershell
+cd C:\mnt\appfs-compose-tinode
+$env:APPFS_PRINCIPAL_ID="code-implementer"
+cargo run --manifest-path C:\Users\esp3j\rep\appfs-platform\appfs-agent\rust\Cargo.toml --target-dir C:\tmp\appfs-agent-local-target -p rusty-claude-cli -- --dangerously-skip-permissions --appfs-idle-wake --running-input
+```
+
+5. Send a message from `default` to `code-implementer` by appending one JSON line to `private/default/tinode/contacts/send_message.act`, then check `private/code-implementer/tinode/_stream/events.evt.jsonl` and `private/code-implementer/tinode/inbox/recent.res.jsonl`.
+
 ## HTTP Demo Integration
 
 For the second Windows checkpoint, use the HTTP demo bridge plus a real `appfs-agent` prompt:

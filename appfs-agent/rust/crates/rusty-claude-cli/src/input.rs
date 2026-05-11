@@ -10,7 +10,8 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode as RustyKeyCode,
+    KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +114,14 @@ impl LineEditor {
         let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
             .expect("rustyline editor should initialize");
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
-        editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
-        editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        editor.bind_sequence(
+            RustyKeyEvent(RustyKeyCode::Char('J'), RustyModifiers::CTRL),
+            Cmd::Newline,
+        );
+        editor.bind_sequence(
+            RustyKeyEvent(RustyKeyCode::Enter, RustyModifiers::SHIFT),
+            Cmd::Newline,
+        );
 
         Self {
             prompt: prompt.into(),
