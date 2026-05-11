@@ -487,6 +487,10 @@ impl AppfsAdapter {
         Ok(())
     }
 
+    pub(super) fn poll_inbound_events_once(&mut self) -> Result<()> {
+        self.drain_connector_inbound_events()
+    }
+
     fn drain_connector_inbound_events(&mut self) -> Result<()> {
         let request_id = Self::new_request_id();
         let request_ctx = ConnectorContext {
@@ -538,7 +542,16 @@ impl AppfsAdapter {
     pub(super) fn poll_once(&mut self) -> Result<()> {
         self.drain_streaming_jobs()?;
         self.drain_connector_inbound_events()?;
+        self.drain_action_sinks()?;
+        Ok(())
+    }
 
+    pub(super) fn poll_action_work_once(&mut self) -> Result<()> {
+        self.drain_streaming_jobs()?;
+        self.drain_action_sinks()
+    }
+
+    fn drain_action_sinks(&mut self) -> Result<()> {
         let mut actions = self.collect_action_files()?;
         actions.sort();
         let mut cursor_dirty = false;
@@ -1102,6 +1115,29 @@ impl AppfsAdapter {
                 Ok(ProcessOutcome::Consumed)
             }
         }
+    }
+
+    pub(super) fn submit_internal_action(
+        &mut self,
+        action_path: &str,
+        payload: JsonValue,
+        client_token: Option<String>,
+    ) -> Result<ProcessOutcome> {
+        let normalized_path = action_path
+            .trim_start_matches('/')
+            .replace('\\', "/")
+            .trim()
+            .to_string();
+        if !is_safe_action_rel_path(&normalized_path) {
+            anyhow::bail!("unsafe internal action path: {normalized_path}");
+        }
+        let Some(spec) = self.find_action_spec(&normalized_path).cloned() else {
+            anyhow::bail!(
+                "internal action path is not declared in the manifest: {normalized_path}"
+            );
+        };
+        let payload_json = serde_json::to_string(&payload)?;
+        self.process_action(&normalized_path, &spec, &payload_json, client_token)
     }
 
     fn find_action_spec(&self, rel_path: &str) -> Option<&ActionSpec> {

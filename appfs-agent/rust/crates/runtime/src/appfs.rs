@@ -8,7 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::session::{AttachmentKind, ConversationMessage, Session, SessionError};
+#[cfg(test)]
+use crate::input_router::render_pending_input_reminder;
+use crate::input_router::{InputEnvelope, InputSource, PendingInput, PendingInputDelivery};
+#[cfg(test)]
+use crate::session::{AttachmentKind, ConversationMessage};
+use crate::session::{Session, SessionError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,15 +21,24 @@ const CONTROL_DIR_NAME: &str = "_appfs";
 const REGISTER_APP_ACTION: &str = "register_app.act";
 const UNREGISTER_APP_ACTION: &str = "unregister_app.act";
 const LIST_APPS_ACTION: &str = "list_apps.act";
+const ATTACH_PRINCIPAL_ACTION: &str = "principals/attach_principal.act";
+const DETACH_PRINCIPAL_ACTION: &str = "principals/detach_principal.act";
 const REGISTRY_FILE: &str = "apps.registry.json";
 const PRINCIPALS_FILE: &str = "principals.registry.json";
 const APP_POLICIES_FILE: &str = "app-policies.registry.json";
 const APP_CONTROL_DIR_NAME: &str = "_app";
+const ENSURE_CREDENTIALS_ACTION: &str = "ensure_credentials.act";
 const APP_STREAM_DIR_NAME: &str = "_stream";
 const EVENTS_FILE: &str = "events.evt.jsonl";
 const STREAM_CURSOR_FILE: &str = "cursor.res.json";
+#[cfg(test)]
 const APPFS_EVENT_REMINDER_MAX_EVENTS: usize = 20;
 const APPFS_EVENT_REMINDER_FIELD_LIMIT: usize = 360;
+#[cfg(not(test))]
+const APPFS_PRIVATE_APP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const APPFS_PRIVATE_APP_WARMUP_TIMEOUT: Duration = Duration::from_millis(300);
+const APPFS_PRIVATE_APP_WARMUP_POLL: Duration = Duration::from_millis(100);
 pub const APPFS_RUNTIME_MANIFEST_REL_PATH: &str = ".well-known/appfs/runtime.json";
 pub const APPFS_ATTACH_SCHEMA_ENV: &str = "APPFS_ATTACH_SCHEMA";
 pub const APPFS_RUNTIME_MANIFEST_ENV: &str = "APPFS_RUNTIME_MANIFEST";
@@ -102,6 +116,10 @@ pub struct AppfsRuntimeManifestControlPlane {
     pub register_action: String,
     pub unregister_action: String,
     pub list_action: String,
+    #[serde(default)]
+    pub attach_principal_action: Option<String>,
+    #[serde(default)]
+    pub detach_principal_action: Option<String>,
     pub registry: String,
     pub events: String,
 }
@@ -145,6 +163,8 @@ pub struct AppfsEnvironment {
     pub register_app_path: Option<PathBuf>,
     pub unregister_app_path: Option<PathBuf>,
     pub list_apps_path: Option<PathBuf>,
+    pub attach_principal_path: Option<PathBuf>,
+    pub detach_principal_path: Option<PathBuf>,
     pub current_app_id: Option<String>,
     pub current_app_root: Option<PathBuf>,
     pub current_app_events_path: Option<PathBuf>,
@@ -175,6 +195,46 @@ pub struct AppfsPrincipalCreateOutcome {
     pub action_path: PathBuf,
     pub registry_path: PathBuf,
     pub visible_private_apps: Vec<AppfsRegisteredApp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsAttachEnsureStatus {
+    NotAppfs,
+    Ready,
+    WaitingForPrivateApps,
+    Created,
+    Submitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsAttachEnsureOutcome {
+    pub status: AppfsAttachEnsureStatus,
+    pub environment: Option<AppfsEnvironment>,
+    pub principal_outcome: Option<AppfsPrincipalCreateOutcome>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsAttachLease {
+    pub principal_id: String,
+    pub attach_id: String,
+    pub action_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppfsPrivateAppWarmupOutcome {
+    pub instance_id: String,
+    pub app_id: String,
+    pub action_path: PathBuf,
+    pub client_token: String,
+    pub status: AppfsPrivateAppWarmupStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsPrivateAppWarmupStatus {
+    Ready,
+    Failed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +301,8 @@ struct HeuristicDetection {
     register_app_path: PathBuf,
     unregister_app_path: PathBuf,
     list_apps_path: PathBuf,
+    attach_principal_path: PathBuf,
+    detach_principal_path: PathBuf,
     current_app_id: Option<String>,
     current_app_root: Option<PathBuf>,
     current_app_events_path: Option<PathBuf>,
@@ -256,26 +318,56 @@ struct ResolvedControlPlanePaths {
     register_app_path: Option<PathBuf>,
     unregister_app_path: Option<PathBuf>,
     list_apps_path: Option<PathBuf>,
+    attach_principal_path: Option<PathBuf>,
+    detach_principal_path: Option<PathBuf>,
 }
 
 #[must_use]
 pub fn detect_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
-    resolve_appfs_environment(cwd)
+    resolve_appfs_environment_raw(cwd)
 }
 
 #[must_use]
 pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
-    let attach_env = load_attach_env();
-    let environment = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())?;
+    resolve_appfs_environment_raw(cwd)
+}
+
+#[must_use]
+pub fn ensure_appfs_attach_identity(cwd: &Path) -> AppfsAttachEnsureOutcome {
+    ensure_appfs_attach_identity_with_attach_env(cwd, load_attach_env())
+}
+
+fn ensure_appfs_attach_identity_with_attach_env(
+    cwd: &Path,
+    attach_env: AppfsAttachEnv,
+) -> AppfsAttachEnsureOutcome {
+    let Some(environment) = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())
+    else {
+        return AppfsAttachEnsureOutcome {
+            status: AppfsAttachEnsureStatus::NotAppfs,
+            environment: None,
+            principal_outcome: None,
+            warnings: Vec::new(),
+        };
+    };
+
     if should_auto_create_default_principal(&environment) {
+        let mut warnings = Vec::new();
+        let mut principal_outcome = None;
         if let Some(control_dir) = environment.control_dir.as_deref() {
             if has_pending_default_principal_create_action(control_dir) {
-                let _ = wait_for_principal_ready(
+                let principal = wait_for_principal_ready(
                     control_dir,
                     &control_dir.join(PRINCIPALS_FILE),
                     environment.registry_path.as_deref(),
                     APPFS_DEFAULT_PRINCIPAL_ID,
                 );
+                if principal.is_none() {
+                    warnings.push(
+                        "pending default principal create action did not become ready before timeout"
+                            .to_string(),
+                    );
+                }
             } else {
                 let request = AppfsPrincipalCreateRequest {
                     principal_id: APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
@@ -283,12 +375,124 @@ pub fn resolve_appfs_environment(cwd: &Path) -> Option<AppfsEnvironment> {
                     description: Some("The default AppFS agent principal.".to_string()),
                     kind: Some("agent".to_string()),
                 };
-                let _ = create_appfs_principal_from_environment(request, environment.clone());
+                match create_appfs_principal_from_environment(request, environment.clone()) {
+                    Ok(outcome) => principal_outcome = Some(outcome),
+                    Err(error) => warnings.push(error),
+                }
             }
         }
-        return resolve_appfs_environment_with_attach_env(cwd, attach_env).or(Some(environment));
+        let resolved = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())
+            .or_else(|| Some(environment.clone()));
+        let status = principal_outcome.as_ref().map_or_else(
+            || {
+                resolved.as_ref().map_or(
+                    AppfsAttachEnsureStatus::WaitingForPrivateApps,
+                    |environment| {
+                        if should_wait_for_selected_private_apps(environment) {
+                            AppfsAttachEnsureStatus::WaitingForPrivateApps
+                        } else {
+                            AppfsAttachEnsureStatus::Ready
+                        }
+                    },
+                )
+            },
+            attach_ensure_status_from_principal_outcome,
+        );
+        return AppfsAttachEnsureOutcome {
+            status,
+            environment: resolved,
+            principal_outcome,
+            warnings,
+        };
     }
-    Some(environment)
+
+    if should_auto_create_selected_principal(&environment, &attach_env) {
+        let request = AppfsPrincipalCreateRequest {
+            principal_id: environment.principal_id.clone(),
+            display_name: Some(environment.principal_id.clone()),
+            description: Some("AppFS principal created by appfs-agent attach.".to_string()),
+            kind: Some("agent".to_string()),
+        };
+        let mut warnings = Vec::new();
+        let principal_outcome =
+            match create_appfs_principal_from_environment(request, environment.clone()) {
+                Ok(outcome) => Some(outcome),
+                Err(error) => {
+                    warnings.push(error);
+                    None
+                }
+            };
+        let resolved = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())
+            .or_else(|| Some(environment.clone()));
+        return AppfsAttachEnsureOutcome {
+            status: principal_outcome
+                .as_ref()
+                .map_or(AppfsAttachEnsureStatus::Submitted, |outcome| {
+                    attach_ensure_status_from_principal_outcome(outcome)
+                }),
+            environment: resolved,
+            principal_outcome,
+            warnings,
+        };
+    }
+
+    if should_wait_for_selected_private_apps(&environment) {
+        let mut warnings = Vec::new();
+        if let Some(control_dir) = environment.control_dir.as_deref() {
+            let principal = wait_for_principal_ready(
+                control_dir,
+                &control_dir.join(PRINCIPALS_FILE),
+                environment.registry_path.as_deref(),
+                &environment.principal_id,
+            );
+            if principal.is_none() {
+                warnings.push(format!(
+                    "principal '{}' exists but private apps were not ready before timeout",
+                    environment.principal_id
+                ));
+            }
+        }
+        let resolved = resolve_appfs_environment_with_attach_env(cwd, attach_env)
+            .or_else(|| Some(environment.clone()));
+        let status = resolved.as_ref().map_or(
+            AppfsAttachEnsureStatus::WaitingForPrivateApps,
+            |environment| {
+                if should_wait_for_selected_private_apps(environment) {
+                    AppfsAttachEnsureStatus::WaitingForPrivateApps
+                } else {
+                    AppfsAttachEnsureStatus::Ready
+                }
+            },
+        );
+        return AppfsAttachEnsureOutcome {
+            status,
+            environment: resolved,
+            principal_outcome: None,
+            warnings,
+        };
+    }
+
+    AppfsAttachEnsureOutcome {
+        status: AppfsAttachEnsureStatus::Ready,
+        environment: Some(environment),
+        principal_outcome: None,
+        warnings: Vec::new(),
+    }
+}
+
+fn attach_ensure_status_from_principal_outcome(
+    outcome: &AppfsPrincipalCreateOutcome,
+) -> AppfsAttachEnsureStatus {
+    match outcome.status {
+        AppfsPrincipalCreateStatus::Created => AppfsAttachEnsureStatus::Created,
+        AppfsPrincipalCreateStatus::Exists => AppfsAttachEnsureStatus::Ready,
+        AppfsPrincipalCreateStatus::Submitted => AppfsAttachEnsureStatus::Submitted,
+    }
+}
+
+#[must_use]
+fn resolve_appfs_environment_raw(cwd: &Path) -> Option<AppfsEnvironment> {
+    resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
 }
 
 pub fn create_appfs_principal(
@@ -298,6 +502,122 @@ pub fn create_appfs_principal(
     let environment = resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
         .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
     create_appfs_principal_from_environment(request, environment)
+}
+
+pub fn attach_appfs_principal(cwd: &Path) -> Result<AppfsAttachLease, String> {
+    let environment = resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+        .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
+    attach_appfs_principal_from_environment(&environment)
+}
+
+pub fn warmup_appfs_private_apps(cwd: &Path) -> Result<Vec<AppfsPrivateAppWarmupOutcome>, String> {
+    let environment = resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
+        .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
+    warmup_private_apps_from_environment(&environment)
+}
+
+pub fn detach_appfs_principal(lease: &AppfsAttachLease, reason: &str) -> Result<(), String> {
+    append_principal_lifecycle_action(
+        &lease.action_path,
+        serde_json::json!({
+            "principal_id": lease.principal_id,
+            "attach_id": lease.attach_id,
+            "reason": reason,
+            "client_token": format!("principal-detach-{}", now_millis()),
+        }),
+        "detach",
+    )
+}
+
+fn attach_appfs_principal_from_environment(
+    environment: &AppfsEnvironment,
+) -> Result<AppfsAttachLease, String> {
+    let principal_id = environment.principal_id.trim();
+    if !is_safe_principal_id(principal_id) {
+        return Err(
+            "principal_id must use ASCII letters, digits, '.', '_' or '-' and cannot be empty"
+                .to_string(),
+        );
+    }
+    if !is_safe_attach_id(&environment.attach_id) {
+        return Err(
+            "attach_id must use ASCII letters, digits, '.', '_' or '-' and cannot be empty"
+                .to_string(),
+        );
+    }
+    let action_path = environment
+        .attach_principal_path
+        .clone()
+        .or_else(|| {
+            environment
+                .control_dir
+                .as_ref()
+                .map(|control_dir| control_dir.join(ATTACH_PRINCIPAL_ACTION))
+        })
+        .ok_or_else(|| "AppFS attach principal action was not detected".to_string())?;
+    append_principal_lifecycle_action(
+        &action_path,
+        serde_json::json!({
+            "principal_id": principal_id,
+            "attach_id": environment.attach_id,
+            "role": environment.attach_role,
+            "session_id": environment.runtime_session_id,
+            "client_token": format!("principal-attach-{}", now_millis()),
+        }),
+        "attach",
+    )?;
+    Ok(AppfsAttachLease {
+        principal_id: principal_id.to_string(),
+        attach_id: environment.attach_id.clone(),
+        action_path: environment
+            .detach_principal_path
+            .clone()
+            .or_else(|| {
+                environment
+                    .control_dir
+                    .as_ref()
+                    .map(|control_dir| control_dir.join(DETACH_PRINCIPAL_ACTION))
+            })
+            .ok_or_else(|| "AppFS detach principal action was not detected".to_string())?,
+    })
+}
+
+fn warmup_private_apps_from_environment(
+    environment: &AppfsEnvironment,
+) -> Result<Vec<AppfsPrivateAppWarmupOutcome>, String> {
+    let mut outcomes = Vec::new();
+    for app in &environment.registered_apps {
+        if app.visibility != AppfsRegisteredAppVisibility::PrivateInstance
+            || app.principal_id.as_deref() != Some(environment.principal_id.as_str())
+        {
+            continue;
+        }
+        let Some(profile_id) = app.profile_id.as_deref() else {
+            continue;
+        };
+        let action_path = app
+            .app_root(&environment.mount_root)
+            .join(APP_CONTROL_DIR_NAME)
+            .join(ENSURE_CREDENTIALS_ACTION);
+        if !action_path.exists() {
+            continue;
+        }
+        let client_token =
+            append_app_private_warmup_action(&action_path, profile_id, &app.instance_id)?;
+        let events_path = app
+            .app_root(&environment.mount_root)
+            .join(APP_STREAM_DIR_NAME)
+            .join(EVENTS_FILE);
+        let status = wait_for_private_app_warmup_status(&events_path, &client_token);
+        outcomes.push(AppfsPrivateAppWarmupOutcome {
+            instance_id: app.instance_id.clone(),
+            app_id: app.app_id.clone(),
+            action_path,
+            client_token,
+            status,
+        });
+    }
+    Ok(outcomes)
 }
 
 fn create_appfs_principal_from_environment(
@@ -366,17 +686,174 @@ pub fn build_appfs_prompt_section(cwd: &Path) -> Option<String> {
     Some(render_appfs_prompt_section(&environment))
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppfsEventSyncOutcome {
+    pub new_event_count: usize,
+    pub cursor_update_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppfsPendingInputSync {
+    pub pending_inputs: Vec<PendingInput>,
+    pub cursor_updates: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppfsIdleWakeScanOutcome {
+    pub wake_event_count: usize,
+    pub cursor_update_count: usize,
+    pub pending_inputs: Vec<PendingInput>,
+}
+
+#[cfg(test)]
 pub fn sync_appfs_event_reminders(session: &mut Session, cwd: &Path) -> Result<(), SessionError> {
+    sync_appfs_event_reminders_with_outcome(session, cwd).map(|_| ())
+}
+
+#[cfg(test)]
+pub fn sync_appfs_event_reminders_with_outcome(
+    session: &mut Session,
+    cwd: &Path,
+) -> Result<AppfsEventSyncOutcome, SessionError> {
+    let sync = collect_appfs_pending_inputs(session, cwd)?;
+    let new_event_count = sync.pending_inputs.len();
+    if !sync.pending_inputs.is_empty() {
+        let reminder = render_pending_input_reminder(&sync.pending_inputs);
+        session.push_message(ConversationMessage::attachment_user_text(
+            reminder,
+            AttachmentKind::InputRouter,
+        ))?;
+    }
+
+    let cursor_update_count = sync.cursor_updates.len();
+    if !sync.cursor_updates.is_empty() {
+        session.update_appfs_event_cursors(sync.cursor_updates)?;
+    }
+
+    Ok(AppfsEventSyncOutcome {
+        new_event_count,
+        cursor_update_count,
+    })
+}
+
+pub fn collect_appfs_pending_inputs(
+    session: &Session,
+    cwd: &Path,
+) -> Result<AppfsPendingInputSync, SessionError> {
     let Some(environment) = detect_appfs_environment(cwd) else {
-        return Ok(());
+        return Ok(AppfsPendingInputSync::default());
+    };
+    Ok(collect_pending_inputs_from_appfs_environment(
+        session,
+        &environment,
+        ModelInputCursorKind::Boundary,
+    ))
+}
+
+pub fn scan_appfs_attention_events_for_idle_wake(
+    session: &mut Session,
+    cwd: &Path,
+) -> Result<AppfsIdleWakeScanOutcome, SessionError> {
+    let Some(environment) = detect_appfs_environment(cwd) else {
+        return Ok(AppfsIdleWakeScanOutcome::default());
     };
     let streams = collect_appfs_event_streams(&environment);
     if streams.is_empty() {
-        return Ok(());
+        return Ok(AppfsIdleWakeScanOutcome::default());
+    }
+
+    let mut wake_cursor_updates = BTreeMap::new();
+    let mut model_cursor_baselines = BTreeMap::new();
+    let mut wake_events = Vec::new();
+    for stream in streams {
+        let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
+        if let Some(max_seq) = stream_max_seq {
+            match session.appfs_wake_event_cursor(&stream.stream_id) {
+                Some(last_seq) if max_seq <= last_seq => continue,
+                None => {
+                    // First idle scan establishes a wake baseline so an agent
+                    // does not auto-run old backlog immediately after attach.
+                    wake_cursor_updates.insert(stream.stream_id.clone(), max_seq);
+                    if session.appfs_event_cursor(&stream.stream_id).is_none() {
+                        model_cursor_baselines.insert(stream.stream_id.clone(), max_seq);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(records) = read_appfs_event_records(&stream) else {
+            continue;
+        };
+        let max_seq = stream_max_seq
+            .or_else(|| records.iter().map(|record| record.seq).max())
+            .unwrap_or(0);
+        match session.appfs_wake_event_cursor(&stream.stream_id) {
+            Some(last_seq) => {
+                if max_seq > last_seq {
+                    wake_cursor_updates.insert(stream.stream_id.clone(), max_seq);
+                    if session.appfs_event_cursor(&stream.stream_id).is_none() {
+                        model_cursor_baselines.insert(stream.stream_id.clone(), last_seq);
+                    }
+                }
+                wake_events.extend(
+                    records
+                        .into_iter()
+                        .filter(|record| record.seq > last_seq)
+                        .filter(should_wake_idle_agent_for_appfs_event),
+                );
+            }
+            None => {
+                wake_cursor_updates.insert(stream.stream_id.clone(), max_seq);
+                if session.appfs_event_cursor(&stream.stream_id).is_none() {
+                    model_cursor_baselines.insert(stream.stream_id.clone(), max_seq);
+                }
+            }
+        }
+    }
+
+    let pending_inputs = wake_events
+        .iter()
+        .filter_map(|event| pending_input_from_appfs_event(event, AppfsDeliveryMode::WakeIfIdle))
+        .collect::<Vec<_>>();
+    let wake_event_count = pending_inputs.len();
+    let cursor_update_count = wake_cursor_updates.len() + model_cursor_baselines.len();
+    if !model_cursor_baselines.is_empty() {
+        session.update_appfs_event_cursors(model_cursor_baselines)?;
+    }
+    if wake_event_count > 0 {
+        session.update_appfs_event_cursors(wake_cursor_updates.clone())?;
+    }
+    if !wake_cursor_updates.is_empty() {
+        session.update_appfs_wake_event_cursors(wake_cursor_updates)?;
+    }
+
+    Ok(AppfsIdleWakeScanOutcome {
+        wake_event_count,
+        cursor_update_count,
+        pending_inputs,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelInputCursorKind {
+    Boundary,
+}
+
+fn collect_pending_inputs_from_appfs_environment(
+    session: &Session,
+    environment: &AppfsEnvironment,
+    _cursor_kind: ModelInputCursorKind,
+) -> AppfsPendingInputSync {
+    let streams = collect_appfs_event_streams(environment);
+    if streams.is_empty() {
+        return AppfsPendingInputSync::default();
     }
 
     let mut cursor_updates = BTreeMap::new();
-    let mut new_events = Vec::new();
+    let mut pending_inputs = Vec::new();
     for stream in streams {
         let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
         if let Some(max_seq) = stream_max_seq {
@@ -403,7 +880,17 @@ pub fn sync_appfs_event_reminders(session: &mut Session, cwd: &Path) -> Result<(
                 if max_seq > last_seq {
                     cursor_updates.insert(stream.stream_id.clone(), max_seq);
                 }
-                new_events.extend(records.into_iter().filter(|record| record.seq > last_seq));
+                pending_inputs.extend(
+                    records
+                        .into_iter()
+                        .filter(|record| record.seq > last_seq)
+                        .filter_map(|record| {
+                            pending_input_from_appfs_event(
+                                &record,
+                                classify_appfs_event(&record).running_delivery,
+                            )
+                        }),
+                );
             }
             None => {
                 // First attach establishes a baseline so old event backlog does not
@@ -413,26 +900,17 @@ pub fn sync_appfs_event_reminders(session: &mut Session, cwd: &Path) -> Result<(
         }
     }
 
-    if !new_events.is_empty() {
-        let reminder = render_appfs_event_reminder(&new_events);
-        session.push_message(ConversationMessage::attachment_user_text(
-            reminder,
-            AttachmentKind::AppfsEvents,
-        ))?;
+    AppfsPendingInputSync {
+        pending_inputs,
+        cursor_updates,
     }
-
-    if !cursor_updates.is_empty() {
-        session.update_appfs_event_cursors(cursor_updates)?;
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
 struct AppfsEventStream {
     stream_id: String,
-    label: String,
     app_id: Option<String>,
+    principal_id: Option<String>,
     path: PathBuf,
 }
 
@@ -443,14 +921,140 @@ struct AppfsStreamCursor {
 
 #[derive(Debug, Clone)]
 struct AppfsEventRecord {
-    label: String,
+    stream_id: String,
     app_id: Option<String>,
+    principal_id: Option<String>,
     seq: i64,
     event_type: String,
     event_path: Option<String>,
     request_id: Option<String>,
     content: Option<Value>,
     error: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppfsInputClass {
+    Guidance,
+    Receipt,
+    Attention,
+    Status,
+    Noise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppfsDeliveryMode {
+    InjectAtNextBoundary,
+    WakeIfIdle,
+    ContextOnly,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppfsEventClassification {
+    input_class: AppfsInputClass,
+    running_delivery: AppfsDeliveryMode,
+    idle_delivery: AppfsDeliveryMode,
+}
+
+fn appfs_event_to_input_envelope(event: &AppfsEventRecord) -> InputEnvelope {
+    let mut text = summarize_appfs_event(event).unwrap_or_default();
+    if let Some(path) = &event.event_path {
+        if text.is_empty() {
+            text = format!("path={path}");
+        } else if !text.contains(path) {
+            text.push_str(&format!("; path={path}"));
+        }
+    }
+    let mut envelope = InputEnvelope::new(InputSource::AppfsEvent, event.event_type.clone(), text);
+    envelope.app_id.clone_from(&event.app_id);
+    envelope.principal_id.clone_from(&event.principal_id);
+    envelope.stream_id = Some(event.stream_id.clone());
+    envelope.seq = Some(event.seq);
+    envelope.correlation_id.clone_from(&event.request_id);
+    envelope.requires_attention = appfs_event_requires_attention(event);
+    envelope.payload = event.content.clone().or_else(|| event.error.clone());
+    envelope
+}
+
+fn pending_input_from_appfs_event(
+    event: &AppfsEventRecord,
+    delivery_mode: AppfsDeliveryMode,
+) -> Option<PendingInput> {
+    let delivery = match delivery_mode {
+        AppfsDeliveryMode::InjectAtNextBoundary
+        | AppfsDeliveryMode::ContextOnly
+        | AppfsDeliveryMode::WakeIfIdle => PendingInputDelivery::InjectAtNextBoundary,
+        AppfsDeliveryMode::Drop => return None,
+    };
+
+    Some(PendingInput {
+        envelope: appfs_event_to_input_envelope(event),
+        delivery,
+    })
+}
+
+fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
+    use AppfsDeliveryMode::{ContextOnly, Drop, InjectAtNextBoundary, WakeIfIdle};
+    use AppfsInputClass::{Attention, Guidance, Noise, Receipt, Status};
+
+    match event.event_type.as_str() {
+        "message.received" if appfs_event_requires_attention(event) => AppfsEventClassification {
+            input_class: Attention,
+            running_delivery: InjectAtNextBoundary,
+            idle_delivery: WakeIfIdle,
+        },
+        "message.received" => AppfsEventClassification {
+            input_class: Guidance,
+            running_delivery: InjectAtNextBoundary,
+            idle_delivery: ContextOnly,
+        },
+        "action.completed" => AppfsEventClassification {
+            input_class: Receipt,
+            running_delivery: ContextOnly,
+            idle_delivery: ContextOnly,
+        },
+        "action.failed" => AppfsEventClassification {
+            input_class: Receipt,
+            running_delivery: InjectAtNextBoundary,
+            idle_delivery: ContextOnly,
+        },
+        "message.sent" => AppfsEventClassification {
+            input_class: Receipt,
+            running_delivery: ContextOnly,
+            idle_delivery: ContextOnly,
+        },
+        "profile.credentials.ready" => AppfsEventClassification {
+            input_class: Status,
+            running_delivery: ContextOnly,
+            idle_delivery: ContextOnly,
+        },
+        "inbox.updated" => AppfsEventClassification {
+            input_class: Noise,
+            running_delivery: Drop,
+            idle_delivery: Drop,
+        },
+        _ => AppfsEventClassification {
+            input_class: Status,
+            running_delivery: ContextOnly,
+            idle_delivery: ContextOnly,
+        },
+    }
+}
+
+fn appfs_event_requires_attention(event: &AppfsEventRecord) -> bool {
+    event
+        .content
+        .as_ref()
+        .and_then(|content| content.get("requires_attention"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn should_wake_idle_agent_for_appfs_event(event: &AppfsEventRecord) -> bool {
+    matches!(
+        classify_appfs_event(event).idle_delivery,
+        AppfsDeliveryMode::WakeIfIdle
+    )
 }
 
 fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEventStream> {
@@ -462,8 +1066,8 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
             &mut seen,
             AppfsEventStream {
                 stream_id: "platform".to_string(),
-                label: "AppFS platform".to_string(),
                 app_id: None,
+                principal_id: None,
                 path: path.clone(),
             },
         );
@@ -476,8 +1080,8 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
             &mut seen,
             AppfsEventStream {
                 stream_id: format!("app:{}", app.instance_id),
-                label: app_event_label(app),
                 app_id: Some(app.app_id.clone()),
+                principal_id: app.principal_id.clone(),
                 path: app_root.join(APP_STREAM_DIR_NAME).join(EVENTS_FILE),
             },
         );
@@ -493,8 +1097,8 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
                 &mut seen,
                 AppfsEventStream {
                     stream_id: format!("app:{app_id}"),
-                    label: format!("AppFS app `{app_id}`"),
                     app_id: Some(app_id.clone()),
+                    principal_id: Some(environment.principal_id.clone()),
                     path: path.clone(),
                 },
             );
@@ -502,15 +1106,6 @@ fn collect_appfs_event_streams(environment: &AppfsEnvironment) -> Vec<AppfsEvent
     }
 
     streams
-}
-
-fn app_event_label(app: &AppfsRegisteredApp) -> String {
-    match (app.visibility, app.principal_id.as_deref()) {
-        (AppfsRegisteredAppVisibility::PrivateInstance, Some(principal_id)) => {
-            format!("AppFS app `{}` for principal `{principal_id}`", app.app_id)
-        }
-        _ => format!("AppFS app `{}`", app.app_id),
-    }
 }
 
 fn push_appfs_event_stream(
@@ -557,8 +1152,9 @@ fn read_appfs_event_records(stream: &AppfsEventStream) -> Option<Vec<AppfsEventR
         let content = value.get("content").cloned();
         let error = value.get("error").cloned();
         records.push(AppfsEventRecord {
-            label: stream.label.clone(),
+            stream_id: stream.stream_id.clone(),
             app_id: stream.app_id.clone(),
+            principal_id: stream.principal_id.clone(),
             seq,
             event_type,
             event_path,
@@ -576,6 +1172,7 @@ fn read_appfs_stream_max_seq_hint(stream: &AppfsEventStream) -> Option<i64> {
     Some(cursor.max_seq.max(0))
 }
 
+#[cfg(test)]
 fn render_appfs_event_reminder(events: &[AppfsEventRecord]) -> String {
     let omitted_count = events.len().saturating_sub(APPFS_EVENT_REMINDER_MAX_EVENTS);
     let visible_start = events.len().saturating_sub(APPFS_EVENT_REMINDER_MAX_EVENTS);
@@ -583,7 +1180,7 @@ fn render_appfs_event_reminder(events: &[AppfsEventRecord]) -> String {
     let mut lines = vec![
         "<system-reminder>".to_string(),
         "New AppFS events were received since the previous model call.".to_string(),
-        "Use these as fresh context; do not re-run completed actions unless the user asks."
+        "Use these as fresh context. If a `message.received` event needs attention, treat it as an active task: reply, act, or continue the conversation in this turn before asking for more context. Do not re-run completed actions unless the user asks."
             .to_string(),
     ];
     if omitted_count > 0 {
@@ -592,7 +1189,12 @@ fn render_appfs_event_reminder(events: &[AppfsEventRecord]) -> String {
         ));
     }
     for event in visible_events {
-        let mut line = format!("- [{}] seq={} {}", event.label, event.seq, event.event_type);
+        let mut line = format!(
+            "- [{}] seq={} {}",
+            appfs_event_display_label(event),
+            event.seq,
+            event.event_type
+        );
         if let Some(app_id) = &event.app_id {
             line.push_str(&format!(" app={app_id}"));
         }
@@ -620,6 +1222,18 @@ fn summarize_appfs_event(event: &AppfsEventRecord) -> Option<String> {
         "action.progress" => summarize_progress_like_event(event, "action progress"),
         "action.completed" => summarize_completed_event(event),
         "action.failed" => summarize_failed_event(event),
+        "message.received" => summarize_message_received_event(event),
+        "message.sent" => summarize_message_sent_event(event),
+        "message.read" => summarize_message_read_event(event),
+        "profile.credentials.ready" => {
+            summarize_credentials_event(event, "profile credentials ready")
+        }
+        "profile.credentials.failed" => {
+            summarize_credentials_event(event, "profile credentials failed")
+        }
+        "profile.credentials.expired" => {
+            summarize_credentials_event(event, "profile credentials expired")
+        }
         "app.registered" => summarize_lifecycle_event(event, "app registered"),
         "app.unregistered" => summarize_lifecycle_event(event, "app unregistered"),
         "app.started" => summarize_lifecycle_event(event, "app started"),
@@ -628,6 +1242,17 @@ fn summarize_appfs_event(event: &AppfsEventRecord) -> Option<String> {
             .content
             .as_ref()
             .map(|content| compact_event_json(content)),
+    }
+}
+
+#[cfg(test)]
+fn appfs_event_display_label(event: &AppfsEventRecord) -> String {
+    match (event.app_id.as_deref(), event.principal_id.as_deref()) {
+        (Some(app_id), Some(principal_id)) => {
+            format!("AppFS app `{app_id}` for principal `{principal_id}`")
+        }
+        (Some(app_id), None) => format!("AppFS app `{app_id}`"),
+        _ => "AppFS platform".to_string(),
     }
 }
 
@@ -683,6 +1308,103 @@ fn summarize_failed_event(event: &AppfsEventRecord) -> Option<String> {
     append_bool_field(&mut parts, error, "retryable");
     if parts.len() == 1 {
         parts.push(format!("error={}", compact_event_json(error)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_message_received_event(event: &AppfsEventRecord) -> Option<String> {
+    let Some(content) = &event.content else {
+        return Some("message received".to_string());
+    };
+    let mut parts = vec!["message received".to_string()];
+    append_string_field(&mut parts, content, "conversation_type");
+    append_string_field(&mut parts, content, "from_display_name");
+    append_string_field(&mut parts, content, "contact_key");
+    append_string_field(&mut parts, content, "group_key");
+    append_string_field(&mut parts, content, "message_id");
+    append_string_field(&mut parts, content, "text_preview");
+    append_bool_field(&mut parts, content, "requires_attention");
+    if content.get("requires_attention").and_then(Value::as_bool) == Some(true) {
+        parts.push("action=reply_or_act".to_string());
+    }
+    if parts.len() == 1 {
+        parts.push(format!("details={}", compact_event_json(content)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_message_sent_event(event: &AppfsEventRecord) -> Option<String> {
+    let Some(content) = &event.content else {
+        return Some("message sent".to_string());
+    };
+    let mut parts = vec!["message sent".to_string()];
+    append_string_field(&mut parts, content, "conversation_type");
+    append_string_field(&mut parts, content, "to_display_name");
+    append_string_field(&mut parts, content, "contact_key");
+    append_string_field(&mut parts, content, "group_key");
+    append_string_field(&mut parts, content, "message_id");
+    append_string_field(&mut parts, content, "text_preview");
+    append_string_field(&mut parts, content, "client_token");
+    if parts.len() == 1 {
+        parts.push(format!("details={}", compact_event_json(content)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_message_read_event(event: &AppfsEventRecord) -> Option<String> {
+    let Some(content) = &event.content else {
+        return Some("message read".to_string());
+    };
+    let mut parts = vec!["message read".to_string()];
+    append_string_field(&mut parts, content, "scope");
+    append_number_field(&mut parts, content, "unread_count");
+    if let Some(cleared) = content.get("cleared") {
+        parts.push(format!("cleared={}", compact_event_json(cleared)));
+    }
+    if parts.len() == 1 {
+        parts.push(format!("details={}", compact_event_json(content)));
+    }
+    Some(truncate_chars(
+        &parts.join("; "),
+        APPFS_EVENT_REMINDER_FIELD_LIMIT,
+    ))
+}
+
+fn summarize_credentials_event(event: &AppfsEventRecord, label: &str) -> Option<String> {
+    if let Some(error) = &event.error {
+        let mut parts = vec![label.to_string()];
+        append_string_field(&mut parts, error, "code");
+        append_message_field(&mut parts, error);
+        append_bool_field(&mut parts, error, "retryable");
+        if parts.len() == 1 {
+            parts.push(format!("error={}", compact_event_json(error)));
+        }
+        return Some(truncate_chars(
+            &parts.join("; "),
+            APPFS_EVENT_REMINDER_FIELD_LIMIT,
+        ));
+    }
+
+    let Some(content) = &event.content else {
+        return Some(label.to_string());
+    };
+    let mut parts = vec![label.to_string()];
+    append_string_field(&mut parts, content, "credential_status");
+    append_string_field(&mut parts, content, "profile_id");
+    append_string_field(&mut parts, content, "display_name");
+    append_string_field(&mut parts, content, "upstream_user_id");
+    append_string_field(&mut parts, content, "login");
+    if parts.len() == 1 {
+        parts.push(format!("details={}", compact_event_json(content)));
     }
     Some(truncate_chars(
         &parts.join("; "),
@@ -900,6 +1622,8 @@ fn build_env_environment(
         register_app_path: control_paths.register_app_path,
         unregister_app_path: control_paths.unregister_app_path,
         list_apps_path: control_paths.list_apps_path,
+        attach_principal_path: control_paths.attach_principal_path,
+        detach_principal_path: control_paths.detach_principal_path,
         current_app_id: current_detection.current_app_id,
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
@@ -946,6 +1670,8 @@ fn build_manifest_environment(
         register_app_path: control_paths.register_app_path,
         unregister_app_path: control_paths.unregister_app_path,
         list_apps_path: control_paths.list_apps_path,
+        attach_principal_path: control_paths.attach_principal_path,
+        detach_principal_path: control_paths.detach_principal_path,
         current_app_id: current_detection.current_app_id,
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
@@ -974,6 +1700,8 @@ fn build_heuristic_environment(
         register_app_path: Some(detection.register_app_path),
         unregister_app_path: Some(detection.unregister_app_path),
         list_apps_path: Some(detection.list_apps_path),
+        attach_principal_path: Some(detection.attach_principal_path),
+        detach_principal_path: Some(detection.detach_principal_path),
         current_app_id: detection.current_app_id,
         current_app_root: detection.current_app_root,
         current_app_events_path: detection.current_app_events_path,
@@ -1051,6 +1779,8 @@ fn control_plane_from_heuristic(detection: &HeuristicDetection) -> ResolvedContr
         register_app_path: Some(detection.register_app_path.clone()),
         unregister_app_path: Some(detection.unregister_app_path.clone()),
         list_apps_path: Some(detection.list_apps_path.clone()),
+        attach_principal_path: Some(detection.attach_principal_path.clone()),
+        detach_principal_path: Some(detection.detach_principal_path.clone()),
     }
 }
 
@@ -1070,6 +1800,24 @@ fn resolve_control_plane_paths(
     let register_app_path = absolute_mount_path(mount_root, &control_plane.register_action);
     let unregister_app_path = absolute_mount_path(mount_root, &control_plane.unregister_action);
     let list_apps_path = absolute_mount_path(mount_root, &control_plane.list_action);
+    let attach_principal_path = control_plane
+        .attach_principal_action
+        .as_deref()
+        .map(|path| absolute_mount_path(mount_root, path))
+        .unwrap_or_else(|| {
+            mount_root
+                .join(CONTROL_DIR_NAME)
+                .join(ATTACH_PRINCIPAL_ACTION)
+        });
+    let detach_principal_path = control_plane
+        .detach_principal_action
+        .as_deref()
+        .map(|path| absolute_mount_path(mount_root, path))
+        .unwrap_or_else(|| {
+            mount_root
+                .join(CONTROL_DIR_NAME)
+                .join(DETACH_PRINCIPAL_ACTION)
+        });
     let registry_path = absolute_mount_path(mount_root, &control_plane.registry);
     let control_events_path = absolute_mount_path(mount_root, &control_plane.events);
     let control_dir = register_app_path.parent().map(Path::to_path_buf);
@@ -1081,6 +1829,8 @@ fn resolve_control_plane_paths(
         register_app_path: Some(register_app_path),
         unregister_app_path: Some(unregister_app_path),
         list_apps_path: Some(list_apps_path),
+        attach_principal_path: Some(attach_principal_path),
+        detach_principal_path: Some(detach_principal_path),
     }
 }
 
@@ -1154,6 +1904,8 @@ fn detect_heuristic_environment(cwd: &Path) -> Option<HeuristicDetection> {
     let register_app_path = control_dir.join(REGISTER_APP_ACTION);
     let unregister_app_path = control_dir.join(UNREGISTER_APP_ACTION);
     let list_apps_path = control_dir.join(LIST_APPS_ACTION);
+    let attach_principal_path = control_dir.join(ATTACH_PRINCIPAL_ACTION);
+    let detach_principal_path = control_dir.join(DETACH_PRINCIPAL_ACTION);
     let control_events_path = control_dir.join(APP_STREAM_DIR_NAME).join(EVENTS_FILE);
     let principal_id = APPFS_DEFAULT_PRINCIPAL_ID;
     let registered_apps =
@@ -1171,6 +1923,8 @@ fn detect_heuristic_environment(cwd: &Path) -> Option<HeuristicDetection> {
         register_app_path,
         unregister_app_path,
         list_apps_path,
+        attach_principal_path,
+        detach_principal_path,
         current_app_id: current_detection.current_app_id,
         current_app_root: current_detection.current_app_root,
         current_app_events_path: current_detection.current_app_events_path,
@@ -1349,6 +2103,115 @@ fn append_create_principal_action(
     })
 }
 
+fn append_principal_lifecycle_action(
+    action_path: &Path,
+    payload: Value,
+    label: &str,
+) -> Result<(), String> {
+    if let Some(parent) = action_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create AppFS principal {label} control directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut line = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to encode principal {label} action: {err}"))?;
+    line.push('\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(action_path)
+        .map_err(|err| {
+            format!(
+                "failed to open AppFS principal {label} action {}: {err}",
+                action_path.display()
+            )
+        })?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        format!(
+            "failed to append AppFS principal {label} action {}: {err}",
+            action_path.display()
+        )
+    })
+}
+
+fn append_app_private_warmup_action(
+    action_path: &Path,
+    expected_profile_id: &str,
+    instance_id: &str,
+) -> Result<String, String> {
+    let client_token = format!("appfs-agent-warmup-{instance_id}-{}", now_millis());
+    let payload = serde_json::json!({
+        "expected_profile_id": expected_profile_id,
+        "client_token": client_token,
+    });
+    let mut line = serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to encode AppFS private app warmup action: {err}"))?;
+    line.push('\n');
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(action_path)
+        .map_err(|err| {
+            format!(
+                "failed to open AppFS private app warmup action {}: {err}",
+                action_path.display()
+            )
+        })?;
+    file.write_all(line.as_bytes()).map_err(|err| {
+        format!(
+            "failed to append AppFS private app warmup action {}: {err}",
+            action_path.display()
+        )
+    })?;
+    Ok(client_token)
+}
+
+fn wait_for_private_app_warmup_status(
+    events_path: &Path,
+    client_token: &str,
+) -> AppfsPrivateAppWarmupStatus {
+    let deadline = SystemTime::now() + APPFS_PRIVATE_APP_WARMUP_TIMEOUT;
+    loop {
+        if let Some(status) = private_app_warmup_status_from_events(events_path, client_token) {
+            return status;
+        }
+        if SystemTime::now() >= deadline {
+            return AppfsPrivateAppWarmupStatus::TimedOut;
+        }
+        thread::sleep(APPFS_PRIVATE_APP_WARMUP_POLL);
+    }
+}
+
+fn private_app_warmup_status_from_events(
+    events_path: &Path,
+    client_token: &str,
+) -> Option<AppfsPrivateAppWarmupStatus> {
+    let contents = fs::read_to_string(events_path).ok()?;
+    for line in contents
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("client_token").and_then(Value::as_str) != Some(client_token) {
+            continue;
+        }
+        return match value.get("type").and_then(Value::as_str) {
+            Some("profile.credentials.ready") => Some(AppfsPrivateAppWarmupStatus::Ready),
+            Some("profile.credentials.failed") | Some("action.failed") => {
+                Some(AppfsPrivateAppWarmupStatus::Failed)
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
 fn wait_for_principal_ready(
     control_dir: &Path,
     registry_path: &Path,
@@ -1405,6 +2268,47 @@ fn should_auto_create_default_principal(environment: &AppfsEnvironment) -> bool 
     environment.principal_id == APPFS_DEFAULT_PRINCIPAL_ID
         && environment.control_dir.is_some()
         && environment.known_principals.is_empty()
+}
+
+fn should_auto_create_selected_principal(
+    environment: &AppfsEnvironment,
+    attach_env: &AppfsAttachEnv,
+) -> bool {
+    let Some(explicit_principal_id) = attach_env
+        .principal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    environment.control_dir.is_some()
+        && environment.principal_id == explicit_principal_id
+        && !environment
+            .known_principals
+            .iter()
+            .any(|principal| principal.principal_id == environment.principal_id)
+}
+
+fn should_wait_for_selected_private_apps(environment: &AppfsEnvironment) -> bool {
+    let Some(control_dir) = environment.control_dir.as_deref() else {
+        return false;
+    };
+    if !environment
+        .known_principals
+        .iter()
+        .any(|principal| principal.principal_id == environment.principal_id)
+    {
+        return false;
+    }
+    let expected_private_apps = private_app_policy_count(&control_dir.join(APP_POLICIES_FILE));
+    expected_private_apps > 0
+        && environment
+            .registry_path
+            .as_deref()
+            .map(|path| private_app_count_for_principal(path, &environment.principal_id))
+            .unwrap_or(0)
+            < expected_private_apps
 }
 
 fn has_pending_default_principal_create_action(control_dir: &Path) -> bool {
@@ -1464,6 +2368,16 @@ fn private_app_count_for_principal(path: &Path, principal_id: &str) -> usize {
 fn is_safe_principal_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_attach_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value != "."
+        && value != ".."
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -1669,7 +2583,7 @@ fn render_appfs_overview_lines(
         "- Mounted apps appear as directories under the AppFS mount root. Public apps usually live at the root or under `public/`; private app instances live under `private/<principal-id>/`. The platform control plane lives under `/_appfs`."
             .to_string(),
         format!(
-            "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation. Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; only inspect `{events_path}` manually for debugging or if no reminder appears."
+            "- AppFS `*.act` files are append-only JSONL action sinks: append exactly one JSON object line to trigger an operation. Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; when the reminder includes `message.received` with attention required, treat it as an active task to answer or act on in this turn. Inspect `{events_path}` manually only for debugging or if no reminder appears."
         ),
         "- Never use `write_file` or `edit_file` on `*.act` files because those tools overwrite the sink. Use `bash` (or another append-capable tool) to append exactly one JSON object plus a trailing newline."
             .to_string(),
@@ -1748,14 +2662,23 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_appfs_prompt_section, create_appfs_principal, detect_appfs_environment,
-        resolve_appfs_environment_with_attach_env, sync_appfs_event_reminders, AppfsAttachEnv,
-        AppfsAttachSource, AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus,
-        AppfsRegisteredAppVisibility, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
-        AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND,
-        APPFS_RUNTIME_MANIFEST_REL_PATH, APPFS_SCHEMA_VERSION,
+        appfs_event_to_input_envelope, attach_appfs_principal_from_environment,
+        build_appfs_prompt_section, classify_appfs_event, collect_appfs_pending_inputs,
+        create_appfs_principal, detach_appfs_principal, detect_appfs_environment,
+        ensure_appfs_attach_identity, ensure_appfs_attach_identity_with_attach_env,
+        render_appfs_event_reminder, resolve_appfs_environment_with_attach_env,
+        scan_appfs_attention_events_for_idle_wake, sync_appfs_event_reminders,
+        sync_appfs_event_reminders_with_outcome, warmup_private_apps_from_environment,
+        AppfsAttachEnsureStatus, AppfsAttachEnv, AppfsAttachSource, AppfsDeliveryMode,
+        AppfsEventRecord, AppfsInputClass, AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus,
+        AppfsPrivateAppWarmupStatus, AppfsRegisteredAppVisibility, AppfsRuntimeManifest,
+        AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
+        APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
+        APPFS_SCHEMA_VERSION,
     };
+    use crate::input_router::InputSource;
     use crate::session::{AttachmentKind, ContentBlock, Session};
+    use serde_json::Value;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1829,6 +2752,20 @@ mod tests {
             fs::write(app_root.join("_stream").join("events.evt.jsonl"), "")
                 .expect("write app events");
         }
+        fs::write(
+            default_tinode_root
+                .join("_app")
+                .join("ensure_credentials.act"),
+            "",
+        )
+        .expect("write default ensure credentials action");
+        fs::write(
+            incident_tinode_root
+                .join("_app")
+                .join("ensure_credentials.act"),
+            "",
+        )
+        .expect("write incident ensure credentials action");
         fs::write(control_dir.join("register_app.act"), "").expect("write register action");
         fs::write(control_dir.join("list_apps.act"), "").expect("write list action");
         fs::write(
@@ -1861,6 +2798,13 @@ mod tests {
     }
 
     fn spawn_default_principal_supervisor_stub(mount_root: &Path) -> thread::JoinHandle<()> {
+        spawn_principal_supervisor_stub(mount_root, "default")
+    }
+
+    fn spawn_principal_supervisor_stub(
+        mount_root: &Path,
+        principal_id: &'static str,
+    ) -> thread::JoinHandle<()> {
         let control_dir = mount_root.join("_appfs");
         let action_path = control_dir.join("principals").join("create_principal.act");
         let principal_registry = control_dir.join("principals.registry.json");
@@ -1869,23 +2813,52 @@ mod tests {
             for _ in 0..80 {
                 if fs::read_to_string(&action_path)
                     .ok()
-                    .is_some_and(|contents| contents.contains(r#""principal_id":"default""#))
+                    .is_some_and(|contents| {
+                        contents.contains(&format!(r#""principal_id":"{principal_id}""#))
+                    })
                 {
+                    let instance_id = format!("tinode--{principal_id}");
+                    let private_path = format!("private/{principal_id}/tinode");
+                    let profile_id = format!("tinode:{principal_id}");
                     fs::write(
                         &principal_registry,
-                        r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+                        format!(
+                            r#"{{"version":1,"default_principal_id":"default","principals":[{{"principal_id":"{principal_id}","display_name":"{principal_id}","description":"Test principal.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}}]}}"#
+                        ),
                     )
                     .expect("write principal registry");
                     thread::sleep(Duration::from_millis(150));
                     fs::write(
                         &apps_registry,
-                        r#"{"version":1,"apps":[{"instance_id":"tinode--default","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"default","profile_id":"tinode:default","path":"private/default/tinode","session_id":"sess-tinode-default","registered_at":"2026-04-07T00:00:00Z","transport":{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}]}"#,
+                        format!(
+                            r#"{{"version":1,"apps":[{{"instance_id":"{instance_id}","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"{principal_id}","profile_id":"{profile_id}","path":"{private_path}","session_id":"sess-tinode-{principal_id}","registered_at":"2026-04-07T00:00:00Z","transport":{{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}}}]}}"#
+                        ),
                     )
                     .expect("write apps registry");
                     return;
                 }
                 thread::sleep(Duration::from_millis(25));
             }
+        })
+    }
+
+    fn spawn_private_app_materializer_stub(
+        mount_root: &Path,
+        principal_id: &'static str,
+    ) -> thread::JoinHandle<()> {
+        let apps_registry = mount_root.join("_appfs").join("apps.registry.json");
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let instance_id = format!("tinode--{principal_id}");
+            let private_path = format!("private/{principal_id}/tinode");
+            let profile_id = format!("tinode:{principal_id}");
+            fs::write(
+                &apps_registry,
+                format!(
+                    r#"{{"version":1,"apps":[{{"instance_id":"{instance_id}","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"{principal_id}","profile_id":"{profile_id}","path":"{private_path}","session_id":"sess-tinode-{principal_id}","registered_at":"2026-04-07T00:00:00Z","transport":{{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}}}]}}"#
+                ),
+            )
+            .expect("write apps registry");
         })
     }
 
@@ -2040,6 +3013,12 @@ mod tests {
                 register_action: "/_appfs/register_app.act".to_string(),
                 unregister_action: "/_appfs/unregister_app.act".to_string(),
                 list_action: "/_appfs/list_apps.act".to_string(),
+                attach_principal_action: Some(
+                    "/_appfs/principals/attach_principal.act".to_string(),
+                ),
+                detach_principal_action: Some(
+                    "/_appfs/principals/detach_principal.act".to_string(),
+                ),
                 registry: "/_appfs/apps.registry.json".to_string(),
                 events: "/_appfs/_stream/events.evt.jsonl".to_string(),
             },
@@ -2194,16 +3173,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_appfs_environment_auto_creates_default_principal() {
+    fn ensure_appfs_attach_identity_auto_creates_default_principal() {
         let temp = TempDirGuard::new("appfs-auto-default-principal");
         let mount_root = temp.path().join("mnt");
         seed_mount_without_principals(&mount_root);
         let supervisor = spawn_default_principal_supervisor_stub(&mount_root);
 
-        let detected =
-            detect_appfs_environment(&mount_root).expect("expected appfs environment to be found");
+        let outcome = ensure_appfs_attach_identity(&mount_root);
         supervisor.join().expect("supervisor stub should finish");
 
+        assert_eq!(outcome.status, AppfsAttachEnsureStatus::Created);
+        let detected = outcome.environment.expect("expected appfs environment");
         assert_eq!(detected.principal_id, "default");
         assert!(detected
             .known_principals
@@ -2225,7 +3205,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_appfs_environment_waits_for_pending_default_principal_action() {
+    fn ensure_appfs_attach_identity_waits_for_pending_default_principal_action() {
         let temp = TempDirGuard::new("appfs-auto-default-principal-pending");
         let mount_root = temp.path().join("mnt");
         seed_mount_without_principals(&mount_root);
@@ -2242,10 +3222,10 @@ mod tests {
         .expect("write pending create principal action");
         let supervisor = spawn_default_principal_supervisor_stub(&mount_root);
 
-        let detected =
-            detect_appfs_environment(&mount_root).expect("expected appfs environment to be found");
+        let outcome = ensure_appfs_attach_identity(&mount_root);
         supervisor.join().expect("supervisor stub should finish");
 
+        let detected = outcome.environment.expect("expected appfs environment");
         assert!(detected
             .registered_apps
             .iter()
@@ -2258,6 +3238,44 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn ensure_appfs_attach_identity_auto_creates_explicit_principal_from_env() {
+        let temp = TempDirGuard::new("appfs-auto-explicit-principal");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        let supervisor = spawn_principal_supervisor_stub(&mount_root, "code-implementer");
+
+        let outcome = ensure_appfs_attach_identity_with_attach_env(
+            &mount_root,
+            AppfsAttachEnv {
+                principal_id: Some("code-implementer".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        );
+        supervisor.join().expect("supervisor stub should finish");
+
+        assert_eq!(outcome.status, AppfsAttachEnsureStatus::Created);
+        let detected = outcome.environment.expect("expected appfs environment");
+        assert_eq!(detected.principal_id, "code-implementer");
+        assert!(detected
+            .known_principals
+            .iter()
+            .any(|principal| principal.principal_id == "code-implementer"));
+        assert!(detected.registered_apps.iter().any(|app| {
+            app.instance_id == "tinode--code-implementer"
+                && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                && app.principal_id.as_deref() == Some("code-implementer")
+        }));
+        let create_action = fs::read_to_string(
+            mount_root
+                .join("_appfs")
+                .join("principals")
+                .join("create_principal.act"),
+        )
+        .expect("read create principal action");
+        assert!(create_action.contains(r#""principal_id":"code-implementer""#));
     }
 
     #[test]
@@ -2284,6 +3302,227 @@ mod tests {
             app.instance_id == "tinode--default"
                 && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
                 && app.principal_id.as_deref() == Some("default")
+        }));
+    }
+
+    #[test]
+    fn attach_and_detach_appfs_principal_append_lifecycle_actions() {
+        let temp = TempDirGuard::new("appfs-principal-attach-detach");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        fs::write(
+            mount_root.join("_appfs").join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+        )
+        .expect("write principal registry");
+
+        let lease = attach_appfs_principal_from_environment(
+            &resolve_appfs_environment_with_attach_env(
+                &mount_root,
+                AppfsAttachEnv {
+                    attach_id: Some("attach-test.1".to_string()),
+                    principal_id: Some("default".to_string()),
+                    attach_role: Some("coordinator".to_string()),
+                    runtime_session_id: Some("session-1".to_string()),
+                    ..AppfsAttachEnv::default()
+                },
+            )
+            .expect("detect appfs environment"),
+        )
+        .expect("attach principal");
+        assert_eq!(lease.principal_id, "default");
+        assert_eq!(lease.attach_id, "attach-test.1");
+
+        let attach_action = fs::read_to_string(
+            mount_root
+                .join("_appfs")
+                .join("principals")
+                .join("attach_principal.act"),
+        )
+        .expect("read attach action");
+        assert!(attach_action.contains(r#""principal_id":"default""#));
+        assert!(attach_action.contains(r#""attach_id":"attach-test.1""#));
+        assert!(attach_action.contains(r#""role":"coordinator""#));
+
+        detach_appfs_principal(&lease, "process_exit").expect("detach principal");
+        let detach_action = fs::read_to_string(
+            mount_root
+                .join("_appfs")
+                .join("principals")
+                .join("detach_principal.act"),
+        )
+        .expect("read detach action");
+        assert!(detach_action.contains(r#""principal_id":"default""#));
+        assert!(detach_action.contains(r#""attach_id":"attach-test.1""#));
+        assert!(detach_action.contains(r#""reason":"process_exit""#));
+    }
+
+    #[test]
+    fn warmup_private_apps_submits_standard_ensure_credentials_actions() {
+        let temp = TempDirGuard::new("appfs-private-app-warmup");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+
+        let environment = resolve_appfs_environment_with_attach_env(
+            &mount_root,
+            AppfsAttachEnv {
+                principal_id: Some("default".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        )
+        .expect("detect appfs environment");
+        let outcomes =
+            warmup_private_apps_from_environment(&environment).expect("warm private apps");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].instance_id, "tinode--default");
+        assert_eq!(outcomes[0].app_id, "tinode");
+        assert_eq!(outcomes[0].status, AppfsPrivateAppWarmupStatus::TimedOut);
+        let default_action = fs::read_to_string(
+            mount_root
+                .join("private")
+                .join("default")
+                .join("tinode")
+                .join("_app")
+                .join("ensure_credentials.act"),
+        )
+        .expect("read default ensure action");
+        assert!(default_action.contains(r#""expected_profile_id":"tinode:default""#));
+        assert!(default_action.contains(r#""client_token":"appfs-agent-warmup-tinode--default-"#));
+        let incident_action = fs::read_to_string(
+            mount_root
+                .join("private")
+                .join("incident-reporter")
+                .join("tinode")
+                .join("_app")
+                .join("ensure_credentials.act"),
+        )
+        .expect("read other principal ensure action");
+        assert_eq!(incident_action, "");
+    }
+
+    #[test]
+    fn warmup_private_apps_reports_ready_when_standard_event_arrives() {
+        let temp = TempDirGuard::new("appfs-private-app-warmup-ready");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let event_writer = thread::spawn(move || {
+            for _ in 0..80 {
+                let action = fs::read_to_string(
+                    mount_root
+                        .join("private")
+                        .join("default")
+                        .join("tinode")
+                        .join("_app")
+                        .join("ensure_credentials.act"),
+                )
+                .unwrap_or_default();
+                let Some(client_token) = action
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter_map(|value| {
+                        value
+                            .get("client_token")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .next()
+                else {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
+                };
+                fs::write(
+                    &events_path,
+                    format!(
+                        r#"{{"app":"tinode","client_token":"{client_token}","content":{{"credential_status":"ready","profile_id":"tinode:default"}},"event_id":"evt-1","path":"/_app/ensure_credentials.act","request_id":"req-1","seq":1,"session_id":"sess-tinode-default","ts":"2026-04-07T00:00:00Z","type":"profile.credentials.ready"}}"#
+                    ),
+                )
+                .expect("write warmup event");
+                return;
+            }
+            panic!("warmup action was not submitted");
+        });
+
+        let environment = resolve_appfs_environment_with_attach_env(
+            &temp.path().join("mnt"),
+            AppfsAttachEnv {
+                principal_id: Some("default".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        )
+        .expect("detect appfs environment");
+        let outcomes =
+            warmup_private_apps_from_environment(&environment).expect("warm private apps");
+        event_writer.join().expect("event writer should finish");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, AppfsPrivateAppWarmupStatus::Ready);
+    }
+
+    #[test]
+    fn warmup_private_apps_skips_apps_without_ensure_credentials_action() {
+        let temp = TempDirGuard::new("appfs-private-app-warmup-skip");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let action_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_app")
+            .join("ensure_credentials.act");
+        fs::remove_file(&action_path).expect("remove ensure action");
+
+        let environment = resolve_appfs_environment_with_attach_env(
+            &mount_root,
+            AppfsAttachEnv {
+                principal_id: Some("default".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        )
+        .expect("detect appfs environment");
+        let outcomes =
+            warmup_private_apps_from_environment(&environment).expect("warm private apps");
+
+        assert!(outcomes.is_empty());
+        assert!(!action_path.exists());
+    }
+
+    #[test]
+    fn ensure_appfs_attach_identity_waits_for_existing_principal_private_apps() {
+        let temp = TempDirGuard::new("appfs-existing-principal-private-app-waits");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        fs::write(
+            mount_root.join("_appfs").join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"code-implementer","display_name":"code-implementer","description":"Existing principal.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+        )
+        .expect("write existing principal registry");
+        let materializer = spawn_private_app_materializer_stub(&mount_root, "code-implementer");
+
+        let outcome = ensure_appfs_attach_identity_with_attach_env(
+            &mount_root,
+            AppfsAttachEnv {
+                principal_id: Some("code-implementer".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        );
+        materializer
+            .join()
+            .expect("materializer stub should finish");
+
+        assert_eq!(outcome.status, AppfsAttachEnsureStatus::Ready);
+        let environment = outcome.environment.expect("environment should be present");
+        assert_eq!(environment.principal_id, "code-implementer");
+        assert!(environment.registered_apps.iter().any(|app| {
+            app.instance_id == "tinode--code-implementer"
+                && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+                && app.principal_id.as_deref() == Some("code-implementer")
         }));
     }
 
@@ -2516,7 +3755,7 @@ mod tests {
                 .attachment_metadata
                 .as_ref()
                 .map(|metadata| metadata.kind),
-            Some(AttachmentKind::AppfsEvents)
+            Some(AttachmentKind::InputRouter)
         );
         let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
             panic!("expected text reminder");
@@ -2532,13 +3771,13 @@ mod tests {
         assert!(text.contains("app=aiim"));
         assert!(text.contains("app=notion"));
         assert!(text.contains("/contacts/zhangsan/send_message.act"));
-        assert!(text.contains("summary=action accepted; status='accepted'"));
-        assert!(text.contains("summary=action progress; percent=50"));
-        assert!(text.contains("summary=action completed; ok=true; payload="));
-        assert!(text.contains(
-            "summary=action failed; code='ERR_TIMEOUT'; message='timed out'; retryable=true"
-        ));
-        assert!(!text.contains("stream=app:"));
+        assert!(text.contains("action accepted; status='accepted'"));
+        assert!(text.contains("action progress; percent=50"));
+        assert!(text.contains("action completed; ok=true; payload="));
+        assert!(
+            text.contains("action failed; code='ERR_TIMEOUT'; message='timed out'; retryable=true")
+        );
+        assert!(text.contains("stream=app:aiim"));
         assert!(!text.contains("old-platform"));
         assert!(!text.contains("/old.act"));
         assert_eq!(session.appfs_event_cursor("platform"), Some(2));
@@ -2547,6 +3786,361 @@ mod tests {
 
         sync_appfs_event_reminders(&mut session, &mount_root).expect("empty sync should succeed");
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn sync_appfs_event_reminders_reports_new_event_count() {
+        let temp = TempDirGuard::new("appfs-event-sync-outcome");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+        fs::write(
+            &events_path,
+            r#"{"seq":1,"type":"message.received","app":"tinode","path":"inbox/recent.res.jsonl","content":{"text_preview":"hello"}}"#,
+        )
+        .expect("write event");
+        fs::write(&cursor_path, r#"{"max_seq":1}"#).expect("write cursor");
+
+        let mut session = Session::new();
+        let baseline = sync_appfs_event_reminders_with_outcome(&mut session, &mount_root)
+            .expect("baseline sync");
+        assert_eq!(baseline.new_event_count, 0);
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"message.received","app":"tinode","path":"inbox/recent.res.jsonl","content":{"text_preview":"hello"}}"#,
+                "\n",
+                r#"{"seq":2,"type":"message.received","app":"tinode","path":"inbox/recent.res.jsonl","content":{"text_preview":"new"}}"#
+            ),
+        )
+        .expect("append event");
+        fs::write(&cursor_path, r#"{"max_seq":2}"#).expect("update cursor");
+
+        let outcome = sync_appfs_event_reminders_with_outcome(&mut session, &mount_root)
+            .expect("new event sync");
+        assert_eq!(outcome.new_event_count, 1);
+        assert_eq!(outcome.cursor_update_count, 1);
+    }
+
+    #[test]
+    fn sync_appfs_event_reminders_drops_noise_but_advances_cursor() {
+        let temp = TempDirGuard::new("appfs-event-drop-noise");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+
+        fs::write(
+            &events_path,
+            r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write baseline event");
+        fs::write(&cursor_path, r#"{"max_seq":1}"#).expect("write baseline cursor");
+
+        let mut session = Session::new();
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("baseline sync");
+        assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(1));
+
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"type":"message.received","app":"tinode","path":"contacts/default/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"please review"}}"#,
+                "\n",
+                r#"{"seq":3,"type":"inbox.updated","app":"tinode","path":"inbox/unread.res.jsonl","content":{"unread_count":1}}"#,
+                "\n",
+                r#"{"seq":4,"type":"action.completed","app":"tinode","path":"/contacts/send_message.act","content":{"ok":true,"message":"sent"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write mixed events");
+        fs::write(&cursor_path, r#"{"max_seq":4}"#).expect("write updated cursor");
+
+        let outcome = sync_appfs_event_reminders_with_outcome(&mut session, &mount_root)
+            .expect("mixed event sync");
+
+        assert_eq!(outcome.new_event_count, 2);
+        assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(4));
+        assert_eq!(session.messages.len(), 1);
+        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
+            panic!("expected text reminder");
+        };
+        assert!(text.contains("[appfs_event]"));
+        assert!(text.contains("message.received"));
+        assert!(text.contains("action.completed"));
+        assert!(!text.contains("inbox.updated"));
+
+        sync_appfs_event_reminders(&mut session, &mount_root).expect("empty sync should succeed");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "dropped noise should not be reread forever"
+        );
+    }
+
+    #[test]
+    fn scan_appfs_attention_events_for_idle_wake_baselines_then_wakes_once() {
+        let temp = TempDirGuard::new("appfs-idle-wake-once");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+
+        fs::write(
+            &events_path,
+            r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write baseline event");
+        fs::write(&cursor_path, r#"{"max_seq":1}"#).expect("write baseline cursor");
+
+        let mut session = Session::new();
+        let baseline = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("baseline scan");
+        assert_eq!(baseline.wake_event_count, 0);
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(1)
+        );
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--default"),
+            Some(1),
+            "idle scan should baseline model cursors without injecting old backlog"
+        );
+        assert!(session.messages.is_empty());
+
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"type":"message.received","app":"tinode","path":"contacts/default/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"please review"}}"#,
+                "\n",
+                r#"{"seq":3,"type":"inbox.updated","app":"tinode","path":"inbox/unread.res.jsonl","content":{"unread_count":1}}"#,
+                "\n"
+            ),
+        )
+        .expect("write attention event");
+        fs::write(&cursor_path, r#"{"max_seq":3}"#).expect("write updated cursor");
+
+        let wake = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("wake scan");
+        assert_eq!(wake.wake_event_count, 1);
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(3)
+        );
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--default"),
+            Some(3),
+            "idle wake queues routed input and advances the model cursor so boundary collection does not duplicate it"
+        );
+        assert!(
+            session.messages.is_empty(),
+            "idle wake should not write reminders directly into the session"
+        );
+        assert_eq!(wake.pending_inputs.len(), 1);
+        let routed = &wake.pending_inputs[0].envelope;
+        assert_eq!(routed.source, InputSource::AppfsEvent);
+        assert_eq!(routed.input_type, "message.received");
+        assert!(routed.text.contains("please review"));
+        let boundary_sync =
+            collect_appfs_pending_inputs(&session, &mount_root).expect("boundary sync");
+        assert!(
+            boundary_sync.pending_inputs.is_empty(),
+            "already queued idle wake input should not be collected twice"
+        );
+        assert_eq!(
+            boundary_sync
+                .cursor_updates
+                .get("app:tinode--default")
+                .copied(),
+            None
+        );
+
+        let repeat = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("repeat scan");
+        assert_eq!(repeat.wake_event_count, 0);
+        assert_eq!(
+            session.messages.len(),
+            0,
+            "attention event should wake only once"
+        );
+    }
+
+    #[test]
+    fn scan_appfs_attention_events_for_idle_wake_ignores_receipts_and_status() {
+        let temp = TempDirGuard::new("appfs-idle-wake-ignore-receipts");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+
+        fs::write(
+            &events_path,
+            r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write baseline event");
+        fs::write(&cursor_path, r#"{"max_seq":1}"#).expect("write baseline cursor");
+
+        let mut session = Session::new();
+        scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("baseline scan");
+
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"type":"action.completed","app":"tinode","path":"/contacts/send_message.act","content":{"ok":true}}"#,
+                "\n",
+                r#"{"seq":3,"type":"message.sent","app":"tinode","path":"/contacts/send_message.act","content":{"text_preview":"sent"}}"#,
+                "\n",
+                r#"{"seq":4,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n"
+            ),
+        )
+        .expect("write non-wake events");
+        fs::write(&cursor_path, r#"{"max_seq":4}"#).expect("write updated cursor");
+
+        let wake = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("wake scan");
+
+        assert_eq!(wake.wake_event_count, 0);
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(4)
+        );
+        assert!(session.messages.is_empty());
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--default"),
+            Some(1),
+            "non-wake events should not advance model cursors beyond the baseline"
+        );
+    }
+
+    #[test]
+    fn scan_appfs_attention_events_for_idle_wake_filters_other_private_principals() {
+        let temp = TempDirGuard::new("appfs-idle-wake-private-principal");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+
+        let write_cursor = |stream_dir: &Path, max_seq: i64| {
+            fs::write(
+                stream_dir.join("cursor.res.json"),
+                format!(r#"{{"min_seq":0,"max_seq":{max_seq},"retention_hint_sec":86400}}"#),
+            )
+            .expect("write stream cursor");
+        };
+
+        let default_stream = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream");
+        let incident_stream = mount_root
+            .join("private")
+            .join("incident-reporter")
+            .join("tinode")
+            .join("_stream");
+        fs::write(
+            default_stream.join("events.evt.jsonl"),
+            r#"{"seq":1,"app":"tinode","type":"profile.credentials.ready","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write default baseline");
+        fs::write(
+            incident_stream.join("events.evt.jsonl"),
+            r#"{"seq":1,"app":"tinode","type":"profile.credentials.ready","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write incident baseline");
+        write_cursor(&default_stream, 1);
+        write_cursor(&incident_stream, 1);
+
+        let mut session = Session::new();
+        scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("baseline scan");
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(1)
+        );
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--incident-reporter"),
+            None
+        );
+
+        fs::write(
+            default_stream.join("events.evt.jsonl"),
+            concat!(
+                r#"{"seq":1,"app":"tinode","type":"profile.credentials.ready","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"app":"tinode","type":"message.received","path":"contacts/default/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"default msg"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write default attention event");
+        fs::write(
+            incident_stream.join("events.evt.jsonl"),
+            concat!(
+                r#"{"seq":1,"app":"tinode","type":"profile.credentials.ready","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"app":"tinode","type":"message.received","path":"contacts/default/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"incident msg"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write incident attention event");
+        write_cursor(&default_stream, 2);
+        write_cursor(&incident_stream, 2);
+
+        let wake = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("wake scan");
+
+        assert_eq!(wake.wake_event_count, 1);
+        assert!(
+            session.messages.is_empty(),
+            "idle wake should not inject reminders directly"
+        );
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--default"),
+            Some(2),
+            "queued idle wake input should advance the model cursor for the visible stream"
+        );
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--incident-reporter"),
+            None
+        );
     }
 
     #[test]
@@ -2624,7 +4218,7 @@ mod tests {
             panic!("expected text reminder");
         };
         assert!(text.contains("sent from default"));
-        assert!(text.contains("principal `default`"));
+        assert!(text.contains("principal=default"));
         assert!(!text.contains("sent from incident"));
         assert!(!text.contains("incident-reporter"));
         assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(2));
@@ -2632,6 +4226,260 @@ mod tests {
             session.appfs_event_cursor("app:tinode--incident-reporter"),
             None
         );
+    }
+
+    fn appfs_event_record_for_test(
+        event_type: &str,
+        content: Option<Value>,
+        error: Option<Value>,
+    ) -> AppfsEventRecord {
+        AppfsEventRecord {
+            stream_id: "app:tinode--default".to_string(),
+            app_id: Some("tinode".to_string()),
+            principal_id: Some("default".to_string()),
+            seq: 1,
+            event_type: event_type.to_string(),
+            event_path: Some("/test.act".to_string()),
+            request_id: Some("req-test".to_string()),
+            content,
+            error,
+        }
+    }
+
+    #[test]
+    fn classifies_attention_message_received_for_running_and_idle_delivery() {
+        let event = appfs_event_record_for_test(
+            "message.received",
+            Some(serde_json::json!({
+                "requires_attention": true,
+                "text_preview": "hello"
+            })),
+            None,
+        );
+
+        let classification = classify_appfs_event(&event);
+
+        assert_eq!(classification.input_class, AppfsInputClass::Attention);
+        assert_eq!(
+            classification.running_delivery,
+            AppfsDeliveryMode::InjectAtNextBoundary
+        );
+        assert_eq!(classification.idle_delivery, AppfsDeliveryMode::WakeIfIdle);
+    }
+
+    #[test]
+    fn classifies_non_attention_message_received_as_guidance_without_idle_wake() {
+        let event = appfs_event_record_for_test(
+            "message.received",
+            Some(serde_json::json!({
+                "requires_attention": false,
+                "text_preview": "for later"
+            })),
+            None,
+        );
+
+        let classification = classify_appfs_event(&event);
+
+        assert_eq!(classification.input_class, AppfsInputClass::Guidance);
+        assert_eq!(
+            classification.running_delivery,
+            AppfsDeliveryMode::InjectAtNextBoundary
+        );
+        assert_eq!(classification.idle_delivery, AppfsDeliveryMode::ContextOnly);
+    }
+
+    #[test]
+    fn classifies_receipt_status_noise_and_unknown_appfs_events() {
+        let cases = [
+            (
+                "action.completed",
+                AppfsInputClass::Receipt,
+                AppfsDeliveryMode::ContextOnly,
+                AppfsDeliveryMode::ContextOnly,
+            ),
+            (
+                "action.failed",
+                AppfsInputClass::Receipt,
+                AppfsDeliveryMode::InjectAtNextBoundary,
+                AppfsDeliveryMode::ContextOnly,
+            ),
+            (
+                "message.sent",
+                AppfsInputClass::Receipt,
+                AppfsDeliveryMode::ContextOnly,
+                AppfsDeliveryMode::ContextOnly,
+            ),
+            (
+                "profile.credentials.ready",
+                AppfsInputClass::Status,
+                AppfsDeliveryMode::ContextOnly,
+                AppfsDeliveryMode::ContextOnly,
+            ),
+            (
+                "inbox.updated",
+                AppfsInputClass::Noise,
+                AppfsDeliveryMode::Drop,
+                AppfsDeliveryMode::Drop,
+            ),
+            (
+                "runtime.started",
+                AppfsInputClass::Status,
+                AppfsDeliveryMode::ContextOnly,
+                AppfsDeliveryMode::ContextOnly,
+            ),
+        ];
+
+        for (event_type, input_class, running_delivery, idle_delivery) in cases {
+            let event = appfs_event_record_for_test(event_type, Some(serde_json::json!({})), None);
+            let classification = classify_appfs_event(&event);
+            assert_eq!(
+                classification.input_class, input_class,
+                "input class for {event_type}"
+            );
+            assert_eq!(
+                classification.running_delivery, running_delivery,
+                "running delivery for {event_type}"
+            );
+            assert_eq!(
+                classification.idle_delivery, idle_delivery,
+                "idle delivery for {event_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn appfs_event_to_input_envelope_preserves_event_identity_and_policy() {
+        let event = appfs_event_record_for_test(
+            "message.received",
+            Some(serde_json::json!({
+                "requires_attention": true,
+                "text_preview": "please review"
+            })),
+            None,
+        );
+
+        let envelope = appfs_event_to_input_envelope(&event);
+
+        assert_eq!(envelope.source, InputSource::AppfsEvent);
+        assert_eq!(envelope.input_type, "message.received");
+        assert_eq!(envelope.app_id.as_deref(), Some("tinode"));
+        assert_eq!(envelope.principal_id.as_deref(), Some("default"));
+        assert_eq!(envelope.stream_id.as_deref(), Some("app:tinode--default"));
+        assert_eq!(envelope.seq, Some(1));
+        assert!(envelope.requires_attention);
+        assert!(envelope.text.contains("please review"));
+        assert_eq!(
+            envelope
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("text_preview"))
+                .and_then(Value::as_str),
+            Some("please review")
+        );
+    }
+
+    #[test]
+    fn appfs_event_to_input_envelope_preserves_error_payload_for_failed_actions() {
+        let event = appfs_event_record_for_test(
+            "action.failed",
+            None,
+            Some(serde_json::json!({
+                "code": "ERR_TIMEOUT",
+                "message": "timed out"
+            })),
+        );
+
+        let envelope = appfs_event_to_input_envelope(&event);
+
+        assert_eq!(envelope.input_type, "action.failed");
+        assert_eq!(
+            envelope
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("code"))
+                .and_then(Value::as_str),
+            Some("ERR_TIMEOUT")
+        );
+    }
+
+    #[test]
+    fn summarizes_tinode_domain_events_for_model_visible_reminders() {
+        let events = vec![
+            appfs_event_record_for_test(
+                "message.received",
+                Some(serde_json::json!({
+                    "conversation_type": "direct",
+                    "from_display_name": "AppFS Agent default",
+                    "message_id": "tinode:usr-default:1",
+                    "requires_attention": true,
+                    "text_preview": "please implement this"
+                })),
+                None,
+            ),
+            appfs_event_record_for_test(
+                "message.sent",
+                Some(serde_json::json!({
+                    "conversation_type": "direct",
+                    "to_display_name": "AppFS Agent code-implementer",
+                    "message_id": "tinode:usr-code:2",
+                    "text_preview": "I will coordinate"
+                })),
+                None,
+            ),
+            appfs_event_record_for_test(
+                "message.read",
+                Some(serde_json::json!({
+                    "scope": "thread",
+                    "cleared": ["tinode:usr-default:1"],
+                    "unread_count": 0
+                })),
+                None,
+            ),
+            appfs_event_record_for_test(
+                "profile.credentials.ready",
+                Some(serde_json::json!({
+                    "credential_status": "ready",
+                    "profile_id": "tinode:default",
+                    "display_name": "AppFS Agent default"
+                })),
+                None,
+            ),
+        ];
+
+        let reminder = render_appfs_event_reminder(&events);
+
+        assert!(reminder.contains("message received"));
+        assert!(reminder.contains("from_display_name='AppFS Agent default'"));
+        assert!(reminder.contains("text_preview='please implement this'"));
+        assert!(reminder.contains("requires_attention=true"));
+        assert!(reminder.contains("message sent"));
+        assert!(reminder.contains("to_display_name='AppFS Agent code-implementer'"));
+        assert!(reminder.contains("message read"));
+        assert!(reminder.contains("scope='thread'"));
+        assert!(reminder.contains("unread_count=0"));
+        assert!(reminder.contains("profile credentials ready"));
+        assert!(reminder.contains("profile_id='tinode:default'"));
+        assert!(!reminder.contains("\"text_preview\""));
+    }
+
+    #[test]
+    fn summarizes_failed_credentials_from_error_payload() {
+        let event = appfs_event_record_for_test(
+            "profile.credentials.failed",
+            None,
+            Some(serde_json::json!({
+                "code": "CREDENTIALS_FAILED",
+                "message": "duplicate credential",
+                "retryable": false
+            })),
+        );
+
+        let reminder = render_appfs_event_reminder(&[event]);
+
+        assert!(reminder.contains("profile credentials failed"));
+        assert!(reminder.contains("code='CREDENTIALS_FAILED'"));
+        assert!(reminder.contains("message='duplicate credential'"));
+        assert!(reminder.contains("retryable=false"));
     }
 
     #[test]

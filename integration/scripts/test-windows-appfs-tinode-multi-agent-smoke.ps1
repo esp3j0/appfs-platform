@@ -399,7 +399,7 @@ runtime:
   backend: winfsp
   init: if_missing
   reset: true
-  poll_ms: 0
+  fallback_poll_ms: 0
 
 connectors:
   aiim-http:
@@ -441,6 +441,7 @@ apps:
     path_template: private/{principal_id}/tinode
     profile_template: tinode:{principal_id}
     credential_policy: auto-create
+    inbound_poll_ms: 1000
     transport:
       http_timeout_ms: 5000
       grpc_timeout_ms: 5000
@@ -605,25 +606,19 @@ function Main {
         }
     }
 
-    $createPrincipalAction = Join-Path $MountPoint "_appfs\principals\create_principal.act"
     $defaultEnsure = Get-TinodePath -PrincipalId "default" -RelativePath "_app\ensure_credentials.act"
+    $codeEnsure = Get-TinodePath -PrincipalId $CodePrincipalId -RelativePath "_app\ensure_credentials.act"
+
+    Write-Section "Attach Default Principal"
+    Assert-ClawPrincipalView -PrincipalId "default" -LogSuffix "default"
     Wait-Until -Description "default Tinode private app materialized" -TimeoutSec $MountBootstrapTimeoutSec -Condition {
         Ensure-ProcessRunning $script:AppfsHandle
-        return (Test-Path $defaultEnsure) -and (Test-Path $createPrincipalAction)
+        return (Test-Path $defaultEnsure)
     }
     Write-Success "default Tinode private app is materialized"
 
-    Write-Section "Create Second Principal"
-    $createPrincipalPayload = @{
-        principal_id = $CodePrincipalId
-        display_name = $CodePrincipalId
-        description = "Implementation worker principal for multi-agent Tinode smoke."
-        kind = "agent"
-        client_token = "create-$CodePrincipalId-$($script:RunId)"
-    } | ConvertTo-Json -Compress
-    Append-Utf8JsonLine -Path $createPrincipalAction -JsonLine $createPrincipalPayload
-
-    $codeEnsure = Get-TinodePath -PrincipalId $CodePrincipalId -RelativePath "_app\ensure_credentials.act"
+    Write-Section "Attach Second Principal"
+    Assert-ClawPrincipalView -PrincipalId $CodePrincipalId -LogSuffix "code"
     Wait-Until -Description "$CodePrincipalId Tinode private app materialized" -TimeoutSec 60 -Condition {
         Ensure-ProcessRunning $script:AppfsHandle
         return (Test-Path $codeEnsure)

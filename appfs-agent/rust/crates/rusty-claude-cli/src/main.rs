@@ -9,8 +9,9 @@
 mod init;
 mod input;
 mod render;
+mod terminal_controller;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -43,21 +44,28 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, create_appfs_principal, detect_appfs_environment,
+    attach_appfs_principal, check_base_commit, clear_oauth_credentials, create_appfs_principal,
+    detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
     format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
     load_oauth_credentials, load_system_prompt_with_appfs, parse_oauth_callback_request_target,
     pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
-    set_shell_if_windows, ApiClient, ApiRequest, AppfsPrincipalCreateRequest,
-    AppfsPrincipalCreateStatus, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
+    ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
+    AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    PendingInput, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
     ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutionResult, ToolExecutor,
-    UsageTracker,
+    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
+    ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use terminal_controller::{
+    PermissionPromptTicket, PermissionPromptView, TerminalCommand, TerminalControllerHandle,
+    TerminalEvent, TerminalMode,
+};
 use tools::{
     execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
     should_inject_model_facing_skill_listing, sync_model_facing_skill_listing, GlobalToolRegistry,
@@ -98,6 +106,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--session",
     "--print",
     "--compact",
+    "--appfs-idle-wake",
+    "--running-input",
     "--base-commit",
     "-p",
 ];
@@ -251,14 +261,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             base_commit,
             session_path,
+            appfs_idle_wake,
+            running_input,
             ..
-        } => run_repl(
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit.as_deref(),
-            session_path.as_deref(),
-        )?,
+        } => {
+            if running_input {
+                run_repl_with_running_input(
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    base_commit.as_deref(),
+                    session_path.as_deref(),
+                    appfs_idle_wake,
+                )?;
+            } else {
+                run_repl(
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    base_commit.as_deref(),
+                    session_path.as_deref(),
+                    appfs_idle_wake,
+                )?;
+            }
+        }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -346,6 +372,8 @@ enum CliAction {
         permission_mode: PermissionMode,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
+        appfs_idle_wake: bool,
+        running_input: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -393,6 +421,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut session_path: Option<PathBuf> = None;
+    let mut appfs_idle_wake = false;
+    let mut running_input = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -447,6 +477,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 compact = true;
                 index += 1;
             }
+            "--watch-appfs-events" => {
+                return Err(
+                    "--watch-appfs-events is disabled because it wakes on every AppFS event; use --appfs-idle-wake for attention-only idle wake"
+                        .to_string(),
+                );
+            }
+            "--appfs-idle-wake" => {
+                appfs_idle_wake = true;
+                index += 1;
+            }
+            "--running-input" => {
+                running_input = true;
+                index += 1;
+            }
             "--base-commit" => {
                 let value = args
                     .get(index + 1)
@@ -461,6 +505,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "-p" => {
                 if session_path.is_some() {
                     return Err("--session cannot be combined with -p prompt mode".to_string());
+                }
+                if appfs_idle_wake {
+                    return Err(
+                        "--appfs-idle-wake can only be used with interactive REPL mode".to_string(),
+                    );
+                }
+                if running_input {
+                    return Err(
+                        "--running-input can only be used with interactive REPL mode".to_string(),
+                    );
                 }
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -544,6 +598,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Err("--session can only be used to start an interactive REPL".to_string());
     }
 
+    if appfs_idle_wake && !rest.is_empty() {
+        return Err("--appfs-idle-wake can only be used with interactive REPL mode".to_string());
+    }
+
+    if running_input && !rest.is_empty() {
+        return Err("--running-input can only be used with interactive REPL mode".to_string());
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
@@ -553,6 +615,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             base_commit,
             reasoning_effort: None,
+            appfs_idle_wake,
+            running_input,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -604,6 +668,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "appfs-events" => Err(
+            "appfs-events watch is disabled because it wakes on every AppFS event; use --appfs-idle-wake for attention-only idle wake"
+                .to_string(),
+        ),
         "hook" => parse_hook_args(&rest[1..]),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
@@ -2646,6 +2714,9 @@ fn fork_session_for_principal(
     forked
         .appfs_event_cursors
         .retain(|stream_id, _| !stream_id.starts_with("app:"));
+    forked
+        .appfs_wake_event_cursors
+        .retain(|stream_id, _| !stream_id.starts_with("app:"));
     let bootstrap = format_principal_fork_bootstrap_message(
         &source.session_id,
         parent_principal_id,
@@ -2686,7 +2757,7 @@ This session was forked from parent session `{parent_session_id}` under AppFS pr
 You are intended to run as AppFS principal `{child_principal_id}`. Verify `/status` if identity-sensitive work depends on private AppFS apps.\n\
 Your delegated task: {task}\n\
 The parent principal remains responsible for overall coordination; focus on the delegated implementation/details.\n\
-Reload AppFS generated skills as needed. Parent AppFS generated skill cache and app event cursors were intentionally cleared for this principal fork.\n\
+Reload AppFS generated skills as needed. Parent AppFS generated skill cache and app event/wake cursors were intentionally cleared for this principal fork.\n\
 </system-reminder>"
     )
 }
@@ -3305,6 +3376,7 @@ fn run_repl(
     permission_mode: PermissionMode,
     base_commit: Option<&str>,
     session_path: Option<&Path>,
+    appfs_idle_wake: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_stale_base_preflight(base_commit);
     let resolved_model = resolve_repl_model(model);
@@ -3323,8 +3395,15 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    if appfs_idle_wake {
+        println!("AppFS idle wake enabled for attention-worthy AppFS events.");
+        cli.drive_appfs_idle_wake()?;
+    }
 
     loop {
+        if appfs_idle_wake {
+            cli.drive_appfs_idle_wake()?;
+        }
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -3342,6 +3421,9 @@ fn run_repl(
                             cli.persist_session()?;
                         }
                         editor.push_history(input);
+                        if appfs_idle_wake {
+                            cli.drive_appfs_idle_wake()?;
+                        }
                         continue;
                     }
                     Ok(None) => {}
@@ -3354,10 +3436,156 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
+                if appfs_idle_wake {
+                    cli.drive_appfs_idle_wake()?;
+                }
             }
-            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Cancel => {
+                if appfs_idle_wake {
+                    cli.drive_appfs_idle_wake()?;
+                }
+            }
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_repl_with_running_input(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<&str>,
+    session_path: Option<&Path>,
+    appfs_idle_wake: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_stale_base_preflight(base_commit);
+    let resolved_model = resolve_repl_model(model);
+    let mut cli = if let Some(session_path) = session_path {
+        LiveCli::new_from_session(
+            resolved_model,
+            true,
+            allowed_tools,
+            permission_mode,
+            session_path,
+        )?
+    } else {
+        LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?
+    };
+    let shared_queue = SharedPendingInputQueue::default();
+    let (permission_tx, permission_rx) = mpsc::channel();
+
+    println!("{}", cli.startup_banner());
+    println!("{}", format_connected_line(&cli.model));
+    println!("Running input enabled. Type while the agent is working to guide the next model boundary; use /queue <text> to defer.");
+    if appfs_idle_wake {
+        println!("AppFS idle wake enabled for attention-worthy AppFS events.");
+    }
+    let terminal = TerminalControllerHandle::start(shared_queue.clone(), permission_rx)?;
+    if appfs_idle_wake {
+        cli.drive_appfs_idle_wake_with_external_inputs(
+            &terminal,
+            shared_queue.clone(),
+            permission_tx.clone(),
+        )?;
+    }
+    terminal.send(TerminalCommand::SetCompletions(
+        cli.repl_completion_candidates().unwrap_or_default(),
+    ))?;
+
+    loop {
+        if appfs_idle_wake {
+            cli.drive_appfs_idle_wake_with_external_inputs(
+                &terminal,
+                shared_queue.clone(),
+                permission_tx.clone(),
+            )?;
+        }
+        terminal.send(TerminalCommand::SetCompletions(
+            cli.repl_completion_candidates().unwrap_or_default(),
+        ))?;
+
+        let event = if appfs_idle_wake {
+            match terminal.recv_timeout(Duration::from_millis(500)) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match terminal.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            }
+        };
+
+        match event {
+            TerminalEvent::SubmittedLine(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    terminal.send(TerminalCommand::RenderPrompt)?;
+                    continue;
+                }
+                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.persist_session()?;
+                    terminal.shutdown();
+                    break;
+                }
+                match SlashCommand::parse(&trimmed) {
+                    Ok(Some(command)) => {
+                        if cli.handle_repl_command(command)? {
+                            cli.persist_session()?;
+                        }
+                        terminal.send(TerminalCommand::RenderPrompt)?;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        terminal.send(TerminalCommand::RenderPrompt)?;
+                        continue;
+                    }
+                }
+                cli.record_prompt_history(&trimmed);
+                terminal.send(TerminalCommand::SetMode(TerminalMode::RunningGuidance))?;
+                let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    cli.run_turn_with_external_inputs(
+                        &trimmed,
+                        shared_queue.clone(),
+                        permission_tx.clone(),
+                    )?;
+                    cli.drain_and_run_queued_inputs_with_external_inputs(
+                        &terminal,
+                        shared_queue.clone(),
+                        permission_tx.clone(),
+                    )?;
+                    Ok(())
+                })();
+                let _ = terminal.send(TerminalCommand::SetMode(TerminalMode::IdlePrompt));
+                result?;
+                if appfs_idle_wake {
+                    cli.drive_appfs_idle_wake_with_external_inputs(
+                        &terminal,
+                        shared_queue.clone(),
+                        permission_tx.clone(),
+                    )?;
+                }
+            }
+            TerminalEvent::Cancel => {
+                if appfs_idle_wake {
+                    cli.drive_appfs_idle_wake_with_external_inputs(
+                        &terminal,
+                        shared_queue.clone(),
+                        permission_tx.clone(),
+                    )?;
+                }
+            }
+            TerminalEvent::Exit => {
+                cli.persist_session()?;
+                terminal.shutdown();
                 break;
             }
         }
@@ -3391,6 +3619,8 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    appfs_attach_ensure: Option<AppfsAttachEnsureOutcome>,
+    appfs_attach_lease: Option<AppfsAttachLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -3442,6 +3672,15 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist before installing hook abort signal");
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+        self
+    }
+
+    fn with_external_pending_inputs(mut self, queue: SharedPendingInputQueue) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing external pending inputs");
+        self.runtime = Some(runtime.with_external_pending_inputs(queue));
         self
     }
 
@@ -3870,6 +4109,88 @@ impl HookAbortMonitor {
     }
 }
 
+fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
+    let cwd = env::current_dir().ok()?;
+    let outcome = ensure_appfs_attach_identity(&cwd);
+    if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
+        return None;
+    }
+    for warning in &outcome.warnings {
+        eprintln!("AppFS attach warning: {warning}");
+    }
+    Some(outcome)
+}
+
+fn attach_live_cli_appfs_principal() -> Option<AppfsAttachLease> {
+    let cwd = env::current_dir().ok()?;
+    match attach_appfs_principal(&cwd) {
+        Ok(lease) => Some(lease),
+        Err(error) => {
+            eprintln!("AppFS attach warning: failed to register attach lease: {error}");
+            None
+        }
+    }
+}
+
+fn warmup_live_cli_appfs_private_apps() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    match warmup_appfs_private_apps(&cwd) {
+        Ok(outcomes) => {
+            for outcome in outcomes {
+                match outcome.status {
+                    AppfsPrivateAppWarmupStatus::Ready => {}
+                    AppfsPrivateAppWarmupStatus::Failed => {
+                        eprintln!(
+                            "AppFS attach warning: private app {} [{}] credential warmup failed",
+                            outcome.app_id, outcome.instance_id
+                        );
+                    }
+                    AppfsPrivateAppWarmupStatus::TimedOut => {
+                        eprintln!(
+                            "AppFS attach warning: private app {} [{}] credential warmup did not finish before timeout",
+                            outcome.app_id, outcome.instance_id
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("AppFS attach warning: failed to warm up private apps: {error}");
+        }
+    }
+}
+
+fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) -> Option<String> {
+    let environment = outcome.environment.as_ref()?;
+    let private_apps = environment
+        .registered_apps
+        .iter()
+        .filter(|app| {
+            app.visibility == runtime::AppfsRegisteredAppVisibility::PrivateInstance
+                && app.principal_id.as_deref() == Some(environment.principal_id.as_str())
+        })
+        .map(|app| format!("{} [{}]", app.app_id, app.path))
+        .collect::<Vec<_>>();
+    let status = match outcome.status {
+        AppfsAttachEnsureStatus::NotAppfs => "not detected",
+        AppfsAttachEnsureStatus::Ready => "ready",
+        AppfsAttachEnsureStatus::WaitingForPrivateApps => "waiting for private apps",
+        AppfsAttachEnsureStatus::Created => "created principal",
+        AppfsAttachEnsureStatus::Submitted => "submitted principal create",
+    };
+    let apps = if private_apps.is_empty() {
+        "private apps <none visible yet>".to_string()
+    } else {
+        format!("private apps {}", private_apps.join(", "))
+    };
+    Some(format!(
+        "\x1b[2mAppFS attach\x1b[0m     {status}; principal {}; {apps}",
+        environment.principal_id
+    ))
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -3877,6 +4198,15 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
+        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
+            attach_live_cli_appfs_principal()
+        } else {
+            None
+        };
+        if appfs_attach_lease.is_some() {
+            warmup_live_cli_appfs_private_apps();
+        }
         let system_prompt = build_system_prompt()?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -3899,6 +4229,8 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            appfs_attach_ensure,
+            appfs_attach_lease,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3911,6 +4243,15 @@ impl LiveCli {
         permission_mode: PermissionMode,
         session_reference: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
+        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
+            attach_live_cli_appfs_principal()
+        } else {
+            None
+        };
+        if appfs_attach_lease.is_some() {
+            warmup_live_cli_appfs_private_apps();
+        }
         let system_prompt = build_system_prompt()?;
         let handle = resolve_session_path_or_reference(session_reference)?;
         let session_state = Session::load_from_path(&handle.path)?;
@@ -3937,6 +4278,8 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            appfs_attach_ensure,
+            appfs_attach_lease,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3960,6 +4303,11 @@ impl LiveCli {
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
         );
+        let appfs_attach = self
+            .appfs_attach_ensure
+            .as_ref()
+            .and_then(format_appfs_attach_ensure_banner_line)
+            .unwrap_or_else(|| "\x1b[2mAppFS attach\x1b[0m     not detected".to_string());
         format!(
             "\x1b[38;5;196m\
  ██████╗██╗      █████╗ ██╗    ██╗\n\
@@ -3974,7 +4322,8 @@ impl LiveCli {
   \x1b[2mWorkspace\x1b[0m        {}\n\
   \x1b[2mDirectory\x1b[0m        {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
+  \x1b[2mAuto-save\x1b[0m        {}\n\
+  {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
             self.permission_mode.as_str(),
@@ -3983,6 +4332,7 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
+            appfs_attach,
         )
     }
 
@@ -4065,6 +4415,253 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn run_turn_with_external_inputs(
+        &mut self,
+        input: &str,
+        external_queue: SharedPendingInputQueue,
+        permission_tx: Sender<PermissionPromptTicket>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let runtime = runtime.with_external_pending_inputs(external_queue);
+        let mut permission_prompter =
+            ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.run_prepared_turn(
+            runtime,
+            hook_abort_monitor,
+            |runtime, prompter| runtime.run_turn(input, Some(prompter)),
+            Some(&mut permission_prompter),
+        )
+    }
+
+    fn drain_and_run_queued_inputs_with_external_inputs(
+        &mut self,
+        terminal: &TerminalControllerHandle,
+        external_queue: SharedPendingInputQueue,
+        permission_tx: Sender<PermissionPromptTicket>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        const MAX_QUEUED_AFTER_TURN_TURNS: usize = 16;
+
+        let queued_inputs = external_queue.drain_after_turn_pending_inputs();
+        if queued_inputs.is_empty() {
+            return Ok(0);
+        }
+
+        terminal.send(TerminalCommand::SetMode(TerminalMode::RunningGuidance))?;
+        let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut processed = 0usize;
+            let mut pending_inputs = VecDeque::from(queued_inputs);
+            while let Some(pending_input) = pending_inputs.pop_front() {
+                let queued_text = pending_input.envelope.text.trim().to_string();
+                if queued_text.is_empty() {
+                    continue;
+                }
+                if processed >= MAX_QUEUED_AFTER_TURN_TURNS {
+                    let mut restore = vec![pending_input];
+                    restore.extend(pending_inputs.into_iter());
+                    external_queue.restore_front(restore);
+                    break;
+                }
+
+                self.record_prompt_history(&queued_text);
+                if let Err(error) = self.run_turn_with_external_inputs(
+                    &queued_text,
+                    external_queue.clone(),
+                    permission_tx.clone(),
+                ) {
+                    let mut restore = vec![pending_input];
+                    restore.extend(pending_inputs.into_iter());
+                    external_queue.restore_front(restore);
+                    return Err(error);
+                }
+
+                processed += 1;
+                let new_queued_inputs = external_queue.drain_after_turn_pending_inputs();
+                if !new_queued_inputs.is_empty() {
+                    pending_inputs.extend(new_queued_inputs);
+                }
+            }
+            Ok(processed)
+        })();
+        let _ = terminal.send(TerminalCommand::SetMode(TerminalMode::IdlePrompt));
+        result
+    }
+
+    fn run_prepared_turn(
+        &mut self,
+        mut runtime: BuiltRuntime,
+        hook_abort_monitor: HookAbortMonitor,
+        runner: impl FnOnce(
+            &mut BuiltRuntime,
+            &mut dyn runtime::PermissionPrompter,
+        ) -> Result<runtime::TurnSummary, RuntimeError>,
+        prompter: Option<&mut dyn runtime::PermissionPrompter>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut spinner = Spinner::new();
+        let mut stdout = io::stdout();
+        spinner.tick(
+            "🦀 Thinking...",
+            TerminalRenderer::new().color_theme(),
+            &mut stdout,
+        )?;
+        let mut fallback_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let prompter = prompter.unwrap_or(&mut fallback_prompter);
+        let result = runner(&mut runtime, prompter);
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                spinner.finish(
+                    "✨ Done",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
+                self.persist_session()?;
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                Err(Box::new(error))
+            }
+        }
+    }
+
+    fn sync_appfs_events_for_idle(
+        &mut self,
+    ) -> Result<Vec<PendingInput>, Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let outcome = scan_appfs_attention_events_for_idle_wake(self.runtime.session_mut(), &cwd)?;
+        if outcome.cursor_update_count > 0 || outcome.wake_event_count > 0 {
+            self.persist_session()?;
+        }
+        Ok(outcome.pending_inputs)
+    }
+
+    fn drive_appfs_idle_wake(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        let pending_inputs = self.sync_appfs_events_for_idle()?;
+        let new_event_count = pending_inputs.len();
+        if pending_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        println!(
+            "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+        );
+        self.run_event_turn(pending_inputs)?;
+        Ok(true)
+    }
+
+    fn drive_appfs_idle_wake_with_external_inputs(
+        &mut self,
+        terminal: &TerminalControllerHandle,
+        external_queue: SharedPendingInputQueue,
+        permission_tx: Sender<PermissionPromptTicket>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let pending_inputs = self.sync_appfs_events_for_idle()?;
+        let new_event_count = pending_inputs.len();
+        if pending_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        println!(
+            "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+        );
+        for pending_input in pending_inputs {
+            external_queue.push(pending_input);
+        }
+        terminal.send(TerminalCommand::SetMode(TerminalMode::RunningGuidance))?;
+        let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+            self.run_event_turn_with_external_inputs(
+                external_queue.clone(),
+                permission_tx.clone(),
+            )?;
+            let _ = self.drain_and_run_queued_inputs_with_external_inputs(
+                terminal,
+                external_queue,
+                permission_tx,
+            )?;
+            Ok(true)
+        })();
+        let _ = terminal.send(TerminalCommand::SetMode(TerminalMode::IdlePrompt));
+        result
+    }
+
+    fn run_event_turn(
+        &mut self,
+        pending_inputs: Vec<PendingInput>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        for pending_input in pending_inputs {
+            runtime.enqueue_pending_input(pending_input);
+        }
+        let mut spinner = Spinner::new();
+        let mut stdout = io::stdout();
+        spinner.tick(
+            "🦀 Thinking...",
+            TerminalRenderer::new().color_theme(),
+            &mut stdout,
+        )?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_event_turn(Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                spinner.finish(
+                    "✨ Done",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                println!();
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
+                self.persist_session()?;
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                spinner.fail(
+                    "❌ Request failed",
+                    TerminalRenderer::new().color_theme(),
+                    &mut stdout,
+                )?;
+                Err(Box::new(error))
+            }
+        }
+    }
+
+    fn run_event_turn_with_external_inputs(
+        &mut self,
+        external_queue: SharedPendingInputQueue,
+        permission_tx: Sender<PermissionPromptTicket>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let runtime = runtime.with_external_pending_inputs(external_queue);
+        let mut permission_prompter =
+            ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.run_prepared_turn(
+            runtime,
+            hook_abort_monitor,
+            |runtime, prompter| runtime.run_event_turn(Some(prompter)),
+            Some(&mut permission_prompter),
+        )
     }
 
     fn run_turn_with_output(
@@ -5104,6 +5701,16 @@ impl LiveCli {
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_issue_report(context));
         Ok(())
+    }
+}
+
+impl Drop for LiveCli {
+    fn drop(&mut self) {
+        if let Some(lease) = self.appfs_attach_lease.take() {
+            if let Err(error) = detach_appfs_principal(&lease, "process_exit") {
+                eprintln!("AppFS attach warning: failed to detach principal lease: {error}");
+            }
+        }
     }
 }
 
@@ -7616,6 +8223,61 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+struct ChannelPermissionPrompter {
+    current_mode: PermissionMode,
+    permission_tx: Sender<PermissionPromptTicket>,
+}
+
+impl ChannelPermissionPrompter {
+    fn new(current_mode: PermissionMode, permission_tx: Sender<PermissionPromptTicket>) -> Self {
+        Self {
+            current_mode,
+            permission_tx,
+        }
+    }
+}
+
+impl runtime::PermissionPrompter for ChannelPermissionPrompter {
+    fn decide(
+        &mut self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        if let Some(decision) = CliPermissionPrompter::decision_from_env(request) {
+            return decision;
+        }
+
+        let (response_tx, response_rx) = mpsc::channel();
+        let ticket = PermissionPromptTicket {
+            view: PermissionPromptView {
+                tool_name: request.tool_name.clone(),
+                current_mode: self.current_mode.as_str().to_string(),
+                required_mode: request.required_mode.as_str().to_string(),
+                reason: request.reason.clone(),
+                input: request.input.clone(),
+            },
+            response_tx,
+        };
+
+        if self.permission_tx.send(ticket).is_err() {
+            return runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied because the permission prompt channel is closed",
+                    request.tool_name
+                ),
+            };
+        }
+
+        response_rx
+            .recv()
+            .unwrap_or_else(|_| runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied because the permission prompt response channel is closed",
+                    request.tool_name
+                ),
+            })
+    }
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ProviderClient,
@@ -9154,11 +9816,11 @@ mod tests {
         response_to_events, resume_supported_slash_commands, run_resume_command,
         run_resume_command_with_compactor, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
-        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
+        ChannelPermissionPrompter, CliAction, CliOutputFormat, CliPermissionPrompter,
+        CliToolExecutor, GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9167,8 +9829,8 @@ mod tests {
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InvokedSkill, MessageRole,
-        OAuthConfig, PermissionMode, PermissionPromptDecision, PermissionRequest, Session,
-        ToolExecutor,
+        OAuthConfig, PermissionMode, PermissionPromptDecision, PermissionPrompter,
+        PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -9569,6 +10231,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
             }
         );
     }
@@ -9822,6 +10486,89 @@ mod tests {
     }
 
     #[test]
+    fn channel_permission_prompter_prefers_test_env_override() {
+        let _guard = env_lock();
+        std::env::set_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE", "allow");
+        let (permission_tx, permission_rx) = std::sync::mpsc::channel();
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: "printf ok".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("bash requires danger-full-access".to_string()),
+        };
+
+        let mut prompter =
+            ChannelPermissionPrompter::new(PermissionMode::WorkspaceWrite, permission_tx);
+        let decision = prompter.decide(&request);
+        std::env::remove_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE");
+
+        assert_eq!(decision, PermissionPromptDecision::Allow);
+        assert!(permission_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn channel_permission_prompter_returns_channel_response() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE");
+        let (permission_tx, permission_rx) = std::sync::mpsc::channel();
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: "printf ok".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("bash requires danger-full-access".to_string()),
+        };
+        let worker = std::thread::spawn(move || {
+            let mut prompter =
+                ChannelPermissionPrompter::new(PermissionMode::WorkspaceWrite, permission_tx);
+            prompter.decide(&request)
+        });
+
+        let ticket = permission_rx.recv().expect("permission ticket");
+        assert_eq!(ticket.view.tool_name, "bash");
+        assert_eq!(ticket.view.current_mode, "workspace-write");
+        assert_eq!(ticket.view.required_mode, "danger-full-access");
+        assert_eq!(
+            ticket.view.reason.as_deref(),
+            Some("bash requires danger-full-access")
+        );
+        assert_eq!(ticket.view.input, "printf ok");
+        ticket
+            .response_tx
+            .send(PermissionPromptDecision::Allow)
+            .expect("permission response should send");
+
+        assert_eq!(
+            worker.join().expect("prompter thread should finish"),
+            PermissionPromptDecision::Allow
+        );
+    }
+
+    #[test]
+    fn channel_permission_prompter_denies_when_prompt_channel_closes() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE");
+        let (permission_tx, permission_rx) = std::sync::mpsc::channel();
+        drop(permission_rx);
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: "printf ok".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("bash requires danger-full-access".to_string()),
+        };
+
+        let mut prompter =
+            ChannelPermissionPrompter::new(PermissionMode::WorkspaceWrite, permission_tx);
+        let decision = prompter.decide(&request);
+
+        assert!(
+            matches!(decision, PermissionPromptDecision::Deny { reason } if reason.contains("permission prompt channel is closed"))
+        );
+    }
+
+    #[test]
     fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
         assert_eq!(
             parse_args(&[
@@ -10024,8 +10771,93 @@ mod tests {
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
                 reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
             }
         );
+    }
+
+    #[test]
+    fn rejects_watch_appfs_events_until_router_idle_wake_is_ready() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--watch-appfs-events".to_string()];
+        let err = parse_args(&args).expect_err("broad watcher should be disabled");
+        assert!(err.contains("disabled"));
+        assert!(err.contains("--appfs-idle-wake"));
+    }
+
+    #[test]
+    fn parses_appfs_idle_wake_flag_for_interactive_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--appfs-idle-wake".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                session_path: None,
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+                appfs_idle_wake: true,
+                running_input: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_running_input_flag_for_interactive_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--running-input".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                session_path: None,
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_running_input_with_prompt_mode() {
+        let err = parse_args(&[
+            "--running-input".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("running input should be repl-only");
+        assert!(err.contains("--running-input"));
+    }
+
+    #[test]
+    fn rejects_running_input_with_short_prompt_mode() {
+        let err = parse_args(&[
+            "--running-input".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("running input should be repl-only");
+        assert!(err.contains("--running-input"));
+    }
+
+    #[test]
+    fn rejects_appfs_idle_wake_with_prompt_mode() {
+        let err = parse_args(&[
+            "--appfs-idle-wake".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ])
+        .expect_err("idle wake should be repl-only");
+        assert!(err.contains("--appfs-idle-wake"));
     }
 
     #[test]
@@ -10042,6 +10874,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
             }
         );
     }
@@ -10087,6 +10921,9 @@ mod tests {
         session
             .appfs_event_cursors
             .insert("platform".to_string(), 3);
+        session
+            .appfs_wake_event_cursors
+            .insert("platform".to_string(), 5);
 
         let forked = fork_session_for_principal(
             &session,
@@ -10117,8 +10954,12 @@ mod tests {
         assert_eq!(forked.invoked_skills.len(), 1);
         assert_eq!(forked.invoked_skills[0].skill, "remember");
         assert_eq!(forked.appfs_event_cursors.get("platform"), Some(&3));
+        assert_eq!(forked.appfs_wake_event_cursors.get("platform"), Some(&5));
         assert!(!forked
             .appfs_event_cursors
+            .contains_key("app:tinode--default"));
+        assert!(!forked
+            .appfs_wake_event_cursors
             .contains_key("app:tinode--default"));
     }
 
@@ -10152,6 +10993,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
             }
         );
     }
@@ -10209,6 +11052,8 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
             }
         );
     }
@@ -10237,6 +11082,26 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn rejects_appfs_events_watch_until_router_idle_wake_is_ready() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "appfs-events".to_string(),
+            "watch".to_string(),
+            "--interval-ms".to_string(),
+            "250".to_string(),
+            "--session".to_string(),
+            "latest".to_string(),
+            "--once".to_string(),
+            "--max-turns=2".to_string(),
+        ];
+
+        let err = parse_args(&args).expect_err("broad watcher should be disabled");
+        assert!(err.contains("disabled"));
+        assert!(err.contains("--appfs-idle-wake"));
     }
 
     #[test]
@@ -11394,6 +12259,12 @@ mod tests {
                         "/mnt/appfs/_appfs/unregister_app.act",
                     )),
                     list_apps_path: Some(PathBuf::from("/mnt/appfs/_appfs/list_apps.act")),
+                    attach_principal_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/principals/attach_principal.act",
+                    )),
+                    detach_principal_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/principals/detach_principal.act",
+                    )),
                     current_app_id: Some("aiim".to_string()),
                     current_app_root: Some(PathBuf::from("/mnt/appfs/aiim")),
                     current_app_events_path: Some(PathBuf::from(
@@ -11511,6 +12382,12 @@ mod tests {
                         "/mnt/appfs/_appfs/unregister_app.act",
                     )),
                     list_apps_path: Some(PathBuf::from("/mnt/appfs/_appfs/list_apps.act")),
+                    attach_principal_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/principals/attach_principal.act",
+                    )),
+                    detach_principal_path: Some(PathBuf::from(
+                        "/mnt/appfs/_appfs/principals/detach_principal.act",
+                    )),
                     current_app_id: Some("aiim".to_string()),
                     current_app_root: Some(PathBuf::from("/mnt/appfs/aiim")),
                     current_app_events_path: Some(PathBuf::from(

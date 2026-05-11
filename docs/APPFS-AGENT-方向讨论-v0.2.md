@@ -246,6 +246,7 @@ AIIM skill 的生成不应只读：
 - `/_appfs/apps.registry.json`
 - `<app>/_meta/manifest.res.json`
 - `<app>/_meta/app-structure-sync.state.res.json`
+- `<app>/_app/skill.res.json`
 - `<app>/_app/control.res.json`
 - `<app>/_app/actions.res.json`
 - `<app>/_app/current_scope.res.json`
@@ -316,4 +317,3 @@ AIIM skill 的生成不应只读：
 而是：
 
 > 让 appfs 先把 AIIM 的控制面和联系人语义描述清楚，再让 appfs-agent 参考 Claude Code TS 版，用 skill listing + 按需加载的方式发现和调用它。
-

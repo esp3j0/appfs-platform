@@ -2,7 +2,10 @@
 
 ## Status
 
-Design is intentionally thin until the generic AppFS multi-agent identity layer is implemented.
+This document is the high-level Tinode/AppFS integration design. The concrete,
+model-facing tree contract now lives in
+[`TINODE-APPFS-tree-v0-design.md`](./TINODE-APPFS-tree-v0-design.md) and should
+be treated as the source of truth for paths and resource fields.
 
 Tinode should be implemented as a new app/connector named `tinode`. The current `aiim` demo app should stay unchanged and continue serving as a stable integration-test fixture.
 
@@ -29,7 +32,7 @@ v0 追求一个可靠闭环：
 
 1. 不替换、不重命名、不改造当前 `aiim` demo。
 2. 不把 Tinode 身份模型做成 Tinode connector 私有协议。
-3. 不在本文件定死最终 Tinode contact/message tree。
+3. 不在本文件重复定义 Tinode contact/message tree；具体树以 `TINODE-APPFS-tree-v0-design.md` 为准。
 4. 不使用 `team` app visibility。
 5. 不依赖 `by-login` 作为 Tinode 路径层设计。
 
@@ -215,11 +218,11 @@ Events should include `principal_id` and `profile_id`.
 Examples:
 
 ```json
-{"type":"account.ready","principal_id":"default","profile_id":"tinode:default","tinode_user_id":"usr...","login":"appfs_default"}
-{"type":"message.sent","principal_id":"default","profile_id":"tinode:default","to":"张三","client_token":"msg-001","text_preview":"明天十点开会"}
-{"type":"message.received","principal_id":"default","profile_id":"tinode:default","from":"张三","seq":42,"text_preview":"收到"}
-{"type":"group.created","principal_id":"incident-reporter","profile_id":"tinode:incident-reporter","topic":"grp...","title":"事故同步群","client_token":"grp-001"}
-{"type":"action.failed","principal_id":"default","profile_id":"tinode:default","path":"contact/张三/send_messages.act","client_token":"msg-001","error":"recipient not found"}
+{"type":"profile.credentials.ready","principal_id":"default","profile_id":"tinode:default","tinode_user_id":"usr...","login":"appfs_default"}
+{"type":"message.sent","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"/contacts/send_message.act","client_token":"msg-001","text_preview":"明天十点开会"}
+{"type":"message.received","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"contacts/张三/messages.res.jsonl","message_id":"tinode:usrZhangSan:42","from_display_name":"张三","text_preview":"收到","requires_attention":true}
+{"type":"group.created","principal_id":"incident-reporter","profile_id":"tinode:incident-reporter","group_key":"事故同步群","title":"事故同步群","path":"groups/事故同步群","client_token":"grp-001"}
+{"type":"action.failed","principal_id":"default","profile_id":"tinode:default","path":"/contacts/send_message.act","client_token":"msg-001","error":"recipient not found"}
 ```
 
 事件被 appfs-agent 注入 `<system-reminder>` 后，模型应该能判断：
@@ -244,7 +247,9 @@ skill 中应包含：
 Use only this principal's Tinode app root unless the user explicitly asks to inspect another principal.
 ```
 
-The skill should avoid final path examples until the Tinode tree is settled.
+The skill may include current v0 path examples from
+`TINODE-APPFS-tree-v0-design.md`, but should avoid inventing paths that are not
+part of that contract.
 
 ## Implementation Plan
 

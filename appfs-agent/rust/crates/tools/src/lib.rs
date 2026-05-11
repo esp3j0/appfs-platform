@@ -92,7 +92,10 @@ fn latest_skill_listing_content(session: &Session) -> Option<String> {
         .iter()
         .rev()
         .find(|message| {
-            message.attachment_metadata.as_ref().map(|metadata| metadata.kind)
+            message
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind)
                 == Some(AttachmentKind::SkillListing)
         })
         .map(conversation_message_text)
@@ -6867,10 +6870,9 @@ mod tests {
         execute_tool_with_effects, final_assistant_text, maybe_commit_provenance,
         model_visible_tool_result, model_visible_tool_result_with_id, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, should_inject_model_facing_skill_listing,
-        sync_model_facing_skill_listing, AgentInput, AgentJob,
-        ForkedSkillExecutionResult, ForkedSkillRequest, GlobalToolRegistry, LaneEventName,
-        LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
+        run_task_packet, should_inject_model_facing_skill_listing, sync_model_facing_skill_listing,
+        AgentInput, AgentJob, ForkedSkillExecutionResult, ForkedSkillRequest, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
         ProviderRuntimeClient, SkillInput, SubagentToolExecutor,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
@@ -7565,7 +7567,10 @@ mod tests {
         ));
         assert!(should_inject_model_facing_skill_listing(
             true,
-            Some(&BTreeSet::from([String::from("Skill"), String::from("bash")]))
+            Some(&BTreeSet::from([
+                String::from("Skill"),
+                String::from("bash")
+            ]))
         ));
         assert!(should_inject_model_facing_skill_listing(true, None));
     }

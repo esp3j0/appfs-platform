@@ -301,8 +301,25 @@ impl TinodeConnector {
             static_json("_app/skill.res.json", self.skill_resource()),
             static_json("_app/self.res.json", self.self_resource(ctx)),
             action("_app/ensure_credentials.act"),
+            action("_app/forget_credentials.act"),
             action("_app/refresh_structure.act"),
             action("_app/refresh_inbox.act"),
+            static_json(
+                "_app/message_layers.res.json",
+                json!({
+                    "live_boundary": "_stream/events.evt.jsonl",
+                    "summary_views": ["inbox/recent.res.jsonl", "inbox/unread.res.jsonl"],
+                    "history_views": [
+                        "contacts/<contact-key>/messages.res.jsonl",
+                        "groups/<group-key>/messages.res.jsonl"
+                    ],
+                    "rules": [
+                        "Use events for live wakeups and turn-local reminders.",
+                        "Use inbox for catch-up and unread summaries.",
+                        "Use full message history only when conversation context is required."
+                    ]
+                }),
+            ),
             dir("contacts"),
             snapshot_jsonl("contacts/index.res.jsonl"),
             action("contacts/send_message.act"),
@@ -354,10 +371,11 @@ impl TinodeConnector {
             "description": "Tinode private chat app for the current AppFS principal.",
             "when_to_use": [
                 "Use when the user wants to send messages through Tinode to a person or another agent.",
+                "Use when a Tinode message is received for the current principal and should be handled now.",
                 "Use when the user wants to inspect the current principal's Tinode inbox, contacts, or groups.",
                 "Load this skill before performing Tinode private-app action-file operations."
             ],
-            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
+            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Treat `_stream/events.evt.jsonl` as the live wake boundary. If `message.received` arrives with `requires_attention=true`, handle it as a current-turn task first. Do not reread inbox or message history just to confirm a reminder that already contains the task; use `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` only as summary views or catch-up aids. Use `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` only when you need full history context. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
             "allowed_tools": ["bash", "read_file", "glob_search"],
             "include_generated_sections": {
                 "scope_summary": false,
@@ -387,14 +405,25 @@ impl TinodeConnector {
                     ]
                 },
                 {
+                    "name": "forget_credentials",
+                    "path": "_app/forget_credentials.act",
+                    "summary": "Remove the current principal's Tinode credential state from connector memory and shared state.",
+                    "example_payload": {
+                        "client_token": "forget-tinode-default"
+                    },
+                    "use_when": [
+                        "The current principal is being deleted or the operator wants to reset the Tinode profile lifecycle."
+                    ]
+                },
+                {
                     "name": "refresh_inbox",
                     "path": "_app/refresh_inbox.act",
-                    "summary": "Refresh inbox resources for the current Tinode profile.",
+                    "summary": "Refresh inbox summary resources for the current Tinode profile.",
                     "example_payload": {
                         "client_token": "refresh-inbox-001"
                     },
                     "use_when": [
-                        "Inbox resources look stale and no AppFS event reminder has arrived."
+                        "Inbox summary looks stale, the agent has just attached, or the agent needs a catch-up view before reading full history."
                     ]
                 }
             ]
@@ -435,12 +464,12 @@ impl TinodeConnector {
                 {
                     "name": "mark_inbox_read",
                     "path": "inbox/mark_read.act",
-                    "summary": "Mark inbox messages as read for the current principal.",
+                    "summary": "Mark inbox messages as handled for the current principal.",
                     "example_payload": {
                         "client_token": "mark-read-001"
                     },
                     "use_when": [
-                        "The user asks to acknowledge or clear read state for Tinode inbox messages."
+                        "The user asks to acknowledge or clear local unread state for Tinode inbox messages."
                     ]
                 }
             ],
@@ -693,6 +722,33 @@ impl TinodeConnector {
         }
     }
 
+    fn purge_shared_credential_state(
+        &self,
+        principal_id: &str,
+        profile_id: &str,
+    ) -> std::result::Result<(), ConnectorError> {
+        let mut state = tinode_shared_state().lock().map_err(|_| {
+            connector_err(
+                connector_error_codes::INTERNAL,
+                "Tinode shared credential state is poisoned",
+                true,
+            )
+        })?;
+        state
+            .credentials
+            .remove(&shared_credential_key(&self.shared_namespace, profile_id));
+        state
+            .principal_profiles
+            .remove(&shared_principal_key(&self.shared_namespace, principal_id));
+        let principal_prefix = format!("{}|principal:", self.shared_namespace);
+        state
+            .principal_profiles
+            .retain(|principal_key, mapped_profile| {
+                !principal_key.starts_with(&principal_prefix) || mapped_profile != profile_id
+            });
+        Ok(())
+    }
+
     fn remember_principal_profile(&self, principal_id: &str, record: &ConnectorCredentialRecord) {
         if let Ok(mut state) = tinode_shared_state().lock() {
             state.principal_profiles.insert(
@@ -868,6 +924,52 @@ impl TinodeConnector {
                 )
             })?,
         ))
+    }
+
+    fn submit_forget_credentials(
+        &mut self,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        let profile_id = effective_profile_id(ctx)?;
+        let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
+        let previous_record = self
+            .credentials
+            .remove(&profile_id)
+            .or_else(|| self.shared_credential(&profile_id));
+
+        self.purge_shared_credential_state(principal_id, &profile_id)?;
+
+        let mut content = json!({
+            "ok": true,
+            "deleted": previous_record.is_some(),
+            "principal_id": principal_id,
+            "profile_id": profile_id.as_str(),
+            "credential_status": "missing",
+        });
+
+        if let Some(previous_record) = previous_record.as_ref() {
+            content["previous_credential"] = serde_json::to_value(previous_record.safe_summary())
+                .map_err(|err| {
+                connector_err(
+                    connector_error_codes::INTERNAL,
+                    format!("failed to encode forgotten credential summary: {err}"),
+                    true,
+                )
+            })?;
+        }
+
+        add_side_event(
+            &mut content,
+            "profile.credentials.forgotten",
+            Some(json!({
+                "deleted": previous_record.is_some(),
+                "principal_id": principal_id,
+                "profile_id": profile_id.as_str(),
+            })),
+            true,
+        );
+
+        Ok(completed_response(ctx, content))
     }
 
     fn submit_resolve_contact(
@@ -1410,36 +1512,43 @@ impl TinodeConnector {
         request: SubmitActionRequest,
         ctx: &ConnectorContext,
     ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
-        let mark_all = request
-            .payload
-            .get("all")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false);
-        let message_id = request
-            .payload
-            .get("message_id")
-            .and_then(JsonValue::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-
+        let mark_read = mark_read_request_from_payload(&request.payload)?;
         let mut cleared = Vec::new();
-        if mark_all {
-            cleared.extend(self.unread_message_ids.drain());
-        } else if let Some(message_id) = message_id {
-            if self.unread_message_ids.remove(&message_id) {
-                cleared.push(message_id);
+
+        match &mark_read {
+            TinodeMarkReadRequest::All => {
+                cleared.extend(self.unread_message_ids.drain());
             }
-        } else {
-            return Err(connector_err(
-                connector_error_codes::INVALID_ARGUMENT,
-                "Tinode inbox/mark_read.act requires `all=true` or a non-empty `message_id`",
-                false,
-            ));
+            TinodeMarkReadRequest::Messages(message_ids) => {
+                for message_id in message_ids {
+                    if self.unread_message_ids.remove(message_id) {
+                        cleared.push(message_id.clone());
+                    }
+                }
+            }
+            TinodeMarkReadRequest::Thread(thread) => {
+                let matching = self
+                    .inbox_recent
+                    .iter()
+                    .filter(|record| {
+                        thread.conversation_type == record.conversation_type
+                            && thread.key == record.contact_key
+                            && self.unread_message_ids.contains(&record.message_id)
+                    })
+                    .map(|record| record.message_id.clone())
+                    .collect::<Vec<_>>();
+                for message_id in matching {
+                    if self.unread_message_ids.remove(&message_id) {
+                        cleared.push(message_id);
+                    }
+                }
+            }
         }
 
+        let scope = mark_read.scope_label();
         let mut content = json!({
             "ok": true,
+            "scope": scope,
             "cleared": cleared,
             "unread_count": self.unread_message_ids.len(),
         });
@@ -1449,6 +1558,7 @@ impl TinodeConnector {
             "message.read",
             "inbox/unread.res.jsonl",
             Some(json!({
+                "scope": scope,
                 "cleared": cleared_for_event,
                 "unread_count": self.unread_message_ids.len(),
             })),
@@ -1562,6 +1672,7 @@ impl AppConnector for TinodeConnector {
         let normalized_path = normalize_path(&request.path);
         match normalized_path.as_str() {
             "_app/ensure_credentials.act" => self.submit_ensure_credentials(ctx),
+            "_app/forget_credentials.act" => self.submit_forget_credentials(ctx),
             "contacts/resolve.act" => self.submit_resolve_contact(request, ctx),
             "contacts/send_message.act" => self.submit_send_message(request, ctx),
             "_app/refresh_inbox.act" => self.submit_refresh_inbox(ctx),
@@ -1928,6 +2039,29 @@ enum RecipientRef {
     ContactKey(String),
     TinodeUser(String),
     Principal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TinodeMarkReadRequest {
+    Messages(Vec<String>),
+    Thread(TinodeMarkReadThread),
+    All,
+}
+
+impl TinodeMarkReadRequest {
+    fn scope_label(&self) -> &'static str {
+        match self {
+            TinodeMarkReadRequest::Messages(_) => "message",
+            TinodeMarkReadRequest::Thread(_) => "thread",
+            TinodeMarkReadRequest::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TinodeMarkReadThread {
+    conversation_type: String,
+    key: String,
 }
 
 struct WebSocketTinodeGateway {
@@ -3109,6 +3243,123 @@ fn group_member_refs_from_payload(
         .collect()
 }
 
+fn mark_read_request_from_payload(
+    payload: &JsonValue,
+) -> std::result::Result<TinodeMarkReadRequest, ConnectorError> {
+    if payload
+        .get("all")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(TinodeMarkReadRequest::All);
+    }
+
+    let scope = payload
+        .get("scope")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+
+    match scope {
+        "" | "message" | "messages" => {
+            let message_ids = message_ids_from_mark_read_payload(payload)?;
+            if message_ids.is_empty() {
+                if scope.is_empty() {
+                    return Err(mark_read_payload_error());
+                }
+                return Err(connector_err(
+                    connector_error_codes::INVALID_ARGUMENT,
+                    "Tinode inbox/mark_read.act with scope=message requires non-empty `message_ids` or `message_id`",
+                    false,
+                ));
+            }
+            Ok(TinodeMarkReadRequest::Messages(message_ids))
+        }
+        "thread" | "conversation" => {
+            if let Some(contact_key) = mark_read_key_from_payload(payload, "contact_key") {
+                return Ok(TinodeMarkReadRequest::Thread(TinodeMarkReadThread {
+                    conversation_type: "direct".to_string(),
+                    key: contact_key,
+                }));
+            }
+            if let Some(group_key) = mark_read_key_from_payload(payload, "group_key") {
+                return Ok(TinodeMarkReadRequest::Thread(TinodeMarkReadThread {
+                    conversation_type: "group".to_string(),
+                    key: group_key,
+                }));
+            }
+            Err(connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode inbox/mark_read.act with scope=thread requires `contact_key` or `group_key`",
+                false,
+            ))
+        }
+        "all" => Ok(TinodeMarkReadRequest::All),
+        other => Err(connector_err(
+            connector_error_codes::INVALID_ARGUMENT,
+            format!(
+                "Tinode inbox/mark_read.act scope must be `message`, `thread`, or `all`, got `{other}`"
+            ),
+            false,
+        )),
+    }
+}
+
+fn message_ids_from_mark_read_payload(
+    payload: &JsonValue,
+) -> std::result::Result<Vec<String>, ConnectorError> {
+    if let Some(message_ids) = payload.get("message_ids") {
+        let Some(items) = message_ids.as_array() else {
+            return Err(connector_err(
+                connector_error_codes::INVALID_ARGUMENT,
+                "Tinode inbox/mark_read.act `message_ids` must be an array of strings",
+                false,
+            ));
+        };
+        let mut parsed = Vec::new();
+        for item in items {
+            let value = item.as_str().ok_or_else(|| {
+                connector_err(
+                    connector_error_codes::INVALID_ARGUMENT,
+                    "Tinode inbox/mark_read.act `message_ids` must contain only strings",
+                    false,
+                )
+            })?;
+            let value = value.trim();
+            if !value.is_empty() {
+                parsed.push(value.to_string());
+            }
+        }
+        return Ok(parsed);
+    }
+
+    Ok(payload
+        .get("message_id")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default())
+}
+
+fn mark_read_key_from_payload(payload: &JsonValue, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn mark_read_payload_error() -> ConnectorError {
+    connector_err(
+        connector_error_codes::INVALID_ARGUMENT,
+        "Tinode inbox/mark_read.act requires `scope=message` with `message_ids`, `scope=thread` with `contact_key` or `group_key`, or `scope=all`",
+        false,
+    )
+}
+
 fn parse_recipient_ref(value: &str) -> std::result::Result<RecipientRef, ConnectorError> {
     let value = value.trim();
     if let Some(login) = value.strip_prefix("basic:") {
@@ -3776,6 +4027,7 @@ mod tests {
             "_app/self.res.json",
             "_app/skill.res.json",
             "_app/ensure_credentials.act",
+            "_app/forget_credentials.act",
             "_app/refresh_structure.act",
             "_app/refresh_inbox.act",
             "contacts/index.res.jsonl",
@@ -3907,6 +4159,58 @@ mod tests {
         assert_eq!(connector.credential_create_attempts(), 1);
         let state = state.lock().expect("mock state");
         assert_eq!(state.created.len(), 1);
+        assert_eq!(state.sent.len(), 2);
+    }
+
+    #[test]
+    fn forget_credentials_clears_shared_state_and_recreates_on_next_use() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"seed"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed credentials");
+        assert_eq!(connector.credential_create_attempts(), 1);
+
+        let forgot = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/_app/forget_credentials.act".to_string(),
+                        payload: json!({}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("forget credentials"),
+        );
+        assert_eq!(forgot["deleted"], true);
+        assert_eq!(forgot["credential_status"], "missing");
+        assert_eq!(forgot["profile_id"], "tinode:default");
+        assert_eq!(forgot["previous_credential"]["credential_status"], "ready");
+        assert!(!forgot.to_string().contains("secret-token"));
+        assert!(!connector.credentials.contains_key("tinode:default"));
+
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"after forget"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("send after forget");
+
+        assert_eq!(connector.credential_create_attempts(), 2);
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.created.len(), 2);
         assert_eq!(state.sent.len(), 2);
     }
 
@@ -4200,6 +4504,127 @@ mod tests {
             )
             .expect("unread inbox");
         assert!(unread.records.is_empty());
+    }
+
+    #[test]
+    fn mark_read_supports_message_thread_all_and_legacy_payloads() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"seed"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed contact");
+
+        for (seq, text) in [(2, "first"), (3, "second")] {
+            state
+                .lock()
+                .expect("mock state")
+                .inbound
+                .push(TinodeInboundMessage {
+                    topic: "usr-zhangsan".to_string(),
+                    seq,
+                    from_tinode_user_id: "usr-zhangsan".to_string(),
+                    text: text.to_string(),
+                });
+        }
+        connector
+            .drain_inbound_events(&ctx())
+            .expect("drain inbound");
+        assert_eq!(connector.unread_message_ids.len(), 2);
+
+        let first_id = "tinode:usr-zhangsan:2";
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/inbox/mark_read.act".to_string(),
+                        payload: json!({"scope":"message","message_ids":[first_id]}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("mark message read"),
+        );
+        assert_eq!(content["scope"], "message");
+        assert_eq!(content["unread_count"], 1);
+        assert!(connector
+            .unread_message_ids
+            .contains("tinode:usr-zhangsan:3"));
+
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/inbox/mark_read.act".to_string(),
+                        payload: json!({"scope":"thread","contact_key":"zhangsan"}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("mark thread read"),
+        );
+        assert_eq!(content["scope"], "thread");
+        assert_eq!(content["unread_count"], 0);
+
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 4,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "third".to_string(),
+            });
+        connector.drain_inbound_events(&ctx()).expect("drain third");
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/inbox/mark_read.act".to_string(),
+                        payload: json!({"message_id":"tinode:usr-zhangsan:4"}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("legacy message_id"),
+        );
+        assert_eq!(content["scope"], "message");
+        assert_eq!(content["unread_count"], 0);
+
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 5,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "fourth".to_string(),
+            });
+        connector
+            .drain_inbound_events(&ctx())
+            .expect("drain fourth");
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/inbox/mark_read.act".to_string(),
+                        payload: json!({"all": true}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("legacy all"),
+        );
+        assert_eq!(content["scope"], "all");
+        assert_eq!(content["unread_count"], 0);
     }
 
     #[test]
