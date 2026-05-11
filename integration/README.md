@@ -11,8 +11,8 @@ This directory is reserved for scenarios that span both `appfs` and `appfs-agent
 5. `integration/scripts/test-windows-appfs-agent-http-demo.ps1`
 6. `integration/scripts/test-windows-appfs-agent-multi-attach.ps1`
 7. `integration/scripts/test-windows-appfs-agent-launcher.ps1`
-8. `integration/scripts/test-unix-appfs-agent-smoke.sh`
-9. `integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1`
+8. `integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1`
+9. `integration/scripts/test-unix-appfs-agent-smoke.sh`
 
 ## Intended Contents
 
@@ -38,6 +38,7 @@ Current contract mapping:
 | `integration/scripts/test-windows-appfs-agent-http-demo.ps1` | `IC-1` | `C0`, `C1`, `C4` |
 | `integration/scripts/test-windows-appfs-agent-multi-attach.ps1` | `IC-2` | `C0`, `C1`, `C2`, `C3`, `C5` |
 | `integration/scripts/test-windows-appfs-agent-launcher.ps1` | `IC-3` | `C0`, `C1`, `C2`, `C3`, `C6` |
+| `integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1` | Tinode multi-agent v0 | principal registry, private app materialization, principal-aware skills/status, Tinode credentials, direct messages, inbox read-through |
 
 ## Unix Local Smoke
 
@@ -231,6 +232,32 @@ Example:
 
 The corresponding manual workflow is `.github/workflows/integration-multi-attach-windows.yml`.
 It is `workflow_dispatch` only for now so we can validate the scenario on the self-hosted WinFsp runner before promoting it into required PR CI.
+
+## Multi-Agent Tinode Smoke
+
+Use `integration/scripts/test-windows-appfs-tinode-multi-agent-smoke.ps1` when validating the current AppFS private-app and Tinode vertical slice on Windows.
+
+Example:
+
+```powershell
+cd C:\Users\esp3j\rep\appfs-platform
+$env:APPFS_TINODE_ENDPOINT = "http://101.34.216.193:6060"
+$env:APPFS_TINODE_API_KEY = "<tinode-api-key>"
+.\integration\scripts\test-windows-appfs-tinode-multi-agent-smoke.ps1
+```
+
+What it validates:
+
+1. starts AppFS compose with AIIM public app plus Tinode private app policy
+2. verifies supervisor auto-creates `default` and materializes `/private/default/tinode`
+3. creates a second principal such as `code-implementer`
+4. verifies appfs-agent `/status` and `skills` are principal-aware and include `appfs-tinode`
+5. initializes Tinode credentials for both principals through `_app/ensure_credentials.act`
+6. sends `default -> code-implementer` and waits for receiver inbox read-through
+7. sends `code-implementer -> default` and waits for receiver inbox read-through
+8. fails with AppFS and appfs-agent logs when an event stream, credential action, or inbox read-through does not complete
+
+The script uses a unique Tinode login prefix per run to avoid duplicate credential errors on a shared Tinode server. Keep Tinode secrets in environment variables or runner secrets; they must not be committed to compose files, events, skills, or session logs.
 
 ## Launcher Integration
 

@@ -713,22 +713,44 @@ impl SnapshotReadThroughContext {
         }
 
         if simulated_delay_ms > snapshot_spec.read_through_timeout_ms {
+            let mut stale_health = if matches!(
+                snapshot_spec.on_timeout,
+                SnapshotOnTimeoutPolicy::ReturnStale
+            ) {
+                Some("stale_cache_missing")
+            } else {
+                Some("stale_cache_disabled")
+            };
             if matches!(
                 snapshot_spec.on_timeout,
                 SnapshotOnTimeoutPolicy::ReturnStale
             ) {
                 if let Some(stale_bytes) = self.read_file_if_exists(&resource_fs_rel).await? {
-                    if stale_bytes.len() <= snapshot_spec.max_materialized_bytes
-                        && self.validate_stale_snapshot_jsonl(&stale_bytes).is_ok()
-                    {
-                        eprintln!(
-                            "[cache] timeout_return_stale resource={} trigger={}",
-                            resource_path, trigger
-                        );
-                        return Ok(stale_bytes);
+                    if stale_bytes.len() > snapshot_spec.max_materialized_bytes {
+                        stale_health = Some("stale_cache_too_large");
+                    } else {
+                        match self.validate_stale_snapshot_jsonl(&stale_bytes) {
+                            Ok(_) => {
+                                eprintln!(
+                                    "[cache] timeout_return_stale resource={} trigger={}",
+                                    resource_path, trigger
+                                );
+                                return Ok(stale_bytes);
+                            }
+                            Err(_) => {
+                                stale_health = Some("stale_cache_unhealthy");
+                            }
+                        }
                     }
                 }
             }
+            eprintln!(
+                "[cache] expand failed resource={} phase=timeout on_timeout={} stale_reason={} trigger={}",
+                resource_path,
+                snapshot_spec.on_timeout.as_str(),
+                stale_health.unwrap_or("stale_cache_missing"),
+                trigger
+            );
             return Err(io_error(
                 RAW_TIMEOUT_ERROR,
                 format!("snapshot read-through timed out: {}", resource_path),
@@ -744,6 +766,13 @@ impl SnapshotReadThroughContext {
             self.fetch_snapshot_jsonl_from_upstream(runtime, resource_rel, &request_id)?
         };
         if expanded_jsonl.len() > snapshot_spec.max_materialized_bytes {
+            eprintln!(
+                "[cache] snapshot_too_large resource={} size={} max_size={} trigger={}",
+                resource_path,
+                expanded_jsonl.len(),
+                snapshot_spec.max_materialized_bytes,
+                trigger
+            );
             return Err(io_error(
                 RAW_IO_ERROR,
                 format!(
@@ -1125,12 +1154,46 @@ impl SnapshotReadThroughFile {
         Ok(file)
     }
 
+    async fn cached_backing_buffer_if_usable(
+        &self,
+    ) -> Result<Option<Vec<u8>>, agentfs_sdk::error::Error> {
+        if snapshot_force_expand_on_refresh() {
+            return Ok(None);
+        }
+        let stats = self
+            .ctx
+            .lookup_path(&self.rel_path)
+            .await
+            .map_err(|err| map_anyhow_to_sdk_error(err, RAW_IO_ERROR))?;
+        let Some(stats) = stats else {
+            return Ok(None);
+        };
+        if stats.size <= 0 {
+            return Ok(None);
+        }
+        let bytes = self
+            .ctx
+            .read_file_if_exists(&self.rel_path)
+            .await
+            .map_err(|err| map_anyhow_to_sdk_error(err, RAW_IO_ERROR))?;
+        Ok(bytes)
+    }
+
     async fn read_buffer(&self) -> Result<Vec<u8>, agentfs_sdk::error::Error> {
         {
             let state = self.state.lock().await;
             if let Some(buffer) = state.read_buffer.as_ref() {
                 return Ok(buffer.clone());
             }
+        }
+
+        if let Some(buffer) = self.cached_backing_buffer_if_usable().await? {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.read_buffer.as_ref() {
+                return Ok(existing.clone());
+            }
+            state.read_buffer = Some(buffer.clone());
+            return Ok(buffer);
         }
 
         let buffer = self
@@ -2008,6 +2071,58 @@ mod tests {
             assert!(
                 placeholder.is_empty(),
                 "pread read-through must not mutate the placeholder file"
+            );
+        });
+    }
+
+    #[test]
+    fn materialized_snapshot_pread_uses_backing_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let snapshot_rel = "aiim/chats/chat-001/messages.res.jsonl";
+        let snapshot_path = temp.path().join(snapshot_rel);
+        fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+            .expect("create snapshot parent");
+        fs::write(&snapshot_path, b"{\"id\":\"cached\",\"text\":\"hot\"}\n")
+            .expect("seed hot snapshot cache");
+
+        let wrapper = build_wrapper(&temp, None);
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+
+        crate::get_runtime().block_on(async move {
+            install_snapshot_runtime(
+                &wrapper,
+                "aiim",
+                "chats/chat-001/messages.res.jsonl",
+                Box::new(FakeSnapshotConnector::new(
+                    fetch_count.clone(),
+                    vec![json!({"id":"upstream","text":"should not fetch"})],
+                )),
+            )
+            .await;
+
+            let snapshot = wrapper
+                .ctx
+                .lookup_path(snapshot_rel)
+                .await
+                .expect("lookup snapshot")
+                .expect("snapshot stats");
+            wrapper
+                .ctx
+                .cache_path(snapshot.ino, snapshot_rel.to_string())
+                .await;
+            let file = wrapper
+                .open(snapshot.ino, OPEN_READ_ONLY)
+                .await
+                .expect("open snapshot");
+            let bytes = file.pread(0, 4096).await.expect("read cached snapshot");
+            assert_eq!(
+                String::from_utf8(bytes).expect("utf8"),
+                "{\"id\":\"cached\",\"text\":\"hot\"}\n"
+            );
+            assert_eq!(
+                fetch_count.load(Ordering::SeqCst),
+                0,
+                "hot backing cache should not trigger another upstream read"
             );
         });
     }

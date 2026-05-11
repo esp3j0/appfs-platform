@@ -326,6 +326,81 @@ function Clear-WindowsIntegrationExecutableTargets {
     }
 }
 
+function Clear-WindowsIntegrationCargoTargetIfLowSpace {
+    param(
+        [string]$CacheRoot,
+        [int]$MinimumFreeGb = 12
+    )
+
+    $resolvedCacheRoot = Resolve-NormalizedWindowsPath $CacheRoot
+    if ([string]::IsNullOrWhiteSpace($resolvedCacheRoot)) {
+        return
+    }
+    if ((Split-Path $resolvedCacheRoot -Leaf) -ne "appfs-platform-cargo-targets") {
+        Write-Host "[warn] Refusing to prune unexpected cargo cache root: $resolvedCacheRoot" -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-Path $resolvedCacheRoot -PathType Container)) {
+        return
+    }
+
+    $driveRoot = [System.IO.Path]::GetPathRoot($resolvedCacheRoot)
+    $driveName = $driveRoot.TrimEnd("\").TrimEnd(":")
+    $minimumFreeBytes = [int64]$MinimumFreeGb * 1GB
+
+    function Get-FreeBytes {
+        $drive = Get-PSDrive -Name $driveName -PSProvider FileSystem -ErrorAction SilentlyContinue
+        if ($null -eq $drive) {
+            return [int64]::MaxValue
+        }
+        return [int64]$drive.Free
+    }
+
+    $forceClear = $env:APPFS_WINDOWS_INTEGRATION_CLEAR_CARGO_TARGET -eq "1"
+    $freeBefore = Get-FreeBytes
+    if (-not $forceClear -and $freeBefore -ge $minimumFreeBytes) {
+        return
+    }
+
+    Write-Host (
+        "[warn] Pruning Windows integration cargo target cache at {0}; free space before={1:N1}GB minimum={2}GB force={3}" -f
+            $resolvedCacheRoot,
+            ($freeBefore / 1GB),
+            $MinimumFreeGb,
+            $forceClear
+    ) -ForegroundColor Yellow
+
+    try {
+        Get-ChildItem -LiteralPath $resolvedCacheRoot -Directory -Recurse -Filter "incremental" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Force -Recurse -ErrorAction SilentlyContinue
+            }
+    } catch {
+        Write-Host "[warn] Failed while pruning incremental target directories: $_" -ForegroundColor Yellow
+    }
+
+    $freeAfterIncremental = Get-FreeBytes
+    if (-not $forceClear -and $freeAfterIncremental -ge $minimumFreeBytes) {
+        Write-Host (
+            "[info] Cargo target incremental prune recovered enough space; free={0:N1}GB" -f
+                ($freeAfterIncremental / 1GB)
+        ) -ForegroundColor DarkGray
+        return
+    }
+
+    try {
+        Remove-Item -LiteralPath $resolvedCacheRoot -Force -Recurse -ErrorAction Stop
+        [void][System.IO.Directory]::CreateDirectory($resolvedCacheRoot)
+        Write-Host (
+            "[warn] Removed shared Windows integration cargo target cache; free space now={0:N1}GB" -f
+                ((Get-FreeBytes) / 1GB)
+        ) -ForegroundColor Yellow
+    } catch {
+        Write-Host "[warn] Failed to remove cargo target cache $resolvedCacheRoot`: $_" -ForegroundColor Yellow
+    }
+}
+
 function Copy-WindowsIntegrationExecutableForRun {
     param(
         [string]$SourcePath,

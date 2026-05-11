@@ -2,12 +2,14 @@
 
 ## Status
 
-Design proposal for the first real Tinode AppFS app tree.
+Implemented v0 tree for the first real Tinode AppFS app slice.
 
 This document fixes the v0 path layout, resource files, action files, event contract, and skill expectations for the `tinode` private app. It depends on:
 
 1. [Tinode AppFS v0 Design](./TINODE-APPFS-v0-design.md)
 2. [AppFS Multi-Agent Identity And App Visibility v0 Design](./APPFS-multi-agent-identity-and-app-visibility-v0-design.md)
+
+Implemented v0 focuses on account bootstrap, direct messages, inbound inbox read-through, principal references, and generated `appfs-tinode` skills. Group paths are part of the v0 tree contract, but direct principal-to-principal messaging is the first smoke-tested path.
 
 ## Goals
 
@@ -220,7 +222,9 @@ Never include tokens, refresh tokens, passwords, API keys, cookies, or raw Tinod
 
 Optional pre-check action for Tinode because Tinode uses `credential_policy = auto-create`.
 
-Normal model behavior should not call this before sending a message. The first credential-required business action should create or reuse credentials transparently.
+Normal model behavior does not need to call this before sending a message. The first credential-required business action should create or reuse credentials transparently.
+
+Operators may still call it during smoke tests to fail fast before sending a business message.
 
 Payload:
 
@@ -842,6 +846,50 @@ printf '%s\n' '{"to":"张三","text":"明天十点开会","client_token":"msg-00
 The skill should use the app root as its base directory, so examples should be relative paths.
 
 ## Model Usage Flows
+
+### Smoke-Test A Principal Pair
+
+Given:
+
+```text
+/private/default/tinode
+/private/code-implementer/tinode
+```
+
+Optional credential pre-check:
+
+```powershell
+function Append-JsonLine($Path, $Json) {
+  [System.IO.File]::AppendAllText($Path, $Json + "`n", [System.Text.UTF8Encoding]::new($false))
+}
+
+$root = "C:\mnt\appfs-compose-aiim-tinode"
+Append-JsonLine "$root\private\default\tinode\_app\ensure_credentials.act" '{"expected_profile_id":"tinode:default","client_token":"ensure-default-001"}'
+Append-JsonLine "$root\private\code-implementer\tinode\_app\ensure_credentials.act" '{"expected_profile_id":"tinode:code-implementer","client_token":"ensure-code-001"}'
+```
+
+Send from `default` to `code-implementer`:
+
+```powershell
+Append-JsonLine "$root\private\default\tinode\contacts\send_message.act" '{"to":"principal:code-implementer","text":"default delegates implementation details.","client_token":"msg-default-code-001"}'
+Get-Content "$root\private\default\tinode\_stream\events.evt.jsonl" -Tail 30
+Get-Content "$root\private\code-implementer\tinode\inbox\recent.res.jsonl" -Tail 20
+```
+
+Send back:
+
+```powershell
+Append-JsonLine "$root\private\code-implementer\tinode\contacts\send_message.act" '{"to":"principal:default","text":"code-implementer acknowledges and starts implementation.","client_token":"msg-code-default-001"}'
+Get-Content "$root\private\code-implementer\tinode\_stream\events.evt.jsonl" -Tail 30
+Get-Content "$root\private\default\tinode\inbox\recent.res.jsonl" -Tail 20
+```
+
+Expected results:
+
+1. sender stream gets `action.accepted`, `message.sent`, and `action.completed`;
+2. receiver stream eventually gets `message.received` and `inbox.updated`;
+3. receiver `inbox/recent.res.jsonl` shows the message through read-through;
+4. no Tinode token, password, refresh token, API key, or cookie appears in files or events.
 
 ### Send To Known Contact
 
