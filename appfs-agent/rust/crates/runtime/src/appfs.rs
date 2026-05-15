@@ -4552,8 +4552,9 @@ mod tests {
                 "message.received",
                 Some(serde_json::json!({
                     "conversation_type": "direct",
-                    "from_display_name": "AppFS Agent default",
-                    "message_id": "tinode:usr-default:1",
+                    "contact_key": "code-implementer",
+                    "from_display_name": "AppFS Agent code-implementer",
+                    "message_id": "tinode:usr-code:1",
                     "requires_attention": true,
                     "text_preview": "please implement this"
                 })),
@@ -4594,7 +4595,7 @@ mod tests {
         assert!(reminder.starts_with("please implement this\n\n<system-reminder>"));
         assert!(reminder.contains("上面的内容是一条来自 AppFS Tinode 的外部消息"));
         assert!(reminder.contains("来源：Tinode direct message"));
-        assert!(reminder.contains("from=AppFS Agent default"));
+        assert!(reminder.contains("from=AppFS Agent code-implementer"));
         assert!(reminder.contains("to_principal=default"));
         assert!(reminder.contains("contact_key=code-implementer"));
         assert!(reminder.contains("seq=1"));
