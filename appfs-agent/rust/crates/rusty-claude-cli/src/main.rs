@@ -4178,7 +4178,7 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
             app.visibility == runtime::AppfsRegisteredAppVisibility::PrivateInstance
                 && app.principal_id.as_deref() == Some(environment.principal_id.as_str())
         })
-        .map(|app| format!("{} [{}]", app.app_id, app.path))
+        .map(|app| app.app_id.clone())
         .collect::<Vec<_>>();
     let status = match outcome.status {
         AppfsAttachEnsureStatus::NotAppfs => "not detected",
@@ -4189,6 +4189,12 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
     };
     let apps = if private_apps.is_empty() {
         "private apps <none visible yet>".to_string()
+    } else if private_apps.len() > 3 {
+        let hidden = private_apps.len() - 3;
+        format!(
+            "private apps {} (+{hidden} more)",
+            private_apps[..3].join(", ")
+        )
     } else {
         format!("private apps {}", private_apps.join(", "))
     };
@@ -4335,7 +4341,8 @@ impl LiveCli {
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\
   {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session\n\
+  \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -4584,20 +4591,21 @@ impl LiveCli {
             return Ok(false);
         }
 
-        let message =
-            format!("AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.");
-        if let Some(redraw_handle) = &self.redraw_handle {
-            redraw_handle.write_output(format!("{message}\n"));
-        } else {
-            println!("\n{message}");
-        }
         let rendered_inputs = render_pending_input_echoes(&pending_inputs);
         if !rendered_inputs.is_empty() {
             if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle.write_output(format!("{rendered_inputs}\n"));
+                redraw_handle.write_output(format!("{rendered_inputs}\n\n"));
             } else {
-                println!("{rendered_inputs}");
+                println!("\n{rendered_inputs}\n");
             }
+        } else if let Some(redraw_handle) = &self.redraw_handle {
+            redraw_handle.write_output(format!(
+                "AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.\n"
+            ));
+        } else {
+            println!(
+                "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+            );
         }
         self.run_event_turn(pending_inputs)?;
         Ok(true)
@@ -4615,7 +4623,14 @@ impl LiveCli {
             return Ok(false);
         }
 
-        if let Some(redraw_handle) = &self.redraw_handle {
+        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
+        if !rendered_inputs.is_empty() {
+            if let Some(redraw_handle) = &self.redraw_handle {
+                redraw_handle.write_output(format!("{rendered_inputs}\n\n"));
+            } else {
+                println!("\n{rendered_inputs}\n");
+            }
+        } else if let Some(redraw_handle) = &self.redraw_handle {
             redraw_handle.write_output(format!(
                 "AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.\n"
             ));
@@ -4623,14 +4638,6 @@ impl LiveCli {
             println!(
                 "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
             );
-        }
-        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
-        if !rendered_inputs.is_empty() {
-            if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle.write_output(format!("{rendered_inputs}\n"));
-            } else {
-                println!("{rendered_inputs}");
-            }
         }
         for pending_input in pending_inputs {
             external_queue.push(pending_input);
@@ -8694,10 +8701,14 @@ impl AnthropicRuntimeClient {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
                         // Display tool call now that input is fully accumulated
-                        let tool_text = format!("\n{}\n", format_tool_call_start(&name, &input));
                         if let Some(redraw_handle) = &self.redraw_handle {
-                            redraw_handle.write_output(tool_text);
+                            redraw_handle.write_output(format!(
+                                "{}\n",
+                                format_tool_call_start(&name, &input)
+                            ));
                         } else {
+                            let tool_text =
+                                format!("\n{}\n", format_tool_call_start(&name, &input));
                             write!(out, "{tool_text}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -9472,27 +9483,32 @@ fn render_pending_input_echoes(inputs: &[PendingInput]) -> String {
         .iter()
         .filter_map(|input| render_pending_input_echo(input))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
 fn render_pending_input_echo(input: &PendingInput) -> Option<String> {
-    let text = summarize_pending_input_text(input);
-    if text.is_empty() {
-        return None;
+    match input.envelope.source {
+        InputSource::AppfsEvent => render_appfs_event_card(&input.envelope),
+        InputSource::UserTerminal | InputSource::AgentMessage | InputSource::System => {
+            let text = summarize_pending_input_text(input);
+            if text.is_empty() {
+                return None;
+            }
+
+            let prefix = match input.envelope.source {
+                InputSource::UserTerminal => match input.envelope.input_type.as_str() {
+                    "user.guidance" => "(guidance)> ",
+                    "user.queued" => "(queued)> ",
+                    _ => "(input)> ",
+                },
+                InputSource::AgentMessage => "[agent] ",
+                InputSource::System => "[system] ",
+                InputSource::AppfsEvent => unreachable!("handled above"),
+            };
+
+            Some(format!("{prefix}{text}"))
+        }
     }
-
-    let prefix = match input.envelope.source {
-        InputSource::UserTerminal => match input.envelope.input_type.as_str() {
-            "user.guidance" => "(guidance)> ",
-            "user.queued" => "(queued)> ",
-            _ => "(input)> ",
-        },
-        InputSource::AppfsEvent => "[event] ",
-        InputSource::AgentMessage => "[agent] ",
-        InputSource::System => "[system] ",
-    };
-
-    Some(format!("{prefix}{text}"))
 }
 
 fn summarize_pending_input_text(input: &PendingInput) -> String {
@@ -9512,6 +9528,66 @@ fn summarize_pending_input_text(input: &PendingInput) -> String {
             parts.join(": ")
         }
     }
+}
+
+fn render_appfs_event_card(envelope: &runtime::InputEnvelope) -> Option<String> {
+    let lines = appfs_event_card_lines(envelope);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let title = "AppFS Wake";
+    let border = "─".repeat(title.len() + 10);
+    let body = lines
+        .into_iter()
+        .map(|line| format!("\x1b[38;5;245m│\x1b[0m {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(format!(
+        "\x1b[38;5;245m╭─ \x1b[1;35m{title}\x1b[0;38;5;245m ─╮\x1b[0m\n{body}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+    ))
+}
+
+fn appfs_event_card_lines(envelope: &runtime::InputEnvelope) -> Vec<String> {
+    let app_label = envelope.app_id.as_deref().unwrap_or("appfs");
+    let mut lines = Vec::new();
+
+    if envelope.input_type == "message.received" {
+        let from = payload_string(envelope.payload.as_ref(), "from_display_name")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "from_principal"))
+            .or_else(|| payload_string(envelope.payload.as_ref(), "contact_key"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut meta = format!("{app_label} · message.received · from {from}");
+        if envelope.requires_attention {
+            meta.push_str(" · attention required");
+        }
+        lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
+
+        let body = payload_string(envelope.payload.as_ref(), "text")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "text_preview"))
+            .unwrap_or_else(|| single_line_preview(&envelope.text, 280));
+        if !body.is_empty() {
+            lines.push(body);
+        }
+        return lines;
+    }
+
+    let mut meta = format!("{app_label} · {}", envelope.input_type.trim());
+    if let Some(principal) = &envelope.principal_id {
+        meta.push_str(&format!(" · principal {principal}"));
+    }
+    if envelope.requires_attention {
+        meta.push_str(" · attention required");
+    }
+    lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
+
+    let preview = single_line_preview(&envelope.text, 280);
+    if !preview.is_empty() {
+        lines.push(preview);
+    }
+
+    lines
 }
 
 fn summarize_appfs_pending_input(envelope: &runtime::InputEnvelope) -> String {
@@ -10048,13 +10124,13 @@ mod tests {
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle,
         delete_merged_local_branches_in, describe_tool_progress, filter_tool_specs,
-        fork_session_for_principal, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_principal_fork_launch_command, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        fork_session_for_principal, format_appfs_attach_ensure_banner_line,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_principal_fork_launch_command, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, git_ref_exists_in, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
@@ -12248,6 +12324,52 @@ mod tests {
     }
 
     #[test]
+    fn appfs_attach_banner_line_summarizes_private_apps_without_paths() {
+        let line = format_appfs_attach_ensure_banner_line(&runtime::AppfsAttachEnsureOutcome {
+            status: runtime::AppfsAttachEnsureStatus::Ready,
+            environment: Some(runtime::AppfsEnvironment {
+                attach_source: runtime::AppfsAttachSource::Env,
+                mount_root: PathBuf::from("/mnt/appfs"),
+                runtime_session_id: Some("session-1".to_string()),
+                attach_id: "attach-1".to_string(),
+                principal_id: "code-implementer".to_string(),
+                attach_role: Some("worker".to_string()),
+                multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+                manifest_path: None,
+                control_dir: None,
+                control_events_path: None,
+                registry_path: None,
+                register_app_path: None,
+                unregister_app_path: None,
+                list_apps_path: None,
+                attach_principal_path: None,
+                detach_principal_path: None,
+                current_app_id: None,
+                current_app_root: None,
+                current_app_events_path: None,
+                registered_apps: vec![runtime::AppfsRegisteredApp {
+                    instance_id: "tinode-worker".to_string(),
+                    app_id: "tinode".to_string(),
+                    visibility: runtime::AppfsRegisteredAppVisibility::PrivateInstance,
+                    parent_app_id: None,
+                    principal_id: Some("code-implementer".to_string()),
+                    profile_id: None,
+                    path: "private/code-implementer/tinode".to_string(),
+                    active_scope: None,
+                }],
+                known_principals: Vec::new(),
+                warnings: Vec::new(),
+            }),
+            principal_outcome: None,
+            warnings: Vec::new(),
+        })
+        .expect("banner line should render");
+
+        assert!(line.contains("private apps tinode"));
+        assert!(!line.contains("private/code-implementer/tinode"));
+    }
+
+    #[test]
     fn format_connected_line_renders_anthropic_provider_for_claude_model() {
         let model = "claude-sonnet-4-6";
 
@@ -13999,8 +14121,11 @@ UU conflicted.rs",
             delivery: runtime::PendingInputDelivery::InjectAtNextBoundary,
         }]);
 
-        assert!(rendered.contains("[event] tinode message from Alice"));
-        assert!(rendered.contains("needs attention"));
+        assert!(rendered.contains("AppFS Wake"));
+        assert!(rendered.contains("tinode"));
+        assert!(rendered.contains("message.received"));
+        assert!(rendered.contains("from Alice"));
+        assert!(rendered.contains("attention required"));
         assert!(rendered.contains("请帮我继续跟进这个限制设计"));
     }
 
