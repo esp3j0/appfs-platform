@@ -1,5 +1,8 @@
+use crossterm::cursor::{MoveTo, MoveToColumn};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::queue;
+use crossterm::style::Print;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType, ScrollUp};
 use runtime::{
     InputEnvelope, InputSource, PendingInput, PendingInputDelivery, SharedPendingInputQueue,
 };
@@ -7,6 +10,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalMode {
@@ -27,6 +31,9 @@ pub enum TerminalCommand {
     SetMode(TerminalMode),
     RenderPrompt,
     SetCompletions(Vec<String>),
+    SetStatus(String),
+    ClearStatus,
+    WriteOutput(String),
     AskPermission(PermissionPromptView),
     Shutdown,
 }
@@ -101,6 +108,10 @@ impl TerminalControllerHandle {
         self.command_tx
             .send(command)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))
+    }
+
+    pub fn command_sender(&self) -> Sender<TerminalCommand> {
+        self.command_tx.clone()
     }
 
     pub fn recv(&self) -> Result<TerminalEvent, mpsc::RecvError> {
@@ -188,6 +199,7 @@ fn terminal_controller_loop(
 struct TerminalControllerState {
     mode: TerminalMode,
     previous_mode: TerminalMode,
+    status_line: Option<String>,
     line: String,
     completions: Vec<String>,
     permission_ticket: Option<PermissionPromptTicket>,
@@ -205,6 +217,7 @@ impl TerminalControllerState {
         Self {
             mode: TerminalMode::IdlePrompt,
             previous_mode: TerminalMode::IdlePrompt,
+            status_line: None,
             line: String::new(),
             completions: Vec::new(),
             permission_ticket: None,
@@ -217,18 +230,37 @@ impl TerminalControllerState {
     fn handle_command(&mut self, command: TerminalCommand) -> io::Result<bool> {
         match command {
             TerminalCommand::SetMode(mode) => {
+                let old_footer_height = self.footer_height();
                 if self.set_mode(mode) {
                     self.line.clear();
-                    self.render_prompt()?;
+                    self.preserve_output_for_footer_resize(
+                        old_footer_height,
+                        self.footer_height(),
+                    )?;
+                    self.render_footer()?;
                 }
                 Ok(false)
             }
             TerminalCommand::RenderPrompt => {
-                self.render_prompt()?;
+                self.render_footer()?;
                 Ok(false)
             }
             TerminalCommand::SetCompletions(completions) => {
                 self.completions = completions;
+                Ok(false)
+            }
+            TerminalCommand::SetStatus(status) => {
+                self.status_line = Some(status);
+                self.render_footer()?;
+                Ok(false)
+            }
+            TerminalCommand::ClearStatus => {
+                self.status_line = None;
+                self.render_footer()?;
+                Ok(false)
+            }
+            TerminalCommand::WriteOutput(text) => {
+                self.write_output(&text)?;
                 Ok(false)
             }
             TerminalCommand::AskPermission(view) => {
@@ -267,13 +299,15 @@ impl TerminalControllerState {
     }
 
     fn enter_permission_prompt(&mut self, ticket: PermissionPromptTicket) -> io::Result<()> {
+        let old_footer_height = self.footer_height();
         if self.mode != TerminalMode::PermissionPrompt {
             self.previous_mode = self.mode;
         }
         self.mode = TerminalMode::PermissionPrompt;
         self.permission_ticket = Some(ticket);
         self.line.clear();
-        self.render_permission_prompt()
+        self.preserve_output_for_footer_resize(old_footer_height, self.footer_height())?;
+        self.render_footer()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
@@ -293,18 +327,26 @@ impl TerminalControllerState {
     fn handle_line_key(&mut self, key: KeyEvent) -> io::Result<bool> {
         match key.code {
             KeyCode::Enter => {
-                writeln!(io::stdout())?;
                 let submitted = std::mem::take(&mut self.line);
                 match self.mode {
                     TerminalMode::IdlePrompt => {
+                        if !submitted.trim().is_empty() {
+                            self.write_output(&format!("> {submitted}\n"))?;
+                        } else {
+                            self.render_footer()?;
+                        }
                         let _ = self.event_tx.send(TerminalEvent::SubmittedLine(submitted));
                     }
                     TerminalMode::RunningGuidance => {
                         if let Some(input) = pending_input_from_running_line(&submitted) {
+                            self.write_output(&format!("{}\n", render_running_input_echo(&input)))?;
                             self.shared_queue.push(input);
-                            writeln!(io::stdout(), "queued for the next model boundary")?;
+                            self.status_line =
+                                Some("Queued for the next model boundary.".to_string());
+                        } else {
+                            self.status_line = Some(self.running_status_line());
                         }
-                        self.render_prompt()?;
+                        self.render_footer()?;
                     }
                     TerminalMode::PermissionPrompt => {}
                 }
@@ -312,8 +354,7 @@ impl TerminalControllerState {
             }
             KeyCode::Backspace => {
                 if self.line.pop().is_some() {
-                    print!("\x08 \x08");
-                    io::stdout().flush()?;
+                    self.render_footer()?;
                 }
                 Ok(false)
             }
@@ -323,14 +364,12 @@ impl TerminalControllerState {
             }
             KeyCode::Esc => {
                 self.line.clear();
-                writeln!(io::stdout())?;
-                self.render_prompt()?;
+                self.render_footer()?;
                 Ok(false)
             }
             KeyCode::Char(value) => {
                 self.line.push(value);
-                print!("{value}");
-                io::stdout().flush()?;
+                self.render_footer()?;
                 Ok(false)
             }
             _ => Ok(false),
@@ -340,8 +379,6 @@ impl TerminalControllerState {
     fn handle_permission_key(&mut self, key: KeyEvent) -> io::Result<bool> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                print!("y");
-                io::stdout().flush()?;
                 self.finish_permission(runtime::PermissionPromptDecision::Allow)
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -362,15 +399,13 @@ impl TerminalControllerState {
             }
             KeyCode::Backspace => {
                 if self.line.pop().is_some() {
-                    print!("\x08 \x08");
-                    io::stdout().flush()?;
+                    self.render_footer()?;
                 }
                 Ok(false)
             }
             KeyCode::Char(value) => {
                 self.line.push(value);
-                print!("{value}");
-                io::stdout().flush()?;
+                self.render_footer()?;
                 Ok(false)
             }
             _ => Ok(false),
@@ -386,15 +421,15 @@ impl TerminalControllerState {
                 } else {
                     self.line.clear();
                     let _ = self.event_tx.send(TerminalEvent::Cancel);
-                    writeln!(io::stdout(), "^C")?;
-                    self.render_prompt()?;
+                    self.status_line = None;
+                    self.render_footer()?;
                     Ok(false)
                 }
             }
             TerminalMode::RunningGuidance => {
                 self.line.clear();
-                writeln!(io::stdout(), "^C guidance cancelled")?;
-                self.render_prompt()?;
+                self.status_line = Some("Guidance cancelled.".to_string());
+                self.render_footer()?;
                 Ok(false)
             }
             TerminalMode::PermissionPrompt => {
@@ -409,52 +444,53 @@ impl TerminalControllerState {
         &mut self,
         decision: runtime::PermissionPromptDecision,
     ) -> io::Result<bool> {
-        writeln!(io::stdout())?;
         if let Some(ticket) = self.permission_ticket.take() {
             let _ = ticket.response_tx.send(decision);
         }
         self.mode = self.previous_mode;
         self.line.clear();
-        self.render_prompt()?;
+        self.render_footer()?;
         Ok(false)
     }
 
     fn render_prompt(&self) -> io::Result<()> {
-        let prompt = match self.mode {
-            TerminalMode::IdlePrompt => "> ",
-            TerminalMode::RunningGuidance => "(guidance)> ",
-            TerminalMode::PermissionPrompt => "",
-        };
-        if !prompt.is_empty() {
-            print!("{prompt}");
-            io::stdout().flush()?;
-        }
-        Ok(())
+        self.render_footer()
     }
 
-    fn render_permission_prompt(&self) -> io::Result<()> {
-        let Some(ticket) = self.permission_ticket.as_ref() else {
-            return Ok(());
-        };
-        writeln!(io::stdout())?;
-        writeln!(io::stdout(), "Permission approval required")?;
-        writeln!(io::stdout(), "  Tool             {}", ticket.view.tool_name)?;
-        writeln!(
-            io::stdout(),
-            "  Current mode     {}",
-            ticket.view.current_mode
-        )?;
-        writeln!(
-            io::stdout(),
-            "  Required mode    {}",
-            ticket.view.required_mode
-        )?;
-        if let Some(reason) = &ticket.view.reason {
-            writeln!(io::stdout(), "  Reason           {reason}")?;
+    fn write_output(&self, text: &str) -> io::Result<()> {
+        let footer_start = self.footer_start_row()?;
+        let mut rendered = text.to_string();
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
         }
-        writeln!(io::stdout(), "  Input            {}", ticket.view.input)?;
-        print!("Approve this tool call? [y/N]: ");
-        io::stdout().flush()
+        let spacer_lines = footer_spacer_lines(&rendered, self.footer_height());
+        let mut stdout = io::stdout();
+        queue!(
+            stdout,
+            MoveTo(0, footer_start),
+            Clear(ClearType::FromCursorDown),
+            Print(&rendered)
+        )?;
+        if spacer_lines > 0 {
+            queue!(stdout, ScrollUp(spacer_lines))?;
+        }
+        stdout.flush()?;
+        self.render_footer()
+    }
+
+    fn preserve_output_for_footer_resize(
+        &self,
+        old_footer_height: u16,
+        new_footer_height: u16,
+    ) -> io::Result<()> {
+        let growth = footer_growth_lines(old_footer_height, new_footer_height);
+        if growth == 0 {
+            return Ok(());
+        }
+
+        let mut stdout = io::stdout();
+        queue!(stdout, ScrollUp(growth))?;
+        stdout.flush()
     }
 
     fn render_matching_completions(&self) -> io::Result<()> {
@@ -471,12 +507,200 @@ impl TerminalControllerState {
         if matches.is_empty() {
             return Ok(());
         }
-        writeln!(io::stdout())?;
-        writeln!(io::stdout(), "{}", matches.join("  "))?;
-        self.render_prompt()?;
-        print!("{}", self.line);
-        io::stdout().flush()
+        self.write_output(&format!("{}\n", matches.join("  ")))
     }
+
+    fn render_footer(&self) -> io::Result<()> {
+        let (_, rows) = size().map_err(io::Error::other)?;
+        let footer_start = rows.saturating_sub(self.footer_height());
+        let mut stdout = io::stdout();
+        queue!(
+            stdout,
+            MoveTo(0, footer_start),
+            Clear(ClearType::FromCursorDown)
+        )?;
+
+        match self.mode {
+            TerminalMode::IdlePrompt => {
+                queue!(
+                    stdout,
+                    MoveTo(0, footer_start),
+                    Print(render_input_line("> ", &self.line, size()?.0))
+                )?;
+            }
+            TerminalMode::RunningGuidance => {
+                queue!(
+                    stdout,
+                    MoveTo(0, footer_start),
+                    Print(truncate_to_width(&self.running_status_line(), size()?.0)),
+                    MoveTo(0, footer_start.saturating_add(1)),
+                    Print(render_input_line("(guidance)> ", &self.line, size()?.0))
+                )?;
+            }
+            TerminalMode::PermissionPrompt => {
+                for (index, line) in self.permission_prompt_lines(size()?.0).iter().enumerate() {
+                    queue!(
+                        stdout,
+                        MoveTo(0, footer_start.saturating_add(index as u16)),
+                        Print(line)
+                    )?;
+                }
+            }
+        }
+
+        stdout.flush()
+    }
+
+    fn running_status_line(&self) -> String {
+        self.status_line
+            .clone()
+            .unwrap_or_else(|| "Running. Type and press Enter to queue guidance.".to_string())
+    }
+
+    fn permission_prompt_lines(&self, width: u16) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(ticket) = self.permission_ticket.as_ref() {
+            lines.push(truncate_to_width("Permission approval required", width));
+            lines.push(truncate_to_width(
+                &format!("  Tool             {}", ticket.view.tool_name),
+                width,
+            ));
+            lines.push(truncate_to_width(
+                &format!("  Current mode     {}", ticket.view.current_mode),
+                width,
+            ));
+            lines.push(truncate_to_width(
+                &format!("  Required mode    {}", ticket.view.required_mode),
+                width,
+            ));
+            if let Some(reason) = &ticket.view.reason {
+                lines.push(truncate_to_width(
+                    &format!("  Reason           {reason}"),
+                    width,
+                ));
+            }
+            lines.push(truncate_to_width(
+                &format!("  Input            {}", ticket.view.input),
+                width,
+            ));
+            lines.push(render_input_line(
+                "Approve this tool call? [y/N]: ",
+                &self.line,
+                width,
+            ));
+        }
+        lines
+    }
+
+    fn footer_height(&self) -> u16 {
+        match self.mode {
+            TerminalMode::IdlePrompt => 1,
+            TerminalMode::RunningGuidance => 2,
+            TerminalMode::PermissionPrompt => self.permission_ticket.as_ref().map_or(1, |ticket| {
+                if ticket.view.reason.is_some() {
+                    7
+                } else {
+                    6
+                }
+            }),
+        }
+    }
+
+    fn footer_start_row(&self) -> io::Result<u16> {
+        let (_, rows) = size().map_err(io::Error::other)?;
+        Ok(rows.saturating_sub(self.footer_height()))
+    }
+}
+
+fn backspace_sequence_for_char(ch: char) -> String {
+    let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+    if width == 0 {
+        return String::new();
+    }
+
+    format!(
+        "{}{}{}",
+        "\x08".repeat(width),
+        " ".repeat(width),
+        "\x08".repeat(width)
+    )
+}
+
+fn render_input_line(prompt: &str, input: &str, width: u16) -> String {
+    let prompt_width = display_width(prompt);
+    let total_width = width as usize;
+    if total_width <= prompt_width {
+        return truncate_to_width(prompt, width);
+    }
+
+    let available = total_width.saturating_sub(prompt_width);
+    let fitted_input = fit_input_tail(input, available);
+    format!("{prompt}{fitted_input}")
+}
+
+fn fit_input_tail(input: &str, width: usize) -> String {
+    if display_width(input) <= width {
+        return input.to_string();
+    }
+
+    let ellipsis = "…";
+    let ellipsis_width = display_width(ellipsis);
+    if width <= ellipsis_width {
+        return truncate_to_width(ellipsis, width as u16);
+    }
+
+    let target_tail_width = width - ellipsis_width;
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut collected = Vec::new();
+    let mut used = 0usize;
+    for ch in chars.iter().rev() {
+        let ch_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+        if used + ch_width > target_tail_width {
+            break;
+        }
+        collected.push(*ch);
+        used += ch_width;
+    }
+    collected.reverse();
+    format!("{ellipsis}{}", collected.into_iter().collect::<String>())
+}
+
+fn truncate_to_width(text: &str, width: u16) -> String {
+    let mut output = String::new();
+    let mut used = 0usize;
+    let max_width = width as usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > max_width {
+            break;
+        }
+        output.push(ch);
+        used += ch_width;
+    }
+    output
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn footer_spacer_lines(text: &str, footer_height: u16) -> u16 {
+    let trailing_newlines = text.chars().rev().take_while(|ch| *ch == '\n').count() as u16;
+    footer_height.saturating_sub(trailing_newlines.min(footer_height))
+}
+
+fn footer_growth_lines(old_footer_height: u16, new_footer_height: u16) -> u16 {
+    new_footer_height.saturating_sub(old_footer_height)
+}
+
+fn render_running_input_echo(input: &PendingInput) -> String {
+    let prompt = match input.delivery {
+        PendingInputDelivery::InjectAtNextBoundary => "(guidance)> ",
+        PendingInputDelivery::QueueAfterTurn => "(queued)> ",
+    };
+    format!("{prompt}{}", input.envelope.text.trim())
 }
 
 pub fn pending_input_from_running_line(line: &str) -> Option<PendingInput> {
@@ -509,7 +733,10 @@ pub fn pending_input_from_running_line(line: &str) -> Option<PendingInput> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pending_input_from_running_line, TerminalCommand, TerminalControllerState, TerminalMode,
+        backspace_sequence_for_char, display_width, fit_input_tail, footer_growth_lines,
+        footer_spacer_lines, pending_input_from_running_line, render_input_line,
+        render_running_input_echo, truncate_to_width, TerminalCommand, TerminalControllerState,
+        TerminalMode,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use runtime::{InputSource, PendingInputDelivery};
@@ -581,5 +808,60 @@ mod tests {
             .expect("release event should be ignored");
 
         assert!(state.line.is_empty());
+    }
+
+    #[test]
+    fn backspace_sequence_clears_full_display_width() {
+        assert_eq!(backspace_sequence_for_char('a'), "\x08 \x08");
+        assert_eq!(backspace_sequence_for_char('中'), "\x08\x08  \x08\x08");
+    }
+
+    #[test]
+    fn truncate_to_width_respects_wide_characters() {
+        assert_eq!(truncate_to_width("中文abc", 4), "中文");
+        assert_eq!(truncate_to_width("hello", 3), "hel");
+    }
+
+    #[test]
+    fn fit_input_tail_keeps_tail_with_ellipsis() {
+        assert_eq!(fit_input_tail("abcdefghijklmnopqrstuvwxyz", 6), "…vwxyz");
+    }
+
+    #[test]
+    fn render_input_line_limits_total_display_width() {
+        let rendered = render_input_line("(guidance)> ", "abcdefghijklmnopqrstuvwxyz", 20);
+        assert!(display_width(&rendered) <= 20);
+        assert!(rendered.starts_with("(guidance)> "));
+    }
+
+    #[test]
+    fn footer_spacer_lines_depend_on_reserved_footer_height() {
+        assert_eq!(footer_spacer_lines("chunk\n", 1), 0);
+        assert_eq!(footer_spacer_lines("chunk\n", 2), 1);
+        assert_eq!(footer_spacer_lines("chunk\n\n", 2), 0);
+    }
+
+    #[test]
+    fn footer_growth_lines_only_counts_new_reserved_rows() {
+        assert_eq!(footer_growth_lines(1, 2), 1);
+        assert_eq!(footer_growth_lines(2, 7), 5);
+        assert_eq!(footer_growth_lines(7, 2), 0);
+    }
+
+    #[test]
+    fn render_running_input_echo_uses_delivery_specific_prompt() {
+        let guidance = pending_input_from_running_line("please continue")
+            .expect("guidance input should parse");
+        let queued =
+            pending_input_from_running_line("/queue run tests later").expect("queue input");
+
+        assert_eq!(
+            render_running_input_echo(&guidance),
+            "(guidance)> please continue"
+        );
+        assert_eq!(
+            render_running_input_echo(&queued),
+            "(queued)> run tests later"
+        );
     }
 }

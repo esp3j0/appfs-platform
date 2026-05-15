@@ -62,9 +62,9 @@ pub use appfs::{
     APPFS_RUNTIME_MANIFEST_REL_PATH,
 };
 pub use bash::{
-    execute_bash, prepare_background_shell_output, prepare_shell_command_output,
-    shell_task_output_path, BackgroundShellOutputCapture, BashCommandInput, BashCommandOutput,
-    PreparedShellCommandOutput,
+    decode_command_output, execute_bash, prepare_background_shell_output,
+    prepare_shell_command_output, shell_task_output_path, BackgroundShellOutputCapture,
+    BashCommandInput, BashCommandOutput, PreparedShellCommandOutput,
 };
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

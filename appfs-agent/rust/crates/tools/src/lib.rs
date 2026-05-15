@@ -14,8 +14,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt_with_appfs,
+    check_freshness, decode_command_output, dedupe_superseded_commit_events, edit_file,
+    execute_bash, glob_search, grep_search, load_system_prompt_with_appfs,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -6210,8 +6210,8 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 
     Ok(ReplOutput {
         language: input.language,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: decode_command_output(&output.stdout),
+        stderr: decode_command_output(&output.stderr),
         exit_code: output.status.code().unwrap_or(1),
         duration_ms: started.elapsed().as_millis(),
     })
@@ -6744,7 +6744,7 @@ fn execute_shell_command(
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
                 let _ = child.kill();
                 let output = child.wait_with_output()?;
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let stderr = decode_command_output(&output.stderr);
                 let stderr = if stderr.trim().is_empty() {
                     format!("Command exceeded timeout of {timeout_ms} ms")
                 } else {
