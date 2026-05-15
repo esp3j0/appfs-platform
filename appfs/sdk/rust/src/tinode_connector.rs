@@ -375,7 +375,7 @@ impl TinodeConnector {
                 "Use when the user wants to inspect the current principal's Tinode inbox, contacts, or groups.",
                 "Load this skill before performing Tinode private-app action-file operations."
             ],
-            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Treat `_stream/events.evt.jsonl` as the live wake boundary. If `message.received` arrives with `requires_attention=true`, handle it as a current-turn task first. Do not reread inbox or message history just to confirm a reminder that already contains the task; use `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` only as summary views or catch-up aids. Use `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` only when you need full history context. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
+            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Treat `_stream/events.evt.jsonl` as the live wake boundary. If `message.received` arrives with `requires_attention=true`, handle it as a current-turn task first. Do not reread inbox or message history just to confirm a reminder that already contains the task; use `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` only as summary views or catch-up aids. Use `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` only when you need full history context. For `send_message.act`, set `requires_response` explicitly when the sender does or does not expect a Tinode reply, and append payloads with Python `json.dumps` or PowerShell `ConvertTo-Json` instead of bare `printf` so multiline text, quotes, and Windows paths are escaped correctly. The bash tool sets `PYTHONIOENCODING=utf-8` so Python output is valid UTF-8 JSONL. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
             "allowed_tools": ["bash", "read_file", "glob_search"],
             "include_generated_sections": {
                 "scope_summary": false,
@@ -441,7 +441,7 @@ impl TinodeConnector {
                     "example_payload": {
                         "to": "principal:code-implementer",
                         "text": "请接手实现这个任务。",
-                        "client_token": "msg-to-agent-001"
+                        "requires_response": true
                     },
                     "use_when": [
                         "The user asks to message another agent or a Tinode contact and the exact contact path is unknown.",
@@ -980,11 +980,16 @@ impl TinodeConnector {
         let reference = recipient_ref_from_payload(&request.payload)?;
         let (record, created_credentials) = self.ensure_credentials(ctx)?;
         let credentials = credentials_from_record(&record)?;
+        let contacts_before = self.contacts.len();
         let contact = self.resolve_recipient(&credentials, reference)?;
+        let structure_changed = self.contacts.len() != contacts_before;
         let mut content = json!({
             "ok": true,
             "contact": contact.to_resource_line(),
         });
+        if structure_changed {
+            content["structure_changed"] = json!(true);
+        }
         add_side_event(
             &mut content,
             "profile.credentials.ready",
@@ -1012,23 +1017,27 @@ impl TinodeConnector {
         ctx: &ConnectorContext,
     ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
         let normalized_path = normalize_path(&request.path);
-        let (reference, text) = message_target_and_text(&normalized_path, &request.payload)?;
+        let (reference, intent) = message_target_and_intent(&normalized_path, &request.payload)?;
         let (record, created_credentials) = self.ensure_credentials(ctx)?;
         let credentials = credentials_from_record(&record)?;
+        let contacts_before = self.contacts.len();
         let contact = self.resolve_recipient(&credentials, reference)?;
+        let structure_changed = self.contacts.len() != contacts_before;
         let receipt = self.gateway.send_direct_message(
             &credentials,
             &contact,
-            &text,
+            &intent.text,
+            intent.requires_response,
             ctx.client_token.as_deref(),
         )?;
         let message = TinodeMessageRecord {
             message_id: receipt.message_id.clone(),
             contact_key: contact.key.clone(),
             direction: "outbound".to_string(),
-            text: text.clone(),
+            text: intent.text.clone(),
             created_at_ms: now_millis(),
             seq: receipt.seq,
+            requires_response: intent.requires_response,
         };
         self.direct_messages
             .entry(contact.key.clone())
@@ -1044,8 +1053,12 @@ impl TinodeConnector {
             "message_id": receipt.message_id,
             "topic": receipt.topic,
             "to": contact.to_resource_line(),
-            "text_preview": text_preview(&text),
+            "text_preview": text_preview(&intent.text),
         });
+        add_optional_bool_field(&mut content, "requires_response", intent.requires_response);
+        if structure_changed {
+            content["structure_changed"] = json!(true);
+        }
         add_side_event(
             &mut content,
             "action.accepted",
@@ -1071,17 +1084,21 @@ impl TinodeConnector {
         add_side_event(
             &mut content,
             "message.sent",
-            Some(json!({
-                "conversation_type": "direct",
-                "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
-                "profile_id": safe_summary.profile_id,
-                "path": request.path,
-                "message_id": message.message_id,
-                "to_display_name": contact.display_name,
-                "to_tinode_user_id": contact.tinode_user_id,
-                "text_preview": text_preview(&text),
-                "client_token": ctx.client_token,
-            })),
+            Some(with_optional_bool_field(
+                json!({
+                    "conversation_type": "direct",
+                    "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+                    "profile_id": safe_summary.profile_id,
+                    "path": request.path,
+                    "message_id": message.message_id,
+                    "to_display_name": contact.display_name,
+                    "to_tinode_user_id": contact.tinode_user_id,
+                    "text_preview": text_preview(&intent.text),
+                    "client_token": ctx.client_token,
+                }),
+                "requires_response",
+                intent.requires_response,
+            )),
             true,
         );
 
@@ -1129,6 +1146,7 @@ impl TinodeConnector {
                 &credentials,
                 &group,
                 &text,
+                None,
                 ctx.client_token.as_deref(),
             )?;
             let message = TinodeGroupMessageRecord::outbound(&group, receipt, text);
@@ -1264,7 +1282,7 @@ impl TinodeConnector {
         ctx: &ConnectorContext,
         group_key: &str,
     ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
-        let text = text_from_payload(&request.payload, "Tinode group send_message")?;
+        let intent = message_intent_from_payload(&request.payload, "Tinode group send_message")?;
         let (record, created_credentials) = self.ensure_credentials(ctx)?;
         let credentials = credentials_from_record(&record)?;
         let group = self.groups.get(group_key).cloned().ok_or_else(|| {
@@ -1277,10 +1295,12 @@ impl TinodeConnector {
         let receipt = self.gateway.send_group_message(
             &credentials,
             &group,
-            &text,
+            &intent.text,
+            intent.requires_response,
             ctx.client_token.as_deref(),
         )?;
-        let message = TinodeGroupMessageRecord::outbound(&group, receipt.clone(), text.clone());
+        let message =
+            TinodeGroupMessageRecord::outbound(&group, receipt.clone(), intent.text.clone());
         self.group_messages
             .entry(group_key.to_string())
             .or_default()
@@ -1298,8 +1318,9 @@ impl TinodeConnector {
             "group_key": group_key,
             "topic": group.topic_id,
             "message_id": receipt.message_id,
-            "text_preview": text_preview(&text),
+            "text_preview": text_preview(&intent.text),
         });
+        add_optional_bool_field(&mut content, "requires_response", intent.requires_response);
         add_side_event(
             &mut content,
             "profile.credentials.ready",
@@ -1315,17 +1336,21 @@ impl TinodeConnector {
         add_side_event(
             &mut content,
             "message.sent",
-            Some(json!({
-                "conversation_type": "group",
-                "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
-                "profile_id": safe_summary.profile_id,
-                "path": request.path,
-                "group_key": group_key,
-                "topic": group.topic_id,
-                "message_id": message.message_id,
-                "text_preview": text_preview(&text),
-                "client_token": ctx.client_token,
-            })),
+            Some(with_optional_bool_field(
+                json!({
+                    "conversation_type": "group",
+                    "principal_id": ctx.principal_id.as_deref().unwrap_or("default"),
+                    "profile_id": safe_summary.profile_id,
+                    "path": request.path,
+                    "group_key": group_key,
+                    "topic": group.topic_id,
+                    "message_id": message.message_id,
+                    "text_preview": text_preview(&intent.text),
+                    "client_token": ctx.client_token,
+                }),
+                "requires_response",
+                intent.requires_response,
+            )),
             true,
         );
 
@@ -1442,6 +1467,7 @@ impl TinodeConnector {
                     text: inbound.text.clone(),
                     created_at_ms: now_millis(),
                     seq: Some(inbound.seq),
+                    requires_response: inbound.requires_response,
                 };
                 self.direct_messages
                     .entry(contact.key.clone())
@@ -1460,6 +1486,7 @@ impl TinodeConnector {
                     text: inbound.text.clone(),
                     created_at_ms: message.created_at_ms,
                     requires_attention: true,
+                    requires_response: inbound.requires_response,
                 };
                 self.inbox_recent.push(inbox_record.clone());
                 events.push(ConnectorInboundEvent {
@@ -1766,6 +1793,7 @@ trait TinodeGateway: Send {
         credentials: &TinodeCredentials,
         contact: &TinodeContact,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError>;
 
@@ -1796,6 +1824,7 @@ trait TinodeGateway: Send {
         credentials: &TinodeCredentials,
         group: &TinodeGroupRecord,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError>;
 }
@@ -1966,6 +1995,7 @@ struct TinodeInboundMessage {
     seq: i64,
     from_tinode_user_id: String,
     text: String,
+    requires_response: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1976,18 +2006,23 @@ struct TinodeMessageRecord {
     text: String,
     created_at_ms: u128,
     seq: Option<i64>,
+    requires_response: Option<bool>,
 }
 
 impl TinodeMessageRecord {
     fn to_resource_line(&self) -> JsonValue {
-        json!({
-            "message_id": self.message_id,
-            "contact_key": self.contact_key,
-            "direction": self.direction,
-            "text": self.text,
-            "created_at_ms": self.created_at_ms,
-            "seq": self.seq,
-        })
+        with_optional_bool_field(
+            json!({
+                "message_id": self.message_id,
+                "contact_key": self.contact_key,
+                "direction": self.direction,
+                "text": self.text,
+                "created_at_ms": self.created_at_ms,
+                "seq": self.seq,
+            }),
+            "requires_response",
+            self.requires_response,
+        )
     }
 }
 
@@ -2001,35 +2036,45 @@ struct InboxRecord {
     text: String,
     created_at_ms: u128,
     requires_attention: bool,
+    requires_response: Option<bool>,
 }
 
 impl InboxRecord {
     fn to_resource_line(&self, unread: bool) -> JsonValue {
-        json!({
-            "message_id": self.message_id,
-            "conversation_type": self.conversation_type,
-            "contact_key": self.contact_key,
-            "from_tinode_user_id": self.from_tinode_user_id,
-            "from_display_name": self.from_display_name,
-            "text": self.text,
-            "text_preview": text_preview(&self.text),
-            "created_at_ms": self.created_at_ms,
-            "requires_attention": self.requires_attention,
-            "unread": unread,
-        })
+        with_optional_bool_field(
+            json!({
+                "message_id": self.message_id,
+                "conversation_type": self.conversation_type,
+                "contact_key": self.contact_key,
+                "from_tinode_user_id": self.from_tinode_user_id,
+                "from_display_name": self.from_display_name,
+                "text": self.text,
+                "text_preview": text_preview(&self.text),
+                "created_at_ms": self.created_at_ms,
+                "requires_attention": self.requires_attention,
+                "unread": unread,
+            }),
+            "requires_response",
+            self.requires_response,
+        )
     }
 
     fn to_event_content(&self, profile_id: &str) -> JsonValue {
-        json!({
-            "profile_id": profile_id,
-            "conversation_type": self.conversation_type,
-            "contact_key": self.contact_key,
-            "message_id": self.message_id,
-            "from_tinode_user_id": self.from_tinode_user_id,
-            "from_display_name": self.from_display_name,
-            "text_preview": text_preview(&self.text),
-            "requires_attention": self.requires_attention,
-        })
+        with_optional_bool_field(
+            json!({
+                "profile_id": profile_id,
+                "conversation_type": self.conversation_type,
+                "contact_key": self.contact_key,
+                "message_id": self.message_id,
+                "from_tinode_user_id": self.from_tinode_user_id,
+                "from_display_name": self.from_display_name,
+                "text": self.text,
+                "text_preview": text_preview(&self.text),
+                "requires_attention": self.requires_attention,
+            }),
+            "requires_response",
+            self.requires_response,
+        )
     }
 }
 
@@ -2165,10 +2210,11 @@ impl TinodeGateway for WebSocketTinodeGateway {
         credentials: &TinodeCredentials,
         contact: &TinodeContact,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
         self.with_client(credentials, |client| {
-            client.send_direct_message(contact, text, client_token)
+            client.send_direct_message(contact, text, requires_response, client_token)
         })
     }
 
@@ -2211,10 +2257,11 @@ impl TinodeGateway for WebSocketTinodeGateway {
         credentials: &TinodeCredentials,
         group: &TinodeGroupRecord,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
         self.with_client(credentials, |client| {
-            client.send_group_message(group, text, client_token)
+            client.send_group_message(group, text, requires_response, client_token)
         })
     }
 }
@@ -2448,6 +2495,7 @@ impl TinodeWsClient {
         &mut self,
         contact: &TinodeContact,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
         let suffix = self.next_suffix();
@@ -2462,9 +2510,7 @@ impl TinodeWsClient {
             json!({
                 "topic": contact.tinode_user_id,
                 "noecho": false,
-                "head": {
-                    "mime": "text/plain"
-                },
+                "head": tinode_message_head(requires_response),
                 "content": tinode_text_plain_content(text)
             }),
             client_token.unwrap_or(&format!("pub-direct-{suffix}")),
@@ -2589,6 +2635,7 @@ impl TinodeWsClient {
         &mut self,
         group: &TinodeGroupRecord,
         text: &str,
+        requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
         let suffix = self.next_suffix();
@@ -2602,9 +2649,7 @@ impl TinodeWsClient {
             json!({
                 "topic": group.topic_id,
                 "noecho": false,
-                "head": {
-                    "mime": "text/plain"
-                },
+                "head": tinode_message_head(requires_response),
                 "content": tinode_text_plain_content(text)
             }),
             client_token.unwrap_or(&format!("pub-group-{suffix}")),
@@ -3154,11 +3199,17 @@ fn recipient_ref_from_payload(
     parse_recipient_ref(value)
 }
 
-fn message_target_and_text(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TinodeMessageIntent {
+    text: String,
+    requires_response: Option<bool>,
+}
+
+fn message_target_and_intent(
     normalized_path: &str,
     payload: &JsonValue,
-) -> std::result::Result<(RecipientRef, String), ConnectorError> {
-    let text = text_from_payload(payload, "Tinode send_message")?;
+) -> std::result::Result<(RecipientRef, TinodeMessageIntent), ConnectorError> {
+    let intent = message_intent_from_payload(payload, "Tinode send_message")?;
 
     let reference = if normalized_path == "contacts/send_message.act" {
         recipient_ref_from_payload(payload)?
@@ -3172,7 +3223,34 @@ fn message_target_and_text(
         ));
     };
 
-    Ok((reference, text))
+    Ok((reference, intent))
+}
+
+fn message_intent_from_payload(
+    payload: &JsonValue,
+    label: &str,
+) -> std::result::Result<TinodeMessageIntent, ConnectorError> {
+    Ok(TinodeMessageIntent {
+        text: text_from_payload(payload, label)?,
+        requires_response: optional_bool_from_payload(payload, "requires_response", label)?,
+    })
+}
+
+fn optional_bool_from_payload(
+    payload: &JsonValue,
+    field: &str,
+    label: &str,
+) -> std::result::Result<Option<bool>, ConnectorError> {
+    let Some(value) = payload.get(field) else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        connector_err(
+            connector_error_codes::INVALID_ARGUMENT,
+            format!("{label} payload `{field}` must be a JSON boolean true or false"),
+            false,
+        )
+    })
 }
 
 fn text_from_payload(
@@ -3480,11 +3558,13 @@ fn inbound_message_from_data(data: &JsonValue) -> Option<TinodeInboundMessage> {
     if text.is_empty() {
         return None;
     }
+    let requires_response = tinode_requires_response_from_head(data.get("head"));
     Some(TinodeInboundMessage {
         topic,
         seq,
         from_tinode_user_id,
         text,
+        requires_response,
     })
 }
 
@@ -3499,6 +3579,25 @@ fn tinode_text_from_content(content: &JsonValue) -> Option<&str> {
 
 fn tinode_text_plain_content(text: &str) -> JsonValue {
     json!(text)
+}
+
+fn tinode_message_head(requires_response: Option<bool>) -> JsonValue {
+    let mut head = JsonMap::new();
+    head.insert("mime".to_string(), json!("text/plain"));
+    if let Some(requires_response) = requires_response {
+        head.insert(
+            "appfs_requires_response".to_string(),
+            json!(requires_response),
+        );
+    }
+    JsonValue::Object(head)
+}
+
+fn tinode_requires_response_from_head(head: Option<&JsonValue>) -> Option<bool> {
+    let head = head?;
+    head.get("appfs_requires_response")
+        .or_else(|| head.get("requires_response"))
+        .and_then(JsonValue::as_bool)
 }
 
 fn tinode_get_data_options(since_seq: Option<i64>, limit: i64) -> JsonValue {
@@ -3620,6 +3719,25 @@ fn add_side_event_with_path(
         event.insert("content".to_string(), content);
     }
     events.push(JsonValue::Object(event));
+}
+
+fn with_optional_bool_field(mut value: JsonValue, field: &str, flag: Option<bool>) -> JsonValue {
+    let Some(flag) = flag else {
+        return value;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(field.to_string(), json!(flag));
+    }
+    value
+}
+
+fn add_optional_bool_field(content: &mut JsonValue, field: &str, flag: Option<bool>) {
+    let Some(flag) = flag else {
+        return;
+    };
+    if let Some(object) = content.as_object_mut() {
+        object.insert(field.to_string(), json!(flag));
+    }
 }
 
 fn text_preview(text: &str) -> String {
@@ -3758,10 +3876,10 @@ mod tests {
     struct MockGatewayState {
         created: Vec<TinodeAccountRequest>,
         resolved: Vec<String>,
-        sent: Vec<(String, String, Option<String>)>,
+        sent: Vec<(String, String, Option<bool>, Option<String>)>,
         groups_created: Vec<(String, Vec<String>, Option<String>)>,
         group_invites: Vec<(String, Vec<String>)>,
-        group_sent: Vec<(String, String, Option<String>)>,
+        group_sent: Vec<(String, String, Option<bool>, Option<String>)>,
         inbound: Vec<TinodeInboundMessage>,
         fetched_since: Vec<Option<i64>>,
         fail_resolve: bool,
@@ -3823,11 +3941,13 @@ mod tests {
             _credentials: &TinodeCredentials,
             contact: &TinodeContact,
             text: &str,
+            requires_response: Option<bool>,
             client_token: Option<&str>,
         ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
             self.state.lock().expect("mock state").sent.push((
                 contact.tinode_user_id.clone(),
                 text.to_string(),
+                requires_response,
                 client_token.map(ToOwned::to_owned),
             ));
             Ok(TinodeSendReceipt {
@@ -3895,11 +4015,13 @@ mod tests {
             _credentials: &TinodeCredentials,
             group: &TinodeGroupRecord,
             text: &str,
+            _requires_response: Option<bool>,
             client_token: Option<&str>,
         ) -> std::result::Result<TinodeSendReceipt, ConnectorError> {
             self.state.lock().expect("mock state").group_sent.push((
                 group.topic_id.clone(),
                 text.to_string(),
+                _requires_response,
                 client_token.map(ToOwned::to_owned),
             ));
             Ok(TinodeSendReceipt {
@@ -4055,6 +4177,10 @@ mod tests {
             skill_doc["description"],
             "Tinode private chat app for the current AppFS principal."
         );
+        assert!(skill_doc["overview_markdown"]
+            .as_str()
+            .expect("overview markdown")
+            .contains("PYTHONIOENCODING=utf-8"));
         let actions_doc = snapshot
             .nodes
             .iter()
@@ -4122,6 +4248,7 @@ mod tests {
         assert_eq!(content["ok"], true);
         assert_eq!(content["profile_id"], "tinode:default");
         assert_eq!(content["text_preview"], "hello");
+        assert_eq!(content["structure_changed"], true);
         let events = content
             .get(CONNECTOR_SIDE_EVENTS_FIELD)
             .and_then(JsonValue::as_array)
@@ -4137,6 +4264,106 @@ mod tests {
         assert_eq!(state.resolved, vec!["zhangsan"]);
         assert_eq!(state.sent.len(), 1);
         assert_eq!(state.sent[0].1, "hello");
+    }
+
+    #[test]
+    fn direct_send_message_propagates_requires_response() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        let content = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/contacts/send_message.act".to_string(),
+                        payload: json!({
+                            "to": "basic:zhangsan",
+                            "text": "please implement this",
+                            "requires_response": true
+                        }),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("send message"),
+        );
+
+        assert_eq!(content["requires_response"], true);
+        let events = content
+            .get(CONNECTOR_SIDE_EVENTS_FIELD)
+            .and_then(JsonValue::as_array)
+            .expect("side events");
+        let sent_event = events
+            .iter()
+            .find(|event| event["type"] == "message.sent")
+            .expect("message.sent event");
+        assert_eq!(sent_event["content"]["requires_response"], true);
+
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.sent.len(), 1);
+        assert_eq!(state.sent[0].2, Some(true));
+        assert_eq!(state.sent[0].3, Some("client-1".to_string()));
+        assert_eq!(state.resolved, vec!["zhangsan"]);
+    }
+
+    #[test]
+    fn send_message_rejects_non_boolean_requires_response() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        let err = connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({
+                        "to": "basic:zhangsan",
+                        "text": "please implement this",
+                        "requires_response": "true"
+                    }),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect_err("string boolean should be rejected");
+
+        assert_eq!(err.code, connector_error_codes::INVALID_ARGUMENT);
+        assert!(err.message.contains("requires_response"));
+        assert!(err.message.contains("JSON boolean"));
+    }
+
+    #[test]
+    fn root_send_message_reports_structure_changed_only_for_new_contact() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+
+        let first = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/contacts/send_message.act".to_string(),
+                        payload: json!({"to":"basic:zhangsan","text":"one"}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("first send"),
+        );
+        assert_eq!(first["structure_changed"], true);
+
+        let second = completed_content(
+            connector
+                .submit_action(
+                    SubmitActionRequest {
+                        path: "/contacts/send_message.act".to_string(),
+                        payload: json!({"to":"basic:zhangsan","text":"two"}),
+                        execution_mode: ActionExecutionMode::Inline,
+                    },
+                    &ctx(),
+                )
+                .expect("second send"),
+        );
+        assert!(
+            second.get("structure_changed").is_none(),
+            "known contacts should not request structure refresh"
+        );
     }
 
     #[test]
@@ -4351,6 +4578,7 @@ mod tests {
                 seq: 2,
                 from_tinode_user_id: "usr-zhangsan".to_string(),
                 text: "reply from user".to_string(),
+                requires_response: None,
             });
 
         let events = connector
@@ -4403,6 +4631,69 @@ mod tests {
     }
 
     #[test]
+    fn inbound_requires_response_controls_reply_expectation_not_attention() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/contacts/send_message.act".to_string(),
+                    payload: json!({"to":"basic:zhangsan","text":"seed"}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("seed contact");
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: "usr-zhangsan".to_string(),
+                seq: 2,
+                from_tinode_user_id: "usr-zhangsan".to_string(),
+                text: "no reply needed".to_string(),
+                requires_response: Some(false),
+            });
+
+        let events = connector
+            .drain_inbound_events(&ctx())
+            .expect("drain inbound");
+        let message_event = events
+            .iter()
+            .find(|event| event.event_type == "message.received")
+            .expect("message.received");
+        let content = message_event.content.as_ref().expect("message content");
+        assert_eq!(content["requires_response"], false);
+        assert_eq!(content["requires_attention"], true);
+
+        let unread = connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/inbox/unread.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("unread inbox");
+        assert_eq!(unread.records[0].line["requires_response"], false);
+        assert_eq!(unread.records[0].line["requires_attention"], true);
+
+        let messages = connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/contacts/zhangsan/messages.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &ctx(),
+            )
+            .expect("messages");
+        assert_eq!(messages.records[1].line["requires_response"], false);
+    }
+
+    #[test]
     fn refresh_inbox_action_returns_side_events_for_inbound_messages() {
         let state = Arc::new(Mutex::new(MockGatewayState::default()));
         let mut connector = connector_with_mock(Arc::clone(&state));
@@ -4425,6 +4716,7 @@ mod tests {
                 seq: 2,
                 from_tinode_user_id: "usr-zhangsan".to_string(),
                 text: "refresh reply".to_string(),
+                requires_response: None,
             });
 
         let content = completed_content(
@@ -4474,6 +4766,7 @@ mod tests {
                 seq: 2,
                 from_tinode_user_id: "usr-zhangsan".to_string(),
                 text: "reply".to_string(),
+                requires_response: None,
             });
         connector
             .drain_inbound_events(&ctx())
@@ -4531,6 +4824,7 @@ mod tests {
                     seq,
                     from_tinode_user_id: "usr-zhangsan".to_string(),
                     text: text.to_string(),
+                    requires_response: None,
                 });
         }
         connector
@@ -4581,6 +4875,7 @@ mod tests {
                 seq: 4,
                 from_tinode_user_id: "usr-zhangsan".to_string(),
                 text: "third".to_string(),
+                requires_response: None,
             });
         connector.drain_inbound_events(&ctx()).expect("drain third");
         let content = completed_content(
@@ -4607,6 +4902,7 @@ mod tests {
                 seq: 5,
                 from_tinode_user_id: "usr-zhangsan".to_string(),
                 text: "fourth".to_string(),
+                requires_response: None,
             });
         connector
             .drain_inbound_events(&ctx())
@@ -4729,6 +5025,7 @@ mod tests {
                 seq: 1,
                 from_tinode_user_id: format!("usr-{default_login}"),
                 text: "hello from default".to_string(),
+                requires_response: None,
             });
 
         let events = code_connector
@@ -4799,6 +5096,7 @@ mod tests {
                 seq: 1,
                 from_tinode_user_id: format!("usr-{default_login}"),
                 text: "read-through hello".to_string(),
+                requires_response: None,
             });
 
         let inbox = code_connector
@@ -4871,6 +5169,7 @@ mod tests {
                 seq: 1,
                 from_tinode_user_id: format!("usr-{default_login}"),
                 text: "fresh connector hello".to_string(),
+                requires_response: None,
             });
 
         assert!(
@@ -4945,18 +5244,21 @@ mod tests {
                 seq: 2,
                 from_tinode_user_id: "usrA".to_string(),
                 text: "two".to_string(),
+                requires_response: None,
             },
             TinodeInboundMessage {
                 topic: "usrA".to_string(),
                 seq: 1,
                 from_tinode_user_id: "usrA".to_string(),
                 text: "one".to_string(),
+                requires_response: None,
             },
             TinodeInboundMessage {
                 topic: "usrA".to_string(),
                 seq: 2,
                 from_tinode_user_id: "usrA".to_string(),
                 text: "two duplicate".to_string(),
+                requires_response: None,
             },
         ]);
 

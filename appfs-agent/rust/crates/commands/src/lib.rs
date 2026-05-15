@@ -3666,7 +3666,8 @@ fn build_appfs_skill_markdown(
         "## AppFS action rules".to_string(),
         "- Every `*.act` file is an append-only JSONL sink.".to_string(),
         "- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string(),
-        "- Use `bash` to append exactly one JSON object plus a trailing newline.".to_string(),
+        "- Use `bash` with Python JSON serialization, or PowerShell `ConvertTo-Json`, to append exactly one JSON object plus a trailing newline.".to_string(),
+        "- Do not hand-build complex JSON with bare `printf`; message text often contains newlines, quotes, backslashes, or Windows paths that must be escaped by a JSON serializer.".to_string(),
         "- After appending to an action, prefer the AppFS event reminder that is injected into the next model call; use `action.completed` or `action.failed` there to decide whether the action succeeded.".to_string(),
         "- Only inspect `_stream/events.evt.jsonl` manually when debugging or when no AppFS event reminder appears.".to_string(),
     ];
@@ -3741,13 +3742,10 @@ fn build_appfs_skill_markdown(
                     .get("summary")
                     .and_then(Value::as_str)
                     .unwrap_or("App action");
-                let mut line = format!("- `{path}`: {summary}");
+                lines.push(format!("- `{path}`: {summary}"));
                 if let Some(example) = action.get("example_payload") {
-                    if let Some(command) = format_appfs_append_example(app_root, path, example) {
-                        line.push_str(&format!(" Append with: `{command}`."));
-                    }
+                    append_appfs_append_example_lines(&mut lines, app_root, path, example);
                 }
-                lines.push(line);
                 if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
                     let reasons = use_when
                         .iter()
@@ -3817,13 +3815,10 @@ fn append_appfs_skill_action_section(
             .get("summary")
             .and_then(Value::as_str)
             .unwrap_or("App action");
-        let mut line = format!("- `{path}`: {summary}");
+        lines.push(format!("- `{path}`: {summary}"));
         if let Some(example) = action.get("example_payload") {
-            if let Some(command) = format_appfs_append_example(app_root, path, example) {
-                line.push_str(&format!(" Append with: `{command}`."));
-            }
+            append_appfs_append_example_lines(lines, app_root, path, example);
         }
-        lines.push(line);
         if let Some(use_when) = action.get("use_when").and_then(Value::as_array) {
             let reasons = use_when
                 .iter()
@@ -3836,18 +3831,86 @@ fn append_appfs_skill_action_section(
     }
 }
 
+fn append_appfs_append_example_lines(
+    lines: &mut Vec<String>,
+    app_root: &Path,
+    action_path: &str,
+    example: &Value,
+) {
+    if let Some(command) = format_appfs_append_example(app_root, action_path, example) {
+        lines.push("  Append safely with JSON serialization:".to_string());
+        lines.push(command);
+    }
+}
+
 fn format_appfs_append_example(
     app_root: &Path,
     action_path: &str,
     example: &Value,
 ) -> Option<String> {
-    let example_text = serde_json::to_string(example).ok()?;
+    let payload = json_value_to_python_literal(example, 0, None)?;
     let target_path = appfs_action_target_path(app_root, action_path);
     Some(format!(
-        "printf '%s\\n' {} >> {}",
-        bash_single_quote(&example_text),
-        bash_single_quote(&path_to_bash_display(&target_path))
+        "```bash\npython - <<'PY' >> {}\nimport json\n\npayload = {}\nprint(json.dumps(payload, ensure_ascii=False))\nPY\n```",
+        bash_single_quote(&path_to_bash_display(&target_path)),
+        payload
     ))
+}
+
+fn json_value_to_python_literal(
+    value: &Value,
+    indent: usize,
+    key_hint: Option<&str>,
+) -> Option<String> {
+    match value {
+        Value::Null => Some("None".to_string()),
+        Value::Bool(value) => Some(if *value { "True" } else { "False" }.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::String(value) => Some(python_string_literal(value, key_hint == Some("text"))),
+        Value::Array(values) => {
+            if values.is_empty() {
+                return Some("[]".to_string());
+            }
+            let child_indent = indent + 4;
+            let child_pad = " ".repeat(child_indent);
+            let pad = " ".repeat(indent);
+            let mut lines = vec!["[".to_string()];
+            for item in values {
+                lines.push(format!(
+                    "{child_pad}{},",
+                    json_value_to_python_literal(item, child_indent, None)?
+                ));
+            }
+            lines.push(format!("{pad}]"));
+            Some(lines.join("\n"))
+        }
+        Value::Object(map) => {
+            if map.is_empty() {
+                return Some("{}".to_string());
+            }
+            let child_indent = indent + 4;
+            let child_pad = " ".repeat(child_indent);
+            let pad = " ".repeat(indent);
+            let mut lines = vec!["{".to_string()];
+            for (key, item) in map {
+                let key_literal = serde_json::to_string(key).ok()?;
+                lines.push(format!(
+                    "{child_pad}{key_literal}: {},",
+                    json_value_to_python_literal(item, child_indent, Some(key))?
+                ));
+            }
+            lines.push(format!("{pad}}}"));
+            Some(lines.join("\n"))
+        }
+    }
+}
+
+fn python_string_literal(value: &str, prefer_multiline: bool) -> String {
+    if prefer_multiline && !value.contains("\"\"\"") && !value.ends_with('\\') {
+        format!("r\"\"\"{value}\"\"\"")
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+    }
 }
 
 fn appfs_action_target_path(app_root: &Path, action_path: &str) -> PathBuf {
@@ -5387,8 +5450,12 @@ mod tests {
         assert!(prompt.contains("append-only JSONL"));
         assert!(prompt.contains("AppFS event reminder"));
         assert!(prompt.contains("contacts/zhangsan/send_message.act"));
-        assert!(prompt.contains("printf '%s\\n'"));
+        assert!(prompt.contains("Python JSON serialization"));
+        assert!(prompt.contains("python - <<'PY'"));
+        assert!(prompt.contains("json.dumps(payload, ensure_ascii=False)"));
+        assert!(prompt.contains(r#"text": r"""明天上午十点开会""""#));
         assert!(prompt.contains(">> '"));
+        assert!(!prompt.contains("printf '%s\\n'"));
         assert!(prompt.contains("张三"));
         assert!(!prompt.contains("tail -n"));
     }
@@ -5427,21 +5494,26 @@ mod tests {
     }
 
     #[test]
-    fn appfs_append_examples_use_git_bash_drive_paths_on_windows_mounts() {
+    fn appfs_append_examples_use_json_serializer_and_git_bash_drive_paths() {
         let command = super::format_appfs_append_example(
             &PathBuf::from(r"C:\mnt\appfs-compose-aiim\aiim"),
             r"\contacts\zhangsan\send_message.act",
             &serde_json::json!({
-                "text": "明天上午十点开会",
+                "text": "第一行\n代码路径: C:\\mnt\\appfs-compose-tinode\\quick_sort.py",
                 "priority": "normal"
             }),
         )
         .expect("append example");
 
-        assert!(command.starts_with("printf '%s\\n' '{"));
+        assert!(command.starts_with("```bash\npython - <<'PY' >> '"));
+        assert!(command.contains("import json"));
+        assert!(command.contains("json.dumps(payload, ensure_ascii=False)"));
+        assert!(command.contains(r#""text": r"""第一行"#));
+        assert!(command.contains(r#"C:\mnt\appfs-compose-tinode\quick_sort.py"#));
         assert!(command
-            .contains("' >> '/c/mnt/appfs-compose-aiim/aiim/contacts/zhangsan/send_message.act'"));
-        assert!(!command.contains(r"C:\mnt"));
+            .contains(" >> '/c/mnt/appfs-compose-aiim/aiim/contacts/zhangsan/send_message.act'"));
+        assert!(!command.contains("printf '%s\\n'"));
+        assert!(!command.contains(r"C:\mnt\appfs-compose-aiim\aiim"));
     }
 
     #[test]

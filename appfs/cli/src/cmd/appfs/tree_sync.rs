@@ -1081,6 +1081,8 @@ fn structure_reason_label(reason: AppStructureSyncReason) -> &'static str {
         AppStructureSyncReason::EnterScope => "enter_scope",
         AppStructureSyncReason::Refresh => "refresh",
         AppStructureSyncReason::Recover => "recover",
+        AppStructureSyncReason::InboundChanged => "inbound_changed",
+        AppStructureSyncReason::ActionChanged => "action_changed",
     }
 }
 

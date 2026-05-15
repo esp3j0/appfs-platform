@@ -16,6 +16,67 @@ Monorepo for the AppFS stack:
 
 This monorepo keeps those layers separate in code layout while making joint development, CI, and end-to-end testing easier.
 
+## Stack Architecture
+
+At a high level, AppFS owns the mounted app surface and runtime state, while `appfs-agent` owns the model loop, prompt assembly, and tool-driven interaction.
+
+```mermaid
+flowchart LR
+  subgraph APPFS["appfs"]
+    Compose["compose / app policies"]
+    Supervisor["runtime supervisor"]
+    Mount["mount runtime + bridges"]
+    Tree["mounted app tree\n/public, /private, /_appfs"]
+    Stream["_stream/events.evt.jsonl"]
+
+    Compose --> Supervisor
+    Supervisor --> Mount
+    Mount --> Tree
+    Mount --> Stream
+  end
+
+  subgraph AGENT["appfs-agent"]
+    Attach["attach / detect AppFS"]
+    Prompt["system prompt + skill listing"]
+    Router["input router / event reminders"]
+    REPL["interactive turn loop"]
+    Tools["shell + file tools"]
+
+    Attach --> Prompt --> Router --> REPL --> Tools
+    Router --> Prompt
+  end
+
+  Tools <--> Tree
+  Stream --> Router
+```
+
+## Interaction Flow
+
+The usual loop is:
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant A as appfs-agent
+  participant F as AppFS
+  participant M as Mounted app tree
+  participant E as Event stream
+
+  U->>A: Enter a request
+  A->>A: Build prompt + select skills
+  A->>M: Read resources / append to *.act
+  M->>F: AppFS processes action
+  F->>E: Emit action.completed / action.failed / message events
+  E->>A: Turn-local reminder or wake signal
+  A->>A: Continue the turn or start the next one
+```
+
+In practice this means:
+
+- AppFS materializes app state as files and streams.
+- `appfs-agent` reads those files, writes actions, and reacts to AppFS events.
+- `integration/` holds the scripts that verify both sides together.
+
 ## Layout
 
 ```text

@@ -339,7 +339,7 @@ Payload:
 ```json
 {
   "text": "明天十点开会",
-  "client_token": "msg-001"
+  "requires_response": true
 }
 ```
 
@@ -349,7 +349,7 @@ Optional fields:
 {
   "text": "明天十点开会",
   "priority": "normal",
-  "client_token": "msg-001",
+  "requires_response": false,
   "metadata": {
     "source": "appfs-agent"
   }
@@ -359,7 +359,7 @@ Optional fields:
 Rules:
 
 1. `text` is required.
-2. `client_token` is strongly recommended for idempotency.
+2. `requires_response` is optional and must be a JSON boolean (`true` or `false`), not a string. Set it to `true` when the sender wants the recipient to continue the conversation or confirm receipt. Set it to `false` when the sender does not expect a Tinode reply. Omit it when the reply expectation should be inferred from content. This field does not suppress `message.received` wakeups; it only controls the receiver reminder's reply guidance.
 3. Credentials are auto-created on first use if missing.
 4. The connector sends as the current app instance `profile_id`.
 5. The action result must produce `action.completed` or `action.failed`.
@@ -375,7 +375,7 @@ Payload:
 {
   "to": "张三",
   "text": "明天十点开会",
-  "client_token": "msg-quick-001"
+  "requires_response": true
 }
 ```
 
@@ -388,7 +388,7 @@ More explicit payload:
     "value": "zhangsan"
   },
   "text": "明天十点开会",
-  "client_token": "msg-quick-001"
+  "requires_response": true
 }
 ```
 
@@ -564,7 +564,7 @@ Payload:
 ```json
 {
   "text": "事故 #1234 已确认，开始同步处理。",
-  "client_token": "grp-msg-001"
+  "requires_response": true
 }
 ```
 
@@ -716,7 +716,7 @@ Practical rules:
 2. If the agent is offline or just attached, surface unread counts and recent inbox items first.
 3. Use full message history only when the current task needs prior context or a specific thread recap.
 4. `inbox.updated` is bookkeeping. It should not be treated as a standalone wake signal.
-5. `message.received` with `requires_attention=true` is the signal that should wake the agent.
+5. `message.received` with `requires_attention=true` is the signal that should wake the agent. `requires_response=false` must still wake the agent; it only tells the receiver that no Tinode reply is expected.
 6. `delete_principal.act` may trigger `_app/forget_credentials.act` on affected private Tinode app instances so connector-private credential state is actually cleaned up, not merely requested.
 7. The model should treat `inbox/` as a summary and triage layer, not as the primary live input stream.
 8. The model should treat `messages.res.jsonl` as archive/history, not as a replacement for the event stream.
@@ -759,8 +759,8 @@ Events must include `principal_id` and `profile_id`.
 ### Message Events
 
 ```json
-{"type":"message.sent","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"contacts/张三/send_message.act","message_id":"tinode:usrZhangSan:42","to_display_name":"张三","text_preview":"明天十点开会","client_token":"msg-001"}
-{"type":"message.received","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"contacts/张三/messages.res.jsonl","message_id":"tinode:usrZhangSan:43","from_display_name":"张三","text_preview":"收到","requires_attention":true}
+{"type":"message.sent","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"contacts/张三/send_message.act","message_id":"tinode:usrZhangSan:42","to_display_name":"张三","text_preview":"明天十点开会","requires_response":true}
+{"type":"message.received","principal_id":"default","profile_id":"tinode:default","conversation_type":"direct","path":"contacts/张三/messages.res.jsonl","message_id":"tinode:usrZhangSan:43","from_display_name":"张三","text_preview":"收到","requires_attention":true,"requires_response":false}
 ```
 
 ### Group Events
@@ -823,15 +823,23 @@ The generated `appfs-tinode` skill should teach the model these rules:
 9. For full conversation history, read `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl`.
 10. For group creation, append one JSON line to `groups/create_group.act`.
 11. To clear local unread state, use `inbox/mark_read.act` with `scope = message`, `thread`, or `all`.
-12. After any action, rely on AppFS event reminders or read `_stream/events.evt.jsonl` for debugging.
+12. For `send_message.act`, use Python `json.dumps` or PowerShell `ConvertTo-Json` to serialize payloads before appending. Do not teach bare `printf` for message payloads because multiline text, quotes, backslashes, Windows paths, and Windows console encodings are easy to corrupt. The bash tool injects `PYTHONIOENCODING=utf-8` so Python `print()` writes valid UTF-8 JSONL.
+13. After any action, rely on AppFS event reminders or read `_stream/events.evt.jsonl` for debugging.
 
 Skill example for known contact:
 
 To send 张三 a message when `contacts/index.res.jsonl` shows `contact_key = 张三`:
 
 ```bash
-printf '%s\n' '{"text":"明天十点开会","client_token":"msg-001"}' \
-  >> contacts/张三/send_message.act
+python - <<'PY' >> contacts/张三/send_message.act
+import json
+
+payload = {
+    "text": r"""明天十点开会""",
+    "requires_response": True,
+}
+print(json.dumps(payload, ensure_ascii=False))
+PY
 ```
 
 Skill example for unknown or ambiguous contact:
@@ -839,8 +847,16 @@ Skill example for unknown or ambiguous contact:
 If you are not sure which contact path maps to 张三:
 
 ```bash
-printf '%s\n' '{"to":"张三","text":"明天十点开会","client_token":"msg-001"}' \
-  >> contacts/send_message.act
+python - <<'PY' >> contacts/send_message.act
+import json
+
+payload = {
+    "to": "张三",
+    "text": r"""明天十点开会""",
+    "requires_response": True,
+}
+print(json.dumps(payload, ensure_ascii=False))
+PY
 ```
 
 The skill should use the app root as its base directory, so examples should be relative paths.
@@ -871,7 +887,7 @@ Append-JsonLine "$root\private\code-implementer\tinode\_app\ensure_credentials.a
 Send from `default` to `code-implementer`:
 
 ```powershell
-Append-JsonLine "$root\private\default\tinode\contacts\send_message.act" '{"to":"principal:code-implementer","text":"default delegates implementation details.","client_token":"msg-default-code-001"}'
+Append-JsonLine "$root\private\default\tinode\contacts\send_message.act" '{"to":"principal:code-implementer","text":"default delegates implementation details.","requires_response":true}'
 Get-Content "$root\private\default\tinode\_stream\events.evt.jsonl" -Tail 30
 Get-Content "$root\private\code-implementer\tinode\inbox\recent.res.jsonl" -Tail 20
 ```
@@ -879,7 +895,7 @@ Get-Content "$root\private\code-implementer\tinode\inbox\recent.res.jsonl" -Tail
 Send back:
 
 ```powershell
-Append-JsonLine "$root\private\code-implementer\tinode\contacts\send_message.act" '{"to":"principal:default","text":"code-implementer acknowledges and starts implementation.","client_token":"msg-code-default-001"}'
+Append-JsonLine "$root\private\code-implementer\tinode\contacts\send_message.act" '{"to":"principal:default","text":"code-implementer acknowledges and starts implementation.","requires_response":false}'
 Get-Content "$root\private\code-implementer\tinode\_stream\events.evt.jsonl" -Tail 30
 Get-Content "$root\private\default\tinode\inbox\recent.res.jsonl" -Tail 20
 ```
