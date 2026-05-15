@@ -53,10 +53,10 @@ use runtime::{
     ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
     AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PendingInput, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    ConversationMessage, ConversationRuntime, InputSource, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PendingInput, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
     RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
     ToolExecutionResult, ToolExecutor, UsageTracker,
 };
@@ -3075,6 +3075,7 @@ fn run_resume_full_compact(
         None,
         default_permission_mode(),
         None,
+        None,
     )?;
     Ok(runtime.compact(CompactionConfig {
         max_estimated_tokens: 0,
@@ -3486,6 +3487,7 @@ fn run_repl_with_running_input(
         println!("AppFS idle wake enabled for attention-worthy AppFS events.");
     }
     let terminal = TerminalControllerHandle::start(shared_queue.clone(), permission_rx)?;
+    cli.redraw_handle = Some(OutputRedrawHandle::new(&terminal));
     if appfs_idle_wake {
         cli.drive_appfs_idle_wake_with_external_inputs(
             &terminal,
@@ -3544,7 +3546,11 @@ fn run_repl_with_running_input(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("{error}");
+                        if let Some(redraw_handle) = &cli.redraw_handle {
+                            redraw_handle.write_output(format!("{error}\n"));
+                        } else {
+                            eprintln!("{error}");
+                        }
                         terminal.send(TerminalCommand::RenderPrompt)?;
                         continue;
                     }
@@ -3621,6 +3627,7 @@ struct LiveCli {
     prompt_history: Vec<PromptHistoryEntry>,
     appfs_attach_ensure: Option<AppfsAttachEnsureOutcome>,
     appfs_attach_lease: Option<AppfsAttachLease>,
+    redraw_handle: Option<OutputRedrawHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -4171,7 +4178,7 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
             app.visibility == runtime::AppfsRegisteredAppVisibility::PrivateInstance
                 && app.principal_id.as_deref() == Some(environment.principal_id.as_str())
         })
-        .map(|app| format!("{} [{}]", app.app_id, app.path))
+        .map(|app| app.app_id.clone())
         .collect::<Vec<_>>();
     let status = match outcome.status {
         AppfsAttachEnsureStatus::NotAppfs => "not detected",
@@ -4182,6 +4189,12 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
     };
     let apps = if private_apps.is_empty() {
         "private apps <none visible yet>".to_string()
+    } else if private_apps.len() > 3 {
+        let hidden = private_apps.len() - 3;
+        format!(
+            "private apps {} (+{hidden} more)",
+            private_apps[..3].join(", ")
+        )
     } else {
         format!("private apps {}", private_apps.join(", "))
     };
@@ -4220,6 +4233,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            None,
         )?;
         let cli = Self {
             model,
@@ -4231,6 +4245,7 @@ impl LiveCli {
             prompt_history: Vec::new(),
             appfs_attach_ensure,
             appfs_attach_lease,
+            redraw_handle: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4269,6 +4284,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            None,
         )?;
         let cli = Self {
             model,
@@ -4280,6 +4296,7 @@ impl LiveCli {
             prompt_history: Vec::new(),
             appfs_attach_ensure,
             appfs_attach_lease,
+            redraw_handle: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4324,7 +4341,8 @@ impl LiveCli {
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\
   {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session\n\
+  \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -4362,6 +4380,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.redraw_handle.clone(),
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -4500,11 +4519,15 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        if let Some(redraw_handle) = &self.redraw_handle {
+            redraw_handle.set_status("⠋ 🦀 Thinking...");
+        } else {
+            spinner.tick(
+                "🦀 Thinking...",
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
         let mut fallback_prompter = CliPermissionPrompter::new(self.permission_mode);
         let prompter = prompter.unwrap_or(&mut fallback_prompter);
         let result = runner(&mut runtime, prompter);
@@ -4512,28 +4535,39 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
+                if let Some(redraw_handle) = &self.redraw_handle {
+                    redraw_handle.write_output("✔ ✨ Done\n".to_string());
+                    redraw_handle.clear_status();
+                } else {
+                    spinner.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    println!();
+                }
                 if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
+                    let notice = format_auto_compaction_notice(event.removed_message_count);
+                    if let Some(redraw_handle) = &self.redraw_handle {
+                        redraw_handle.write_output(format!("{notice}\n"));
+                    } else {
+                        println!("{notice}");
+                    }
                 }
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if let Some(redraw_handle) = &self.redraw_handle {
+                    redraw_handle.write_output("✘ ❌ Request failed\n".to_string());
+                } else {
+                    spinner.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 Err(Box::new(error))
             }
         }
@@ -4557,9 +4591,22 @@ impl LiveCli {
             return Ok(false);
         }
 
-        println!(
-            "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
-        );
+        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
+        if !rendered_inputs.is_empty() {
+            if let Some(redraw_handle) = &self.redraw_handle {
+                redraw_handle.write_output(format!("{rendered_inputs}\n\n"));
+            } else {
+                println!("\n{rendered_inputs}\n");
+            }
+        } else if let Some(redraw_handle) = &self.redraw_handle {
+            redraw_handle.write_output(format!(
+                "AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.\n"
+            ));
+        } else {
+            println!(
+                "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+            );
+        }
         self.run_event_turn(pending_inputs)?;
         Ok(true)
     }
@@ -4576,9 +4623,22 @@ impl LiveCli {
             return Ok(false);
         }
 
-        println!(
-            "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
-        );
+        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
+        if !rendered_inputs.is_empty() {
+            if let Some(redraw_handle) = &self.redraw_handle {
+                redraw_handle.write_output(format!("{rendered_inputs}\n\n"));
+            } else {
+                println!("\n{rendered_inputs}\n");
+            }
+        } else if let Some(redraw_handle) = &self.redraw_handle {
+            redraw_handle.write_output(format!(
+                "AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.\n"
+            ));
+        } else {
+            println!(
+                "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+            );
+        }
         for pending_input in pending_inputs {
             external_queue.push(pending_input);
         }
@@ -5032,6 +5092,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            None,
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -5078,6 +5139,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            None,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -5107,6 +5169,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
             None,
         )?;
         self.replace_runtime(runtime)?;
@@ -5149,6 +5212,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
             None,
         )?;
         self.replace_runtime(runtime)?;
@@ -5284,6 +5348,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    None,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -5318,6 +5383,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    None,
                     None,
                 )?;
                 self.replace_runtime(runtime)?;
@@ -5585,6 +5651,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            None,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -5604,6 +5671,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            None,
             None,
         )?;
         self.replace_runtime(runtime)?;
@@ -5632,6 +5700,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            None,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -8048,6 +8117,7 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    redraw_handle: Option<OutputRedrawHandle>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state()?;
     build_runtime_with_plugin_state(
@@ -8060,6 +8130,7 @@ fn build_runtime(
         allowed_tools,
         permission_mode,
         progress_reporter,
+        redraw_handle,
         runtime_plugin_state,
     )
 }
@@ -8076,6 +8147,7 @@ fn build_runtime_with_plugin_state(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    redraw_handle: Option<OutputRedrawHandle>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let RuntimePluginState {
@@ -8092,6 +8164,7 @@ fn build_runtime_with_plugin_state(
     }
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let hook_redraw_handle = redraw_handle.clone();
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -8102,33 +8175,39 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            redraw_handle.clone(),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
+            redraw_handle,
         ),
         policy,
         system_prompt,
         &feature_config,
     );
     if emit_output {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter {
+            redraw_handle: hook_redraw_handle,
+        }));
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
-struct CliHookProgressReporter;
+struct CliHookProgressReporter {
+    redraw_handle: Option<OutputRedrawHandle>,
+}
 
 impl runtime::HookProgressReporter for CliHookProgressReporter {
     fn on_event(&mut self, event: &runtime::HookProgressEvent) {
-        match event {
+        let line = match event {
             runtime::HookProgressEvent::Started {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => format!(
                 "[hook {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),
@@ -8136,7 +8215,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => format!(
                 "[hook done {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),
@@ -8144,10 +8223,15 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => format!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),
+        };
+        if let Some(redraw_handle) = &self.redraw_handle {
+            redraw_handle.write_output(format!("{line}\n"));
+        } else {
+            eprintln!("{line}");
         }
     }
 }
@@ -8278,6 +8362,37 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter {
     }
 }
 
+#[derive(Clone)]
+struct OutputRedrawHandle {
+    command_tx: Sender<TerminalCommand>,
+}
+
+impl OutputRedrawHandle {
+    fn new(terminal: &TerminalControllerHandle) -> Self {
+        Self {
+            command_tx: terminal.command_sender(),
+        }
+    }
+
+    fn redraw_prompt(&self) {
+        let _ = self.command_tx.send(TerminalCommand::RenderPrompt);
+    }
+
+    fn write_output(&self, text: String) {
+        let _ = self.command_tx.send(TerminalCommand::WriteOutput(text));
+    }
+
+    fn set_status(&self, text: impl Into<String>) {
+        let _ = self
+            .command_tx
+            .send(TerminalCommand::SetStatus(text.into()));
+    }
+
+    fn clear_status(&self) {
+        let _ = self.command_tx.send(TerminalCommand::ClearStatus);
+    }
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ProviderClient,
@@ -8288,6 +8403,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    redraw_handle: Option<OutputRedrawHandle>,
 }
 
 impl AnthropicRuntimeClient {
@@ -8299,6 +8415,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        redraw_handle: Option<OutputRedrawHandle>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
             .map_err(Box::<dyn std::error::Error>::from)?;
@@ -8321,6 +8438,7 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            redraw_handle,
         })
     }
 
@@ -8539,9 +8657,13 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                if let Some(redraw_handle) = &self.redraw_handle {
+                                    redraw_handle.write_output(rendered);
+                                } else {
+                                    write!(out, "{rendered}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
                             }
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -8553,7 +8675,11 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::ThinkingDelta { .. } => {
                         if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
+                            if let Some(redraw_handle) = &self.redraw_handle {
+                                redraw_handle.set_status(thinking_block_summary_text(None, false));
+                            } else {
+                                render_thinking_block_summary(out, None, false)?;
+                            }
                             block_has_thinking_summary = true;
                         }
                     }
@@ -8562,18 +8688,31 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if let Some(redraw_handle) = &self.redraw_handle {
+                            redraw_handle.write_output(rendered);
+                        } else {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
                         // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if let Some(redraw_handle) = &self.redraw_handle {
+                            redraw_handle.write_output(format!(
+                                "{}\n",
+                                format_tool_call_start(&name, &input)
+                            ));
+                        } else {
+                            let tool_text =
+                                format!("\n{}\n", format_tool_call_start(&name, &input));
+                            write!(out, "{tool_text}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
@@ -8583,9 +8722,13 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if let Some(redraw_handle) = &self.redraw_handle {
+                            redraw_handle.write_output(rendered);
+                        } else {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                     }
                     events.push(AssistantEvent::MessageStop);
                 }
@@ -9325,6 +9468,178 @@ fn render_thinking_block_summary(
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
+fn thinking_block_summary_text(char_count: Option<usize>, redacted: bool) -> String {
+    if redacted {
+        "▶ Thinking block hidden by provider".to_string()
+    } else if let Some(char_count) = char_count {
+        format!("▶ Thinking ({char_count} chars hidden)")
+    } else {
+        "▶ Thinking hidden".to_string()
+    }
+}
+
+fn render_pending_input_echoes(inputs: &[PendingInput]) -> String {
+    inputs
+        .iter()
+        .filter_map(|input| render_pending_input_echo(input))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_pending_input_echo(input: &PendingInput) -> Option<String> {
+    match input.envelope.source {
+        InputSource::AppfsEvent => render_appfs_event_card(&input.envelope),
+        InputSource::UserTerminal | InputSource::AgentMessage | InputSource::System => {
+            let text = summarize_pending_input_text(input);
+            if text.is_empty() {
+                return None;
+            }
+
+            let prefix = match input.envelope.source {
+                InputSource::UserTerminal => match input.envelope.input_type.as_str() {
+                    "user.guidance" => "(guidance)> ",
+                    "user.queued" => "(queued)> ",
+                    _ => "(input)> ",
+                },
+                InputSource::AgentMessage => "[agent] ",
+                InputSource::System => "[system] ",
+                InputSource::AppfsEvent => unreachable!("handled above"),
+            };
+
+            Some(format!("{prefix}{text}"))
+        }
+    }
+}
+
+fn summarize_pending_input_text(input: &PendingInput) -> String {
+    let envelope = &input.envelope;
+    match envelope.source {
+        InputSource::UserTerminal => single_line_preview(&envelope.text, 160),
+        InputSource::AppfsEvent => summarize_appfs_pending_input(envelope),
+        InputSource::AgentMessage | InputSource::System => {
+            let mut parts = Vec::new();
+            if !envelope.input_type.trim().is_empty() {
+                parts.push(envelope.input_type.trim().to_string());
+            }
+            let preview = single_line_preview(&envelope.text, 160);
+            if !preview.is_empty() {
+                parts.push(preview);
+            }
+            parts.join(": ")
+        }
+    }
+}
+
+fn render_appfs_event_card(envelope: &runtime::InputEnvelope) -> Option<String> {
+    let lines = appfs_event_card_lines(envelope);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let title = "AppFS Wake";
+    let border = "─".repeat(title.len() + 10);
+    let body = lines
+        .into_iter()
+        .map(|line| format!("\x1b[38;5;245m│\x1b[0m {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(format!(
+        "\x1b[38;5;245m╭─ \x1b[1;35m{title}\x1b[0;38;5;245m ─╮\x1b[0m\n{body}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+    ))
+}
+
+fn appfs_event_card_lines(envelope: &runtime::InputEnvelope) -> Vec<String> {
+    let app_label = envelope.app_id.as_deref().unwrap_or("appfs");
+    let mut lines = Vec::new();
+
+    if envelope.input_type == "message.received" {
+        let from = payload_string(envelope.payload.as_ref(), "from_display_name")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "from_principal"))
+            .or_else(|| payload_string(envelope.payload.as_ref(), "contact_key"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut meta = format!("{app_label} · message.received · from {from}");
+        if envelope.requires_attention {
+            meta.push_str(" · attention required");
+        }
+        lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
+
+        let body = payload_string(envelope.payload.as_ref(), "text")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "text_preview"))
+            .unwrap_or_else(|| single_line_preview(&envelope.text, 280));
+        if !body.is_empty() {
+            lines.push(body);
+        }
+        return lines;
+    }
+
+    let mut meta = format!("{app_label} · {}", envelope.input_type.trim());
+    if let Some(principal) = &envelope.principal_id {
+        meta.push_str(&format!(" · principal {principal}"));
+    }
+    if envelope.requires_attention {
+        meta.push_str(" · attention required");
+    }
+    lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
+
+    let preview = single_line_preview(&envelope.text, 280);
+    if !preview.is_empty() {
+        lines.push(preview);
+    }
+
+    lines
+}
+
+fn summarize_appfs_pending_input(envelope: &runtime::InputEnvelope) -> String {
+    let app_label = envelope.app_id.as_deref().unwrap_or("AppFS");
+    if envelope.input_type == "message.received" {
+        let from = payload_string(envelope.payload.as_ref(), "from_display_name")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "from_principal"))
+            .or_else(|| payload_string(envelope.payload.as_ref(), "contact_key"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let body = payload_string(envelope.payload.as_ref(), "text")
+            .or_else(|| payload_string(envelope.payload.as_ref(), "text_preview"))
+            .unwrap_or_else(|| single_line_preview(&envelope.text, 160));
+        let attention = if envelope.requires_attention {
+            "needs attention; "
+        } else {
+            ""
+        };
+        return format!("{app_label} message from {from}: {attention}{body}");
+    }
+
+    let preview = single_line_preview(&envelope.text, 160);
+    if preview.is_empty() {
+        format!("{app_label} {}", envelope.input_type.trim())
+    } else {
+        format!("{app_label} {}: {preview}", envelope.input_type.trim())
+    }
+}
+
+fn payload_string(payload: Option<&Value>, key: &str) -> Option<String> {
+    payload
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn single_line_preview(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = String::new();
+    let mut count = 0usize;
+    for ch in collapsed.chars() {
+        if count >= max_chars {
+            preview.push('…');
+            return preview;
+        }
+        preview.push(ch);
+        count += 1;
+    }
+    preview
+}
+
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
@@ -9423,6 +9738,7 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    redraw_handle: Option<OutputRedrawHandle>,
 }
 
 impl CliToolExecutor {
@@ -9431,6 +9747,7 @@ impl CliToolExecutor {
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        redraw_handle: Option<OutputRedrawHandle>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
@@ -9438,6 +9755,7 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            redraw_handle,
         }
     }
 
@@ -9537,18 +9855,28 @@ impl ToolExecutor for CliToolExecutor {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(resolved_tool_name, &output.output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    let rendered = self.renderer.markdown_to_ansi_stream_chunk(&markdown);
+                    if let Some(redraw_handle) = &self.redraw_handle {
+                        redraw_handle.write_output(rendered);
+                    } else {
+                        self.renderer
+                            .stream_markdown(&markdown, &mut io::stdout())
+                            .map_err(|error| ToolError::new(error.to_string()))?;
+                    }
                 }
                 Ok(output)
             }
             Err(error) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    let rendered = self.renderer.markdown_to_ansi_stream_chunk(&markdown);
+                    if let Some(redraw_handle) = &self.redraw_handle {
+                        redraw_handle.write_output(rendered);
+                    } else {
+                        self.renderer
+                            .stream_markdown(&markdown, &mut io::stdout())
+                            .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    }
                 }
                 Err(error)
             }
@@ -9796,13 +10124,13 @@ mod tests {
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle,
         delete_merged_local_branches_in, describe_tool_progress, filter_tool_specs,
-        fork_session_for_principal, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_principal_fork_launch_command, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        fork_session_for_principal, format_appfs_attach_ensure_banner_line,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_principal_fork_launch_command, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, git_ref_exists_in, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
@@ -9810,17 +10138,18 @@ mod tests {
         parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
         print_help_to, push_output_block, render_config_report, render_diff_report,
         render_diff_report_for, render_hook_list_report_for, render_memory_report,
-        render_merged_runtime_config_json, render_prompt_history_report, render_repl_help,
-        render_resume_usage, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command,
-        run_resume_command_with_compactor, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context, status_json_value,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture,
-        ChannelPermissionPrompter, CliAction, CliOutputFormat, CliPermissionPrompter,
-        CliToolExecutor, GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        render_merged_runtime_config_json, render_pending_input_echoes,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, run_resume_command_with_compactor,
+        short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, thinking_block_summary_text,
+        validate_no_args, write_mcp_server_fixture, ChannelPermissionPrompter, CliAction,
+        CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
+        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9828,9 +10157,9 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InvokedSkill, MessageRole,
-        OAuthConfig, PermissionMode, PermissionPromptDecision, PermissionPrompter,
-        PermissionRequest, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InputSource, InvokedSkill,
+        MessageRole, OAuthConfig, PendingInput, PermissionMode, PermissionPromptDecision,
+        PermissionPrompter, PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -11995,6 +12324,52 @@ mod tests {
     }
 
     #[test]
+    fn appfs_attach_banner_line_summarizes_private_apps_without_paths() {
+        let line = format_appfs_attach_ensure_banner_line(&runtime::AppfsAttachEnsureOutcome {
+            status: runtime::AppfsAttachEnsureStatus::Ready,
+            environment: Some(runtime::AppfsEnvironment {
+                attach_source: runtime::AppfsAttachSource::Env,
+                mount_root: PathBuf::from("/mnt/appfs"),
+                runtime_session_id: Some("session-1".to_string()),
+                attach_id: "attach-1".to_string(),
+                principal_id: "code-implementer".to_string(),
+                attach_role: Some("worker".to_string()),
+                multi_agent_mode: runtime::APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+                manifest_path: None,
+                control_dir: None,
+                control_events_path: None,
+                registry_path: None,
+                register_app_path: None,
+                unregister_app_path: None,
+                list_apps_path: None,
+                attach_principal_path: None,
+                detach_principal_path: None,
+                current_app_id: None,
+                current_app_root: None,
+                current_app_events_path: None,
+                registered_apps: vec![runtime::AppfsRegisteredApp {
+                    instance_id: "tinode-worker".to_string(),
+                    app_id: "tinode".to_string(),
+                    visibility: runtime::AppfsRegisteredAppVisibility::PrivateInstance,
+                    parent_app_id: None,
+                    principal_id: Some("code-implementer".to_string()),
+                    profile_id: None,
+                    path: "private/code-implementer/tinode".to_string(),
+                    active_scope: None,
+                }],
+                known_principals: Vec::new(),
+                warnings: Vec::new(),
+            }),
+            principal_outcome: None,
+            warnings: Vec::new(),
+        })
+        .expect("banner line should render");
+
+        assert!(line.contains("private apps tinode"));
+        assert!(!line.contains("private/code-implementer/tinode"));
+    }
+
+    #[test]
     fn format_connected_line_renders_anthropic_provider_for_claude_model() {
         let model = "claude-sonnet-4-6";
 
@@ -13689,6 +14064,72 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn thinking_block_summary_text_matches_rendered_copy() {
+        assert_eq!(
+            thinking_block_summary_text(None, false),
+            "▶ Thinking hidden"
+        );
+        assert_eq!(
+            thinking_block_summary_text(Some(6), false),
+            "▶ Thinking (6 chars hidden)"
+        );
+        assert_eq!(
+            thinking_block_summary_text(None, true),
+            "▶ Thinking block hidden by provider"
+        );
+    }
+
+    #[test]
+    fn render_pending_input_echoes_include_user_guidance_and_queue() {
+        let guidance = PendingInput {
+            envelope: runtime::InputEnvelope::new(
+                InputSource::UserTerminal,
+                "user.guidance",
+                "先别改 schema",
+            ),
+            delivery: runtime::PendingInputDelivery::InjectAtNextBoundary,
+        };
+        let queued = PendingInput {
+            envelope: runtime::InputEnvelope::new(
+                InputSource::UserTerminal,
+                "user.queued",
+                "等完成后补测试",
+            ),
+            delivery: runtime::PendingInputDelivery::QueueAfterTurn,
+        };
+
+        let rendered = render_pending_input_echoes(&[guidance, queued]);
+        assert!(rendered.contains("(guidance)> 先别改 schema"));
+        assert!(rendered.contains("(queued)> 等完成后补测试"));
+    }
+
+    #[test]
+    fn render_pending_input_echoes_surface_appfs_message_preview() {
+        let mut envelope = runtime::InputEnvelope::new(
+            InputSource::AppfsEvent,
+            "message.received",
+            "message received",
+        );
+        envelope.app_id = Some("tinode".to_string());
+        envelope.requires_attention = true;
+        envelope.payload = Some(json!({
+            "from_display_name": "Alice",
+            "text_preview": "请帮我继续跟进这个限制设计"
+        }));
+        let rendered = render_pending_input_echoes(&[PendingInput {
+            envelope,
+            delivery: runtime::PendingInputDelivery::InjectAtNextBoundary,
+        }]);
+
+        assert!(rendered.contains("AppFS Wake"));
+        assert!(rendered.contains("tinode"));
+        assert!(rendered.contains("message.received"));
+        assert!(rendered.contains("from Alice"));
+        assert!(rendered.contains("attention required"));
+        assert!(rendered.contains("请帮我继续跟进这个限制设计"));
+    }
+
+    #[test]
     fn login_browser_failure_keeps_json_stdout_clean() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -13793,6 +14234,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let tool_output = executor
@@ -13891,6 +14333,7 @@ UU conflicted.rs",
             false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            None,
         );
 
         let search_output = executor
@@ -13922,6 +14365,7 @@ UU conflicted.rs",
             Some(BTreeSet::from([String::from("ToolSearch")])),
             false,
             GlobalToolRegistry::builtin(),
+            None,
             None,
         );
 
@@ -13974,6 +14418,7 @@ UU conflicted.rs",
             false,
             None,
             PermissionMode::DangerFullAccess,
+            None,
             None,
             runtime_plugin_state,
         )

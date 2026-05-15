@@ -23,6 +23,7 @@ use crate::{bash_shell_path, ConfigLoader};
 static SHELL_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_PERSISTED_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const SHELL_TASK_ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+const PYTHON_IO_ENCODING: &str = "utf-8";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
@@ -135,8 +136,8 @@ pub fn prepare_shell_command_output(
     stdout: &[u8],
     stderr: &[u8],
 ) -> PreparedShellCommandOutput {
-    let raw_stdout = String::from_utf8_lossy(stdout).into_owned();
-    let raw_stderr = String::from_utf8_lossy(stderr).into_owned();
+    let raw_stdout = decode_command_output(stdout);
+    let raw_stderr = decode_command_output(stderr);
     let persisted = if stdout.len() > MAX_OUTPUT_BYTES {
         persist_stdout_for_model(cwd, stdout).ok()
     } else {
@@ -298,6 +299,26 @@ struct PersistedShellOutput {
     original_size: u64,
 }
 
+#[must_use]
+pub fn decode_command_output(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+
+    #[cfg(windows)]
+    if let Some(decoded) = decode_windows_ansi(bytes) {
+        return decoded;
+    }
+
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_windows_ansi(bytes: &[u8]) -> Option<String> {
+    let (decoded, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    (!had_errors).then(|| decoded.into_owned())
+}
+
 fn preview_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -340,6 +361,7 @@ fn prepare_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
+        configure_bash_tool_env(&mut prepared);
         return Ok(prepared);
     }
 
@@ -347,6 +369,7 @@ fn prepare_command(
     prepared.arg("-lc").arg(command);
 
     prepared.current_dir(cwd);
+    configure_bash_tool_env(&mut prepared);
     if sandbox_status.filesystem_active {
         configure_bash_sandbox_env(&mut prepared, cwd);
     }
@@ -368,6 +391,7 @@ fn prepare_tokio_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
+        configure_bash_tool_env(&mut prepared);
         return Ok(prepared);
     }
 
@@ -375,6 +399,7 @@ fn prepare_tokio_command(
     prepared.arg("-lc").arg(command);
 
     prepared.current_dir(cwd);
+    configure_bash_tool_env(&mut prepared);
     if sandbox_status.filesystem_active {
         configure_bash_sandbox_env(&mut prepared, cwd);
     }
@@ -384,6 +409,15 @@ fn prepare_tokio_command(
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+}
+
+fn configure_bash_tool_env<T>(command: &mut T)
+where
+    T: BashEnvCommand,
+{
+    // Keep Python stdout/stderr deterministic when bash runs under Windows
+    // console code pages. AppFS action files are JSONL and are decoded as UTF-8.
+    command.env("PYTHONIOENCODING", PYTHON_IO_ENCODING);
 }
 
 fn configure_bash_sandbox_env<T>(command: &mut T, cwd: &std::path::Path)
@@ -436,8 +470,8 @@ impl BashEnvCommand for TokioCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_bash, prepare_background_shell_output, prepare_shell_command_output,
-        BashCommandInput, MAX_OUTPUT_BYTES,
+        decode_command_output, execute_bash, prepare_background_shell_output,
+        prepare_shell_command_output, BashCommandInput, MAX_OUTPUT_BYTES,
     };
     use crate::tool_session::with_tool_session_context;
     #[cfg(windows)]
@@ -555,6 +589,33 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn injects_pythonioencoding_utf8_into_bash_tool() {
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        let _guard = test_env_lock();
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
+        let output = execute_bash(BashCommandInput {
+            command: String::from("printf '%s' \"$PYTHONIOENCODING\""),
+            timeout: Some(TEST_TIMEOUT_MS),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash command should execute");
+
+        assert_eq!(output.stdout, "utf-8");
     }
 
     #[test]
@@ -680,6 +741,20 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn decode_command_output_falls_back_to_windows_ansi_for_gbk_bytes() {
+        let bytes = [
+            61, 61, 61, 32, 195, 176, 197, 221, 197, 197, 208, 242, 32, 61, 61, 61, 10, 212, 173,
+            202, 253, 215, 233, 58, 32, 91, 49, 44, 32, 50, 44, 32, 51, 93, 10,
+        ];
+
+        assert_eq!(
+            decode_command_output(&bytes),
+            "=== 冒泡排序 ===\n原数组: [1, 2, 3]\n"
+        );
     }
 }
 
