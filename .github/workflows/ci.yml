@@ -42,6 +42,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: appfs-agent/rust
+          cache-bin: false
 
       - name: Run cargo check
         run: cargo check --workspace
