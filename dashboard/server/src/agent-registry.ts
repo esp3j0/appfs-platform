@@ -12,8 +12,10 @@ export class AgentRegistry {
     this.dumpDir = dumpDir;
   }
 
-  /** Scan for agents. First tries agent-meta.json files, then falls back to
-   *  scanning session JSONL files in the dump dir itself. */
+  /** Scan for agents. Discovery order:
+   *  1. agent-meta-*.json files in dump dir (Phase 3 debug-dump)
+   *  2. .claw/sessions/<fingerprint>/*.jsonl (real claw session layout)
+   *  3. *.jsonl directly in dump dir (flat fixture mode) */
   discover(): void {
     if (!fs.existsSync(this.dumpDir)) return;
 
@@ -34,11 +36,49 @@ export class AgentRegistry {
       return;
     }
 
-    // Phase 1 fallback: treat each *.jsonl file in dump dir as a session
+    // Phase 1b: .claw/sessions/<fingerprint>/*.jsonl
+    const clawSessionsDir = path.join(this.dumpDir, '.claw', 'sessions');
+    if (fs.existsSync(clawSessionsDir)) {
+      this.discoverClawSessions(clawSessionsDir);
+      if (this.agents.size > 0) return;
+    }
+
+    // Phase 1a fallback: flat *.jsonl files in dump dir
     const jsonlFiles = fs.readdirSync(this.dumpDir).filter(f => f.endsWith('.jsonl'));
     for (const file of jsonlFiles) {
       const fullPath = path.join(this.dumpDir, file);
       this.registerFromSessionFile(fullPath);
+    }
+  }
+
+  /** Recursively scan .claw/sessions/ for session-*.jsonl files.
+   *  Layout: .claw/sessions/<fingerprint>/<session-id>.jsonl
+   *  Both agents (default, code-implementer) share the same fingerprint dir
+   *  because they share the same workspace path. */
+  private discoverClawSessions(sessionsDir: string): void {
+    // Read fingerprint directories
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(sessionsDir);
+    } catch {
+      return;
+    }
+
+    for (const fingerprint of entries) {
+      const fpDir = path.join(sessionsDir, fingerprint);
+      if (!fs.statSync(fpDir).isDirectory()) continue;
+
+      let sessionFiles: string[];
+      try {
+        sessionFiles = fs.readdirSync(fpDir).filter(f => f.endsWith('.jsonl'));
+      } catch {
+        continue;
+      }
+
+      for (const file of sessionFiles) {
+        const fullPath = path.join(fpDir, file);
+        this.registerFromSessionFile(fullPath);
+      }
     }
   }
 

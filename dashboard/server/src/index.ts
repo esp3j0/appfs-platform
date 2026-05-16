@@ -12,8 +12,15 @@ const HOST = process.env.HOST ?? '127.0.0.1';
 const DUMP_DIR = process.argv[2] ?? process.env.APPFS_DEBUG_DUMP_DIR ?? '';
 
 if (!DUMP_DIR) {
-  console.error('Usage: tsx src/index.ts <dump-dir>');
-  console.error('   or: set APPFS_DEBUG_DUMP_DIR=<path>');
+  console.error('Usage: tsx src/index.ts <workspace-or-dump-dir>');
+  console.error('');
+  console.error('  Accepts:');
+  console.error('    - AppFS mount point (e.g. C:\\mnt\\appfs-compose-tinode)');
+  console.error('      → scans .claw/sessions/<hash>/*.jsonl automatically');
+  console.error('    - Flat directory with *.jsonl fixtures');
+  console.error('    - Directory with agent-meta-*.json (debug-dump mode)');
+  console.error('');
+  console.error('  Or: set APPFS_DEBUG_DUMP_DIR=<path>');
   process.exit(1);
 }
 
