@@ -1,0 +1,23 @@
+{
+  "name": "appfs-debug-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "vite",
+    "build": "vite build",
+    "start": "npm --prefix server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "vite": "^6.3.0",
+    "@vitejs/plugin-react": "^4.4.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  }
+}
