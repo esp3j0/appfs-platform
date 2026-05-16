@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AppFS Debug Dashboard - Mockup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+
+  /* Top bar */
+  .topbar { background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; }
+  .topbar h1 { font-size: 14px; color: #58a6ff; }
+  .topbar .status { display: flex; gap: 12px; font-size: 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .status-dot.online { background: #3fb950; }
+  .status-dot.offline { background: #484f58; }
+
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* Left sidebar */
+  .sidebar { width: 240px; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; }
+  .sidebar-header { padding: 12px; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; }
+  .agent-list { flex: 1; overflow-y: auto; }
+  .agent-item { padding: 10px 12px; border-bottom: 1px solid #21262d; cursor: pointer; transition: background 0.15s; display: flex; align-items: flex-start; gap: 8px; }
+  .agent-item:hover { background: #1c2128; }
+  .agent-item.active { background: #1c2128; }
+  .agent-checkbox { margin-top: 2px; accent-color: #58a6ff; cursor: pointer; }
+  .agent-info { flex: 1; }
+  .agent-name { font-size: 13px; font-weight: 600; color: #e6edf3; margin-bottom: 2px; }
+  .agent-meta { font-size: 11px; color: #8b949e; }
+  .agent-model { color: #d2a8ff; font-size: 11px; }
+  .agent-status-badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+  .agent-status-badge.running { background: #1b4332; color: #3fb950; }
+  .agent-status-badge.idle { background: #21262d; color: #8b949e; }
+
+  /* Agent color indicators */
+  .agent-color { width: 4px; border-radius: 2px; min-height: 40px; flex-shrink: 0; }
+  .agent-color.c-blue { background: #58a6ff; }
+  .agent-color.c-green { background: #3fb950; }
+  .agent-color.c-purple { background: #d2a8ff; }
+  .agent-color.c-orange { background: #d29922; }
+
+  /* Timeline */
+  .timeline { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+  .timeline-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .timeline-header h2 { font-size: 15px; color: #e6edf3; }
+  .selected-agents { display: flex; gap: 6px; align-items: center; }
+  .selected-tag { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .selected-tag.blue { background: #1f6feb33; color: #58a6ff; }
+  .selected-tag.green { background: #23863633; color: #3fb950; }
+  .selected-tag.purple { background: #8957e533; color: #d2a8ff; }
+  .timeline-header .filters { display: flex; gap: 8px; }
+  .filter-btn { background: #21262d; border: 1px solid #30363d; color: #8b949e; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: inherit; }
+  .filter-btn.active { background: #1f6feb33; border-color: #58a6ff; color: #58a6ff; }
+
+  /* Messages */
+  .msg { padding: 8px 12px; border-radius: 6px; font-size: 13px; line-height: 1.5; position: relative; }
+  .msg-role { font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+  .msg-time { font-size: 10px; color: #484f58; position: absolute; top: 8px; right: 10px; }
+  .msg-tokens { font-size: 10px; color: #484f58; margin-top: 4px; }
+
+  /* Agent source label */
+  .msg-agent { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; margin-right: 6px; }
+  .msg-agent.blue { background: #1f6feb33; color: #58a6ff; }
+  .msg-agent.green { background: #23863633; color: #3fb950; }
+  .msg-agent.purple { background: #8957e533; color: #d2a8ff; }
+
+  .msg.system { background: #1c2128; border-left: 3px solid #d29922; }
+  .msg.system .msg-role { color: #d29922; }
+
+  .msg.user { background: #1c2128; border-left: 3px solid #58a6ff; }
+  .msg.user .msg-role { color: #58a6ff; }
+
+  .msg.assistant { background: #161b22; border: 1px solid #30363d; }
+  .msg.assistant .msg-role { color: #3fb950; }
+
+  .msg.tool-result { background: #0d1117; border: 1px dashed #30363d; font-size: 12px; }
+  .msg.tool-result .msg-role { color: #8b949e; }
+  .msg.tool-result .tool-name { color: #d2a8ff; }
+
+  .msg.debug-dump { background: #1a1225; border: 1px solid #341a5e; }
+  .msg.debug-dump .msg-role { color: #bc8cff; }
+
+  /* Collapsible */
+  .collapsible-toggle { font-size: 11px; color: #58a6ff; cursor: pointer; margin-top: 4px; }
+  .collapsible-content { display: none; white-space: pre-wrap; font-size: 12px; max-height: 300px; overflow-y: auto; background: #0d1117; padding: 8px; border-radius: 4px; margin-top: 4px; }
+  .collapsible-content.open { display: block; }
+
+  /* Usage bar */
+  .usage-bar { background: #21262d; border-radius: 3px; height: 4px; margin-top: 4px; overflow: hidden; }
+  .usage-fill { height: 100%; border-radius: 3px; }
+  .usage-fill.input { background: #58a6ff; }
+  .usage-fill.output { background: #3fb950; }
+
+  /* Time divider */
+  .time-divider { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; font-size: 11px; color: #484f58; }
+  .time-divider::before, .time-divider::after { content: ''; flex: 1; height: 1px; background: #21262d; }
+
+  /* Interaction arrow */
+  .interaction-arrow { display: flex; align-items: center; gap: 4px; margin: 4px 0; padding: 0 12px; font-size: 10px; color: #484f58; }
+  .interaction-arrow .arrow-line { flex: 1; height: 1px; background: linear-gradient(to right, #58a6ff44, #3fb95044); }
+  .interaction-arrow .arrow-label { padding: 1px 8px; background: #21262d; border-radius: 3px; white-space: nowrap; }
+
+  /* Session info panel (right) */
+  .info-panel { width: 280px; background: #161b22; border-left: 1px solid #30363d; padding: 12px; overflow-y: auto; }
+  .info-section { margin-bottom: 16px; }
+  .info-title { font-size: 11px; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; margin-bottom: 6px; }
+  .info-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 3px; }
+  .info-label { color: #8b949e; }
+  .info-value { color: #e6edf3; }
+  .info-value.highlight { color: #58a6ff; }
+
+  .prompt-viewer { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 8px; font-size: 11px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; color: #8b949e; }
+
+  /* Multi-select hint */
+  .select-hint { font-size: 10px; color: #484f58; padding: 6px 12px; border-bottom: 1px solid #21262d; font-style: italic; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>AppFS Debug Dashboard</h1>
+  <div class="status">
+    <span><span class="status-dot online"></span> 3 agents online</span>
+    <span style="color: #484f58">|</span>
+    <span style="color: #8b949e">Mount: /tmp/appfs-demo</span>
+    <span style="color: #484f58">|</span>
+    <span style="color: #8b949e">Updated: 14:23:13</span>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Left sidebar: agent list with checkboxes -->
+  <div class="sidebar">
+    <div class="sidebar-header">Agents (multi-select)</div>
+    <div class="select-hint">Click to toggle. Select 2+ for merged timeline.</div>
+    <div class="agent-list">
+      <!-- Agent 1: checked -->
+      <div class="agent-item active" style="border-left: 3px solid #58a6ff;">
+        <input type="checkbox" class="agent-checkbox" checked>
+        <div class="agent-info">
+          <div class="agent-name">default</div>
+          <div class="agent-meta">principal: default</div>
+          <div class="agent-model">claude-sonnet-4-6</div>
+          <div style="margin-top:4px"><span class="agent-status-badge running">running</span></div>
+        </div>
+      </div>
+      <!-- Agent 2: checked -->
+      <div class="agent-item active" style="border-left: 3px solid #3fb950;">
+        <input type="checkbox" class="agent-checkbox" checked>
+        <div class="agent-info">
+          <div class="agent-name">code-implementer</div>
+          <div class="agent-meta">principal: implementer</div>
+          <div class="agent-model">claude-sonnet-4-6</div>
+          <div style="margin-top:4px"><span class="agent-status-badge idle">idle</span></div>
+        </div>
+      </div>
+      <!-- Agent 3: unchecked -->
+      <div class="agent-item">
+        <input type="checkbox" class="agent-checkbox">
+        <div class="agent-info">
+          <div class="agent-name">reviewer</div>
+          <div class="agent-meta">principal: reviewer</div>
+          <div class="agent-model">qwen-plus</div>
+          <div style="margin-top:4px"><span class="agent-status-badge idle">idle</span></div>
+        </div>
+      </div>
+    </div>
+    <!-- Usage summary -->
+    <div style="padding: 12px; border-top: 1px solid #30363d;">
+      <div class="sidebar-header" style="padding: 0; border: none; margin-bottom: 8px;">Total Usage</div>
+      <div class="info-row"><span class="info-label">Input</span><span class="info-value">124,531 tok</span></div>
+      <div class="usage-bar"><div class="usage-fill input" style="width: 62%"></div></div>
+      <div class="info-row" style="margin-top:6px"><span class="info-label">Output</span><span class="info-value">18,204 tok</span></div>
+      <div class="usage-bar"><div class="usage-fill output" style="width: 24%"></div></div>
+      <div class="info-row" style="margin-top:6px"><span class="info-label">Cost</span><span class="info-value highlight">$0.42</span></div>
+    </div>
+  </div>
+
+  <!-- Center: MERGED timeline (2 agents selected) -->
+  <div class="timeline" id="timeline">
+    <div class="timeline-header">
+      <div>
+        <h2>Merged Timeline</h2>
+        <div class="selected-agents" style="margin-top:4px">
+          <span class="selected-tag blue">default</span>
+          <span class="selected-tag green">code-implementer</span>
+          <span style="color:#484f58; font-size:11px">2 agents, 14 messages</span>
+        </div>
+      </div>
+      <div class="filters">
+        <button class="filter-btn active">All</button>
+        <button class="filter-btn">Model I/O</button>
+        <button class="filter-btn">Tools</button>
+        <button class="filter-btn">Cross-agent</button>
+      </div>
+    </div>
+
+    <!-- ===== 14:22:58 — code-implementer starts ===== -->
+    <div class="time-divider">14:22:58</div>
+
+    <div class="msg debug-dump">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> [debug-dump] MessageRequest #1</div>
+      <div class="msg-time">14:22:58</div>
+      <div style="font-size: 12px; color: #bc8cff; margin-bottom: 4px;">model: claude-sonnet-4-6 | max_tokens: 16384 | tools: 12</div>
+      <div class="collapsible-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ Show system prompt (3,102 chars)</div>
+      <div class="collapsible-content">You are code-implementer, an AI agent specialized in writing code...
+
+Your principal is "implementer" with contacts:
+- default (principal: default) — coordinator
+- reviewer (principal: reviewer) — code review
+
+Current task from default: "Implement auto mark-as-read for Tinode read receipts"</div>
+    </div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> assistant</div>
+      <div class="msg-time">14:23:02</div>
+      <div>I'll implement the auto mark-as-read feature. Let me first check the current Tinode connector code to understand the message flow.</div>
+      <div class="msg-tokens">input: 3,102 | output: 28</div>
+    </div>
+
+    <!-- ===== 14:23:01 — default gets the initial message ===== -->
+    <div class="time-divider">14:23:01</div>
+
+    <div class="msg debug-dump">
+      <div class="msg-role"><span class="msg-agent blue">default</span> [debug-dump] MessageRequest #1</div>
+      <div class="msg-time">14:23:01</div>
+      <div style="font-size: 12px; color: #bc8cff;">model: claude-sonnet-4-6 | max_tokens: 16384</div>
+    </div>
+
+    <div class="msg user">
+      <div class="msg-role"><span class="msg-agent blue">default</span> user [input_router]</div>
+      <div class="msg-time">14:23:01</div>
+      <div>[Pending input reminder]
+[1] [appfs_event] type=message.received
+From: code-implementer
+"I'm starting the implementation now."</div>
+    </div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent blue">default</span> assistant</div>
+      <div class="msg-time">14:23:04</div>
+      <div>Acknowledged. I'll monitor the progress and review when the implementation is ready.</div>
+      <div class="msg-tokens">input: 2,847 | output: 22</div>
+    </div>
+
+    <!-- ===== Cross-agent interaction arrow ===== -->
+    <div class="interaction-arrow">
+      <div class="arrow-line"></div>
+      <div class="arrow-label">code-implementer → default (message.received via Tinode)</div>
+      <div class="arrow-line"></div>
+    </div>
+
+    <!-- ===== 14:23:05 — code-implementer working ===== -->
+    <div class="time-divider">14:23:05</div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> assistant → tool_use</div>
+      <div class="msg-time">14:23:05</div>
+      <div>read_file({"path": "appfs/sdk/rust/src/tinode_connector.rs", "offset": 2900, "limit": 80})</div>
+    </div>
+
+    <div class="msg tool-result">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> tool_result → <span class="tool-name">read_file</span></div>
+      <div class="msg-time">14:23:06</div>
+      <div class="collapsible-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ Show output (1,847 chars)</div>
+      <div class="collapsible-content">fn maybe_capture_read_receipt(&mut self, msg: &JsonValue) {
+    // BUG: checking "kp" instead of "info"
+    if let Some(kp) = msg.get("kp") {
+        ...
+    }
+}</div>
+    </div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> assistant</div>
+      <div class="msg-time">14:23:08</div>
+      <div>Found the bug — the connector is checking `msg.get("kp")` but Tinode forwards read receipts as `{info}` packets. Let me fix this.</div>
+      <div class="msg-tokens">input: 5,489 | output: 34</div>
+    </div>
+
+    <!-- ===== 14:23:10 — code-implementer sends result ===== -->
+    <div class="time-divider">14:23:10</div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent green">code-implementer</span> assistant</div>
+      <div class="msg-time">14:23:10</div>
+      <div>Fix applied. Changed `maybe_capture_read_receipt()` from checking `{kp}` to `{info}`. Sending message to default for review.</div>
+      <div class="msg-tokens">input: 8,231 | output: 28</div>
+    </div>
+
+    <!-- Cross-agent interaction arrow -->
+    <div class="interaction-arrow">
+      <div class="arrow-line"></div>
+      <div class="arrow-label">code-implementer → default (message.sent via Tinode)</div>
+      <div class="arrow-line"></div>
+    </div>
+
+    <!-- ===== 14:23:11 — default receives ===== -->
+    <div class="time-divider">14:23:11</div>
+
+    <div class="msg user">
+      <div class="msg-role"><span class="msg-agent blue">default</span> user [input_router]</div>
+      <div class="msg-time">14:23:11</div>
+      <div>[Pending input reminder]
+[1] [appfs_event] type=message.received
+From: code-implementer
+"Fix applied. Changed `{kp}` to `{info}`. Ready for review."</div>
+    </div>
+
+    <div class="msg debug-dump">
+      <div class="msg-role"><span class="msg-agent blue">default</span> [debug-dump] MessageRequest #2</div>
+      <div class="msg-time">14:23:11</div>
+      <div style="font-size: 12px; color: #8b949e;">messages: 5 | includes read_file tool_result</div>
+    </div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent blue">default</span> assistant</div>
+      <div class="msg-time">14:23:16</div>
+      <div>Looks good. The `{info}` packet handling is correct. Let me verify by checking the code.</div>
+      <div class="msg-tokens">input: 6,412 | output: 22 | cache_read: 2,847</div>
+    </div>
+
+    <div class="msg assistant">
+      <div class="msg-role"><span class="msg-agent blue">default</span> assistant → tool_use</div>
+      <div class="msg-time">14:23:16</div>
+      <div>read_file({"path": "appfs/sdk/rust/src/tinode_connector.rs", "offset": 2940})</div>
+    </div>
+
+    <div class="msg tool-result">
+      <div class="msg-role"><span class="msg-agent blue">default</span> tool_result → <span class="tool-name">read_file</span></div>
+      <div class="msg-time">14:23:17</div>
+      <div class="collapsible-toggle" onclick="this.nextElementSibling.classList.toggle('open')">▶ Show output (2,831 chars)</div>
+      <div class="collapsible-content">fn maybe_capture_read_receipt(&mut self, msg: &JsonValue) {
+    if let Some(info) = msg.get("info") {
+        if info.get("what").and_then(JsonValue::as_str) == Some("read") {
+            ...
+            self.pending_read_receipts
+                .push((topic.to_string(), seq, from));
+        }
+    }
+}</div>
+    </div>
+
+    <!-- ===== 14:23:13 — auto mark-read event ===== -->
+    <div class="time-divider">14:23:13</div>
+
+    <div class="msg user">
+      <div class="msg-role"><span class="msg-agent blue">default</span> user [input_router]</div>
+      <div class="msg-time">14:23:13</div>
+      <div>[Pending input reminder]
+[1] [appfs_event] type=message.read from=code-implementer seq=47
+    (auto mark-as-read: matched wake input, sending {note})</div>
+    </div>
+
+    <!-- Cross-agent interaction arrow -->
+    <div class="interaction-arrow">
+      <div class="arrow-line"></div>
+      <div class="arrow-label">code-implementer → default (message.read — {info} read receipt)</div>
+      <div class="arrow-line"></div>
+    </div>
+
+  </div>
+
+  <!-- Right info panel -->
+  <div class="info-panel">
+    <div class="info-section">
+      <div class="info-title">Merged View</div>
+      <div class="info-row"><span class="info-label">Agents</span><span class="info-value highlight">2 selected</span></div>
+      <div class="info-row"><span class="info-label">Messages</span><span class="info-value">14 total</span></div>
+      <div class="info-row"><span class="info-label">Interactions</span><span class="info-value">3 cross-agent</span></div>
+      <div class="info-row"><span class="info-label">Time Range</span><span class="info-value">14:22:58 — 14:23:17</span></div>
+    </div>
+
+    <div class="info-section">
+      <div class="info-title">default</div>
+      <div class="info-row"><span class="info-label">Model</span><span class="info-value">claude-sonnet-4-6</span></div>
+      <div class="info-row"><span class="info-label">Messages</span><span class="info-value">7</span></div>
+      <div class="info-row"><span class="info-label">Input</span><span class="info-value">11,653 tok</span></div>
+      <div class="info-row"><span class="info-label">Output</span><span class="info-value">66 tok</span></div>
+      <div class="info-row"><span class="info-label">Cost</span><span class="info-value highlight">$0.04</span></div>
+    </div>
+
+    <div class="info-section">
+      <div class="info-title">code-implementer</div>
+      <div class="info-row"><span class="info-label">Model</span><span class="info-value">claude-sonnet-4-6</span></div>
+      <div class="info-row"><span class="info-label">Messages</span><span class="info-value">7</span></div>
+      <div class="info-row"><span class="info-label">Input</span><span class="info-value">18,834 tok</span></div>
+      <div class="info-row"><span class="info-label">Output</span><span class="info-value">90 tok</span></div>
+      <div class="info-row"><span class="info-label">Cost</span><span class="info-value highlight">$0.06</span></div>
+    </div>
+
+    <div class="info-section">
+      <div class="info-title">Cross-Agent Events</div>
+      <div style="background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 8px; font-size: 11px;">
+        <div style="margin-bottom: 6px; color: #3fb950;">code-implementer → default</div>
+        <div style="color: #8b949e; padding-left: 8px; margin-bottom: 8px; border-left: 2px solid #3fb95044;">
+          message.received (14:23:01)<br>
+          message.sent (14:23:10)<br>
+          message.read (14:23:13)
+        </div>
+        <div style="margin-bottom: 6px; color: #58a6ff;">default → code-implementer</div>
+        <div style="color: #8b949e; padding-left: 8px; border-left: 2px solid #58a6ff44;">
+          message.sent (14:23:04)<br>
+          message.read (14:23:14)
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
