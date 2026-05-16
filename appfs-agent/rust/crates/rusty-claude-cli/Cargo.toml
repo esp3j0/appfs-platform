@@ -25,6 +25,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 tools = { path = "../tools" }
 unicode-width = "0.2"
 
+[features]
+default = []
+debug-dump = []
+
 [lints]
 workspace = true
 

@@ -11,6 +11,9 @@ mod input;
 mod render;
 mod terminal_controller;
 
+#[cfg(feature = "debug-dump")]
+mod debug_dump;
+
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
@@ -8542,6 +8545,10 @@ fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api:
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        #[cfg(feature = "debug-dump")]
+        if let Ok(dir) = std::env::var("APPFS_DEBUG_DUMP_DIR") {
+            crate::debug_dump::write_request(&dir, &self.session_id, &request);
+        }
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
