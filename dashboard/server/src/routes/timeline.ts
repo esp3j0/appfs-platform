@@ -19,9 +19,10 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
       for (const rec of msgs) {
         const msg = rec.message;
         const content = extractTextContent(msg.blocks);
+        const timestamp = rec.timestamp_ms ?? 0;
         const entry: TimelineEntry = {
           agentName: name,
-          timestamp: 0,
+          timestamp,
           source: 'session',
           role: msg.role,
           content,
@@ -38,7 +39,7 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
               fromAgent: receivedMatch[1],
               toAgent: name,
               eventType: 'message.received',
-              timestamp: 0,
+              timestamp,
               label: `${receivedMatch[1]} → ${name} (message.received)`,
             });
           }
@@ -48,7 +49,7 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
               fromAgent: readMatch[1],
               toAgent: name,
               eventType: 'message.read',
-              timestamp: 0,
+              timestamp,
               label: `${readMatch[1]} → ${name} (message.read)`,
             });
           }
@@ -56,11 +57,8 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
       }
     }
 
-    // Assign stable index-based ordering
-    let idx = 0;
-    for (const entry of entries) {
-      entry.timestamp = idx++;
-    }
+    // Sort by real timestamp; stable sort preserves JSONL order for ties
+    entries.sort((a, b) => a.timestamp - b.timestamp);
 
     return { entries, interactions };
   });

@@ -16,6 +16,7 @@ export interface SessionMetaRecord {
 
 export interface MessageRecord {
   type: 'message';
+  timestamp_ms?: number;
   message: ConversationMessage;
 }
 

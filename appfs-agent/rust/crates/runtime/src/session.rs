@@ -1821,6 +1821,13 @@ impl InvokedSkill {
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
+    object.insert(
+        "timestamp_ms".to_string(),
+        JsonValue::Number(i64_from_u64(
+            current_time_millis(),
+            "timestamp_ms",
+        ).unwrap_or(0)),
+    );
     object.insert("message".to_string(), message.to_json());
     JsonValue::Object(object)
 }
