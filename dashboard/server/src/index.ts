@@ -1,0 +1,46 @@
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import path from 'node:path';
+import { AgentRegistry } from './agent-registry.js';
+import { registerAgentsRoute } from './routes/agents.js';
+import { registerMessagesRoute } from './routes/messages.js';
+import { registerTimelineRoute } from './routes/timeline.js';
+import { registerEventsRoute } from './routes/events.js';
+
+const PORT = parseInt(process.env.PORT ?? '3100', 10);
+const HOST = process.env.HOST ?? '127.0.0.1';
+const DUMP_DIR = process.argv[2] ?? process.env.APPFS_DEBUG_DUMP_DIR ?? '';
+
+if (!DUMP_DIR) {
+  console.error('Usage: tsx src/index.ts <dump-dir>');
+  console.error('   or: set APPFS_DEBUG_DUMP_DIR=<path>');
+  process.exit(1);
+}
+
+const dumpDir = path.resolve(DUMP_DIR);
+
+async function main() {
+  const registry = new AgentRegistry(dumpDir);
+  registry.discover();
+
+  console.log(`Discovered ${registry.getAgents().length} agent(s) in ${dumpDir}`);
+  for (const agent of registry.getAgents()) {
+    console.log(`  - ${agent.name} (${agent.model}, ${agent.messageCount} messages)`);
+  }
+
+  const app = Fastify({ logger: false });
+  await app.register(cors, { origin: true });
+
+  registerAgentsRoute(app, registry);
+  registerMessagesRoute(app, registry);
+  registerTimelineRoute(app, registry);
+  registerEventsRoute(app, registry);
+
+  await app.listen({ port: PORT, host: HOST });
+  console.log(`Dashboard API listening on http://${HOST}:${PORT}`);
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
