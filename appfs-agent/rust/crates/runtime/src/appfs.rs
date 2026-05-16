@@ -706,6 +706,111 @@ pub struct AppfsIdleWakeScanOutcome {
     pub pending_inputs: Vec<PendingInput>,
 }
 
+/// For each `message.received` pending input that woke the idle agent,
+/// auto-write an `inbox/mark_read.act` action so that the connector sends
+/// a read-note upstream and the sender can observe a read receipt.
+///
+/// Returns the number of mark-read actions written. Errors are logged and
+/// do not propagate — auto mark-read is best-effort.
+pub fn auto_mark_read_for_wake_inputs(
+    pending_inputs: &[PendingInput],
+    cwd: &Path,
+) -> usize {
+    let Some(environment) = detect_appfs_environment(cwd) else {
+        return 0;
+    };
+
+    // Collect message_ids grouped by app_id from attention-worthy message.received events.
+    let mut message_ids_by_app: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for input in pending_inputs {
+        if input.envelope.input_type != "message.received" || !input.envelope.requires_attention {
+            continue;
+        }
+        let Some(ref payload) = input.envelope.payload else {
+            continue;
+        };
+        let Some(message_id) = payload.get("message_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let app_id = input
+            .envelope
+            .app_id
+            .as_deref()
+            .unwrap_or("tinode")
+            .to_string();
+        message_ids_by_app
+            .entry(app_id)
+            .or_default()
+            .push(message_id.to_string());
+    }
+
+    if message_ids_by_app.is_empty() {
+        return 0;
+    }
+
+    // Build a lookup from app_id to app root path.
+    let mut app_root_by_id: BTreeMap<&str, PathBuf> = BTreeMap::new();
+    for app in &environment.registered_apps {
+        app_root_by_id
+            .entry(&app.app_id)
+            .or_insert_with(|| app.app_root(&environment.mount_root));
+    }
+
+    let mut written = 0;
+    for (app_id, message_ids) in message_ids_by_app {
+        let Some(app_root) = app_root_by_id.get(app_id.as_str()) else {
+            continue;
+        };
+        let mark_read_path = app_root.join("inbox").join("mark_read.act");
+        let client_token = format!("auto-wake-{}", now_millis());
+        let payload = serde_json::json!({
+            "scope": "message",
+            "message_ids": message_ids,
+            "client_token": client_token,
+        });
+        let mut line = match serde_json::to_string(&payload) {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!(
+                    "[auto-mark-read] failed to encode payload for app {app_id}: {err}"
+                );
+                continue;
+            }
+        };
+        line.push('\n');
+
+        if let Some(parent) = mark_read_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&mark_read_path)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()) {
+                    eprintln!(
+                        "[auto-mark-read] failed to write to {}: {err}",
+                        mark_read_path.display()
+                    );
+                    continue;
+                }
+                written += message_ids.len();
+            }
+            Err(err) => {
+                eprintln!(
+                    "[auto-mark-read] failed to open {}: {err}",
+                    mark_read_path.display()
+                );
+                continue;
+            }
+        }
+    }
+
+    written
+}
+
 #[cfg(test)]
 pub fn sync_appfs_event_reminders(session: &mut Session, cwd: &Path) -> Result<(), SessionError> {
     sync_appfs_event_reminders_with_outcome(session, cwd).map(|_| ())
@@ -1008,7 +1113,7 @@ fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
             running_delivery: InjectAtNextBoundary,
             idle_delivery: ContextOnly,
         },
-        "action.completed" => AppfsEventClassification {
+        "action.completed" | "message.sent" | "message.read" => AppfsEventClassification {
             input_class: Receipt,
             running_delivery: ContextOnly,
             idle_delivery: ContextOnly,
@@ -1016,11 +1121,6 @@ fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
         "action.failed" => AppfsEventClassification {
             input_class: Receipt,
             running_delivery: InjectAtNextBoundary,
-            idle_delivery: ContextOnly,
-        },
-        "message.sent" => AppfsEventClassification {
-            input_class: Receipt,
-            running_delivery: ContextOnly,
             idle_delivery: ContextOnly,
         },
         "profile.credentials.ready" => AppfsEventClassification {

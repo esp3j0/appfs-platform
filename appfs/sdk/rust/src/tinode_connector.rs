@@ -1507,6 +1507,50 @@ impl TinodeConnector {
                 });
             }
         }
+
+        // Drain any read-receipt notifications received from the Tinode server
+        // (e.g., when another agent reads a message we sent).
+        // Tinode forwards {note what="read"} as {info what="read"} with a
+        // `from` field identifying who read the message.
+        let read_receipts = self.gateway.drain_read_receipts(&credentials)?;
+        for (topic, seq, from_user_id) in read_receipts {
+            let message_id = format!("tinode:{topic}:{seq}");
+            // The `from` field in {info} is the Tinode user ID of the reader.
+            // Map it to the local contact key.
+            let contact_key = self
+                .contacts
+                .values()
+                .find(|contact| contact.tinode_user_id == from_user_id)
+                .or_else(|| {
+                    // Fallback: try matching by topic (P2P topic = peer's user ID)
+                    self.contacts
+                        .values()
+                        .find(|contact| contact.tinode_user_id == topic)
+                })
+                .map(|contact| contact.key.clone())
+                .unwrap_or_else(|| topic.clone());
+            let from_display_name = self
+                .contacts
+                .values()
+                .find(|contact| contact.tinode_user_id == from_user_id)
+                .map(|contact| contact.display_name.clone())
+                .unwrap_or_default();
+            events.push(ConnectorInboundEvent {
+                event_type: "message.read".to_string(),
+                path: format!("contacts/{contact_key}/messages.res.jsonl"),
+                content: Some(json!({
+                    "message_id": message_id,
+                    "conversation_type": "direct",
+                    "contact_key": contact_key,
+                    "topic": topic,
+                    "seq": seq,
+                    "from_tinode_user_id": from_user_id,
+                    "from_display_name": from_display_name,
+                })),
+                error: None,
+            });
+        }
+
         Ok(events)
     }
 
@@ -1567,6 +1611,21 @@ impl TinodeConnector {
                     if self.unread_message_ids.remove(&message_id) {
                         cleared.push(message_id);
                     }
+                }
+            }
+        }
+
+        // Send best-effort read-note packets to the Tinode server for each
+        // cleared message so the sender's Tinode client can show read receipts.
+        let notes: Vec<(String, i64)> = cleared
+            .iter()
+            .filter_map(|id| parse_tinode_message_id(id))
+            .collect();
+        if !notes.is_empty() {
+            let profile_key = effective_profile_id(ctx).unwrap_or_default();
+            if let Some(record) = self.credentials.get(&profile_key) {
+                if let Ok(tinode_creds) = credentials_from_record(record) {
+                    let _ = self.gateway.send_read_notes(&tinode_creds, notes);
                 }
             }
         }
@@ -1826,6 +1885,22 @@ trait TinodeGateway: Send {
         requires_response: Option<bool>,
         client_token: Option<&str>,
     ) -> std::result::Result<TinodeSendReceipt, ConnectorError>;
+
+    /// Send read-note packets to the Tinode server for the given (topic, seq)
+    /// pairs. This is best-effort: failures are logged but do not propagate.
+    fn send_read_notes(
+        &mut self,
+        credentials: &TinodeCredentials,
+        notes: Vec<(String, i64)>,
+    ) -> std::result::Result<(), ConnectorError>;
+
+    /// Drain any accumulated read-receipt `{info what="read"}` notifications
+    /// received from the Tinode server for the given profile.
+    /// Returns (topic, seq, from_user_id) tuples.
+    fn drain_read_receipts(
+        &mut self,
+        credentials: &TinodeCredentials,
+    ) -> std::result::Result<Vec<(String, i64, String)>, ConnectorError>;
 }
 
 #[derive(Debug, Clone)]
@@ -2263,6 +2338,26 @@ impl TinodeGateway for WebSocketTinodeGateway {
             client.send_group_message(group, text, requires_response, client_token)
         })
     }
+
+    fn send_read_notes(
+        &mut self,
+        credentials: &TinodeCredentials,
+        notes: Vec<(String, i64)>,
+    ) -> std::result::Result<(), ConnectorError> {
+        self.with_client(credentials, |client| {
+            for (topic, seq) in &notes {
+                client.send_read_note(topic, *seq);
+            }
+            Ok(())
+        })
+    }
+
+    fn drain_read_receipts(
+        &mut self,
+        credentials: &TinodeCredentials,
+    ) -> std::result::Result<Vec<(String, i64, String)>, ConnectorError> {
+        self.with_client(credentials, |client| Ok(client.drain_read_receipts()))
+    }
 }
 
 struct TinodeWsClient {
@@ -2271,6 +2366,9 @@ struct TinodeWsClient {
     user_id: Option<String>,
     token: Option<String>,
     request_seq: u64,
+    /// Accumulated read-receipt notifications received from the Tinode server
+    /// during request/response cycles. Each entry is (topic, seq, from_user_id).
+    pending_read_receipts: Vec<(String, i64, String)>,
 }
 
 impl TinodeWsClient {
@@ -2292,6 +2390,7 @@ impl TinodeWsClient {
             user_id: None,
             token: None,
             request_seq: 0,
+            pending_read_receipts: Vec::new(),
         };
         client.request(
             "hi",
@@ -2752,6 +2851,7 @@ impl TinodeWsClient {
         let mut messages = Vec::new();
         for _ in 0..400 {
             let msg = self.read_message_json()?;
+            self.maybe_capture_read_receipt(&msg);
             if let Some(data) = msg.get("data") {
                 if data.get("topic").and_then(JsonValue::as_str) == Some(topic) {
                     if let Some(message) = inbound_message_from_data(data) {
@@ -2792,6 +2892,7 @@ impl TinodeWsClient {
     ) -> std::result::Result<JsonValue, ConnectorError> {
         for _ in 0..200 {
             let msg = self.read_message_json()?;
+            self.maybe_capture_read_receipt(&msg);
             let Some(ctrl) = msg.get("ctrl") else {
                 continue;
             };
@@ -2829,6 +2930,50 @@ impl TinodeWsClient {
                 true,
             )
         })
+    }
+
+    /// Check if an incoming message is a `{info what="read"}` notification and,
+    /// if so, buffer it for later retrieval via `drain_read_receipts()`.
+    ///
+    /// Tinode forwards client-generated `{note}` packets as `{info}` messages
+    /// to other sessions. See Tinode API docs: `{info}` section.
+    fn maybe_capture_read_receipt(&mut self, msg: &JsonValue) {
+        if let Some(info) = msg.get("info") {
+            if info.get("what").and_then(JsonValue::as_str) == Some("read") {
+                if let (Some(topic), Some(seq)) = (
+                    info.get("topic").and_then(JsonValue::as_str),
+                    info.get("seq").and_then(JsonValue::as_i64),
+                ) {
+                    let from = info
+                        .get("from")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.pending_read_receipts
+                        .push((topic.to_string(), seq, from));
+                }
+            }
+        }
+    }
+
+    /// Drain all accumulated read-receipt notifications.
+    /// Returns (topic, seq, from_user_id) tuples.
+    fn drain_read_receipts(&mut self) -> Vec<(String, i64, String)> {
+        std::mem::take(&mut self.pending_read_receipts)
+    }
+
+    /// Send a best-effort read-note to the Tinode server for the given topic
+    /// and seq. Tinode does not respond to `{note}` packets, so this is
+    /// fire-and-forget. Failures are silently ignored.
+    fn send_read_note(&mut self, topic: &str, seq: i64) {
+        let packet = json!({
+            "note": {
+                "topic": topic,
+                "what": "read",
+                "seq": seq,
+            }
+        });
+        let _ = self.send_packet(packet);
     }
 
     fn read_message_json(&mut self) -> std::result::Result<JsonValue, ConnectorError> {
@@ -3177,6 +3322,16 @@ fn credentials_from_record(
         login,
         token,
     })
+}
+
+/// Parse a Tinode message_id in the form `tinode:<topic>:<seq>` into its
+/// constituent topic and seq. Returns `None` if the format does not match.
+fn parse_tinode_message_id(message_id: &str) -> Option<(String, i64)> {
+    let message_id = message_id.strip_prefix("tinode:")?;
+    let colon_pos = message_id.rfind(':')?;
+    let topic = &message_id[..colon_pos];
+    let seq: i64 = message_id[colon_pos + 1..].parse().ok()?;
+    Some((topic.to_string(), seq))
 }
 
 fn recipient_ref_from_payload(
@@ -3876,6 +4031,7 @@ mod tests {
         inbound: Vec<TinodeInboundMessage>,
         fetched_since: Vec<Option<i64>>,
         fail_resolve: bool,
+        read_notes_sent: Vec<(String, i64)>,
     }
 
     struct MockTinodeGateway {
@@ -4022,6 +4178,26 @@ mod tests {
                 message_id: format!("tinode:{}:1", group.topic_id),
                 seq: Some(1),
             })
+        }
+
+        fn send_read_notes(
+            &mut self,
+            _credentials: &TinodeCredentials,
+            notes: Vec<(String, i64)>,
+        ) -> std::result::Result<(), ConnectorError> {
+            self.state
+                .lock()
+                .expect("mock state")
+                .read_notes_sent
+                .extend(notes);
+            Ok(())
+        }
+
+        fn drain_read_receipts(
+            &mut self,
+            _credentials: &TinodeCredentials,
+        ) -> std::result::Result<Vec<(String, i64, String)>, ConnectorError> {
+            Ok(Vec::new())
         }
     }
 
