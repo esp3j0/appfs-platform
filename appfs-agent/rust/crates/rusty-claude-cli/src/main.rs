@@ -50,6 +50,7 @@ use runtime::{
     load_oauth_credentials, load_system_prompt_with_appfs, parse_oauth_callback_request_target,
     pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
     scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
+    auto_mark_read_for_wake_inputs,
     ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
     AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
@@ -4591,6 +4592,19 @@ impl LiveCli {
             return Ok(false);
         }
 
+        // Auto mark received messages as read before waking the agent.
+        let cwd = env::current_dir()?;
+        let marked = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
+        if marked > 0 {
+            if let Some(redraw_handle) = &self.redraw_handle {
+                redraw_handle.write_output(format!(
+                    "AppFS auto-marked {marked} message(s) as read.\n"
+                ));
+            } else {
+                println!("AppFS auto-marked {marked} message(s) as read.");
+            }
+        }
+
         let rendered_inputs = render_pending_input_echoes(&pending_inputs);
         if !rendered_inputs.is_empty() {
             if let Some(redraw_handle) = &self.redraw_handle {
@@ -4621,6 +4635,19 @@ impl LiveCli {
         let new_event_count = pending_inputs.len();
         if pending_inputs.is_empty() {
             return Ok(false);
+        }
+
+        // Auto mark received messages as read before waking the agent.
+        let cwd = env::current_dir()?;
+        let marked = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
+        if marked > 0 {
+            if let Some(redraw_handle) = &self.redraw_handle {
+                redraw_handle.write_output(format!(
+                    "AppFS auto-marked {marked} message(s) as read.\n"
+                ));
+            } else {
+                println!("AppFS auto-marked {marked} message(s) as read.");
+            }
         }
 
         let rendered_inputs = render_pending_input_echoes(&pending_inputs);

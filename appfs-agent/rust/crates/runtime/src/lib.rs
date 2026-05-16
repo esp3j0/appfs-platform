@@ -50,9 +50,10 @@ mod windows_shell;
 pub mod worker_boot;
 
 pub use appfs::{
-    attach_appfs_principal, create_appfs_principal, detach_appfs_principal,
-    detect_appfs_environment, ensure_appfs_attach_identity, resolve_appfs_environment,
-    scan_appfs_attention_events_for_idle_wake, warmup_appfs_private_apps, AppfsAttachEnsureOutcome,
+    attach_appfs_principal, auto_mark_read_for_wake_inputs, create_appfs_principal,
+    detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
+    resolve_appfs_environment, scan_appfs_attention_events_for_idle_wake,
+    warmup_appfs_private_apps, AppfsAttachEnsureOutcome,
     AppfsAttachEnsureStatus, AppfsAttachLease, AppfsAttachSource, AppfsEnvironment,
     AppfsIdleWakeScanOutcome, AppfsPrincipalCreateOutcome, AppfsPrincipalCreateRequest,
     AppfsPrincipalCreateStatus, AppfsPrincipalSummary, AppfsPrivateAppWarmupOutcome,
