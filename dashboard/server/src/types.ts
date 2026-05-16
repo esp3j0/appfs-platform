@@ -7,6 +7,7 @@ export interface SessionMetaRecord {
   created_at_ms: number;
   updated_at_ms: number;
   workspace_root?: string;
+  appfs_principal_id?: string;
   invoked_skills?: unknown[];
   appfs_event_cursors?: Record<string, unknown>;
   appfs_wake_event_cursors?: Record<string, unknown>;

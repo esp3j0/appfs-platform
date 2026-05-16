@@ -109,11 +109,13 @@ export class AgentRegistry {
     const content = fs.readFileSync(fullPath, 'utf-8');
     const sess = parseMeta(content);
     const msgs = parseMessages(content);
-    const name = sess?.session_id ?? path.basename(fullPath, '.jsonl');
+    // Use principal_id as the display name when available, fallback to session_id
+    const principalId = sess?.appfs_principal_id;
+    const name = principalId ?? sess?.session_id ?? path.basename(fullPath, '.jsonl');
 
     this.agents.set(name, {
       name,
-      principalId: name,
+      principalId: principalId ?? name,
       sessionId: sess?.session_id ?? name,
       model: 'unknown',
       pid: 0,

@@ -4225,7 +4225,11 @@ impl LiveCli {
             warmup_live_cli_appfs_private_apps();
         }
         let system_prompt = build_system_prompt()?;
-        let session_state = Session::new();
+        let mut session_state = Session::new();
+        if let Some(lease) = &appfs_attach_lease {
+            session_state =
+                session_state.with_appfs_principal_id(lease.principal_id.as_str());
+        }
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -5188,7 +5192,11 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = Session::new();
+        let mut session_state = Session::new();
+        if let Some(lease) = &self.appfs_attach_lease {
+            session_state =
+                session_state.with_appfs_principal_id(lease.principal_id.as_str());
+        }
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),

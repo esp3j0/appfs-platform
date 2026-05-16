@@ -170,6 +170,8 @@ pub struct Session {
     pub invoked_skills: Vec<InvokedSkill>,
     pub appfs_event_cursors: BTreeMap<String, i64>,
     pub appfs_wake_event_cursors: BTreeMap<String, i64>,
+    /// AppFS principal this session is bound to (set after environment detection).
+    pub appfs_principal_id: Option<String>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -240,6 +242,7 @@ impl Session {
             invoked_skills: Vec::new(),
             appfs_event_cursors: BTreeMap::new(),
             appfs_wake_event_cursors: BTreeMap::new(),
+            appfs_principal_id: None,
             persistence: None,
         }
     }
@@ -258,6 +261,13 @@ impl Session {
     #[must_use]
     pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
         self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    /// Bind this session to an AppFS principal.
+    #[must_use]
+    pub fn with_appfs_principal_id(mut self, principal_id: impl Into<String>) -> Self {
+        self.appfs_principal_id = Some(principal_id.into());
         self
     }
 
@@ -467,6 +477,7 @@ impl Session {
             invoked_skills: self.invoked_skills.clone(),
             appfs_event_cursors: self.appfs_event_cursors.clone(),
             appfs_wake_event_cursors: self.appfs_wake_event_cursors.clone(),
+            appfs_principal_id: self.appfs_principal_id.clone(),
             persistence: None,
         }
     }
@@ -544,6 +555,12 @@ impl Session {
                 appfs_event_cursors_to_json(&self.appfs_wake_event_cursors),
             );
         }
+        if let Some(principal_id) = &self.appfs_principal_id {
+            object.insert(
+                "appfs_principal_id".to_string(),
+                JsonValue::String(principal_id.clone()),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -613,6 +630,10 @@ impl Session {
             .map(appfs_event_cursors_from_json)
             .transpose()?
             .unwrap_or_default();
+        let appfs_principal_id = object
+            .get("appfs_principal_id")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         Ok(Self {
             version,
             session_id,
@@ -626,6 +647,7 @@ impl Session {
             invoked_skills,
             appfs_event_cursors,
             appfs_wake_event_cursors,
+            appfs_principal_id,
             persistence: None,
         })
     }
@@ -643,6 +665,7 @@ impl Session {
         let mut invoked_skills = Vec::new();
         let mut appfs_event_cursors = BTreeMap::new();
         let mut appfs_wake_event_cursors = BTreeMap::new();
+        let mut appfs_principal_id = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -690,6 +713,10 @@ impl Session {
                     if let Some(value) = object.get("appfs_wake_event_cursors") {
                         appfs_wake_event_cursors = appfs_event_cursors_from_json(value)?;
                     }
+                    appfs_principal_id = object
+                        .get("appfs_principal_id")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -735,6 +762,7 @@ impl Session {
             invoked_skills,
             appfs_event_cursors,
             appfs_wake_event_cursors,
+            appfs_principal_id,
             persistence: None,
         })
     }
@@ -850,6 +878,12 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if let Some(principal_id) = &self.appfs_principal_id {
+            object.insert(
+                "appfs_principal_id".to_string(),
+                JsonValue::String(principal_id.clone()),
             );
         }
         if !self.invoked_skills.is_empty() {
