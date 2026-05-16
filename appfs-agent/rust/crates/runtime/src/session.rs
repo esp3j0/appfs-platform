@@ -172,6 +172,8 @@ pub struct Session {
     pub appfs_wake_event_cursors: BTreeMap<String, i64>,
     /// AppFS principal this session is bound to (set after environment detection).
     pub appfs_principal_id: Option<String>,
+    /// LLM model used for this session (e.g. "claude-sonnet-4-20250514").
+    pub model: Option<String>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -243,6 +245,7 @@ impl Session {
             appfs_event_cursors: BTreeMap::new(),
             appfs_wake_event_cursors: BTreeMap::new(),
             appfs_principal_id: None,
+            model: None,
             persistence: None,
         }
     }
@@ -268,6 +271,13 @@ impl Session {
     #[must_use]
     pub fn with_appfs_principal_id(mut self, principal_id: impl Into<String>) -> Self {
         self.appfs_principal_id = Some(principal_id.into());
+        self
+    }
+
+    /// Set the LLM model for this session.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -478,6 +488,7 @@ impl Session {
             appfs_event_cursors: self.appfs_event_cursors.clone(),
             appfs_wake_event_cursors: self.appfs_wake_event_cursors.clone(),
             appfs_principal_id: self.appfs_principal_id.clone(),
+            model: self.model.clone(),
             persistence: None,
         }
     }
@@ -561,6 +572,12 @@ impl Session {
                 JsonValue::String(principal_id.clone()),
             );
         }
+        if let Some(model) = &self.model {
+            object.insert(
+                "model".to_string(),
+                JsonValue::String(model.clone()),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -634,6 +651,10 @@ impl Session {
             .get("appfs_principal_id")
             .and_then(JsonValue::as_str)
             .map(ToOwned::to_owned);
+        let model = object
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         Ok(Self {
             version,
             session_id,
@@ -648,6 +669,7 @@ impl Session {
             appfs_event_cursors,
             appfs_wake_event_cursors,
             appfs_principal_id,
+            model,
             persistence: None,
         })
     }
@@ -666,6 +688,7 @@ impl Session {
         let mut appfs_event_cursors = BTreeMap::new();
         let mut appfs_wake_event_cursors = BTreeMap::new();
         let mut appfs_principal_id = None;
+        let mut model = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -717,6 +740,10 @@ impl Session {
                         .get("appfs_principal_id")
                         .and_then(JsonValue::as_str)
                         .map(ToOwned::to_owned);
+                    model = object
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -763,6 +790,7 @@ impl Session {
             appfs_event_cursors,
             appfs_wake_event_cursors,
             appfs_principal_id,
+            model,
             persistence: None,
         })
     }
@@ -884,6 +912,12 @@ impl Session {
             object.insert(
                 "appfs_principal_id".to_string(),
                 JsonValue::String(principal_id.clone()),
+            );
+        }
+        if let Some(model) = &self.model {
+            object.insert(
+                "model".to_string(),
+                JsonValue::String(model.clone()),
             );
         }
         if !self.invoked_skills.is_empty() {

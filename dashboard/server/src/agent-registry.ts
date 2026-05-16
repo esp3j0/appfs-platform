@@ -117,7 +117,7 @@ export class AgentRegistry {
       name,
       principalId: principalId ?? name,
       sessionId: sess?.session_id ?? name,
-      model: 'unknown',
+      model: sess?.model ?? 'unknown',
       pid: 0,
       startedAt: sess?.created_at_ms ?? Date.now(),
       sessionJsonlPath: fullPath,

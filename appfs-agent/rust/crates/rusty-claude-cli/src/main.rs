@@ -4225,7 +4225,7 @@ impl LiveCli {
             warmup_live_cli_appfs_private_apps();
         }
         let system_prompt = build_system_prompt()?;
-        let mut session_state = Session::new();
+        let mut session_state = Session::new().with_model(&model);
         if let Some(lease) = &appfs_attach_lease {
             session_state =
                 session_state.with_appfs_principal_id(lease.principal_id.as_str());
@@ -5192,7 +5192,7 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let mut session_state = Session::new();
+        let mut session_state = Session::new().with_model(&self.model);
         if let Some(lease) = &self.appfs_attach_lease {
             session_state =
                 session_state.with_appfs_principal_id(lease.principal_id.as_str());
