@@ -111,6 +111,8 @@ pub struct ConversationMessage {
     pub hook_result_metadata: Option<HookResultMetadata>,
     pub is_compact_summary: bool,
     pub is_visible_in_transcript_only: bool,
+    /// Wall-clock epoch millis when this message was created (survives compaction).
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -981,6 +983,7 @@ impl ConversationMessage {
             hook_result_metadata,
             is_compact_summary,
             is_visible_in_transcript_only,
+            timestamp_ms: current_time_millis(),
         }
     }
 
@@ -1186,6 +1189,10 @@ impl ConversationMessage {
                 JsonValue::Bool(true),
             );
         }
+        object.insert(
+            "timestamp_ms".to_string(),
+            JsonValue::Number(i64_from_u64(self.timestamp_ms, "timestamp_ms").unwrap_or(0)),
+        );
         JsonValue::Object(object)
     }
 
@@ -1296,6 +1303,11 @@ impl ConversationMessage {
             hook_result_metadata,
             is_compact_summary,
             is_visible_in_transcript_only,
+            timestamp_ms: object
+                .get("timestamp_ms")
+                .and_then(JsonValue::as_i64)
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0),
         })
     }
 }
@@ -1821,13 +1833,6 @@ impl InvokedSkill {
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
-    object.insert(
-        "timestamp_ms".to_string(),
-        JsonValue::Number(i64_from_u64(
-            current_time_millis(),
-            "timestamp_ms",
-        ).unwrap_or(0)),
-    );
     object.insert("message".to_string(), message.to_json());
     JsonValue::Object(object)
 }

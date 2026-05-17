@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { AgentRegistry } from '../agent-registry.js';
-import type { TimelineEntry, ContentBlock, CrossAgentInteraction } from '../types.js';
+import type { TimelineEntry, MessageRecord, ContentBlock, CrossAgentInteraction } from '../types.js';
 
 export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegistry): void {
   app.get('/api/timeline', async (request) => {
@@ -11,15 +11,18 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
       return { entries: [], interactions: [] };
     }
 
-    const entries: TimelineEntry[] = [];
     const interactions: CrossAgentInteraction[] = [];
+
+    // Build per-agent ordered timelines
+    const perAgent: Map<string, TimelineEntry[]> = new Map();
 
     for (const name of agentNames) {
       const msgs = registry.getMessages(name);
+      const entries: TimelineEntry[] = [];
       for (const rec of msgs) {
         const msg = rec.message;
         const content = extractTextContent(msg.blocks);
-        const timestamp = rec.timestamp_ms ?? 0;
+        const timestamp = msg.timestamp_ms ?? 0;
         const entry: TimelineEntry = {
           agentName: name,
           timestamp,
@@ -55,13 +58,56 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
           }
         }
       }
+      perAgent.set(name, entries);
     }
 
-    // Sort by real timestamp; stable sort preserves JSONL order for ties
-    entries.sort((a, b) => a.timestamp - b.timestamp);
+    // Merge per-agent timelines by timestamp, preserving JSONL order within
+    // each agent (stable for equal timestamps). This is a k-way merge.
+    const merged = mergeTimelines(perAgent);
 
-    return { entries, interactions };
+    return { entries: merged, interactions };
   });
+}
+
+/**
+ * K-way merge of per-agent timelines.
+ *
+ * Each agent's timeline is already in chronological JSONL order.
+ * We merge them by comparing the current head of each list using
+ * their timestamp_ms, preserving intra-agent order when timestamps
+ * are equal (batch persistence).
+ */
+function mergeTimelines(perAgent: Map<string, TimelineEntry[]>): TimelineEntry[] {
+  // Create index pointers for each agent
+  const indices = new Map<string, number>();
+  const total = Array.from(perAgent.values()).reduce((s, e) => s + e.length, 0);
+  const result: TimelineEntry[] = [];
+  result.length = total;
+
+  for (let i = 0; i < total; i++) {
+    // Find the agent with the smallest timestamp at its current position
+    let bestAgent: string | null = null;
+    let bestTs = Infinity;
+
+    for (const [name, entries] of perAgent) {
+      const idx = indices.get(name) ?? 0;
+      if (idx < entries.length) {
+        const ts = entries[idx].timestamp;
+        if (ts < bestTs) {
+          bestTs = ts;
+          bestAgent = name;
+        }
+      }
+    }
+
+    if (bestAgent === null) break;
+
+    const idx = indices.get(bestAgent) ?? 0;
+    result[i] = perAgent.get(bestAgent)![idx];
+    indices.set(bestAgent, idx + 1);
+  }
+
+  return result;
 }
 
 function extractTextContent(blocks: ContentBlock[]): string {

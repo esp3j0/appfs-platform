@@ -16,7 +16,6 @@ export interface SessionMetaRecord {
 
 export interface MessageRecord {
   type: 'message';
-  timestamp_ms?: number;
   message: ConversationMessage;
 }
 
@@ -35,6 +34,7 @@ export interface ConversationMessage {
   hook_result_metadata?: unknown;
   is_compact_summary?: boolean;
   is_visible_in_transcript_only?: boolean;
+  timestamp_ms?: number;
 }
 
 export type ContentBlock =
