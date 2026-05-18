@@ -1,4 +1,4 @@
-import type { JsonlRecord, MessageRecord, SessionMetaRecord } from './types.js';
+import type { CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, JsonlRecord, MessageRecord, SessionMetaRecord } from './types.js';
 
 /**
  * Parse a complete JSONL file into records.
@@ -36,6 +36,35 @@ export function parseMessages(content: string): MessageRecord[] {
 export function parseMeta(content: string): SessionMetaRecord | undefined {
   return parseJsonl(content).find(
     (r): r is SessionMetaRecord => r.type === 'session_meta',
+  );
+}
+
+/**
+ * Parse only debug-dump (message_request) records from JSONL content.
+ */
+export function parseDebugDumps(content: string): DebugDumpRecord[] {
+  return parseJsonl(content).filter(
+    (r): r is DebugDumpRecord => r.type === 'message_request',
+  );
+}
+
+/**
+ * Parse only compaction archive records from JSONL content.
+ * These contain messages that were removed during session compaction.
+ */
+export function parseCompactionArchives(content: string): CompactionArchiveRecord[] {
+  return parseJsonl(content).filter(
+    (r): r is CompactionArchiveRecord => r.type === 'compaction_archive',
+  );
+}
+
+/**
+ * Parse only compaction boundary records from JSONL content.
+ * These mark the point where a session compaction removed older messages.
+ */
+export function parseCompactionBoundaries(content: string): CompactionBoundaryRecord[] {
+  return parseJsonl(content).filter(
+    (r): r is CompactionBoundaryRecord => r.type === 'compaction_boundary',
   );
 }
 

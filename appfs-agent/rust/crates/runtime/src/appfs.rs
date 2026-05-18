@@ -712,10 +712,7 @@ pub struct AppfsIdleWakeScanOutcome {
 ///
 /// Returns the number of mark-read actions written. Errors are logged and
 /// do not propagate — auto mark-read is best-effort.
-pub fn auto_mark_read_for_wake_inputs(
-    pending_inputs: &[PendingInput],
-    cwd: &Path,
-) -> usize {
+pub fn auto_mark_read_for_wake_inputs(pending_inputs: &[PendingInput], cwd: &Path) -> usize {
     let Some(environment) = detect_appfs_environment(cwd) else {
         return 0;
     };
@@ -771,9 +768,7 @@ pub fn auto_mark_read_for_wake_inputs(
         let mut line = match serde_json::to_string(&payload) {
             Ok(line) => line,
             Err(err) => {
-                eprintln!(
-                    "[auto-mark-read] failed to encode payload for app {app_id}: {err}"
-                );
+                eprintln!("[auto-mark-read] failed to encode payload for app {app_id}: {err}");
                 continue;
             }
         };

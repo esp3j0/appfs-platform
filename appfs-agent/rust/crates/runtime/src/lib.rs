@@ -53,14 +53,13 @@ pub use appfs::{
     attach_appfs_principal, auto_mark_read_for_wake_inputs, create_appfs_principal,
     detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
     resolve_appfs_environment, scan_appfs_attention_events_for_idle_wake,
-    warmup_appfs_private_apps, AppfsAttachEnsureOutcome,
-    AppfsAttachEnsureStatus, AppfsAttachLease, AppfsAttachSource, AppfsEnvironment,
-    AppfsIdleWakeScanOutcome, AppfsPrincipalCreateOutcome, AppfsPrincipalCreateRequest,
-    AppfsPrincipalCreateStatus, AppfsPrincipalSummary, AppfsPrivateAppWarmupOutcome,
-    AppfsPrivateAppWarmupStatus, AppfsRegisteredApp, AppfsRegisteredAppVisibility,
-    AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
-    APPFS_DEFAULT_PRINCIPAL_ID, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_PRINCIPAL_ID_ENV,
-    APPFS_RUNTIME_MANIFEST_REL_PATH,
+    warmup_appfs_private_apps, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
+    AppfsAttachSource, AppfsEnvironment, AppfsIdleWakeScanOutcome, AppfsPrincipalCreateOutcome,
+    AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrincipalSummary,
+    AppfsPrivateAppWarmupOutcome, AppfsPrivateAppWarmupStatus, AppfsRegisteredApp,
+    AppfsRegisteredAppVisibility, AppfsRuntimeManifest, AppfsRuntimeManifestCapabilities,
+    AppfsRuntimeManifestControlPlane, APPFS_DEFAULT_PRINCIPAL_ID, APPFS_MULTI_AGENT_MODE_SHARED,
+    APPFS_PRINCIPAL_ID_ENV, APPFS_RUNTIME_MANIFEST_REL_PATH,
 };
 pub use bash::{
     decode_command_output, execute_bash, prepare_background_shell_output,
@@ -103,7 +102,8 @@ pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
 pub use input_router::{
-    InputEnvelope, InputSource, PendingInput, PendingInputDelivery, SharedPendingInputQueue,
+    render_input_router_block, InputEnvelope, InputSource, PendingInput, PendingInputDelivery,
+    SharedPendingInputQueue,
 };
 pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
@@ -173,8 +173,8 @@ pub use sandbox::{
 pub use session::{
     AttachmentKind, AttachmentMetadata, CompactBoundaryMetadata, CompactPreservedSegment,
     CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, HookResultMetadata,
-    InvokedSkill, MessageRole, Session, SessionCompaction, SessionError, SessionFork,
-    SessionPromptEntry, SystemMessageSubtype,
+    InputRouterBlockInput, InvokedSkill, MessageRole, Session, SessionCompaction, SessionError,
+    SessionFork, SessionPromptEntry, SystemMessageSubtype,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

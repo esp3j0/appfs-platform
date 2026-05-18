@@ -7,7 +7,7 @@ import type { MessageRecord } from './types.js';
 export type FileChangeHandler = (agentName: string, newRecords: MessageRecord[]) => void;
 
 export class FileWatcher {
-  private watcher: chokidar.FSWatcher | null = null;
+  private watcher: ReturnType<typeof chokidar.watch> | null = null;
   private lineCounts = new Map<string, number>();
 
   constructor(private registry: AgentRegistry) {}

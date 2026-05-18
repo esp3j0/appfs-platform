@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use crate::input_router::render_input_router_block;
 use crate::session::{
     AttachmentKind, CompactBoundaryMetadata, CompactPreservedSegment, CompactTrigger, ContentBlock,
     ConversationMessage, InvokedSkill, MessageRole, Session,
@@ -123,6 +124,10 @@ pub struct CompactionResult {
     pub formatted_summary: String,
     pub compacted_session: Session,
     pub removed_message_count: usize,
+    /// Messages that were removed during compaction, in their original order.
+    /// Available for external archiving (e.g., debug dashboard) before they
+    /// are discarded. Empty when no messages were removed.
+    pub removed_messages: Vec<ConversationMessage>,
     pub user_display_message: Option<String>,
 }
 
@@ -462,11 +467,26 @@ pub(crate) fn build_compaction_result(
     compacted_session.messages = compacted_messages;
     compacted_session.record_compaction(summary.clone(), removed_message_count);
 
+    // Collect messages that were removed by this compaction.
+    // Surviving UUIDs are those in the compacted session messages.
+    let surviving_uuids: std::collections::HashSet<&str> = compacted_session
+        .messages
+        .iter()
+        .map(|m| m.uuid.as_str())
+        .collect();
+    let removed_messages: Vec<ConversationMessage> = session
+        .messages
+        .iter()
+        .filter(|m| !surviving_uuids.contains(m.uuid.as_str()))
+        .cloned()
+        .collect();
+
     CompactionResult {
         summary,
         formatted_summary,
         compacted_session,
         removed_message_count,
+        removed_messages,
         user_display_message,
     }
 }
@@ -624,6 +644,7 @@ fn create_plan_mode_context_message(
                 parse_tool_result_json_prefix::<CompactPlanModeOutput>(output)
             }
             ContentBlock::Text { .. }
+            | ContentBlock::InputRouter { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
         })?;
@@ -721,6 +742,7 @@ fn successful_tool_outputs<'a>(
                 ..
             } if !*is_error && block_tool_name == tool_name => Some(output.as_str()),
             ContentBlock::Text { .. }
+            | ContentBlock::InputRouter { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
         })
@@ -741,6 +763,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
             formatted_summary: String::new(),
             compacted_session: session.clone(),
             removed_message_count: 0,
+            removed_messages: Vec::new(),
             user_display_message: None,
         };
     }
@@ -788,7 +811,7 @@ fn collect_discovered_tools(messages: &[ConversationMessage]) -> Vec<String> {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::InputRouter { .. } => None,
         })
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -912,6 +935,7 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
+        ContentBlock::InputRouter { inputs } => render_input_router_block(inputs),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -971,6 +995,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
         .flat_map(|message| message.blocks.iter())
         .map(|block| match block {
             ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::InputRouter { .. } => "",
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
         })
@@ -993,7 +1018,8 @@ fn infer_current_work(messages: &[ConversationMessage]) -> Option<String> {
 fn first_text_block(message: &ConversationMessage) -> Option<&str> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-        ContentBlock::ToolUse { .. }
+        ContentBlock::InputRouter { .. }
+        | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
         | ContentBlock::Text { .. } => None,
     })
@@ -1041,6 +1067,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
+            ContentBlock::InputRouter { inputs } => render_input_router_block(inputs).len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
                 tool_name, output, ..
@@ -1675,7 +1702,9 @@ mod tests {
             .iter()
             .filter_map(|message| match &message.blocks[0] {
                 ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                ContentBlock::InputRouter { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1739,7 +1768,9 @@ mod tests {
             .expect("legacy skill context message");
         let rendered = match &message.blocks[0] {
             ContentBlock::Text { text } => text,
-            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => {
+            ContentBlock::InputRouter { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => {
                 panic!("expected text attachment")
             }
         };

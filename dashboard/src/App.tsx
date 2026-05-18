@@ -5,12 +5,22 @@ import { TopBar } from './components/TopBar';
 import { AgentSidebar } from './components/AgentSidebar';
 import { TimelinePanel } from './components/TimelinePanel';
 import { InfoPanel } from './components/InfoPanel';
+import { ModelViewPanel } from './components/ModelViewPanel';
+
+type MainView = 'timeline' | 'model';
+
+const EMPTY_TIMELINE: TimelineResponse = {
+  entries: [],
+  interactions: [],
+  compactionBoundaries: [],
+};
 
 export function App() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
-  const [timeline, setTimeline] = useState<TimelineResponse>({ entries: [], interactions: [] });
+  const [timeline, setTimeline] = useState<TimelineResponse>(EMPTY_TIMELINE);
   const [filter, setFilter] = useState<string>('all');
+  const [mainView, setMainView] = useState<MainView>('timeline');
 
   useEffect(() => {
     fetch('/api/agents')
@@ -26,12 +36,15 @@ export function App() {
 
   const loadTimeline = useCallback((names: string[]) => {
     if (names.length === 0) {
-      setTimeline({ entries: [], interactions: [] });
+      setTimeline(EMPTY_TIMELINE);
       return;
     }
     fetch(`/api/timeline?agents=${names.map(encodeURIComponent).join(',')}`)
       .then(r => r.json())
-      .then((data: TimelineResponse) => setTimeline(data))
+      .then((data: TimelineResponse) => setTimeline({
+        ...data,
+        compactionBoundaries: data.compactionBoundaries ?? [],
+      }))
       .catch(() => {});
   }, []);
 
@@ -41,10 +54,18 @@ export function App() {
 
   useSSE('/api/events', {
     onMessage: (entry) => {
-      setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      if (selectedAgents.has(entry.agentName)) {
+        loadTimeline(Array.from(selectedAgents));
+      } else {
+        setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      }
     },
     onDebugDump: (entry) => {
-      setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      if (selectedAgents.has(entry.agentName)) {
+        loadTimeline(Array.from(selectedAgents));
+      } else {
+        setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      }
     },
     onAgentOnline: (agent: any) => {
       setAgents(prev => {
@@ -66,12 +87,13 @@ export function App() {
     });
   };
 
+  const crossEntryIds = new Set(timeline.interactions.map(i => i.entryId));
   const filtered = filter === 'all'
     ? timeline.entries
     : timeline.entries.filter(e => {
         if (filter === 'model') return e.role === 'assistant' || e.source === 'debug-dump';
         if (filter === 'tools') return e.role === 'tool' || e.content.includes('tool_use');
-        if (filter === 'cross') return timeline.interactions.some(i => i.fromAgent === e.agentName || i.toAgent === e.agentName);
+        if (filter === 'cross') return crossEntryIds.has(e.id);
         return true;
       });
 
@@ -80,7 +102,17 @@ export function App() {
       <TopBar agentCount={agents.filter(a => a.status === 'online').length} />
       <div className="main-layout">
         <AgentSidebar agents={agents} selected={selectedAgents} onToggle={toggleAgent} />
-        <TimelinePanel selectedAgents={Array.from(selectedAgents)} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
+        <div className="work-area">
+          <div className="view-tabs">
+            <button className={`view-tab ${mainView === 'timeline' ? 'active' : ''}`} onClick={() => setMainView('timeline')}>Timeline</button>
+            <button className={`view-tab ${mainView === 'model' ? 'active' : ''}`} onClick={() => setMainView('model')}>Model</button>
+          </div>
+          {mainView === 'timeline' ? (
+            <TimelinePanel selectedAgents={Array.from(selectedAgents)} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
+          ) : (
+            <ModelViewPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} compactionBoundaries={timeline.compactionBoundaries ?? []} />
+          )}
+        </div>
         <InfoPanel agents={agents.filter(a => selectedAgents.has(a.name))} interactions={timeline.interactions} />
       </div>
     </>

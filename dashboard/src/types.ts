@@ -15,6 +15,7 @@ export interface AgentInfo {
 export interface ContentBlock {
   type: string;
   text?: string;
+  inputs?: InputRouterBlockInput[];
   id?: string;
   name?: string;
   input?: string;
@@ -22,6 +23,20 @@ export interface ContentBlock {
   tool_name?: string;
   output?: string;
   is_error?: boolean;
+}
+
+export interface InputRouterBlockInput {
+  source: string;
+  input_type: string;
+  text: string;
+  principal_id?: string;
+  app_id?: string;
+  stream_id?: string;
+  seq?: number;
+  correlation_id?: string;
+  requires_attention?: boolean;
+  delivery?: string;
+  payload?: unknown;
 }
 
 export interface ConversationMessage {
@@ -38,26 +53,49 @@ export interface ConversationMessage {
   is_compact_summary?: boolean;
 }
 
+export interface AppfsEventRecord {
+  id: string;
+  parentMessageUuid: string;
+  source: string;
+  eventType: string;
+  principal?: string;
+  fromAgent?: string;
+  toAgent?: string;
+  app?: string;
+  stream?: string;
+  seq?: number;
+  correlationId?: string;
+  contactKey?: string;
+  text?: string;
+  rawLine: string;
+}
+
 export interface DebugDumpRecord {
   type: 'message_request';
   timestamp_ms: number;
   request_index: number;
   model: string;
   max_tokens: number;
-  system_prompt: string;
-  system_prompt_length: number;
-  message_count: number;
-  messages: { role: string; content: string }[];
-  tools_count: number;
-  tools: { name: string; description: string }[];
+  /** The system prompt sent to the API (field name matches MessageRequest) */
+  system?: string;
+  /** Legacy debug-dump field from early dashboard fixtures */
+  system_prompt?: string;
+  system_prompt_length?: number;
+  message_count?: number;
+  /** Messages sent to the API — InputMessage[] from the api crate */
+  messages: { role: string; content: unknown[] }[];
+  /** Tool definitions sent to the API */
+  tools?: { name: string; description?: string; input_schema: unknown }[];
+  tools_count?: number;
   stream: boolean;
-  reasoning_effort: string | null;
+  reasoning_effort?: string | null;
 }
 
 export interface TimelineEntry {
+  id: string;
   agentName: string;
   timestamp: number;
-  source: 'session' | 'debug-dump';
+  source: 'session' | 'debug-dump' | 'compaction-archive';
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   raw: ConversationMessage | DebugDumpRecord;
@@ -67,19 +105,30 @@ export interface TimelineEntry {
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
   };
+  appfsEvents?: AppfsEventRecord[];
 }
 
 export interface CrossAgentInteraction {
+  entryId: string;
   fromAgent: string;
   toAgent: string;
   eventType: string;
   timestamp: number;
+  seq?: number;
   label: string;
+}
+
+export interface TimelineCompactionBoundary {
+  agentName: string;
+  timestamp: number;
+  compactionCount: number;
+  archivedMessageCount: number;
 }
 
 export interface TimelineResponse {
   entries: TimelineEntry[];
   interactions: CrossAgentInteraction[];
+  compactionBoundaries: TimelineCompactionBoundary[];
 }
 
 export const AGENT_COLORS = ['#58a6ff', '#3fb950', '#d2a8ff', '#d29922', '#39d2c0', '#f778ba'] as const;

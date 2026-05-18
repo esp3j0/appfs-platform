@@ -39,8 +39,23 @@ export interface ConversationMessage {
 
 export type ContentBlock =
   | { type: 'text'; text: string }
+  | { type: 'input_router'; inputs: InputRouterBlockInput[] }
   | { type: 'tool_use'; id: string; name: string; input: string }
   | { type: 'tool_result'; tool_use_id: string; tool_name: string; output: string; is_error: boolean };
+
+export interface InputRouterBlockInput {
+  source: string;
+  input_type: string;
+  text: string;
+  principal_id?: string;
+  app_id?: string;
+  stream_id?: string;
+  seq?: number;
+  correlation_id?: string;
+  requires_attention?: boolean;
+  delivery?: string;
+  payload?: unknown;
+}
 
 export interface TokenUsage {
   input_tokens: number;
@@ -53,6 +68,25 @@ export interface AttachmentMetadata {
   kind: string;
 }
 
+// ── AppFS/input-router event records extracted from user attachments ──
+
+export interface AppfsEventRecord {
+  id: string;
+  parentMessageUuid: string;
+  source: string;
+  eventType: string;
+  principal?: string;
+  fromAgent?: string;
+  toAgent?: string;
+  app?: string;
+  stream?: string;
+  seq?: number;
+  correlationId?: string;
+  contactKey?: string;
+  text?: string;
+  rawLine: string;
+}
+
 // ── Debug-dump record (from agent debug-dump feature) ──
 
 export interface DebugDumpRecord {
@@ -61,14 +95,31 @@ export interface DebugDumpRecord {
   request_index: number;
   model: string;
   max_tokens: number;
-  system_prompt: string;
-  system_prompt_length: number;
-  message_count: number;
-  messages: { role: string; content: string }[];
-  tools_count: number;
-  tools: { name: string; description: string }[];
+  system?: string;
+  system_prompt?: string;
+  system_prompt_length?: number;
+  message_count?: number;
+  messages: { role: string; content: unknown[] }[];
+  tools_count?: number;
+  tools?: { name: string; description?: string; input_schema?: unknown }[];
   stream: boolean;
-  reasoning_effort: string | null;
+  reasoning_effort?: string | null;
+}
+
+// ── Compaction archive records (from debug-dump feature) ──
+
+export interface CompactionBoundaryRecord {
+  type: 'compaction_boundary';
+  timestamp_ms: number;
+  compaction_count: number;
+  archived_message_count: number;
+}
+
+export interface CompactionArchiveRecord {
+  type: 'compaction_archive';
+  timestamp_ms: number;
+  /** The archived message in the same format as session JSONL messages */
+  message: ConversationMessage;
 }
 
 // ── Agent discovery ──
@@ -100,20 +151,36 @@ export interface AgentInfo {
 }
 
 export interface TimelineEntry {
+  id: string;
   agentName: string;
   timestamp: number;
-  source: 'session' | 'debug-dump';
+  source: 'session' | 'debug-dump' | 'compaction-archive';
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   raw: ConversationMessage | DebugDumpRecord;
   usage?: TokenUsage;
+  appfsEvents?: AppfsEventRecord[];
 }
 
 export interface CrossAgentInteraction {
+  entryId: string;
   fromAgent: string;
   toAgent: string;
   eventType: 'message.sent' | 'message.received' | 'message.read';
   timestamp: number;
   seq?: number;
   label: string;
+}
+
+export interface TimelineCompactionBoundary {
+  agentName: string;
+  timestamp: number;
+  compactionCount: number;
+  archivedMessageCount: number;
+}
+
+export interface TimelineResponse {
+  entries: TimelineEntry[];
+  interactions: CrossAgentInteraction[];
+  compactionBoundaries: TimelineCompactionBoundary[];
 }

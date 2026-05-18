@@ -47,13 +47,13 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    attach_appfs_principal, check_base_commit, clear_oauth_credentials, create_appfs_principal,
-    detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
-    format_stale_base_warning, format_usd, generate_pkce_pair, generate_state,
-    load_oauth_credentials, load_system_prompt_with_appfs, parse_oauth_callback_request_target,
-    pricing_for_model, resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
+    attach_appfs_principal, auto_mark_read_for_wake_inputs, check_base_commit,
+    clear_oauth_credentials, create_appfs_principal, detach_appfs_principal,
+    detect_appfs_environment, ensure_appfs_attach_identity, format_stale_base_warning, format_usd,
+    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt_with_appfs,
+    parse_oauth_callback_request_target, pricing_for_model, render_input_router_block,
+    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
     scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
-    auto_mark_read_for_wake_inputs,
     ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
     AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
@@ -3125,6 +3125,19 @@ where
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
+            #[cfg(feature = "debug-dump")]
+            if !result.removed_messages.is_empty() {
+                let compaction_count = result
+                    .compacted_session
+                    .compaction
+                    .as_ref()
+                    .map_or(1, |c| c.count);
+                crate::debug_dump::write_compaction_archive(
+                    session_path,
+                    &result.removed_messages,
+                    compaction_count,
+                );
+            }
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
@@ -4227,8 +4240,7 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let mut session_state = Session::new().with_model(&model);
         if let Some(lease) = &appfs_attach_lease {
-            session_state =
-                session_state.with_appfs_principal_id(lease.principal_id.as_str());
+            session_state = session_state.with_appfs_principal_id(lease.principal_id.as_str());
         }
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -4424,6 +4436,18 @@ impl LiveCli {
                 )?;
                 println!();
                 if let Some(event) = summary.auto_compaction {
+                    #[cfg(feature = "debug-dump")]
+                    if !event.removed_messages.is_empty() {
+                        crate::debug_dump::write_compaction_archive(
+                            &self.session.path,
+                            &event.removed_messages,
+                            self.runtime
+                                .session()
+                                .compaction
+                                .as_ref()
+                                .map_or(1, |c| c.count),
+                        );
+                    }
                     println!(
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
@@ -4555,6 +4579,18 @@ impl LiveCli {
                     println!();
                 }
                 if let Some(event) = summary.auto_compaction {
+                    #[cfg(feature = "debug-dump")]
+                    if !event.removed_messages.is_empty() {
+                        crate::debug_dump::write_compaction_archive(
+                            &self.session.path,
+                            &event.removed_messages,
+                            self.runtime
+                                .session()
+                                .compaction
+                                .as_ref()
+                                .map_or(1, |c| c.count),
+                        );
+                    }
                     let notice = format_auto_compaction_notice(event.removed_message_count);
                     if let Some(redraw_handle) = &self.redraw_handle {
                         redraw_handle.write_output(format!("{notice}\n"));
@@ -4604,9 +4640,8 @@ impl LiveCli {
         let marked = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
         if marked > 0 {
             if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle.write_output(format!(
-                    "AppFS auto-marked {marked} message(s) as read.\n"
-                ));
+                redraw_handle
+                    .write_output(format!("AppFS auto-marked {marked} message(s) as read.\n"));
             } else {
                 println!("AppFS auto-marked {marked} message(s) as read.");
             }
@@ -4649,9 +4684,8 @@ impl LiveCli {
         let marked = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
         if marked > 0 {
             if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle.write_output(format!(
-                    "AppFS auto-marked {marked} message(s) as read.\n"
-                ));
+                redraw_handle
+                    .write_output(format!("AppFS auto-marked {marked} message(s) as read.\n"));
             } else {
                 println!("AppFS auto-marked {marked} message(s) as read.");
             }
@@ -4721,6 +4755,18 @@ impl LiveCli {
                 )?;
                 println!();
                 if let Some(event) = summary.auto_compaction {
+                    #[cfg(feature = "debug-dump")]
+                    if !event.removed_messages.is_empty() {
+                        crate::debug_dump::write_compaction_archive(
+                            &self.session.path,
+                            &event.removed_messages,
+                            self.runtime
+                                .session()
+                                .compaction
+                                .as_ref()
+                                .map_or(1, |c| c.count),
+                        );
+                    }
                     println!(
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
@@ -4791,6 +4837,20 @@ impl LiveCli {
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
+        if let Some(event) = &summary.auto_compaction {
+            #[cfg(feature = "debug-dump")]
+            if !event.removed_messages.is_empty() {
+                crate::debug_dump::write_compaction_archive(
+                    &self.session.path,
+                    &event.removed_messages,
+                    self.runtime
+                        .session()
+                        .compaction
+                        .as_ref()
+                        .map_or(1, |c| c.count),
+                );
+            }
+        }
         self.persist_session()?;
         println!(
             "{}",
@@ -4798,7 +4858,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "model": self.model,
                 "iterations": summary.iterations,
-                "auto_compaction": summary.auto_compaction.map(|event| json!({
+                "auto_compaction": summary.auto_compaction.as_ref().map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
                 })),
@@ -5194,8 +5254,7 @@ impl LiveCli {
         let previous_session = self.session.clone();
         let mut session_state = Session::new().with_model(&self.model);
         if let Some(lease) = &self.appfs_attach_lease {
-            session_state =
-                session_state.with_appfs_principal_id(lease.principal_id.as_str());
+            session_state = session_state.with_appfs_principal_id(lease.principal_id.as_str());
         }
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -5700,6 +5759,20 @@ impl LiveCli {
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
+
+        #[cfg(feature = "debug-dump")]
+        if !result.removed_messages.is_empty() {
+            let compaction_count = result
+                .compacted_session
+                .compaction
+                .as_ref()
+                .map_or(1, |c| c.count);
+            crate::debug_dump::write_compaction_archive(
+                &self.session.path,
+                &result.removed_messages,
+                compaction_count,
+            );
+        }
         let runtime = build_runtime(
             result.compacted_session,
             &self.session.id,
@@ -7488,6 +7561,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::InputRouter { inputs } => {
+                    lines.push(render_input_router_block(inputs));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -7670,6 +7746,14 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
             match block {
                 ContentBlock::Text { text } => {
                     let trimmed = text.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::InputRouter { inputs } => {
+                    let rendered = render_input_router_block(inputs);
+                    let trimmed = rendered.trim_end();
                     if !trimmed.is_empty() {
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
@@ -8203,6 +8287,8 @@ fn build_runtime_with_plugin_state(
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let hook_redraw_handle = redraw_handle.clone();
+    #[cfg(feature = "debug-dump")]
+    let debug_jsonl_path = session.persistence_path().map(|p| p.to_path_buf());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -8214,6 +8300,8 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             progress_reporter,
             redraw_handle.clone(),
+            #[cfg(feature = "debug-dump")]
+            debug_jsonl_path,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -8442,6 +8530,10 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     redraw_handle: Option<OutputRedrawHandle>,
+    #[cfg(feature = "debug-dump")]
+    session_jsonl_path: Option<PathBuf>,
+    #[cfg(feature = "debug-dump")]
+    request_index: usize,
 }
 
 impl AnthropicRuntimeClient {
@@ -8454,6 +8546,7 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
         redraw_handle: Option<OutputRedrawHandle>,
+        #[cfg(feature = "debug-dump")] session_jsonl_path: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
             .map_err(Box::<dyn std::error::Error>::from)?;
@@ -8477,6 +8570,10 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             redraw_handle,
+            #[cfg(feature = "debug-dump")]
+            session_jsonl_path,
+            #[cfg(feature = "debug-dump")]
+            request_index: 0,
         })
     }
 
@@ -8553,10 +8650,6 @@ fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api:
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        #[cfg(feature = "debug-dump")]
-        if let Ok(dir) = std::env::var("APPFS_DEBUG_DUMP_DIR") {
-            crate::debug_dump::write_request(&dir, &self.session_id, &request);
-        }
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -8578,6 +8671,13 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
             ..Default::default()
         };
+        // Debug-dump: write the *actual* MessageRequest sent to the API
+        // (model, max_tokens, tools, messages — all resolved).
+        #[cfg(feature = "debug-dump")]
+        if let Some(ref path) = self.session_jsonl_path {
+            crate::debug_dump::write_message_request(path, self.request_index, &message_request);
+            self.request_index += 1;
+        }
         let override_client;
         let client = if request.model_override.is_some() {
             override_client = self.provider_client_for_model(&effective_model)?;
@@ -9952,6 +10052,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
+                        text: render_input_router_block(inputs),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -10199,9 +10302,9 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InputSource, InvokedSkill,
-        MessageRole, OAuthConfig, PendingInput, PermissionMode, PermissionPromptDecision,
-        PermissionPrompter, PermissionRequest, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput,
+        InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
+        PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -13269,6 +13372,7 @@ UU conflicted.rs",
                     formatted_summary: "formatted".to_string(),
                     compacted_session: compacted_session.clone(),
                     removed_message_count: 1,
+                    removed_messages: Vec::new(),
                     user_display_message: Some("pre compact note\npost compact note".to_string()),
                 })
             },
@@ -13607,6 +13711,37 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    #[test]
+    fn convert_messages_renders_input_router_blocks_for_model_view() {
+        let messages = vec![ConversationMessage::input_router(vec![
+            InputRouterBlockInput {
+                source: "appfs_event".to_string(),
+                input_type: "message.received".to_string(),
+                text: "请实现桶排序".to_string(),
+                principal_id: Some("code-implementer".to_string()),
+                app_id: Some("tinode".to_string()),
+                stream_id: Some("app:tinode--code-implementer".to_string()),
+                seq: Some(7),
+                correlation_id: Some("msg-7".to_string()),
+                requires_attention: true,
+                delivery: Some("inject_at_next_boundary".to_string()),
+                payload: None,
+            },
+        ])];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        let api::InputContentBlock::Text { text } = &converted[0].content[0] else {
+            panic!("input router should be rendered as model-visible text");
+        };
+        assert!(text.contains("请实现桶排序"));
+        assert!(text.contains("AppFS Tinode"));
+        assert!(!text.contains("\"input_type\""));
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();

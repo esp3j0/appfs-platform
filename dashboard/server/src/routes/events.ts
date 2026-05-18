@@ -16,8 +16,9 @@ export function registerEventsRoute(app: FastifyInstance, registry: AgentRegistr
     for (const rec of newRecords) {
       const msg = rec.message;
       const entry: TimelineEntry = {
+        id: `${agentName}:${msg.uuid}`,
         agentName,
-        timestamp: Date.now(),
+        timestamp: msg.timestamp_ms ?? Date.now(),
         source: 'session',
         role: msg.role,
         content: extractTextContent(msg.blocks),

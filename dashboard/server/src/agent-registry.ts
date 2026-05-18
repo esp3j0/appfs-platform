@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AgentInfo, AgentMeta, MessageRecord, SessionMetaRecord } from './types.js';
-import { parseMessages, parseMeta } from './jsonl-parser.js';
+import type { AgentInfo, AgentMeta, CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, MessageRecord, SessionMetaRecord } from './types.js';
+import { parseCompactionArchives, parseCompactionBoundaries, parseDebugDumps, parseMessages, parseMeta } from './jsonl-parser.js';
 
 export class AgentRegistry {
   private agents = new Map<string, AgentInfo>();
   private messages = new Map<string, MessageRecord[]>();
+  private debugDumps = new Map<string, DebugDumpRecord[]>();
+  private compactionArchives = new Map<string, CompactionArchiveRecord[]>();
+  private compactionBoundaries = new Map<string, CompactionBoundaryRecord[]>();
   private dumpDir: string;
 
   constructor(dumpDir: string) {
@@ -44,7 +47,7 @@ export class AgentRegistry {
     }
 
     // Phase 1a fallback: flat *.jsonl files in dump dir
-    const jsonlFiles = fs.readdirSync(this.dumpDir).filter(f => f.endsWith('.jsonl'));
+    const jsonlFiles = fs.readdirSync(this.dumpDir).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
     for (const file of jsonlFiles) {
       const fullPath = path.join(this.dumpDir, file);
       this.registerFromSessionFile(fullPath);
@@ -70,7 +73,7 @@ export class AgentRegistry {
 
       let sessionFiles: string[];
       try {
-        sessionFiles = fs.readdirSync(fpDir).filter(f => f.endsWith('.jsonl'));
+        sessionFiles = fs.readdirSync(fpDir).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
       } catch {
         continue;
       }
@@ -89,6 +92,17 @@ export class AgentRegistry {
       sessionContent = fs.readFileSync(meta.session_jsonl_path, 'utf-8');
     }
     const msgs = parseMessages(sessionContent);
+    // Look for companion .debug.jsonl
+    const debugPath = (meta.session_jsonl_path ?? '').replace(/\.jsonl$/, '.debug.jsonl');
+    let dumps: import('./types.js').DebugDumpRecord[] = [];
+    let archives: import('./types.js').CompactionArchiveRecord[] = [];
+    let boundaries: import('./types.js').CompactionBoundaryRecord[] = [];
+    if (debugPath && fs.existsSync(debugPath)) {
+      const debugContent = fs.readFileSync(debugPath, 'utf-8');
+      dumps = parseDebugDumps(debugContent);
+      archives = parseCompactionArchives(debugContent);
+      boundaries = parseCompactionBoundaries(debugContent);
+    }
 
     this.agents.set(name, {
       name,
@@ -103,12 +117,26 @@ export class AgentRegistry {
       ...this.sumUsage(msgs),
     });
     this.messages.set(name, msgs);
+    this.debugDumps.set(name, dumps);
+    this.compactionArchives.set(name, archives);
+    this.compactionBoundaries.set(name, boundaries);
   }
 
   private registerFromSessionFile(fullPath: string): void {
     const content = fs.readFileSync(fullPath, 'utf-8');
     const sess = parseMeta(content);
     const msgs = parseMessages(content);
+    // Look for companion .debug.jsonl file (session-xxx.debug.jsonl)
+    const debugPath = fullPath.replace(/\.jsonl$/, '.debug.jsonl');
+    let dumps: import('./types.js').DebugDumpRecord[] = [];
+    let archives: import('./types.js').CompactionArchiveRecord[] = [];
+    let boundaries: import('./types.js').CompactionBoundaryRecord[] = [];
+    if (fs.existsSync(debugPath)) {
+      const debugContent = fs.readFileSync(debugPath, 'utf-8');
+      dumps = parseDebugDumps(debugContent);
+      archives = parseCompactionArchives(debugContent);
+      boundaries = parseCompactionBoundaries(debugContent);
+    }
     // Use principal_id as the display name when available, fallback to session_id
     const principalId = sess?.appfs_principal_id;
     const name = principalId ?? sess?.session_id ?? path.basename(fullPath, '.jsonl');
@@ -126,6 +154,9 @@ export class AgentRegistry {
       ...this.sumUsage(msgs),
     });
     this.messages.set(name, msgs);
+    this.debugDumps.set(name, dumps);
+    this.compactionArchives.set(name, archives);
+    this.compactionBoundaries.set(name, boundaries);
   }
 
   private sumUsage(msgs: MessageRecord[]): { totalInputTokens: number; totalOutputTokens: number } {
@@ -152,13 +183,39 @@ export class AgentRegistry {
     return this.messages.get(name) ?? [];
   }
 
-  /** Reload a single agent's messages from its session file. */
+  getDebugDumps(name: string): DebugDumpRecord[] {
+    return this.debugDumps.get(name) ?? [];
+  }
+
+  getCompactionArchives(name: string): CompactionArchiveRecord[] {
+    return this.compactionArchives.get(name) ?? [];
+  }
+
+  getCompactionBoundaries(name: string): CompactionBoundaryRecord[] {
+    return this.compactionBoundaries.get(name) ?? [];
+  }
+
+  /** Reload a single agent's messages and debug dumps from its session file. */
   reloadAgent(name: string): MessageRecord[] {
     const info = this.agents.get(name);
     if (!info) return [];
     const content = fs.readFileSync(info.sessionJsonlPath, 'utf-8');
     const msgs = parseMessages(content);
+    // Look for companion .debug.jsonl
+    const debugPath = info.sessionJsonlPath.replace(/\.jsonl$/, '.debug.jsonl');
+    let dumps: import('./types.js').DebugDumpRecord[] = [];
+    let archives: import('./types.js').CompactionArchiveRecord[] = [];
+    let boundaries: import('./types.js').CompactionBoundaryRecord[] = [];
+    if (fs.existsSync(debugPath)) {
+      const debugContent = fs.readFileSync(debugPath, 'utf-8');
+      dumps = parseDebugDumps(debugContent);
+      archives = parseCompactionArchives(debugContent);
+      boundaries = parseCompactionBoundaries(debugContent);
+    }
     this.messages.set(name, msgs);
+    this.debugDumps.set(name, dumps);
+    this.compactionArchives.set(name, archives);
+    this.compactionBoundaries.set(name, boundaries);
     this.agents.set(name, {
       ...info,
       messageCount: msgs.length,

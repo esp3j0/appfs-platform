@@ -20,7 +20,7 @@ use runtime::{
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     prepare_background_shell_output, prepare_shell_command_output, read_file,
-    shell_task_output_path,
+    render_input_router_block, shell_task_output_path,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -107,7 +107,9 @@ fn conversation_message_text(message: &ConversationMessage) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            ContentBlock::InputRouter { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => None,
         })
         .collect()
 }
@@ -2668,6 +2670,17 @@ struct SkillOutput {
     result: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SkillToolResultOutput {
+    skill: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ExecutedSkill {
     output: SkillOutput,
@@ -3544,7 +3557,7 @@ fn resolve_bundled_skill_file_path(
 
 fn execute_skill_tool_result(input: SkillInput) -> Result<ToolExecutionResult, String> {
     let executed = execute_skill_with_fork_runner(input, execute_forked_skill)?;
-    let output = to_pretty_json(executed.output.clone())?;
+    let output = to_pretty_json(skill_tool_result_output(&executed.output))?;
     if executed.execution_context == Some(commands::SkillExecutionContext::Fork) {
         return Ok(ToolExecutionResult::text(output).with_invoked_skill(executed.invoked_skill));
     }
@@ -3569,6 +3582,15 @@ fn execute_skill_tool_result(input: SkillInput) -> Result<ToolExecutionResult, S
         Ok(result)
     } else {
         Ok(result.with_context_update(context_update))
+    }
+}
+
+fn skill_tool_result_output(output: &SkillOutput) -> SkillToolResultOutput {
+    SkillToolResultOutput {
+        skill: output.skill.clone(),
+        status: output.status.clone(),
+        agent_id: output.agent_id.clone(),
+        result: output.result.clone(),
     }
 }
 
@@ -5424,6 +5446,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
+                        text: render_input_router_block(inputs),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -8917,6 +8942,24 @@ mod tests {
         let output: serde_json::Value =
             serde_json::from_str(&result.output).expect("valid skill output json");
         assert_eq!(output["skill"], "trace");
+        assert!(
+            output.get("prompt").is_none(),
+            "inline Skill tool result should stay compact; prompt is injected separately"
+        );
+        assert!(
+            output.get("metadata").is_none(),
+            "inline Skill tool result should not duplicate metadata stored with invoked skill"
+        );
+        let model_visible = model_visible_tool_result("Skill", &result.output, false);
+        assert_eq!(
+            model_visible,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Launching skill: trace".to_string(),
+                }],
+                is_error: false,
+            }
+        );
         assert_eq!(result.invoked_skills.len(), 1);
         assert_eq!(result.invoked_skills[0].skill, "trace");
         assert_eq!(
