@@ -6460,6 +6460,7 @@ mod tests {
                     formatted_summary: "formatted".to_string(),
                     compacted_session: compacted_session.clone(),
                     removed_message_count: 2,
+                    removed_messages: session.messages[1..3].to_vec(),
                     user_display_message: Some("post compact note".to_string()),
                 })
             },

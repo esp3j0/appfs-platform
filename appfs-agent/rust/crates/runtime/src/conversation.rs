@@ -1244,8 +1244,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         assistant_text, build_assistant_message, parse_auto_compaction_threshold, ApiClient,
-        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
+        ApiRequest, AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -2734,13 +2734,12 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 6,
-                removed_messages: Vec::new(),
-            })
-        );
+        let auto_compaction = summary
+            .auto_compaction
+            .as_ref()
+            .expect("auto-compaction should report archived messages");
+        assert_eq!(auto_compaction.removed_message_count, 6);
+        assert_eq!(auto_compaction.removed_messages.len(), 6);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
         assert_eq!(runtime.session().messages.len(), 2);
         assert_eq!(runtime.session().messages[1].role, MessageRole::User);
