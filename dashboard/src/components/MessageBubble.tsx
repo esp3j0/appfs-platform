@@ -83,27 +83,8 @@ function renderBlocks(entry: TimelineEntry): React.ReactNode {
         </React.Fragment>
       );
     }
-    if (block.type === 'input_router' && block.inputs) {
-      return (
-        <div key={i}>
-          <CollapsibleBlock label={`Structured routed inputs (${block.inputs.length})`}>
-            <div className="appfs-events-list">
-              {block.inputs.map((input, index) => (
-                <div key={index} className="appfs-event-row">
-                  <div className="event-line">
-                    <span className="event-type">{input.input_type}</span>
-                    <span className="event-pill">{input.source}</span>
-                    {input.app_id && <span className="event-pill">{input.app_id}</span>}
-                    {input.seq !== undefined && <span className="event-pill">seq {input.seq}</span>}
-                    {input.requires_attention && <span className="event-pill">attention</span>}
-                  </div>
-                  {input.text && <div className="event-text">{input.text}</div>}
-                </div>
-              ))}
-            </div>
-          </CollapsibleBlock>
-        </div>
-      );
+    if (block.type === 'input_router') {
+      return null;
     }
     if (block.type === 'tool_use') {
       const inputLen = (block.input ?? '').length;
