@@ -5,3 +5,10 @@ integration/state/
 integration/**/*.db
 integration/**/*.sqlite
 integration/**/*.sqlite3
+dashboard/dist/
+dashboard/node_modules/
+dashboard/server/node_modules/
+.claude/
+.claw/
+.sandbox-home/
+.sandbox-tmp/
