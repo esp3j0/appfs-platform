@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::json::JsonValue;
+use crate::session::InputRouterBlockInput;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +29,16 @@ impl InputSource {
 pub enum PendingInputDelivery {
     InjectAtNextBoundary,
     QueueAfterTurn,
+}
+
+impl PendingInputDelivery {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InjectAtNextBoundary => "inject_at_next_boundary",
+            Self::QueueAfterTurn => "queue_after_turn",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +81,117 @@ impl InputEnvelope {
 pub struct PendingInput {
     pub envelope: InputEnvelope,
     pub delivery: PendingInputDelivery,
+}
+
+#[must_use]
+pub fn input_router_block_from_pending_inputs(
+    inputs: &[PendingInput],
+) -> Vec<InputRouterBlockInput> {
+    inputs
+        .iter()
+        .map(|input| InputRouterBlockInput {
+            source: input.envelope.source.as_str().to_string(),
+            input_type: input.envelope.input_type.clone(),
+            text: input.envelope.text.clone(),
+            principal_id: input.envelope.principal_id.clone(),
+            app_id: input.envelope.app_id.clone(),
+            stream_id: input.envelope.stream_id.clone(),
+            seq: input.envelope.seq,
+            correlation_id: input.envelope.correlation_id.clone(),
+            requires_attention: input.envelope.requires_attention,
+            delivery: Some(input.delivery.as_str().to_string()),
+            payload: input
+                .envelope
+                .payload
+                .as_ref()
+                .and_then(serde_value_to_session_json),
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn render_input_router_block(inputs: &[InputRouterBlockInput]) -> String {
+    let pending_inputs = inputs
+        .iter()
+        .filter_map(pending_input_from_input_router_block)
+        .collect::<Vec<_>>();
+    render_pending_input_reminder(&pending_inputs)
+}
+
+fn pending_input_from_input_router_block(input: &InputRouterBlockInput) -> Option<PendingInput> {
+    let source = input_source_from_str(&input.source)?;
+    let delivery = input
+        .delivery
+        .as_deref()
+        .and_then(pending_input_delivery_from_str)
+        .unwrap_or(PendingInputDelivery::InjectAtNextBoundary);
+    let mut envelope = InputEnvelope::new(source, input.input_type.clone(), input.text.clone());
+    envelope.principal_id.clone_from(&input.principal_id);
+    envelope.app_id.clone_from(&input.app_id);
+    envelope.stream_id.clone_from(&input.stream_id);
+    envelope.seq = input.seq;
+    envelope.correlation_id.clone_from(&input.correlation_id);
+    envelope.requires_attention = input.requires_attention;
+    envelope.payload = input.payload.as_ref().map(session_json_to_serde_value);
+    Some(PendingInput { envelope, delivery })
+}
+
+fn input_source_from_str(source: &str) -> Option<InputSource> {
+    match source {
+        "user_terminal" => Some(InputSource::UserTerminal),
+        "appfs_event" => Some(InputSource::AppfsEvent),
+        "agent_message" => Some(InputSource::AgentMessage),
+        "system" => Some(InputSource::System),
+        _ => None,
+    }
+}
+
+fn pending_input_delivery_from_str(delivery: &str) -> Option<PendingInputDelivery> {
+    match delivery {
+        "inject_at_next_boundary" => Some(PendingInputDelivery::InjectAtNextBoundary),
+        "queue_after_turn" => Some(PendingInputDelivery::QueueAfterTurn),
+        _ => None,
+    }
+}
+
+fn serde_value_to_session_json(value: &Value) -> Option<JsonValue> {
+    match value {
+        Value::Null => Some(JsonValue::Null),
+        Value::Bool(value) => Some(JsonValue::Bool(*value)),
+        Value::Number(value) => value.as_i64().map(JsonValue::Number),
+        Value::String(value) => Some(JsonValue::String(value.clone())),
+        Value::Array(values) => values
+            .iter()
+            .map(serde_value_to_session_json)
+            .collect::<Option<Vec<_>>>()
+            .map(JsonValue::Array),
+        Value::Object(entries) => entries
+            .iter()
+            .map(|(key, value)| Some((key.clone(), serde_value_to_session_json(value)?)))
+            .collect::<Option<std::collections::BTreeMap<_, _>>>()
+            .map(JsonValue::Object),
+    }
+}
+
+fn session_json_to_serde_value(value: &JsonValue) -> Value {
+    match value {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(value) => Value::Bool(*value),
+        JsonValue::Number(value) => Value::Number(serde_json::Number::from(*value)),
+        JsonValue::String(value) => Value::String(value.clone()),
+        JsonValue::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(session_json_to_serde_value)
+                .collect::<Vec<_>>(),
+        ),
+        JsonValue::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), session_json_to_serde_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 #[derive(Debug, Default)]

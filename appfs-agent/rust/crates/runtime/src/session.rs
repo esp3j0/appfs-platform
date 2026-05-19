@@ -30,6 +30,9 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    InputRouter {
+        inputs: Vec<InputRouterBlockInput>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -41,6 +44,21 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputRouterBlockInput {
+    pub source: String,
+    pub input_type: String,
+    pub text: String,
+    pub principal_id: Option<String>,
+    pub app_id: Option<String>,
+    pub stream_id: Option<String>,
+    pub seq: Option<i64>,
+    pub correlation_id: Option<String>,
+    pub requires_attention: bool,
+    pub delivery: Option<String>,
+    pub payload: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +129,8 @@ pub struct ConversationMessage {
     pub hook_result_metadata: Option<HookResultMetadata>,
     pub is_compact_summary: bool,
     pub is_visible_in_transcript_only: bool,
+    /// Wall-clock epoch millis when this message was created (survives compaction).
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +190,10 @@ pub struct Session {
     pub invoked_skills: Vec<InvokedSkill>,
     pub appfs_event_cursors: BTreeMap<String, i64>,
     pub appfs_wake_event_cursors: BTreeMap<String, i64>,
+    /// AppFS principal this session is bound to (set after environment detection).
+    pub appfs_principal_id: Option<String>,
+    /// LLM model used for this session (e.g. "claude-sonnet-4-20250514").
+    pub model: Option<String>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -240,6 +264,8 @@ impl Session {
             invoked_skills: Vec::new(),
             appfs_event_cursors: BTreeMap::new(),
             appfs_wake_event_cursors: BTreeMap::new(),
+            appfs_principal_id: None,
+            model: None,
             persistence: None,
         }
     }
@@ -258,6 +284,20 @@ impl Session {
     #[must_use]
     pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
         self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    /// Bind this session to an AppFS principal.
+    #[must_use]
+    pub fn with_appfs_principal_id(mut self, principal_id: impl Into<String>) -> Self {
+        self.appfs_principal_id = Some(principal_id.into());
+        self
+    }
+
+    /// Set the LLM model for this session.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -467,6 +507,8 @@ impl Session {
             invoked_skills: self.invoked_skills.clone(),
             appfs_event_cursors: self.appfs_event_cursors.clone(),
             appfs_wake_event_cursors: self.appfs_wake_event_cursors.clone(),
+            appfs_principal_id: self.appfs_principal_id.clone(),
+            model: self.model.clone(),
             persistence: None,
         }
     }
@@ -544,6 +586,15 @@ impl Session {
                 appfs_event_cursors_to_json(&self.appfs_wake_event_cursors),
             );
         }
+        if let Some(principal_id) = &self.appfs_principal_id {
+            object.insert(
+                "appfs_principal_id".to_string(),
+                JsonValue::String(principal_id.clone()),
+            );
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -613,6 +664,14 @@ impl Session {
             .map(appfs_event_cursors_from_json)
             .transpose()?
             .unwrap_or_default();
+        let appfs_principal_id = object
+            .get("appfs_principal_id")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
+        let model = object
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         Ok(Self {
             version,
             session_id,
@@ -626,6 +685,8 @@ impl Session {
             invoked_skills,
             appfs_event_cursors,
             appfs_wake_event_cursors,
+            appfs_principal_id,
+            model,
             persistence: None,
         })
     }
@@ -643,6 +704,8 @@ impl Session {
         let mut invoked_skills = Vec::new();
         let mut appfs_event_cursors = BTreeMap::new();
         let mut appfs_wake_event_cursors = BTreeMap::new();
+        let mut appfs_principal_id = None;
+        let mut model = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -690,6 +753,14 @@ impl Session {
                     if let Some(value) = object.get("appfs_wake_event_cursors") {
                         appfs_wake_event_cursors = appfs_event_cursors_from_json(value)?;
                     }
+                    appfs_principal_id = object
+                        .get("appfs_principal_id")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
+                    model = object
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -735,6 +806,8 @@ impl Session {
             invoked_skills,
             appfs_event_cursors,
             appfs_wake_event_cursors,
+            appfs_principal_id,
+            model,
             persistence: None,
         })
     }
@@ -852,6 +925,15 @@ impl Session {
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
             );
         }
+        if let Some(principal_id) = &self.appfs_principal_id {
+            object.insert(
+                "appfs_principal_id".to_string(),
+                JsonValue::String(principal_id.clone()),
+            );
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
         if !self.invoked_skills.is_empty() {
             object.insert(
                 "invoked_skills".to_string(),
@@ -913,6 +995,7 @@ impl ConversationMessage {
             hook_result_metadata,
             is_compact_summary,
             is_visible_in_transcript_only,
+            timestamp_ms: current_time_millis(),
         }
     }
 
@@ -956,6 +1039,23 @@ impl ConversationMessage {
     #[must_use]
     pub fn attachment_user_text(text: impl Into<String>, kind: AttachmentKind) -> Self {
         Self::user_text_with_metadata(text, Some(AttachmentMetadata { kind }), None, false, false)
+    }
+
+    #[must_use]
+    pub fn input_router(inputs: Vec<InputRouterBlockInput>) -> Self {
+        Self::new(
+            MessageRole::User,
+            vec![ContentBlock::InputRouter { inputs }],
+            None,
+            None,
+            None,
+            Some(AttachmentMetadata {
+                kind: AttachmentKind::InputRouter,
+            }),
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
@@ -1118,6 +1218,10 @@ impl ConversationMessage {
                 JsonValue::Bool(true),
             );
         }
+        object.insert(
+            "timestamp_ms".to_string(),
+            JsonValue::Number(i64_from_u64(self.timestamp_ms, "timestamp_ms").unwrap_or(0)),
+        );
         JsonValue::Object(object)
     }
 
@@ -1228,6 +1332,11 @@ impl ConversationMessage {
             hook_result_metadata,
             is_compact_summary,
             is_visible_in_transcript_only,
+            timestamp_ms: object
+                .get("timestamp_ms")
+                .and_then(JsonValue::as_i64)
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0),
         })
     }
 }
@@ -1240,6 +1349,16 @@ impl ContentBlock {
             Self::Text { text } => {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
+            }
+            Self::InputRouter { inputs } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("input_router".to_string()),
+                );
+                object.insert(
+                    "inputs".to_string(),
+                    JsonValue::Array(inputs.iter().map(InputRouterBlockInput::to_json).collect()),
+                );
             }
             Self::ToolUse { id, name, input } => {
                 object.insert(
@@ -1287,6 +1406,16 @@ impl ContentBlock {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
             }),
+            "input_router" => {
+                let inputs = object
+                    .get("inputs")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| SessionError::Format("missing inputs".to_string()))?
+                    .iter()
+                    .map(InputRouterBlockInput::from_json)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::InputRouter { inputs })
+            }
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
                 name: required_string(object, "name")?,
@@ -1305,6 +1434,78 @@ impl ContentBlock {
                 "unsupported block type: {other}"
             ))),
         }
+    }
+}
+
+impl InputRouterBlockInput {
+    #[must_use]
+    fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("source".to_string(), JsonValue::String(self.source.clone()));
+        object.insert(
+            "input_type".to_string(),
+            JsonValue::String(self.input_type.clone()),
+        );
+        object.insert("text".to_string(), JsonValue::String(self.text.clone()));
+        if let Some(principal_id) = &self.principal_id {
+            object.insert(
+                "principal_id".to_string(),
+                JsonValue::String(principal_id.clone()),
+            );
+        }
+        if let Some(app_id) = &self.app_id {
+            object.insert("app_id".to_string(), JsonValue::String(app_id.clone()));
+        }
+        if let Some(stream_id) = &self.stream_id {
+            object.insert(
+                "stream_id".to_string(),
+                JsonValue::String(stream_id.clone()),
+            );
+        }
+        if let Some(seq) = self.seq {
+            object.insert("seq".to_string(), JsonValue::Number(seq));
+        }
+        if let Some(correlation_id) = &self.correlation_id {
+            object.insert(
+                "correlation_id".to_string(),
+                JsonValue::String(correlation_id.clone()),
+            );
+        }
+        if self.requires_attention {
+            object.insert(
+                "requires_attention".to_string(),
+                JsonValue::Bool(self.requires_attention),
+            );
+        }
+        if let Some(delivery) = &self.delivery {
+            object.insert("delivery".to_string(), JsonValue::String(delivery.clone()));
+        }
+        if let Some(payload) = &self.payload {
+            object.insert("payload".to_string(), payload.clone());
+        }
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("input_router input must be an object".to_string())
+        })?;
+        Ok(Self {
+            source: required_string(object, "source")?,
+            input_type: required_string(object, "input_type")?,
+            text: required_string(object, "text")?,
+            principal_id: optional_string(object, "principal_id"),
+            app_id: optional_string(object, "app_id"),
+            stream_id: optional_string(object, "stream_id"),
+            seq: object.get("seq").and_then(JsonValue::as_i64),
+            correlation_id: optional_string(object, "correlation_id"),
+            requires_attention: object
+                .get("requires_attention")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            delivery: optional_string(object, "delivery"),
+            payload: object.get("payload").cloned(),
+        })
     }
 }
 
@@ -1801,6 +2002,13 @@ fn required_string(
         .ok_or_else(|| SessionError::Format(format!("missing {key}")))
 }
 
+fn optional_string(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn required_u32(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<u32, SessionError> {
     let value = object
         .get(key)
@@ -2065,8 +2273,8 @@ mod tests {
     use super::{
         cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, AttachmentKind,
         CompactBoundaryMetadata, CompactPreservedSegment, CompactTrigger, ContentBlock,
-        ConversationMessage, HookResultEvent, InvokedSkill, MessageRole, Session, SessionFork,
-        SystemMessageSubtype,
+        ConversationMessage, HookResultEvent, InputRouterBlockInput, InvokedSkill, MessageRole,
+        Session, SessionFork, SystemMessageSubtype,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -2128,6 +2336,58 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn persists_and_restores_structured_input_router_blocks() {
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::input_router(vec![
+                InputRouterBlockInput {
+                    source: "appfs_event".to_string(),
+                    input_type: "message.received".to_string(),
+                    text: "hello from another agent".to_string(),
+                    principal_id: Some("code-implementer".to_string()),
+                    app_id: Some("tinode".to_string()),
+                    stream_id: Some("app:tinode--code-implementer".to_string()),
+                    seq: Some(42),
+                    correlation_id: Some("msg-42".to_string()),
+                    requires_attention: true,
+                    delivery: Some("inject_at_next_boundary".to_string()),
+                    payload: Some(JsonValue::Object(
+                        [(
+                            "contact_key".to_string(),
+                            JsonValue::String("default".to_string()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )),
+                },
+            ]))
+            .expect("input router message should append");
+
+        let path = temp_session_path("input-router");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored, session);
+        assert_eq!(
+            restored.messages[0]
+                .attachment_metadata
+                .as_ref()
+                .map(|metadata| metadata.kind),
+            Some(AttachmentKind::InputRouter)
+        );
+        let [ContentBlock::InputRouter { inputs }] = restored.messages[0].blocks.as_slice() else {
+            panic!("expected structured input router block");
+        };
+        assert_eq!(inputs[0].input_type, "message.received");
+        assert!(inputs[0]
+            .payload
+            .as_ref()
+            .and_then(JsonValue::as_object)
+            .is_some_and(|payload| payload.contains_key("contact_key")));
     }
 
     #[test]

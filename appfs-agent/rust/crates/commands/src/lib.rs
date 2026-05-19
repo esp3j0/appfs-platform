@@ -16,11 +16,11 @@ use plugins::{
     PluginError, PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry, PluginSummary,
 };
 use runtime::{
-    detect_appfs_environment, load_system_prompt, tool_output_root, AssistantEvent,
-    CompactionConfig, ConfigLoader, ConfigSource, ConversationMessage, ConversationRuntime,
-    McpOAuthConfig, McpServerConfig, MessageRole, PermissionMode, PermissionPolicy, RuntimeConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimeProviderConfig, RuntimeProviderKind,
-    ScopedMcpServerConfig, Session, StaticToolExecutor,
+    detect_appfs_environment, load_system_prompt, render_input_router_block, tool_output_root,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ConversationMessage,
+    ConversationRuntime, McpOAuthConfig, McpServerConfig, MessageRole, PermissionMode,
+    PermissionPolicy, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimeProviderConfig, RuntimeProviderKind, ScopedMcpServerConfig, Session, StaticToolExecutor,
 };
 use serde_json::{json, Value};
 
@@ -4888,6 +4888,9 @@ fn convert_compact_messages(messages: &[ConversationMessage]) -> Vec<InputMessag
                     runtime::ContentBlock::Text { text } => {
                         InputContentBlock::Text { text: text.clone() }
                     }
+                    runtime::ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
+                        text: render_input_router_block(inputs),
+                    },
                     runtime::ContentBlock::ToolUse { id, name, input } => {
                         InputContentBlock::ToolUse {
                             id: id.clone(),
@@ -6457,6 +6460,7 @@ mod tests {
                     formatted_summary: "formatted".to_string(),
                     compacted_session: compacted_session.clone(),
                     removed_message_count: 2,
+                    removed_messages: session.messages[1..3].to_vec(),
                     user_display_message: Some("post compact note".to_string()),
                 })
             },

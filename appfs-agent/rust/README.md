@@ -49,6 +49,13 @@ records as `<system-reminder>` context. This keeps same-turn action receipts
 such as `action.completed`, `action.failed`, and Tinode `message.received`
 available while the model is actively working.
 
+Session JSONL stores these routed inputs as structured `input_router` content
+blocks rather than pre-rendered reminder text. The model request conversion layer
+renders those blocks into the external-message body and source reminder that the
+model actually sees. This mirrors tool results: raw session data is optimized for
+debugging and dashboard timelines, while debug-dump/model-view records show the
+post-conversion prompt payload.
+
 The earlier broad idle watcher commands remain disabled because they woke the
 model on every event, including self-generated receipts:
 

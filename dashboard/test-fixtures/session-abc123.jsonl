@@ -1,0 +1,7 @@
+{"type":"session_meta","version":1,"session_id":"session-abc123","created_at_ms":1747407778000,"updated_at_ms":1747407791000}
+{"type":"message","message":{"uuid":"msg-001","role":"system","blocks":[{"type":"text","text":"You are an AI agent attached to an AppFS mount."}]}}
+{"type":"message","message":{"uuid":"msg-002","role":"user","blocks":[{"type":"text","text":"[Pending input reminder]\n[1] [appfs_event] type=message.received\nFrom: code-implementer\n\"I've started the implementation.\""}]}}
+{"type":"message","message":{"uuid":"msg-003","role":"assistant","blocks":[{"type":"text","text":"Acknowledged. I'll monitor the progress."}],"usage":{"input_tokens":2847,"output_tokens":22,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+{"type":"message","message":{"uuid":"msg-004","role":"assistant","blocks":[{"type":"tool_use","id":"tu-1","name":"read_file","input":"{\"path\":\"tinode.rs\",\"offset\":2900}"}]}}
+{"type":"message","message":{"uuid":"msg-005","role":"tool","blocks":[{"type":"tool_result","tool_use_id":"tu-1","tool_name":"read_file","output":"fn maybe_capture_read_receipt(&mut self, msg: &JsonValue) {\n    if let Some(info) = msg.get(\"info\") {\n        ...\n    }\n}","is_error":false}]}}
+{"type":"message","message":{"uuid":"msg-006","role":"user","blocks":[{"type":"text","text":"[Pending input reminder]\n[1] [appfs_event] type=message.read from=code-implementer seq=47\n    (auto mark-as-read: sending {note})"}]}}

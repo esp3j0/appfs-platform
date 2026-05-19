@@ -195,7 +195,9 @@ fn extract_skillify_user_messages(messages: &[ConversationMessage]) -> Vec<Strin
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(text.as_str()),
-                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                    ContentBlock::InputRouter { .. }
+                    | ContentBlock::ToolUse { .. }
+                    | ContentBlock::ToolResult { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n");

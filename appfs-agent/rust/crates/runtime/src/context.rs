@@ -1,3 +1,4 @@
+use crate::input_router::render_input_router_block;
 use crate::prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 use crate::session::{ContentBlock, MessageRole, Session};
 
@@ -55,6 +56,10 @@ pub fn analyze_context_usage(system_prompt: &[String], session: &Session) -> Con
                         MessageRole::Assistant => assistant_message_tokens += tokens,
                         MessageRole::Tool => tool_result_tokens += tokens,
                     }
+                }
+                ContentBlock::InputRouter { inputs } => {
+                    let tokens = estimate_text_tokens(&render_input_router_block(inputs));
+                    user_message_tokens += tokens;
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
                     tool_call_tokens += estimate_text_tokens(name) + estimate_text_tokens(input);

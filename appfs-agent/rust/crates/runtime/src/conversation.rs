@@ -14,7 +14,7 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::input_router::{
-    render_pending_input_reminder, InputSource, PendingInput, PendingInputQueue,
+    input_router_block_from_pending_inputs, InputSource, PendingInput, PendingInputQueue,
     SharedPendingInputQueue,
 };
 use crate::permissions::{
@@ -245,9 +245,12 @@ pub struct TurnSummary {
     pub auto_compaction: Option<AutoCompactionEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    /// Messages that were removed during auto-compaction.
+    /// Available for external archiving (e.g., debug dashboard).
+    pub removed_messages: Vec<ConversationMessage>,
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -778,13 +781,10 @@ where
             return Ok(());
         }
 
-        let reminder = render_pending_input_reminder(&pending_inputs);
+        let input_router_inputs = input_router_block_from_pending_inputs(&pending_inputs);
         if let Err(error) = self
             .session
-            .push_message(ConversationMessage::attachment_user_text(
-                reminder,
-                AttachmentKind::InputRouter,
-            ))
+            .push_message(ConversationMessage::input_router(input_router_inputs))
         {
             self.pending_inputs.restore_front(local_pending_inputs);
             if let Some(queue) = &self.external_pending_inputs {
@@ -947,6 +947,7 @@ where
         self.session = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
+            removed_messages: result.removed_messages,
         })
     }
 
@@ -1130,7 +1131,9 @@ fn assistant_text(message: &ConversationMessage) -> Option<String> {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+            ContentBlock::InputRouter { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => None,
         })
         .collect::<String>()
         .trim()
@@ -1241,14 +1244,15 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         assistant_text, build_assistant_message, parse_auto_compaction_threshold, ApiClient,
-        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
+        ApiRequest, AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::input_router::{
-        InputEnvelope, InputSource, PendingInput, PendingInputDelivery, SharedPendingInputQueue,
+        render_input_router_block, InputEnvelope, InputSource, PendingInput, PendingInputDelivery,
+        SharedPendingInputQueue,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -1467,8 +1471,11 @@ mod tests {
             })
             .expect("pending input attachment should be present");
         assert!(user_index < pending_index);
-        let pending_text = assistant_text(&request.messages[pending_index])
-            .expect("pending input attachment should contain text");
+        let ContentBlock::InputRouter { inputs } = &request.messages[pending_index].blocks[0]
+        else {
+            panic!("pending input attachment should contain structured input router block");
+        };
+        let pending_text = render_input_router_block(inputs);
         assert!(pending_text.contains("[user_terminal]"));
         assert!(pending_text.contains("type=user.guidance"));
         assert!(pending_text.contains("guide now"));
@@ -1539,7 +1546,7 @@ mod tests {
         let requests = requests.borrow();
         assert_eq!(requests.len(), 2);
         let second_request = &requests[1];
-        let pending_text = second_request
+        let pending_inputs = second_request
             .messages
             .iter()
             .find_map(|message| {
@@ -1548,10 +1555,14 @@ mod tests {
                     .as_ref()
                     .map(|metadata| metadata.kind)
                     == Some(AttachmentKind::InputRouter))
-                .then(|| assistant_text(message))
+                .then(|| match &message.blocks[..] {
+                    [ContentBlock::InputRouter { inputs }] => Some(inputs),
+                    _ => None,
+                })
                 .flatten()
             })
             .expect("second request should include input-router attachment");
+        let pending_text = render_input_router_block(pending_inputs);
         assert!(pending_text.contains("[user_terminal]"));
         assert!(pending_text.contains("type=user.guidance"));
         assert!(pending_text.contains("guide from terminal"));
@@ -2378,7 +2389,9 @@ mod tests {
             .and_then(|message| message.blocks.first())
             .and_then(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                ContentBlock::InputRouter { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. } => None,
             })
             .expect("compact request should end with a text prompt");
         assert!(compact_prompt.contains("Your task is to create a detailed summary"));
@@ -2539,7 +2552,9 @@ mod tests {
             .and_then(|message| message.blocks.first())
             .and_then(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
+                ContentBlock::InputRouter { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. } => None,
             })
             .expect("compact request should end with a text prompt");
         assert!(compact_prompt.contains("Additional Instructions:"));
@@ -2719,12 +2734,12 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 6,
-            })
-        );
+        let auto_compaction = summary
+            .auto_compaction
+            .as_ref()
+            .expect("auto-compaction should report archived messages");
+        assert_eq!(auto_compaction.removed_message_count, 6);
+        assert_eq!(auto_compaction.removed_messages.len(), 6);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
         assert_eq!(runtime.session().messages.len(), 2);
         assert_eq!(runtime.session().messages[1].role, MessageRole::User);
