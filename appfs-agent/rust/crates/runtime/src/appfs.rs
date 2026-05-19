@@ -9,10 +9,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-use crate::input_router::render_pending_input_reminder;
+use crate::input_router::input_router_block_from_pending_inputs;
 use crate::input_router::{InputEnvelope, InputSource, PendingInput, PendingInputDelivery};
 #[cfg(test)]
-use crate::session::{AttachmentKind, ConversationMessage};
+use crate::session::ConversationMessage;
 use crate::session::{Session, SessionError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -819,10 +819,8 @@ pub fn sync_appfs_event_reminders_with_outcome(
     let sync = collect_appfs_pending_inputs(session, cwd)?;
     let new_event_count = sync.pending_inputs.len();
     if !sync.pending_inputs.is_empty() {
-        let reminder = render_pending_input_reminder(&sync.pending_inputs);
-        session.push_message(ConversationMessage::attachment_user_text(
-            reminder,
-            AttachmentKind::InputRouter,
+        session.push_message(ConversationMessage::input_router(
+            input_router_block_from_pending_inputs(&sync.pending_inputs),
         ))?;
     }
 
@@ -2912,8 +2910,8 @@ mod tests {
         APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
         APPFS_SCHEMA_VERSION,
     };
-    use crate::input_router::InputSource;
-    use crate::session::{AttachmentKind, ContentBlock, Session};
+    use crate::input_router::{render_input_router_block, InputSource};
+    use crate::session::{AttachmentKind, ContentBlock, ConversationMessage, Session};
     use serde_json::Value;
     use std::env;
     use std::fs;
@@ -2949,6 +2947,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn rendered_input_router_text(message: &ConversationMessage) -> String {
+        let [ContentBlock::InputRouter { inputs }] = message.blocks.as_slice() else {
+            panic!("expected structured input router reminder");
+        };
+        render_input_router_block(inputs)
     }
 
     fn seed_heuristic_mount(mount_root: &Path) {
@@ -3993,9 +3998,7 @@ mod tests {
                 .map(|metadata| metadata.kind),
             Some(AttachmentKind::InputRouter)
         );
-        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
-            panic!("expected text reminder");
-        };
+        let text = rendered_input_router_text(&session.messages[0]);
         assert!(text.contains("<system-reminder>"));
         assert!(text.contains("action.completed"));
         assert!(text.contains("app_id='scheduler'"));
@@ -4116,9 +4119,7 @@ mod tests {
         assert_eq!(outcome.new_event_count, 2);
         assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(4));
         assert_eq!(session.messages.len(), 1);
-        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
-            panic!("expected text reminder");
-        };
+        let text = rendered_input_router_text(&session.messages[0]);
         assert!(text.contains("[appfs_event]"));
         assert!(text.contains("please review\n\n<system-reminder>"));
         assert!(text.contains("上面的内容是一条来自 AppFS Tinode 的外部消息"));
@@ -4452,9 +4453,7 @@ mod tests {
         sync_appfs_event_reminders(&mut session, &mount_root).expect("new event should sync");
 
         assert_eq!(session.messages.len(), 1);
-        let [ContentBlock::Text { text }] = session.messages[0].blocks.as_slice() else {
-            panic!("expected text reminder");
-        };
+        let text = rendered_input_router_text(&session.messages[0]);
         assert!(text.contains("sent from default"));
         assert!(text.contains("principal=default"));
         assert!(!text.contains("sent from incident"));

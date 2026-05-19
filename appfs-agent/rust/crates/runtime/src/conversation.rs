@@ -1261,7 +1261,7 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{
         AttachmentKind, CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent,
-        InvokedSkill, MessageRole, Session, SessionCompaction,
+        InputRouterBlockInput, InvokedSkill, MessageRole, Session, SessionCompaction,
     };
     use crate::tool_session::{
         current_tool_session_compaction_summary, current_tool_session_messages,
@@ -1591,10 +1591,21 @@ mod tests {
         };
         let mut session = Session::new();
         session
-            .push_message(ConversationMessage::attachment_user_text(
-                "<system-reminder>\nmessage.received\n</system-reminder>",
-                AttachmentKind::InputRouter,
-            ))
+            .push_message(ConversationMessage::input_router(vec![
+                InputRouterBlockInput {
+                    source: "appfs_event".to_string(),
+                    input_type: "message.received".to_string(),
+                    text: "message.received".to_string(),
+                    principal_id: Some("default".to_string()),
+                    app_id: Some("tinode".to_string()),
+                    stream_id: Some("app:tinode--default".to_string()),
+                    seq: Some(1),
+                    correlation_id: None,
+                    requires_attention: true,
+                    delivery: Some("inject_at_next_boundary".to_string()),
+                    payload: None,
+                },
+            ]))
             .expect("append event reminder");
         let mut runtime = ConversationRuntime::new(
             session,

@@ -313,7 +313,7 @@ impl SharedPendingInputQueue {
 }
 
 #[must_use]
-pub fn render_pending_input_reminder(inputs: &[PendingInput]) -> String {
+fn render_pending_input_reminder(inputs: &[PendingInput]) -> String {
     let (message_inputs, other_inputs): (Vec<_>, Vec<_>) = inputs
         .iter()
         .partition(|input| is_appfs_message_received(&input.envelope));
