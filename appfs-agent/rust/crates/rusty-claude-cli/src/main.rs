@@ -10050,17 +10050,20 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
-                        text: render_input_router_block(inputs),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::InputRouter { inputs } => {
+                        let text = render_input_router_block(inputs);
+                        (!text.trim().is_empty()).then_some(InputContentBlock::Text { text })
+                    }
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         tool_name,
@@ -10069,11 +10072,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         ..
                     } => {
                         let result = model_visible_tool_result(tool_name, output, *is_error);
-                        InputContentBlock::ToolResult {
+                        Some(InputContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: result.content,
                             is_error: result.is_error,
-                        }
+                        })
                     }
                 })
                 .collect::<Vec<_>>();
@@ -13719,6 +13722,10 @@ UU conflicted.rs",
                 source: "appfs_event".to_string(),
                 input_type: "message.received".to_string(),
                 text: "请实现桶排序".to_string(),
+                event_id: None,
+                ts: None,
+                client_token: None,
+                event_path: None,
                 principal_id: Some("code-implementer".to_string()),
                 app_id: Some("tinode".to_string()),
                 stream_id: Some("app:tinode--code-implementer".to_string()),
@@ -13727,6 +13734,8 @@ UU conflicted.rs",
                 requires_attention: true,
                 delivery: Some("inject_at_next_boundary".to_string()),
                 payload: None,
+                raw_event: None,
+                event_render_metadata: None,
             },
         ])];
 

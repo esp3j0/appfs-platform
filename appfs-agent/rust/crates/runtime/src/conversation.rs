@@ -1596,6 +1596,10 @@ mod tests {
                     source: "appfs_event".to_string(),
                     input_type: "message.received".to_string(),
                     text: "message.received".to_string(),
+                    event_id: None,
+                    ts: None,
+                    client_token: None,
+                    event_path: None,
                     principal_id: Some("default".to_string()),
                     app_id: Some("tinode".to_string()),
                     stream_id: Some("app:tinode--default".to_string()),
@@ -1604,6 +1608,8 @@ mod tests {
                     requires_attention: true,
                     delivery: Some("inject_at_next_boundary".to_string()),
                     payload: None,
+                    raw_event: None,
+                    event_render_metadata: None,
                 },
             ]))
             .expect("append event reminder");

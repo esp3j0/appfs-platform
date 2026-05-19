@@ -298,6 +298,7 @@ impl TinodeConnector {
             dir("_app"),
             static_json("_app/actions.res.json", self.actions_resource()),
             static_json("_app/control.res.json", self.control_resource()),
+            static_json("_app/events.res.json", self.events_resource()),
             static_json("_app/skill.res.json", self.skill_resource()),
             static_json("_app/self.res.json", self.self_resource(ctx)),
             action("_app/ensure_credentials.act"),
@@ -479,6 +480,50 @@ impl TinodeConnector {
                     "send_message_path": "contacts/send_message.act"
                 }
             ]
+        })
+    }
+
+    fn events_resource(&self) -> JsonValue {
+        json!({
+            "version": 1,
+            "app_id": TINODE_APP_ID,
+            "events": {
+                "message.received": {
+                    "class": "external_message",
+                    "model_render": {
+                        "mode": "body_with_source_reminder",
+                        "body_template": "{{content.text_preview}}",
+                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+                    }
+                },
+                "message.sent": {
+                    "class": "receipt",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 消息已发送给 {{content.to_display_name}}：{{content.text_preview}}。"
+                    }
+                },
+                "action.failed": {
+                    "class": "failure",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 操作失败：{{error.code}}，{{error.message}}。"
+                    }
+                },
+                "profile.credentials.ready": {
+                    "class": "status",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 凭据已就绪（profile_id={{content.profile_id}}）。"
+                    }
+                },
+                "inbox.updated": {
+                    "class": "noise",
+                    "model_render": {
+                        "mode": "debug_only"
+                    }
+                }
+            }
         })
     }
 
@@ -4315,6 +4360,7 @@ mod tests {
         for expected in [
             "_app/actions.res.json",
             "_app/control.res.json",
+            "_app/events.res.json",
             "_app/self.res.json",
             "_app/skill.res.json",
             "_app/ensure_credentials.act",
@@ -4361,6 +4407,20 @@ mod tests {
             .expect("recommended actions")
             .iter()
             .any(|action| action["path"] == "contacts/send_message.act"));
+        let events_doc = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.path == "_app/events.res.json")
+            .and_then(|node| node.seed_content.as_ref())
+            .expect("tinode events seed content");
+        assert_eq!(
+            events_doc["events"]["message.received"]["model_render"]["mode"],
+            "body_with_source_reminder"
+        );
+        assert_eq!(
+            events_doc["events"]["inbox.updated"]["model_render"]["mode"],
+            "debug_only"
+        );
     }
 
     #[test]

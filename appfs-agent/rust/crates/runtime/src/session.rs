@@ -51,6 +51,10 @@ pub struct InputRouterBlockInput {
     pub source: String,
     pub input_type: String,
     pub text: String,
+    pub event_id: Option<String>,
+    pub ts: Option<String>,
+    pub client_token: Option<String>,
+    pub event_path: Option<String>,
     pub principal_id: Option<String>,
     pub app_id: Option<String>,
     pub stream_id: Option<String>,
@@ -59,6 +63,8 @@ pub struct InputRouterBlockInput {
     pub requires_attention: bool,
     pub delivery: Option<String>,
     pub payload: Option<JsonValue>,
+    pub raw_event: Option<JsonValue>,
+    pub event_render_metadata: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1447,6 +1453,24 @@ impl InputRouterBlockInput {
             JsonValue::String(self.input_type.clone()),
         );
         object.insert("text".to_string(), JsonValue::String(self.text.clone()));
+        if let Some(event_id) = &self.event_id {
+            object.insert("event_id".to_string(), JsonValue::String(event_id.clone()));
+        }
+        if let Some(ts) = &self.ts {
+            object.insert("ts".to_string(), JsonValue::String(ts.clone()));
+        }
+        if let Some(client_token) = &self.client_token {
+            object.insert(
+                "client_token".to_string(),
+                JsonValue::String(client_token.clone()),
+            );
+        }
+        if let Some(event_path) = &self.event_path {
+            object.insert(
+                "event_path".to_string(),
+                JsonValue::String(event_path.clone()),
+            );
+        }
         if let Some(principal_id) = &self.principal_id {
             object.insert(
                 "principal_id".to_string(),
@@ -1483,6 +1507,15 @@ impl InputRouterBlockInput {
         if let Some(payload) = &self.payload {
             object.insert("payload".to_string(), payload.clone());
         }
+        if let Some(raw_event) = &self.raw_event {
+            object.insert("raw_event".to_string(), raw_event.clone());
+        }
+        if let Some(event_render_metadata) = &self.event_render_metadata {
+            object.insert(
+                "event_render_metadata".to_string(),
+                event_render_metadata.clone(),
+            );
+        }
         JsonValue::Object(object)
     }
 
@@ -1494,6 +1527,10 @@ impl InputRouterBlockInput {
             source: required_string(object, "source")?,
             input_type: required_string(object, "input_type")?,
             text: required_string(object, "text")?,
+            event_id: optional_string(object, "event_id"),
+            ts: optional_string(object, "ts"),
+            client_token: optional_string(object, "client_token"),
+            event_path: optional_string(object, "event_path"),
             principal_id: optional_string(object, "principal_id"),
             app_id: optional_string(object, "app_id"),
             stream_id: optional_string(object, "stream_id"),
@@ -1505,6 +1542,8 @@ impl InputRouterBlockInput {
                 .unwrap_or(false),
             delivery: optional_string(object, "delivery"),
             payload: object.get("payload").cloned(),
+            raw_event: object.get("raw_event").cloned(),
+            event_render_metadata: object.get("event_render_metadata").cloned(),
         })
     }
 }
@@ -2347,6 +2386,10 @@ mod tests {
                     source: "appfs_event".to_string(),
                     input_type: "message.received".to_string(),
                     text: "hello from another agent".to_string(),
+                    event_id: Some("evt-42".to_string()),
+                    ts: Some("2026-05-19T12:00:00Z".to_string()),
+                    client_token: Some("client-42".to_string()),
+                    event_path: Some("contacts/default/messages.res.jsonl".to_string()),
                     principal_id: Some("code-implementer".to_string()),
                     app_id: Some("tinode".to_string()),
                     stream_id: Some("app:tinode--code-implementer".to_string()),
@@ -2358,6 +2401,36 @@ mod tests {
                         [(
                             "contact_key".to_string(),
                             JsonValue::String("default".to_string()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )),
+                    raw_event: Some(JsonValue::Object(
+                        [
+                            (
+                                "event_id".to_string(),
+                                JsonValue::String("evt-42".to_string()),
+                            ),
+                            (
+                                "type".to_string(),
+                                JsonValue::String("message.received".to_string()),
+                            ),
+                            ("seq".to_string(), JsonValue::Number(42)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )),
+                    event_render_metadata: Some(JsonValue::Object(
+                        [(
+                            "model_render".to_string(),
+                            JsonValue::Object(
+                                [(
+                                    "mode".to_string(),
+                                    JsonValue::String("body_with_source_reminder".to_string()),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
                         )]
                         .into_iter()
                         .collect(),
@@ -2383,11 +2456,60 @@ mod tests {
             panic!("expected structured input router block");
         };
         assert_eq!(inputs[0].input_type, "message.received");
+        assert_eq!(inputs[0].event_id.as_deref(), Some("evt-42"));
+        assert_eq!(inputs[0].ts.as_deref(), Some("2026-05-19T12:00:00Z"));
+        assert_eq!(inputs[0].client_token.as_deref(), Some("client-42"));
+        assert_eq!(
+            inputs[0].event_path.as_deref(),
+            Some("contacts/default/messages.res.jsonl")
+        );
         assert!(inputs[0]
             .payload
             .as_ref()
             .and_then(JsonValue::as_object)
             .is_some_and(|payload| payload.contains_key("contact_key")));
+        assert!(inputs[0]
+            .raw_event
+            .as_ref()
+            .and_then(JsonValue::as_object)
+            .is_some_and(|raw_event| raw_event.contains_key("event_id")));
+        assert!(inputs[0]
+            .event_render_metadata
+            .as_ref()
+            .and_then(JsonValue::as_object)
+            .is_some_and(|metadata| metadata.contains_key("model_render")));
+    }
+
+    #[test]
+    fn input_router_blocks_load_without_raw_event_metadata() {
+        let legacy_input = JsonValue::Object(
+            [
+                (
+                    "source".to_string(),
+                    JsonValue::String("appfs_event".to_string()),
+                ),
+                (
+                    "input_type".to_string(),
+                    JsonValue::String("action.completed".to_string()),
+                ),
+                ("text".to_string(), JsonValue::String("done".to_string())),
+                ("seq".to_string(), JsonValue::Number(7)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let input =
+            InputRouterBlockInput::from_json(&legacy_input).expect("legacy input should parse");
+
+        assert_eq!(input.input_type, "action.completed");
+        assert_eq!(input.seq, Some(7));
+        assert!(input.event_id.is_none());
+        assert!(input.ts.is_none());
+        assert!(input.client_token.is_none());
+        assert!(input.event_path.is_none());
+        assert!(input.raw_event.is_none());
+        assert!(input.event_render_metadata.is_none());
     }
 
     #[test]
