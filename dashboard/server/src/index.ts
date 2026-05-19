@@ -6,6 +6,7 @@ import { registerAgentsRoute } from './routes/agents.js';
 import { registerMessagesRoute } from './routes/messages.js';
 import { registerTimelineRoute } from './routes/timeline.js';
 import { registerEventsRoute } from './routes/events.js';
+import { registerAppEventOverridesRoute } from './routes/app-event-overrides.js';
 
 const PORT = parseInt(process.env.PORT ?? '3100', 10);
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -42,6 +43,7 @@ async function main() {
   registerMessagesRoute(app, registry);
   registerTimelineRoute(app, registry);
   registerEventsRoute(app, registry);
+  registerAppEventOverridesRoute(app, registry);
 
   await app.listen({ port: PORT, host: HOST });
   console.log(`Dashboard API listening on http://${HOST}:${PORT}`);

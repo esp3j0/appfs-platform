@@ -28,6 +28,7 @@ const PRINCIPALS_FILE: &str = "principals.registry.json";
 const APP_POLICIES_FILE: &str = "app-policies.registry.json";
 const APP_CONTROL_DIR_NAME: &str = "_app";
 const APP_EVENTS_DESCRIPTOR_FILE: &str = "events.res.json";
+const APPFS_EVENT_RENDER_OVERRIDES_REL_PATH: &str = ".claw/appfs-event-render-overrides.json";
 const ENSURE_CREDENTIALS_ACTION: &str = "ensure_credentials.act";
 const APP_STREAM_DIR_NAME: &str = "_stream";
 const EVENTS_FILE: &str = "events.evt.jsonl";
@@ -1248,12 +1249,16 @@ pub fn scan_appfs_attention_events_for_idle_wake(
                         model_cursor_baselines.insert(stream.stream_id.clone(), last_seq);
                     }
                 }
-                wake_events.extend(
-                    records
-                        .into_iter()
-                        .filter(|record| record.seq > last_seq)
-                        .filter(should_wake_idle_agent_for_appfs_event),
-                );
+                wake_events.extend(records.into_iter().filter(|record| {
+                    if record.seq <= last_seq {
+                        return false;
+                    }
+                    let event_metadata = event_render_metadata_for(&render_metadata, record);
+                    should_wake_idle_agent_for_appfs_event_with_render_metadata(
+                        record,
+                        event_metadata.as_ref(),
+                    )
+                }));
             }
             None => {
                 wake_cursor_updates.insert(stream.stream_id.clone(), max_seq);
@@ -1342,10 +1347,15 @@ fn collect_pending_inputs_from_appfs_environment(
                         .into_iter()
                         .filter(|record| record.seq > last_seq)
                         .filter_map(|record| {
+                            let event_metadata = event_render_metadata_for(&render_metadata, &record);
                             pending_input_from_appfs_event(
                                 &record,
-                                classify_appfs_event(&record).running_delivery,
-                                event_render_metadata_for(&render_metadata, &record),
+                                classify_appfs_event_with_render_metadata(
+                                    &record,
+                                    event_metadata.as_ref(),
+                                )
+                                .running_delivery,
+                                event_metadata,
                             )
                         }),
                 );
@@ -1513,6 +1523,88 @@ fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
     }
 }
 
+fn classify_appfs_event_with_render_metadata(
+    event: &AppfsEventRecord,
+    event_render_metadata: Option<&Value>,
+) -> AppfsEventClassification {
+    let mut classification = classify_appfs_event(event);
+    let Some(metadata) = event_render_metadata else {
+        return classification;
+    };
+
+    if let Some(input_class) = metadata.get("class").and_then(Value::as_str) {
+        classification.input_class = match input_class {
+            "external_message" | "attention" => AppfsInputClass::Attention,
+            "guidance" => AppfsInputClass::Guidance,
+            "receipt" => AppfsInputClass::Receipt,
+            "status" => AppfsInputClass::Status,
+            "noise" => AppfsInputClass::Noise,
+            _ => classification.input_class,
+        };
+    }
+
+    match event_model_render_mode(metadata) {
+        Some("drop") => {
+            classification.running_delivery = AppfsDeliveryMode::Drop;
+            classification.idle_delivery = AppfsDeliveryMode::Drop;
+        }
+        Some("debug_only" | "hidden") => {
+            classification.running_delivery = AppfsDeliveryMode::ContextOnly;
+            classification.idle_delivery = AppfsDeliveryMode::ContextOnly;
+        }
+        _ => {}
+    }
+
+    if let Some(running_delivery) = metadata
+        .get("running_delivery")
+        .and_then(Value::as_str)
+        .and_then(appfs_delivery_mode_from_str)
+    {
+        classification.running_delivery = running_delivery;
+    }
+    if let Some(idle_delivery) = metadata
+        .get("idle_delivery")
+        .and_then(Value::as_str)
+        .and_then(appfs_delivery_mode_from_str)
+    {
+        classification.idle_delivery = idle_delivery;
+    }
+    if let Some(wake) = metadata.get("wake").and_then(Value::as_bool) {
+        classification.idle_delivery = if wake {
+            AppfsDeliveryMode::WakeIfIdle
+        } else {
+            AppfsDeliveryMode::ContextOnly
+        };
+    }
+
+    classification
+}
+
+fn event_model_render_mode(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("model_render")
+        .and_then(|model_render| {
+            model_render
+                .get("mode")
+                .and_then(Value::as_str)
+                .or_else(|| model_render.get("visibility").and_then(Value::as_str))
+        })
+        .or_else(|| metadata.get("mode").and_then(Value::as_str))
+        .or_else(|| metadata.get("visibility").and_then(Value::as_str))
+}
+
+fn appfs_delivery_mode_from_str(value: &str) -> Option<AppfsDeliveryMode> {
+    match value {
+        "inject_at_next_boundary" | "inject" | "model" => {
+            Some(AppfsDeliveryMode::InjectAtNextBoundary)
+        }
+        "wake_if_idle" | "wake" => Some(AppfsDeliveryMode::WakeIfIdle),
+        "context_only" | "context" | "debug_only" => Some(AppfsDeliveryMode::ContextOnly),
+        "drop" | "hidden" => Some(AppfsDeliveryMode::Drop),
+        _ => None,
+    }
+}
+
 fn appfs_event_requires_attention(event: &AppfsEventRecord) -> bool {
     event
         .content
@@ -1522,9 +1614,12 @@ fn appfs_event_requires_attention(event: &AppfsEventRecord) -> bool {
         .unwrap_or(false)
 }
 
-fn should_wake_idle_agent_for_appfs_event(event: &AppfsEventRecord) -> bool {
+fn should_wake_idle_agent_for_appfs_event_with_render_metadata(
+    event: &AppfsEventRecord,
+    event_render_metadata: Option<&Value>,
+) -> bool {
     matches!(
-        classify_appfs_event(event).idle_delivery,
+        classify_appfs_event_with_render_metadata(event, event_render_metadata).idle_delivery,
         AppfsDeliveryMode::WakeIfIdle
     )
 }
@@ -1604,7 +1699,88 @@ fn read_appfs_event_render_metadata(
         }
     }
 
+    apply_appfs_event_render_overrides(environment, &mut metadata);
     metadata
+}
+
+fn apply_appfs_event_render_overrides(
+    environment: &AppfsEnvironment,
+    metadata: &mut BTreeMap<String, BTreeMap<String, Value>>,
+) {
+    let override_path = environment
+        .mount_root
+        .join(APPFS_EVENT_RENDER_OVERRIDES_REL_PATH);
+    let Some(overrides) = read_json_file::<Value>(&override_path) else {
+        return;
+    };
+
+    if let Some(streams) = overrides.get("streams").and_then(Value::as_object) {
+        for (stream_id, value) in streams {
+            apply_event_render_override_entry(metadata, stream_id, value);
+        }
+    }
+
+    if let Some(apps) = overrides.get("apps").and_then(Value::as_object) {
+        for app in &environment.registered_apps {
+            if let Some(value) = apps.get(&app.app_id) {
+                apply_event_render_override_entry(
+                    metadata,
+                    &format!("app:{}", app.instance_id),
+                    value,
+                );
+            }
+        }
+    }
+
+    if let Some(platform) = overrides.get("platform") {
+        apply_event_render_override_entry(metadata, "platform", platform);
+    }
+}
+
+fn apply_event_render_override_entry(
+    metadata: &mut BTreeMap<String, BTreeMap<String, Value>>,
+    stream_id: &str,
+    value: &Value,
+) {
+    let Some(overrides) = read_event_render_override_events(value) else {
+        return;
+    };
+
+    let target = metadata.entry(stream_id.to_string()).or_default();
+    for (event_type, override_metadata) in overrides {
+        target
+            .entry(event_type)
+            .and_modify(|existing| merge_json_values(existing, &override_metadata))
+            .or_insert(override_metadata);
+    }
+}
+
+fn read_event_render_override_events(value: &Value) -> Option<BTreeMap<String, Value>> {
+    let events = value.get("events").unwrap_or(value);
+    let object = events.as_object()?;
+    let mut result = BTreeMap::new();
+    for (event_type, metadata) in object {
+        result.insert(event_type.clone(), metadata.clone());
+    }
+    Some(result)
+}
+
+fn merge_json_values(existing: &mut Value, overrides: &Value) {
+    match (existing, overrides) {
+        (Value::Object(existing_object), Value::Object(override_object)) => {
+            for (key, override_value) in override_object {
+                match existing_object.get_mut(key) {
+                    Some(existing_value) => merge_json_values(existing_value, override_value),
+                    None => {
+                        existing_object.insert(key.clone(), override_value.clone());
+                    }
+                }
+            }
+        }
+        (existing_slot, override_value) => {
+            *existing_slot = override_value.clone();
+        }
+    }
 }
 
 fn read_appfs_events_descriptor(app_root: &Path) -> Option<BTreeMap<String, Value>> {
@@ -3346,9 +3522,12 @@ mod tests {
     use super::{
         appfs_act_wait_plan_has_terminal_event, appfs_event_to_input_envelope,
         attach_appfs_principal_from_environment, build_appfs_prompt_section, classify_appfs_event,
-        collect_appfs_pending_inputs, create_appfs_principal, detach_appfs_principal,
-        detect_appfs_environment, ensure_appfs_attach_identity,
+        classify_appfs_event_with_render_metadata, collect_appfs_pending_inputs,
+        create_appfs_principal, detach_appfs_principal, detect_appfs_environment,
+        ensure_appfs_attach_identity,
         ensure_appfs_attach_identity_with_attach_env, extract_appfs_act_tokens,
+        event_render_metadata_for, read_appfs_event_render_metadata, AppfsEnvironment,
+        AppfsRegisteredApp,
         prepare_appfs_act_event_wait_with_options, render_appfs_event_reminder,
         resolve_appfs_environment_with_attach_env, scan_appfs_attention_events_for_idle_wake,
         sync_appfs_event_reminders, sync_appfs_event_reminders_with_outcome,
@@ -4796,6 +4975,112 @@ PY"#,
         let text = rendered_input_router_text(&session.messages[0]);
         assert!(text.contains("Tinode custom sent AppFS Agent code-implementer: 你好."));
         assert!(!text.contains("消息已发送给"));
+    }
+
+    #[test]
+    fn app_event_render_overrides_merge_into_app_metadata() {
+        let temp = TempDirGuard::new("appfs-event-render-overrides");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+
+        let app_root = mount_root.join("private").join("default").join("tinode");
+        fs::write(
+            app_root.join("_app").join("events.res.json"),
+            r#"{"version":1,"events":{"message.received":{"wake":true,"running_delivery":"inject_at_next_boundary","idle_delivery":"wake_if_idle","model_render":{"mode":"summary","template":"BASE {{content.text_preview}}"}}}}"#,
+        )
+        .expect("write base event render descriptor");
+
+        let overrides_path = mount_root
+            .join(".claw")
+            .join("appfs-event-render-overrides.json");
+        fs::create_dir_all(overrides_path.parent().expect("override parent")).expect("create override dir");
+        fs::write(
+            &overrides_path,
+            r#"{"version":1,"apps":{"tinode":{"events":{"message.received":{"wake":false,"idle_delivery":"context_only","model_render":{"template":"OVERRIDE {{content.text_preview}}"}}}}}}"#,
+        )
+        .expect("write override document");
+
+        let environment = AppfsEnvironment {
+            attach_source: AppfsAttachSource::Heuristic,
+            mount_root: mount_root.clone(),
+            runtime_session_id: None,
+            attach_id: "attach-test".to_string(),
+            principal_id: "default".to_string(),
+            attach_role: None,
+            multi_agent_mode: APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
+            manifest_path: None,
+            control_dir: Some(mount_root.join("_appfs")),
+            control_events_path: Some(mount_root.join("_appfs").join("_stream").join("events.evt.jsonl")),
+            registry_path: Some(mount_root.join("_appfs").join("apps.registry.json")),
+            register_app_path: Some(mount_root.join("_appfs").join("register_app.act")),
+            unregister_app_path: Some(mount_root.join("_appfs").join("unregister_app.act")),
+            list_apps_path: Some(mount_root.join("_appfs").join("list_apps.act")),
+            attach_principal_path: Some(mount_root.join("_appfs").join("principals").join("attach_principal.act")),
+            detach_principal_path: Some(mount_root.join("_appfs").join("principals").join("detach_principal.act")),
+            current_app_id: None,
+            current_app_root: None,
+            current_app_events_path: None,
+            registered_apps: vec![AppfsRegisteredApp {
+                instance_id: "tinode--default".to_string(),
+                app_id: "tinode".to_string(),
+                visibility: AppfsRegisteredAppVisibility::PrivateInstance,
+                parent_app_id: Some("tinode".to_string()),
+                principal_id: Some("default".to_string()),
+                profile_id: Some("tinode:default".to_string()),
+                path: "private/default/tinode".to_string(),
+                active_scope: None,
+            }],
+            known_principals: vec![],
+            warnings: vec![],
+        };
+
+        let render_metadata = read_appfs_event_render_metadata(&environment);
+        let event = appfs_event_record_for_test(
+            "message.received",
+            Some(serde_json::json!({ "text_preview": "hello" })),
+            None,
+        );
+        let merged = event_render_metadata_for(&render_metadata, &event)
+            .expect("merged render metadata");
+
+        assert_eq!(
+            merged
+                .get("wake")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            merged
+                .get("idle_delivery")
+                .and_then(Value::as_str),
+            Some("context_only")
+        );
+        assert_eq!(
+            merged
+                .get("running_delivery")
+                .and_then(Value::as_str),
+            Some("inject_at_next_boundary")
+        );
+        assert_eq!(
+            merged
+                .get("model_render")
+                .and_then(Value::as_object)
+                .and_then(|model_render: &serde_json::Map<String, Value>| model_render.get("mode"))
+                .and_then(Value::as_str),
+            Some("summary")
+        );
+        assert_eq!(
+            merged
+                .get("model_render")
+                .and_then(Value::as_object)
+                .and_then(|model_render: &serde_json::Map<String, Value>| model_render.get("template"))
+                .and_then(Value::as_str),
+            Some("OVERRIDE {{content.text_preview}}")
+        );
+        assert_eq!(
+            classify_appfs_event_with_render_metadata(&event, Some(&merged)).idle_delivery,
+            AppfsDeliveryMode::ContextOnly
+        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ export interface InputRouterBlockInput {
   source: string;
   input_type: string;
   text: string;
+  event_id?: string;
+  ts?: string;
+  client_token?: string;
+  event_path?: string;
   principal_id?: string;
   app_id?: string;
   stream_id?: string;
@@ -55,6 +59,8 @@ export interface InputRouterBlockInput {
   requires_attention?: boolean;
   delivery?: string;
   payload?: unknown;
+  raw_event?: unknown;
+  event_render_metadata?: unknown;
 }
 
 export interface TokenUsage {
@@ -183,4 +189,15 @@ export interface TimelineResponse {
   entries: TimelineEntry[];
   interactions: CrossAgentInteraction[];
   compactionBoundaries: TimelineCompactionBoundary[];
+}
+
+export interface AppEventRenderScopeOverride {
+  events: Record<string, unknown>;
+}
+
+export interface AppEventRenderOverridesDoc {
+  version: number;
+  streams?: Record<string, AppEventRenderScopeOverride>;
+  apps?: Record<string, AppEventRenderScopeOverride>;
+  platform?: AppEventRenderScopeOverride;
 }

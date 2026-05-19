@@ -205,6 +205,202 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   flex-shrink: 0;
 }
 
+/* ── App Control ── */
+
+.app-control {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 16px;
+}
+.app-control-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+.app-control-header h2 {
+  font-size: 15px;
+  color: #e6edf3;
+}
+.app-control-meta,
+.app-control-subtitle {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #8b949e;
+}
+.app-control-agents,
+.app-control-title,
+.app-control-event-title,
+.app-control-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.app-control-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 4px;
+}
+.app-control-card {
+  background: #111820;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.app-control-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  border-left: 3px solid #39d2c0;
+  border-bottom: 1px solid #30363d;
+  background: #161b22;
+  padding: 10px 12px;
+}
+.app-control-app-name {
+  color: #39d2c0;
+  font-size: 13px;
+  font-weight: 800;
+}
+.app-control-stats span,
+.app-control-pill {
+  border: 1px solid #30363d;
+  background: #0d1117;
+  border-radius: 3px;
+  color: #8b949e;
+  padding: 2px 6px;
+  font-size: 10px;
+}
+.app-control-pill.hot {
+  border-color: #d29922;
+  background: #3d2b14;
+  color: #f2cc60;
+}
+.app-control-pill.muted {
+  color: #484f58;
+}
+.app-control-event-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+.app-control-event {
+  border: 1px solid #21262d;
+  background: #0d1117;
+  border-radius: 5px;
+  padding: 10px;
+}
+.app-control-event-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.app-control-event-type {
+  color: #d2a8ff;
+  font-weight: 800;
+  font-size: 12px;
+}
+.app-control-preview {
+  border-left: 2px solid #24495a;
+  padding-left: 8px;
+  margin-bottom: 8px;
+}
+.app-control-preview-label {
+  color: #58a6ff;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 3px;
+}
+.app-control-preview-text {
+  color: #c9d1d9;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.app-control-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.app-control-kv {
+  background: #111820;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  padding: 6px;
+  min-width: 0;
+}
+.app-control-kv span {
+  display: block;
+  color: #484f58;
+  font-size: 10px;
+  margin-bottom: 2px;
+}
+.app-control-kv strong {
+  color: #e6edf3;
+  font-size: 11px;
+  word-break: break-word;
+}
+.app-control-edit-grid,
+.app-control-template-grid {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.app-control-edit-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.app-control-template-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.app-control-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.app-control-field span {
+  color: #8b949e;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.app-control-field select,
+.app-control-field textarea {
+  width: 100%;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  background: #0d1117;
+  color: #c9d1d9;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  resize: vertical;
+}
+.app-control-field textarea {
+  min-height: 72px;
+}
+.app-control-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
 /* ── Model View ── */
 
 .model-view {
@@ -486,5 +682,17 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   }
   .model-request-stats {
     justify-content: flex-start;
+  }
+  .app-control-header,
+  .app-control-card-head,
+  .app-control-event-head {
+    flex-direction: column;
+  }
+  .app-control-kv-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .app-control-edit-grid,
+  .app-control-template-grid {
+    grid-template-columns: 1fr;
   }
 }

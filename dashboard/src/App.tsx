@@ -6,8 +6,9 @@ import { AgentSidebar } from './components/AgentSidebar';
 import { TimelinePanel } from './components/TimelinePanel';
 import { InfoPanel } from './components/InfoPanel';
 import { ModelViewPanel } from './components/ModelViewPanel';
+import { AppControlPanel } from './components/AppControlPanel';
 
-type MainView = 'timeline' | 'model';
+type MainView = 'timeline' | 'apps' | 'model';
 
 const EMPTY_TIMELINE: TimelineResponse = {
   entries: [],
@@ -105,10 +106,13 @@ export function App() {
         <div className="work-area">
           <div className="view-tabs">
             <button className={`view-tab ${mainView === 'timeline' ? 'active' : ''}`} onClick={() => setMainView('timeline')}>Timeline</button>
+            <button className={`view-tab ${mainView === 'apps' ? 'active' : ''}`} onClick={() => setMainView('apps')}>Apps</button>
             <button className={`view-tab ${mainView === 'model' ? 'active' : ''}`} onClick={() => setMainView('model')}>Model</button>
           </div>
           {mainView === 'timeline' ? (
             <TimelinePanel selectedAgents={Array.from(selectedAgents)} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
+          ) : mainView === 'apps' ? (
+            <AppControlPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} />
           ) : (
             <ModelViewPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} compactionBoundaries={timeline.compactionBoundaries ?? []} />
           )}

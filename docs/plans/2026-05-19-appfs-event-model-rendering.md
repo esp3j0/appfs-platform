@@ -23,6 +23,18 @@ AppFS event records are generated in adapter/runtime code and stored in app stre
 
 The problem is that non-message AppFS events are currently rendered as debug-like lines. A single inline `.act` can produce `action.accepted`, `message.sent`, and `action.completed`, which is useful for debugging but too verbose for the model.
 
+## Completion Summary
+
+This plan is now fully implemented and verified.
+
+- P0: concise model-facing rendering for AppFS events is in place.
+- P1: raw event fields are preserved in session blocks for dashboard/debug use.
+- P2.1-P2.4: renderer context, built-in platform policy, app event descriptors, safe templates, and the Tinode descriptor are all implemented.
+- P3.1-P3.2: the dashboard can inspect event policy and write per-stream/per-app/platform overrides that the runtime merges before model rendering.
+- Verification: Rust runtime tests, dashboard build, and dashboard server typecheck all pass.
+
+If future work needs richer event policy controls, it should start as a new phase or a new plan rather than extending this one.
+
 ## Design Principles
 
 - Preserve rich session/debug data.
@@ -221,6 +233,10 @@ P2 should intentionally avoid a full template engine. Missing fields should rend
 
 **Goal:** Let an operator inspect and tune event behavior per app.
 
+**P3.1 status:** Implemented as a read-only inspector in the debug dashboard. The panel now groups observed AppFS inputs by app instance, shows event-type counts, render mode/class/delivery hints, and previews the model-facing text plus the stored render metadata.
+
+**P3.2 status:** Implemented as a read/write override editor. The dashboard can persist per-stream, per-app, and platform event render overrides to `.claw/appfs-event-render-overrides.json`, and appfs-agent merges those overrides into event render metadata before model rendering.
+
 **Capabilities:**
 - View event types observed for each app.
 - Configure whether an event wakes the agent.
@@ -235,7 +251,10 @@ P2 should intentionally avoid a full template engine. Missing fields should rend
 
 ## Rollout Plan
 
-1. Implement P0 first.
-2. Validate with Tinode direct-message flow.
-3. Keep session/dashboard data unchanged.
-4. Defer P1/P2 until dashboard and app descriptor needs are clearer.
+This rollout is complete.
+
+1. Keep the raw event JSONL unchanged in AppFS adapters.
+2. Continue storing structured raw events in session data for debug and dashboard views.
+3. Render concise model-facing summaries only at the appfs-agent boundary.
+4. Use the dashboard override editor for operator tuning when needed.
+5. Open a new plan for any future event-policy expansion.
