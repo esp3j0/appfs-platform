@@ -91,24 +91,28 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
 
 .event-text,
 .collapsible-content,
-.model-block-content {
+.model-block-content,
+.app-control-event-list {
   scrollbar-color: #3d4856 #0d1117;
 }
 .event-text::-webkit-scrollbar,
 .collapsible-content::-webkit-scrollbar,
-.model-block-content::-webkit-scrollbar {
+.model-block-content::-webkit-scrollbar,
+.app-control-event-list::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 .event-text::-webkit-scrollbar-thumb,
 .collapsible-content::-webkit-scrollbar-thumb,
-.model-block-content::-webkit-scrollbar-thumb {
+.model-block-content::-webkit-scrollbar-thumb,
+.app-control-event-list::-webkit-scrollbar-thumb {
   background: #3d4856;
   border: 2px solid #0d1117;
 }
 .event-text::-webkit-scrollbar-thumb:hover,
 .collapsible-content::-webkit-scrollbar-thumb:hover,
-.model-block-content::-webkit-scrollbar-thumb:hover {
+.model-block-content::-webkit-scrollbar-thumb:hover,
+.app-control-event-list::-webkit-scrollbar-thumb:hover {
   background: #58687b;
 }
 
@@ -212,7 +216,7 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
   padding: 16px;
 }
 .app-control-header {
@@ -245,7 +249,7 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
 .app-control-list {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -294,6 +298,8 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   flex-direction: column;
   gap: 10px;
   padding: 10px 12px 12px;
+  max-height: 650px;
+  overflow-y: auto;
 }
 .app-control-event {
   border: 1px solid #21262d;
@@ -332,6 +338,8 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
 }
 .app-control-kv-grid {
   display: grid;

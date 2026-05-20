@@ -200,4 +200,9 @@ export interface AppEventRenderOverridesDoc {
   streams?: Record<string, AppEventRenderScopeOverride>;
   apps?: Record<string, AppEventRenderScopeOverride>;
   platform?: AppEventRenderScopeOverride;
+  discoveredApps?: Record<string, {
+    appId: string;
+    principalId: string;
+    events: Record<string, unknown>;
+  }>;
 }

@@ -146,6 +146,11 @@ export interface AppEventRenderOverridesDoc {
   streams?: Record<string, AppEventRenderScopeOverride>;
   apps?: Record<string, AppEventRenderScopeOverride>;
   platform?: AppEventRenderScopeOverride;
+  discoveredApps?: Record<string, {
+    appId: string;
+    principalId: string;
+    events: Record<string, unknown>;
+  }>;
 }
 
 export const AGENT_COLORS = ['#58a6ff', '#3fb950', '#d2a8ff', '#d29922', '#39d2c0', '#f778ba'] as const;

@@ -10,6 +10,7 @@ mod init;
 mod input;
 mod render;
 mod terminal_controller;
+mod appfs_event_ui;
 
 #[cfg(feature = "debug-dump")]
 mod debug_dump;
@@ -9630,7 +9631,7 @@ fn render_pending_input_echoes(inputs: &[PendingInput]) -> String {
 
 fn render_pending_input_echo(input: &PendingInput) -> Option<String> {
     match input.envelope.source {
-        InputSource::AppfsEvent => render_appfs_event_card(&input.envelope),
+        InputSource::AppfsEvent => appfs_event_ui::render_appfs_event_card(&input.envelope),
         InputSource::UserTerminal | InputSource::AgentMessage | InputSource::System => {
             let text = summarize_pending_input_text(input);
             if text.is_empty() {
@@ -9657,7 +9658,7 @@ fn summarize_pending_input_text(input: &PendingInput) -> String {
     let envelope = &input.envelope;
     match envelope.source {
         InputSource::UserTerminal => single_line_preview(&envelope.text, 160),
-        InputSource::AppfsEvent => summarize_appfs_pending_input(envelope),
+        InputSource::AppfsEvent => appfs_event_ui::summarize_appfs_pending_input(envelope),
         InputSource::AgentMessage | InputSource::System => {
             let mut parts = Vec::new();
             if !envelope.input_type.trim().is_empty() {
@@ -9670,101 +9671,6 @@ fn summarize_pending_input_text(input: &PendingInput) -> String {
             parts.join(": ")
         }
     }
-}
-
-fn render_appfs_event_card(envelope: &runtime::InputEnvelope) -> Option<String> {
-    let lines = appfs_event_card_lines(envelope);
-    if lines.is_empty() {
-        return None;
-    }
-
-    let title = "AppFS Wake";
-    let border = "─".repeat(title.len() + 10);
-    let body = lines
-        .into_iter()
-        .map(|line| format!("\x1b[38;5;245m│\x1b[0m {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Some(format!(
-        "\x1b[38;5;245m╭─ \x1b[1;35m{title}\x1b[0;38;5;245m ─╮\x1b[0m\n{body}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    ))
-}
-
-fn appfs_event_card_lines(envelope: &runtime::InputEnvelope) -> Vec<String> {
-    let app_label = envelope.app_id.as_deref().unwrap_or("appfs");
-    let mut lines = Vec::new();
-
-    if envelope.input_type == "message.received" {
-        let from = payload_string(envelope.payload.as_ref(), "from_display_name")
-            .or_else(|| payload_string(envelope.payload.as_ref(), "from_principal"))
-            .or_else(|| payload_string(envelope.payload.as_ref(), "contact_key"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut meta = format!("{app_label} · message.received · from {from}");
-        if envelope.requires_attention {
-            meta.push_str(" · attention required");
-        }
-        lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
-
-        let body = payload_string(envelope.payload.as_ref(), "text")
-            .or_else(|| payload_string(envelope.payload.as_ref(), "text_preview"))
-            .unwrap_or_else(|| single_line_preview(&envelope.text, 280));
-        if !body.is_empty() {
-            lines.push(body);
-        }
-        return lines;
-    }
-
-    let mut meta = format!("{app_label} · {}", envelope.input_type.trim());
-    if let Some(principal) = &envelope.principal_id {
-        meta.push_str(&format!(" · principal {principal}"));
-    }
-    if envelope.requires_attention {
-        meta.push_str(" · attention required");
-    }
-    lines.push(format!("\x1b[1;36m{meta}\x1b[0m"));
-
-    let preview = single_line_preview(&envelope.text, 280);
-    if !preview.is_empty() {
-        lines.push(preview);
-    }
-
-    lines
-}
-
-fn summarize_appfs_pending_input(envelope: &runtime::InputEnvelope) -> String {
-    let app_label = envelope.app_id.as_deref().unwrap_or("AppFS");
-    if envelope.input_type == "message.received" {
-        let from = payload_string(envelope.payload.as_ref(), "from_display_name")
-            .or_else(|| payload_string(envelope.payload.as_ref(), "from_principal"))
-            .or_else(|| payload_string(envelope.payload.as_ref(), "contact_key"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let body = payload_string(envelope.payload.as_ref(), "text")
-            .or_else(|| payload_string(envelope.payload.as_ref(), "text_preview"))
-            .unwrap_or_else(|| single_line_preview(&envelope.text, 160));
-        let attention = if envelope.requires_attention {
-            "needs attention; "
-        } else {
-            ""
-        };
-        return format!("{app_label} message from {from}: {attention}{body}");
-    }
-
-    let preview = single_line_preview(&envelope.text, 160);
-    if preview.is_empty() {
-        format!("{app_label} {}", envelope.input_type.trim())
-    } else {
-        format!("{app_label} {}: {preview}", envelope.input_type.trim())
-    }
-}
-
-fn payload_string(payload: Option<&Value>, key: &str) -> Option<String> {
-    payload
-        .and_then(|value| value.get(key))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn single_line_preview(text: &str, max_chars: usize) -> String {

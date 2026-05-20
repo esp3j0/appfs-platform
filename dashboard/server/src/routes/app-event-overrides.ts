@@ -8,7 +8,12 @@ const OVERRIDES_REL_PATH = path.join('.claw', 'appfs-event-render-overrides.json
 
 export function registerAppEventOverridesRoute(app: FastifyInstance, registry: AgentRegistry): void {
   app.get('/api/app-event-overrides', async () => {
-    return readOverrides(registry.dumpDirectory);
+    const overrides = readOverrides(registry.dumpDirectory);
+    const discoveredApps = discoverStaticAppEvents(registry.dumpDirectory);
+    return {
+      ...overrides,
+      discoveredApps,
+    };
   });
 
   app.put('/api/app-event-overrides', async (request, reply) => {
@@ -19,8 +24,69 @@ export function registerAppEventOverridesRoute(app: FastifyInstance, registry: A
     }
 
     const written = writeOverrides(registry.dumpDirectory, normalizeOverrides(body));
-    return written;
+    const discoveredApps = discoverStaticAppEvents(registry.dumpDirectory);
+    return {
+      ...written,
+      discoveredApps,
+    };
   });
+}
+
+function discoverStaticAppEvents(dumpDir: string): Record<string, {
+  appId: string;
+  principalId: string;
+  events: Record<string, unknown>;
+}> {
+  const discovered: Record<string, {
+    appId: string;
+    principalId: string;
+    events: Record<string, unknown>;
+  }> = {};
+
+  const privateDir = path.join(dumpDir, 'private');
+  if (!fs.existsSync(privateDir)) {
+    return discovered;
+  }
+
+  try {
+    const principals = fs.readdirSync(privateDir);
+    for (const principalId of principals) {
+      const principalPath = path.join(privateDir, principalId);
+      if (!fs.statSync(principalPath).isDirectory()) {
+        continue;
+      }
+
+      const apps = fs.readdirSync(principalPath);
+      for (const appId of apps) {
+        const appPath = path.join(principalPath, appId);
+        if (!fs.statSync(appPath).isDirectory()) {
+          continue;
+        }
+
+        const eventsJsonPath = path.join(appPath, '_app', 'events.res.json');
+        if (fs.existsSync(eventsJsonPath)) {
+          try {
+            const content = fs.readFileSync(eventsJsonPath, 'utf-8');
+            const parsed = JSON.parse(content);
+            if (parsed && typeof parsed === 'object' && parsed.events && typeof parsed.events === 'object') {
+              const streamId = `app:${appId}--${principalId}`;
+              discovered[streamId] = {
+                appId,
+                principalId,
+                events: parsed.events,
+              };
+            }
+          } catch (e) {
+            // Ignore parse errors for individual files
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore overall dir read errors
+  }
+
+  return discovered;
 }
 
 function overridesPath(root: string): string {

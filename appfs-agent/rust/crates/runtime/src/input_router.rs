@@ -1001,7 +1001,30 @@ fn ensure_summary_bullet(text: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTemplateTarget {
+    Model,
+    Terminal,
+}
+
+#[must_use]
+pub fn render_event_template_for_target(
+    envelope: &InputEnvelope,
+    template: &str,
+    target: EventTemplateTarget,
+) -> String {
+    render_event_template_inner(envelope, template, target)
+}
+
 fn render_event_template(envelope: &InputEnvelope, template: &str) -> String {
+    render_event_template_inner(envelope, template, EventTemplateTarget::Model)
+}
+
+fn render_event_template_inner(
+    envelope: &InputEnvelope,
+    template: &str,
+    target: EventTemplateTarget,
+) -> String {
     let mut output = String::new();
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -1012,20 +1035,30 @@ fn render_event_template(envelope: &InputEnvelope, template: &str) -> String {
             return sanitize_router_text(&output);
         };
         let variable = after_start[..end].trim();
-        output.push_str(&template_value(envelope, variable).unwrap_or_default());
+        output.push_str(&template_value(envelope, variable, target).unwrap_or_default());
         rest = &after_start[end + 2..];
     }
     output.push_str(rest);
     sanitize_router_text(&output)
 }
 
-fn template_value(envelope: &InputEnvelope, variable: &str) -> Option<String> {
+fn template_value(
+    envelope: &InputEnvelope,
+    variable: &str,
+    target: EventTemplateTarget,
+) -> Option<String> {
+    if variable.starts_with("ansi.") {
+        return ansi_template_value(variable, target);
+    }
+    if let Some(field) = variable.strip_prefix("message.") {
+        return template_message_value(envelope, field);
+    }
     match variable {
         "type" => Some(envelope.input_type.clone()),
         "path" => envelope.event_path.clone(),
         "seq" => envelope.seq.map(|seq| seq.to_string()),
         "principal_id" => envelope.principal_id.clone(),
-        "app_id" => envelope.app_id.clone(),
+        "app_id" | "app.id" => envelope.app_id.clone(),
         "stream_id" => envelope.stream_id.clone(),
         "app.display_name" => Some(app_display_name(envelope)),
         other => {
@@ -1042,6 +1075,44 @@ fn template_value(envelope: &InputEnvelope, variable: &str) -> Option<String> {
             }
             None
         }
+    }
+}
+
+fn ansi_template_value(variable: &str, target: EventTemplateTarget) -> Option<String> {
+    if target != EventTemplateTarget::Terminal {
+        return Some(String::new());
+    }
+    let value = match variable {
+        "ansi.bold" => "\x1b[1m",
+        "ansi.dim" => "\x1b[2m",
+        "ansi.italic" => "\x1b[3m",
+        "ansi.underline" => "\x1b[4m",
+        "ansi.reset" => "\x1b[0m",
+        "ansi.cyan" => "\x1b[36m",
+        "ansi.green" => "\x1b[32m",
+        "ansi.yellow" => "\x1b[33m",
+        "ansi.blue" => "\x1b[34m",
+        "ansi.magenta" => "\x1b[35m",
+        "ansi.red" => "\x1b[31m",
+        "ansi.gray" => "\x1b[90m",
+        _ => return None,
+    };
+    Some(value.to_string())
+}
+
+fn template_message_value(envelope: &InputEnvelope, field: &str) -> Option<String> {
+    match field {
+        "sender" => payload_str(envelope, "from_display_name")
+            .or_else(|| payload_str(envelope, "from_principal"))
+            .or_else(|| payload_str(envelope, "contact_key"))
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("unknown".to_string())),
+        "body" => payload_str(envelope, "text")
+            .or_else(|| payload_str(envelope, "text_preview"))
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(envelope.text.trim().to_string()))
+            .filter(|value| !value.is_empty()),
+        _ => None,
     }
 }
 
@@ -1110,8 +1181,9 @@ fn sanitize_router_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_pending_input_reminder, InputEnvelope, InputSource, PendingInput,
-        PendingInputDelivery, PendingInputQueue, SharedPendingInputQueue,
+        render_pending_input_reminder, EventTemplateTarget, InputEnvelope, InputSource,
+        PendingInput, PendingInputDelivery, PendingInputQueue, SharedPendingInputQueue,
+        render_event_template_for_target,
     };
     use serde_json::json;
 
@@ -1610,4 +1682,41 @@ mod tests {
         );
         assert!(!reminder.contains("操作已接受"));
     }
+
+    #[test]
+    fn event_template_omits_ansi_for_model_target() {
+        let mut envelope = InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
+        envelope.app_id = Some("tinode".to_string());
+        envelope.payload = Some(json!({
+            "from_display_name": "AppFS Agent default",
+            "text_preview": "hello"
+        }));
+
+        let rendered = render_event_template_for_target(
+            &envelope,
+            "{{ansi.cyan}}{{message.sender}}{{ansi.reset}}: {{message.body}}",
+            EventTemplateTarget::Model,
+        );
+
+        assert_eq!(rendered, "AppFS Agent default: hello");
+    }
+
+    #[test]
+    fn event_template_allows_ansi_for_terminal_target() {
+        let mut envelope = InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
+        envelope.app_id = Some("tinode".to_string());
+        envelope.payload = Some(json!({
+            "from_display_name": "AppFS Agent default",
+            "text_preview": "hello"
+        }));
+
+        let rendered = render_event_template_for_target(
+            &envelope,
+            "{{ansi.cyan}}{{message.sender}}{{ansi.reset}}: {{message.body}}",
+            EventTemplateTarget::Terminal,
+        );
+
+        assert_eq!(rendered, "\x1b[36mAppFS Agent default\x1b[0m: hello");
+    }
 }
+

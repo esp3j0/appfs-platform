@@ -29,6 +29,21 @@ interface EventRenderMetadata {
     source_template?: string;
     [key: string]: unknown;
   };
+  terminal_render?: {
+    mode?: string;
+    lines?: string[];
+    template?: string;
+  };
+  ui_render?: {
+    mode?: string;
+    lines?: string[];
+    template?: string;
+  };
+  user_render?: {
+    mode?: string;
+    lines?: string[];
+    template?: string;
+  };
   [key: string]: unknown;
 }
 
@@ -81,6 +96,7 @@ interface EventDraft {
   template: string;
   bodyTemplate: string;
   sourceTemplate: string;
+  terminalLines: string;
 }
 
 const DEFAULT_DRAFT: EventDraft = {
@@ -92,12 +108,14 @@ const DEFAULT_DRAFT: EventDraft = {
   template: '{{app.display_name}}: 操作已完成。',
   bodyTemplate: '{{content.text_preview}}',
   sourceTemplate: '来源：{{app.display_name}} {{type}}，seq={{seq}}',
+  terminalLines: '{{ansi.cyan}}{{app.display_name}} · from {{message.sender}}{{ansi.reset}}\n{{message.body}}',
 };
 
 export function AppControlPanel({ selectedAgents, entries }: Props) {
   const [overrides, setOverrides] = React.useState<AppEventRenderOverridesDoc>({ version: 1, streams: {} });
   const [loading, setLoading] = React.useState(true);
   const [status, setStatus] = React.useState<string>('');
+  const [scopeFilter, setScopeFilter] = React.useState<'session' | 'all'>('session');
 
   React.useEffect(() => {
     let cancelled = false;
@@ -120,8 +138,8 @@ export function AppControlPanel({ selectedAgents, entries }: Props) {
   }, []);
 
   const apps = React.useMemo(
-    () => collectAppSummaries(entries, selectedAgents, overrides),
-    [entries, selectedAgents, overrides],
+    () => collectAppSummaries(entries, selectedAgents, overrides, scopeFilter === 'all'),
+    [entries, selectedAgents, overrides, scopeFilter],
   );
   const totalEventTypes = apps.reduce((sum, app) => sum + app.eventTypes.size, 0);
   const totalEvents = apps.reduce((sum, app) => sum + app.totalEvents, 0);
@@ -136,12 +154,28 @@ export function AppControlPanel({ selectedAgents, entries }: Props) {
           </div>
           {status && <div className="app-control-subtitle">{status}</div>}
         </div>
-        <div className="app-control-agents">
-          {selectedAgents.length === 0 ? (
-            <span className="app-control-pill muted">no agents selected</span>
-          ) : selectedAgents.map(agent => (
-            <span className="app-control-pill" key={agent}>{agent}</span>
-          ))}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div className="model-view-controls">
+            <button
+              className={`filter-btn ${scopeFilter === 'session' ? 'active' : ''}`}
+              onClick={() => setScopeFilter('session')}
+            >
+              Session observed
+            </button>
+            <button
+              className={`filter-btn ${scopeFilter === 'all' ? 'active' : ''}`}
+              onClick={() => setScopeFilter('all')}
+            >
+              All configured
+            </button>
+          </div>
+          <div className="app-control-agents">
+            {selectedAgents.length === 0 ? (
+              <span className="app-control-pill muted">no agents selected</span>
+            ) : selectedAgents.map(agent => (
+              <span className="app-control-pill" key={agent}>{agent}</span>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -243,6 +277,7 @@ function EventCard({
   }, [effectiveMetadata, sample]);
 
   const preview = renderEventPreview(draft, sample, app.label);
+  const terminalPreviewLines = renderTerminalPreview(draft, sample, app.label);
   const deliverySummary = draft.wake ? 'wake on' : 'wake off';
 
   const save = async () => {
@@ -294,9 +329,16 @@ function EventCard({
         </div>
       </div>
 
-      <div className="app-control-preview">
-        <div className="app-control-preview-label">Model preview</div>
-        <div className="app-control-preview-text">{preview || '(empty)'}</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '16px', marginBottom: '12px' }}>
+        <div className="app-control-preview" style={{ marginBottom: 0 }}>
+          <div className="app-control-preview-label">Model preview</div>
+          <div className="app-control-preview-text" style={{ minHeight: '130px' }}>{preview || '(empty)'}</div>
+        </div>
+
+        <div className="app-control-preview" style={{ marginBottom: 0 }}>
+          <div className="app-control-preview-label" style={{ color: '#cba6f7' }}>Terminal preview</div>
+          <TerminalPreviewCard lines={terminalPreviewLines} />
+        </div>
       </div>
 
       <div className="app-control-kv-grid">
@@ -383,6 +425,16 @@ function EventCard({
             onChange={e => setDraft(prev => ({ ...prev, sourceTemplate: e.target.value }))}
           />
         </label>
+        <label className="app-control-field" style={{ gridColumn: 'span 3' }}>
+          <span>Terminal wake card template (one line per template line)</span>
+          <textarea
+            rows={4}
+            placeholder={`{{ansi.cyan}}{{app.display_name}} · from {{message.sender}}{{ansi.reset}}\n{{message.body}}`}
+            value={draft.terminalLines}
+            onChange={e => setDraft(prev => ({ ...prev, terminalLines: e.target.value }))}
+            style={{ fontFamily: 'Consolas, Monaco, monospace' }}
+          />
+        </label>
       </div>
 
       <div className="app-control-actions">
@@ -421,6 +473,7 @@ function collectAppSummaries(
   entries: TimelineEntry[],
   selectedAgents: string[],
   overrides: AppEventRenderOverridesDoc,
+  showAllConfigured: boolean = false,
 ): AppSummary[] {
   const apps = new Map<string, AppSummary>();
   const selectedAgentSet = new Set(selectedAgents);
@@ -483,6 +536,143 @@ function collectAppSummaries(
             correlationId: input.correlation_id,
             eventPath: input.event_path,
           });
+        }
+      }
+    }
+  }
+
+  if (showAllConfigured) {
+    if (overrides.streams) {
+      for (const [streamId, scope] of Object.entries(overrides.streams)) {
+        if (!scope?.events) continue;
+        const appId = streamId.startsWith('app:') ? streamId.slice('app:'.length) : streamId;
+        const dummyInput: InputRouterBlockInput = {
+          stream_id: streamId,
+          app_id: appId,
+          source: 'appfs_event',
+          input_type: '',
+          text: '',
+        };
+        const app = ensureAppSummary(apps, dummyInput);
+        
+        for (const [eventType, eventMeta] of Object.entries(scope.events)) {
+          const event = ensureEventSummary(app, eventType);
+          const effectiveMetadata = asEventRenderMetadata(eventMeta);
+          if (effectiveMetadata?.class) event.classes.add(String(effectiveMetadata.class));
+          if (event.samples.length === 0) {
+            event.samples.push({
+              agentName: 'system',
+              appLabel: app.label,
+              appId: app.appId,
+              streamId: app.streamId ?? `app:${app.appId}`,
+              eventType,
+              timestamp: Date.now(),
+              text: '(no active event sample in session)',
+              metadata: effectiveMetadata,
+            });
+          }
+        }
+      }
+    }
+
+    if (overrides.apps) {
+      for (const [appId, scope] of Object.entries(overrides.apps)) {
+        if (!scope?.events) continue;
+        const streamId = `app:${appId}`;
+        const dummyInput: InputRouterBlockInput = {
+          stream_id: streamId,
+          app_id: appId,
+          source: 'appfs_event',
+          input_type: '',
+          text: '',
+        };
+        const app = ensureAppSummary(apps, dummyInput);
+        
+        for (const [eventType, eventMeta] of Object.entries(scope.events)) {
+          const event = ensureEventSummary(app, eventType);
+          const effectiveMetadata = asEventRenderMetadata(eventMeta);
+          if (effectiveMetadata?.class) event.classes.add(String(effectiveMetadata.class));
+          if (event.samples.length === 0) {
+            event.samples.push({
+              agentName: 'system',
+              appLabel: app.label,
+              appId: app.appId,
+              streamId: app.streamId ?? `app:${app.appId}`,
+              eventType,
+              timestamp: Date.now(),
+              text: '(no active event sample in session)',
+              metadata: effectiveMetadata,
+            });
+          }
+        }
+      }
+    }
+
+    if (overrides.platform?.events) {
+      const dummyInput: InputRouterBlockInput = {
+        stream_id: 'platform',
+        app_id: 'platform',
+        source: 'appfs_event',
+        input_type: '',
+        text: '',
+      };
+      const app = ensureAppSummary(apps, dummyInput);
+      for (const [eventType, eventMeta] of Object.entries(overrides.platform.events)) {
+        const event = ensureEventSummary(app, eventType);
+        const effectiveMetadata = asEventRenderMetadata(eventMeta);
+        if (effectiveMetadata?.class) event.classes.add(String(effectiveMetadata.class));
+        if (event.samples.length === 0) {
+          event.samples.push({
+            agentName: 'system',
+            appLabel: app.label,
+            appId: app.appId,
+            streamId: app.streamId ?? `app:${app.appId}`,
+            eventType,
+            timestamp: Date.now(),
+            text: '(no active event sample in session)',
+            metadata: effectiveMetadata,
+          });
+        }
+      }
+    }
+    if (overrides.discoveredApps) {
+      for (const [streamId, appInfo] of Object.entries(overrides.discoveredApps)) {
+        if (!appInfo?.events) continue;
+        const appId = appInfo.appId;
+        const dummyInput: InputRouterBlockInput = {
+          stream_id: streamId,
+          app_id: appId,
+          source: 'appfs_event',
+          input_type: '',
+          text: '',
+          principal_id: appInfo.principalId,
+        };
+        const app = ensureAppSummary(apps, dummyInput);
+        
+        for (const [eventType, eventMeta] of Object.entries(appInfo.events)) {
+          const event = ensureEventSummary(app, eventType);
+          const overrideMetadata = getEventOverrideMetadata(
+            overrides,
+            streamId,
+            eventType,
+            appId,
+          );
+          const baseMetadata = asEventRenderMetadata(eventMeta);
+          const effectiveMetadata = mergeEventRenderMetadata(baseMetadata, overrideMetadata);
+          
+          if (effectiveMetadata?.class) event.classes.add(String(effectiveMetadata.class));
+          if (event.samples.length === 0) {
+            event.samples.push({
+              agentName: 'system',
+              appLabel: app.label,
+              appId: app.appId,
+              streamId: app.streamId ?? `app:${app.appId}`,
+              eventType,
+              timestamp: Date.now(),
+              text: '(no active event sample in session)',
+              metadata: effectiveMetadata,
+            });
+          }
         }
       }
     }
@@ -616,6 +806,12 @@ function draftFromMetadata(
   );
   const classValue = stringOrDefault(metadata?.class, DEFAULT_DRAFT.classValue);
 
+  // Read terminal render overrides or legacy ui/user renders
+  const terminalRender = metadata?.terminal_render ?? metadata?.ui_render ?? metadata?.user_render ?? {};
+  const terminalLines = Array.isArray(terminalRender.lines)
+    ? terminalRender.lines.filter((line): line is string => typeof line === 'string').join('\n')
+    : stringOrDefault(terminalRender.template, DEFAULT_DRAFT.terminalLines);
+
   return {
     classValue,
     mode,
@@ -625,6 +821,7 @@ function draftFromMetadata(
     template,
     bodyTemplate,
     sourceTemplate,
+    terminalLines,
   };
 }
 
@@ -637,13 +834,28 @@ function draftToOverride(draft: EventDraft): EventRenderMetadata {
     modelRender.body_template = draft.bodyTemplate;
     modelRender.source_template = draft.sourceTemplate;
   }
-  return {
+
+  const terminalLinesArray = draft.terminalLines
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => line.length > 0);
+
+  const override: EventRenderMetadata = {
     class: draft.classValue,
     wake: draft.wake,
     running_delivery: draft.runningDelivery,
     idle_delivery: draft.idleDelivery,
     model_render: modelRender,
   };
+
+  if (terminalLinesArray.length > 0) {
+    override.terminal_render = {
+      mode: 'card',
+      lines: terminalLinesArray,
+    };
+  }
+
+  return override;
 }
 
 function upsertOverride(
@@ -698,7 +910,53 @@ function renderTemplate(template: string, sample: AppEventSample): string {
 }
 
 function resolveTemplateToken(key: string, sample: AppEventSample): string {
+  // Resolve message helpers
+  if (key === 'message.sender') {
+    const payload = sample.payload as Record<string, unknown> | undefined;
+    return String(
+      payload?.from_display_name ||
+      payload?.from_principal ||
+      payload?.contact_key ||
+      'unknown'
+    );
+  }
+  if (key === 'message.body') {
+    const payload = sample.payload as Record<string, unknown> | undefined;
+    return String(
+      payload?.text ||
+      payload?.text_preview ||
+      sample.text ||
+      ''
+    );
+  }
+
+  // Resolve ANSI sequences
   switch (key) {
+    case 'ansi.bold':
+      return '\x1b[1m';
+    case 'ansi.dim':
+      return '\x1b[2m';
+    case 'ansi.italic':
+      return '\x1b[3m';
+    case 'ansi.underline':
+      return '\x1b[4m';
+    case 'ansi.reset':
+      return '\x1b[0m';
+    case 'ansi.cyan':
+      return '\x1b[36m';
+    case 'ansi.green':
+      return '\x1b[32m';
+    case 'ansi.yellow':
+      return '\x1b[33m';
+    case 'ansi.blue':
+      return '\x1b[34m';
+    case 'ansi.magenta':
+      return '\x1b[35m';
+    case 'ansi.red':
+      return '\x1b[31m';
+    case 'ansi.gray':
+      return '\x1b[90m';
+
     case 'type':
       return sample.eventType;
     case 'path':
@@ -708,6 +966,7 @@ function resolveTemplateToken(key: string, sample: AppEventSample): string {
     case 'app.display_name':
       return sample.appLabel;
     case 'app.id':
+    case 'app_id':
       return sample.appId;
     case 'stream':
       return sample.streamId;
@@ -759,6 +1018,7 @@ function normalizeOverrides(doc: AppEventRenderOverridesDoc | undefined): AppEve
     streams: normalizeScopes(doc?.streams),
     apps: normalizeScopes(doc?.apps),
     platform: normalizeScope(doc?.platform),
+    discoveredApps: doc?.discoveredApps,
   };
   return next;
 }
@@ -850,4 +1110,207 @@ function formatTime(timestamp: number): string {
     return 'unknown time';
   }
   return new Date(timestamp).toLocaleString();
+}
+
+function TerminalPreviewCard({ lines }: { lines: string[] }) {
+  if (lines.length === 0) {
+    return (
+      <div style={{
+        fontFamily: 'Consolas, Monaco, monospace',
+        backgroundColor: '#1e1e2e',
+        color: '#585b70',
+        padding: '16px',
+        borderRadius: '8px',
+        fontSize: '13px',
+        border: '1px solid #313244',
+        minHeight: '130px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontStyle: 'italic',
+      }}>
+        (card hidden or dropped)
+      </div>
+    );
+  }
+
+  const title = "AppFS Wake";
+  const border = "─".repeat(title.length + 10);
+  
+  const bodyText = lines
+    .map(line => `\u001b[38;5;245m│\u001b[0m ${line}`)
+    .join('\n');
+    
+  const fullAnsiText = `\u001b[38;5;245m╭─ \u001b[1;35m${title}\u001b[0;38;5;245m ─╮\u001b[0m\n${bodyText}\n\u001b[38;5;245m╰${border}╯\u001b[0m`;
+
+  return (
+    <pre style={{
+      fontFamily: 'Consolas, Monaco, monospace',
+      backgroundColor: '#1e1e2e',
+      color: '#cdd6f4',
+      padding: '16px',
+      borderRadius: '8px',
+      fontSize: '13px',
+      border: '1px solid #313244',
+      margin: 0,
+      minHeight: '130px',
+      maxHeight: '220px',
+      overflowX: 'auto',
+      overflowY: 'auto',
+      whiteSpace: 'pre-wrap',
+      lineHeight: '1.5',
+    }}>
+      {ansiToHtml(fullAnsiText)}
+    </pre>
+  );
+}
+
+function renderTerminalPreview(draft: EventDraft, sample?: AppEventSample, appLabel?: string): string[] {
+  if (!sample) {
+    return [];
+  }
+  
+  const terminalLinesArray = draft.terminalLines
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => line.length > 0);
+
+  if (terminalLinesArray.length > 0) {
+    return terminalLinesArray.map(template => renderTemplate(template, sample));
+  }
+
+  const app_label = appLabel || sample.appLabel || 'appfs';
+  const lines: string[] = [];
+
+  if (sample.eventType === 'message.received') {
+    const payload = sample.payload as Record<string, unknown> | undefined;
+    const from = String(
+      payload?.from_display_name ||
+      payload?.from_principal ||
+      payload?.contact_key ||
+      'unknown'
+    );
+    let meta = `${app_label} · message.received · from ${from}`;
+    if (sample.requiresAttention) {
+      meta += ' · attention required';
+    }
+    lines.push(`\u001b[1;36m${meta}\u001b[0m`);
+
+    const body = String(
+      payload?.text ||
+      payload?.text_preview ||
+      singleLinePreview(sample.text, 280)
+    );
+    if (body.trim()) {
+      lines.push(body);
+    }
+    return lines;
+  }
+
+  let meta = `${app_label} · ${sample.eventType.trim()}`;
+  if (sample.payload && (sample.payload as Record<string, unknown>).principal_id) {
+    meta += ` · principal ${(sample.payload as Record<string, unknown>).principal_id}`;
+  }
+  if (sample.requiresAttention) {
+    meta += ' · attention required';
+  }
+  lines.push(`\u001b[1;36m${meta}\u001b[0m`);
+
+  const preview = singleLinePreview(sample.text, 280);
+  if (preview.trim()) {
+    lines.push(preview);
+  }
+
+  return lines;
+}
+
+function singleLinePreview(text: string, maxChars: number): string {
+  if (!text) return '';
+  const collapsed = text.split(/\s+/).join(' ');
+  if (collapsed.length <= maxChars) {
+    return collapsed;
+  }
+  return collapsed.substring(0, maxChars) + '…';
+}
+
+function ansiToHtml(text: string): React.ReactNode[] {
+  const regex = /\u001b\[([0-9;]*)m/g;
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  
+  let bold = false;
+  let dim = false;
+  let italic = false;
+  let underline = false;
+  let color = '';
+
+  const getColor = (num: number): string => {
+    switch (num) {
+      case 31: return '#f38ba8'; // red
+      case 32: return '#a6e3a1'; // green
+      case 33: return '#f9e2af'; // yellow
+      case 34: return '#89b4fa'; // blue
+      case 35: return '#cba6f7'; // magenta
+      case 36: return '#89dceb'; // cyan
+      case 90: return '#585b70'; // gray
+      default: return '';
+    }
+  };
+
+  let match;
+  let key = 0;
+  while ((match = regex.exec(text)) !== null) {
+    const textChunk = text.substring(lastIndex, match.index);
+    if (textChunk) {
+      const style: React.CSSProperties = {};
+      if (bold) style.fontWeight = 'bold';
+      if (dim) style.opacity = 0.6;
+      if (italic) style.fontStyle = 'italic';
+      if (underline) style.textDecoration = 'underline';
+      if (color) style.color = color;
+      parts.push(<span key={key++} style={style}>{textChunk}</span>);
+    }
+
+    const codeStr = match[1];
+    const codes = codeStr.split(';').map(Number);
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      if (code === 0) {
+        bold = false;
+        dim = false;
+        italic = false;
+        underline = false;
+        color = '';
+      } else if (code === 1) {
+        bold = true;
+      } else if (code === 2) {
+        dim = true;
+      } else if (code === 3) {
+        italic = true;
+      } else if (code === 4) {
+        underline = true;
+      } else if (code >= 30 && code <= 37) {
+        color = getColor(code);
+      } else if (code === 90) {
+        color = '#585b70';
+      } else if (code === 38 && codes[i+1] === 5 && codes[i+2] === 245) {
+        color = '#8087a2';
+        i += 2; // skip parameters
+      }
+    }
+    lastIndex = regex.lastIndex;
+  }
+
+  const remaining = text.substring(lastIndex);
+  if (remaining) {
+    const style: React.CSSProperties = {};
+    if (bold) style.fontWeight = 'bold';
+    if (dim) style.opacity = 0.6;
+    if (italic) style.fontStyle = 'italic';
+    if (underline) style.textDecoration = 'underline';
+    if (color) style.color = color;
+    parts.push(<span key={key++} style={style}>{remaining}</span>);
+  }
+
+  return parts;
 }
