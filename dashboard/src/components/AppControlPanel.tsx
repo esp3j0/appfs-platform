@@ -106,7 +106,7 @@ const DEFAULT_DRAFT: EventDraft = {
   runningDelivery: 'context_only',
   idleDelivery: 'context_only',
   template: '{{app.display_name}}: 操作已完成。',
-  bodyTemplate: '{{content.text_preview}}',
+  bodyTemplate: '{{content.text}}',
   sourceTemplate: '来源：{{app.display_name}} {{type}}，seq={{seq}}',
   terminalLines: '{{ansi.cyan}}{{app.display_name}} · from {{message.sender}}{{ansi.reset}}\n{{message.body}}',
 };

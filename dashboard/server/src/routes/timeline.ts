@@ -9,6 +9,7 @@ import type {
   TimelineCompactionBoundary,
   TimelineResponse,
 } from '../types.js';
+import { isModelContextAttachmentMessage } from '../session-message-filters.js';
 
 export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegistry): void {
   app.get('/api/timeline', async (request) => {
@@ -28,6 +29,9 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
 
       for (const rec of registry.getMessages(name)) {
         const msg = rec.message;
+        if (isModelContextAttachmentMessage(msg)) {
+          continue;
+        }
         const content = extractTextContent(msg.blocks);
         const timestamp = msg.timestamp_ms ?? 0;
         const entryId = `${name}:${msg.uuid}`;
@@ -69,6 +73,9 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
 
       for (const archive of registry.getCompactionArchives(name)) {
         const msg = archive.message;
+        if (isModelContextAttachmentMessage(msg)) {
+          continue;
+        }
         const content = extractTextContent(msg.blocks);
         const timestamp = msg.timestamp_ms ?? archive.timestamp_ms;
         const entryId = `${name}:archive:${msg.uuid}:${archive.timestamp_ms}`;

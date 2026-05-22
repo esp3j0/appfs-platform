@@ -7,8 +7,9 @@ import { TimelinePanel } from './components/TimelinePanel';
 import { InfoPanel } from './components/InfoPanel';
 import { ModelViewPanel } from './components/ModelViewPanel';
 import { AppControlPanel } from './components/AppControlPanel';
+import { PlaygroundPanel } from './components/PlaygroundPanel';
 
-type MainView = 'timeline' | 'apps' | 'model';
+type MainView = 'timeline' | 'apps' | 'model' | 'chat';
 
 const EMPTY_TIMELINE: TimelineResponse = {
   entries: [],
@@ -23,17 +24,21 @@ export function App() {
   const [filter, setFilter] = useState<string>('all');
   const [mainView, setMainView] = useState<MainView>('timeline');
 
-  useEffect(() => {
+  const loadAgents = useCallback(() => {
     fetch('/api/agents')
       .then(r => r.json())
       .then((data: AgentInfo[]) => {
         setAgents(data);
         if (data.length > 0) {
-          setSelectedAgents(new Set([data[0].name]));
+          setSelectedAgents(prev => prev.size > 0 ? prev : new Set([data[0].name]));
         }
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    loadAgents();
+  }, [loadAgents]);
 
   const loadTimeline = useCallback((names: string[]) => {
     if (names.length === 0) {
@@ -68,11 +73,33 @@ export function App() {
         setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
       }
     },
-    onAgentOnline: (agent: any) => {
+    onAgentOnline: (agent: Partial<AgentInfo>) => {
+      if (!agent.name || !agent.sessionId || !agent.principalId) {
+        loadAgents();
+        return;
+      }
       setAgents(prev => {
-        if (prev.some(a => a.name === agent.name)) return prev;
-        return [...prev, agent];
+        const existingIndex = prev.findIndex(a => a.sessionId === agent.sessionId);
+        if (existingIndex >= 0) {
+          const next = [...prev];
+          next[existingIndex] = { ...next[existingIndex], ...agent } as AgentInfo;
+          return next;
+        }
+        return [...prev, agent as AgentInfo];
       });
+      if (agent.controlMode === 'managed' && agent.name) {
+        setSelectedAgents(prev => new Set(prev).add(agent.name!));
+      }
+    },
+    onAgentOffline: (agent: any) => {
+      const sessionId = agent?.sessionId;
+      if (!sessionId) {
+        loadAgents();
+        return;
+      }
+      setAgents(prev => prev.map(item =>
+        item.sessionId === sessionId ? { ...item, status: 'offline' } : item
+      ));
     },
   });
 
@@ -102,15 +129,26 @@ export function App() {
     <>
       <TopBar agentCount={agents.filter(a => a.status === 'online').length} />
       <div className="main-layout">
-        <AgentSidebar agents={agents} selected={selectedAgents} onToggle={toggleAgent} />
+        <AgentSidebar
+          agents={agents}
+          selected={selectedAgents}
+          onToggle={toggleAgent}
+          onRefreshAgents={loadAgents}
+        />
         <div className="work-area">
           <div className="view-tabs">
             <button className={`view-tab ${mainView === 'timeline' ? 'active' : ''}`} onClick={() => setMainView('timeline')}>Timeline</button>
+            <button className={`view-tab ${mainView === 'chat' ? 'active' : ''}`} onClick={() => setMainView('chat')}>💬 Chat</button>
             <button className={`view-tab ${mainView === 'apps' ? 'active' : ''}`} onClick={() => setMainView('apps')}>Apps</button>
             <button className={`view-tab ${mainView === 'model' ? 'active' : ''}`} onClick={() => setMainView('model')}>Model</button>
           </div>
           {mainView === 'timeline' ? (
             <TimelinePanel selectedAgents={Array.from(selectedAgents)} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
+          ) : mainView === 'chat' ? (
+            <PlaygroundPanel
+              agents={agents}
+              selectedAgents={agents.filter(a => selectedAgents.has(a.name))}
+            />
           ) : mainView === 'apps' ? (
             <AppControlPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} />
           ) : (

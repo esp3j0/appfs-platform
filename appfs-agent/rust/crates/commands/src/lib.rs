@@ -3662,15 +3662,15 @@ fn build_appfs_skill_markdown(
         format!("# appfs-{app_id}"),
         String::new(),
         overview_markdown,
-        String::new(),
-        "## AppFS action rules".to_string(),
-        "- Every `*.act` file is an append-only JSONL sink.".to_string(),
-        "- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string(),
-        "- Use `bash` with Python JSON serialization, or PowerShell `ConvertTo-Json`, to append exactly one JSON object plus a trailing newline.".to_string(),
-        "- Do not hand-build complex JSON with bare `printf`; message text often contains newlines, quotes, backslashes, or Windows paths that must be escaped by a JSON serializer.".to_string(),
-        "- After appending to an action, prefer the AppFS event reminder that is injected into the next model call; use `action.completed` or `action.failed` there to decide whether the action succeeded.".to_string(),
-        "- Only inspect `_stream/events.evt.jsonl` manually when debugging or when no AppFS event reminder appears.".to_string(),
     ];
+
+    if appfs_skill_generated_section_enabled(skill_doc, "appfs_action_rules") {
+        lines.push(String::new());
+        lines.push("## AppFS action rules".to_string());
+        lines.push("- Every `*.act` file is an append-only JSONL sink.".to_string());
+        lines.push("- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string());
+        lines.push("- Use `bash` with Python JSON serialization, or PowerShell `ConvertTo-Json`, to append exactly one JSON object plus a trailing newline.".to_string());
+    }
 
     if !uses_skill_narrative {
         if let Some(description) = control_doc

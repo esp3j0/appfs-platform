@@ -1,4 +1,4 @@
-use runtime::{InputEnvelope, EventTemplateTarget, render_event_template_for_target};
+use runtime::{render_event_template_for_target, EventTemplateTarget, InputEnvelope};
 use serde_json::Value;
 
 pub fn render_appfs_event_card(envelope: &InputEnvelope) -> Option<String> {
@@ -98,14 +98,9 @@ fn event_terminal_render(envelope: &InputEnvelope) -> Option<&Value> {
         .or_else(|| metadata.get("user_render"))
 }
 
-fn appfs_event_card_lines_from_terminal_render(
-    envelope: &InputEnvelope,
-) -> Option<Vec<String>> {
+fn appfs_event_card_lines_from_terminal_render(envelope: &InputEnvelope) -> Option<Vec<String>> {
     let render = event_terminal_render(envelope)?;
-    let mode = render
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("card");
+    let mode = render.get("mode").and_then(Value::as_str).unwrap_or("card");
     if matches!(mode, "hidden" | "drop" | "debug_only") {
         return Some(Vec::new());
     }
@@ -115,11 +110,7 @@ fn appfs_event_card_lines_from_terminal_render(
             .iter()
             .filter_map(Value::as_str)
             .map(|template| {
-                render_event_template_for_target(
-                    envelope,
-                    template,
-                    EventTemplateTarget::Terminal,
-                )
+                render_event_template_for_target(envelope, template, EventTemplateTarget::Terminal)
             })
             .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>();
@@ -127,11 +118,8 @@ fn appfs_event_card_lines_from_terminal_render(
     }
 
     let template = render.get("template").and_then(Value::as_str)?;
-    let rendered = render_event_template_for_target(
-        envelope,
-        template,
-        EventTemplateTarget::Terminal,
-    );
+    let rendered =
+        render_event_template_for_target(envelope, template, EventTemplateTarget::Terminal);
     Some(rendered.lines().map(ToOwned::to_owned).collect())
 }
 

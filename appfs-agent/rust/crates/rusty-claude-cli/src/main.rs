@@ -6,11 +6,11 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod appfs_event_ui;
 mod init;
 mod input;
 mod render;
 mod terminal_controller;
-mod appfs_event_ui;
 
 #[cfg(feature = "debug-dump")]
 mod debug_dump;
@@ -18,7 +18,7 @@ mod debug_dump;
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -58,12 +58,12 @@ use runtime::{
     ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
     AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, InputSource, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PendingInput, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
-    ToolExecutionResult, ToolExecutor, UsageTracker,
+    ConversationMessage, ConversationRuntime, InputEnvelope, InputSource, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PendingInput, PendingInputDelivery, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, SharedPendingInputQueue,
+    TokenUsage, ToolError, ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -92,6 +92,7 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const HEADLESS_IDLE_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
@@ -114,6 +115,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--appfs-idle-wake",
     "--running-input",
     "--base-commit",
+    "--headless",
     "-p",
 ];
 
@@ -268,9 +270,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             appfs_idle_wake,
             running_input,
+            headless,
             ..
         } => {
-            if running_input {
+            if headless {
+                run_headless(
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    base_commit.as_deref(),
+                    session_path.as_deref(),
+                    appfs_idle_wake,
+                )?;
+            } else if running_input {
                 run_repl_with_running_input(
                     model,
                     allowed_tools,
@@ -379,6 +391,7 @@ enum CliAction {
         reasoning_effort: Option<String>,
         appfs_idle_wake: bool,
         running_input: bool,
+        headless: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -428,6 +441,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut session_path: Option<PathBuf> = None;
     let mut appfs_idle_wake = false;
     let mut running_input = false;
+    let mut headless = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -496,6 +510,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 running_input = true;
                 index += 1;
             }
+            "--headless" => {
+                headless = true;
+                index += 1;
+            }
             "--base-commit" => {
                 let value = args
                     .get(index + 1)
@@ -510,6 +528,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "-p" => {
                 if session_path.is_some() {
                     return Err("--session cannot be combined with -p prompt mode".to_string());
+                }
+                if headless {
+                    return Err("--headless cannot be combined with -p prompt mode".to_string());
                 }
                 if appfs_idle_wake {
                     return Err(
@@ -603,12 +624,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Err("--session can only be used to start an interactive REPL".to_string());
     }
 
-    if appfs_idle_wake && !rest.is_empty() {
+    if appfs_idle_wake && !rest.is_empty() && !headless {
         return Err("--appfs-idle-wake can only be used with interactive REPL mode".to_string());
     }
 
     if running_input && !rest.is_empty() {
         return Err("--running-input can only be used with interactive REPL mode".to_string());
+    }
+
+    if headless && !rest.is_empty() {
+        return Err("--headless can only be used to start a headless session REPL".to_string());
+    }
+
+    if headless && running_input {
+        return Err("--running-input cannot be combined with --headless".to_string());
     }
 
     if rest.is_empty() {
@@ -622,6 +651,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort: None,
             appfs_idle_wake,
             running_input,
+            headless,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -3618,6 +3648,357 @@ fn run_repl_with_running_input(
     Ok(())
 }
 
+struct HeadlessContext {
+    enabled: bool,
+    request_id: String,
+    turn_id: String,
+}
+
+static HEADLESS_CONTEXT: std::sync::OnceLock<std::sync::Mutex<HeadlessContext>> =
+    std::sync::OnceLock::new();
+
+fn get_headless_context() -> std::sync::MutexGuard<'static, HeadlessContext> {
+    HEADLESS_CONTEXT
+        .get_or_init(|| {
+            std::sync::Mutex::new(HeadlessContext {
+                enabled: false,
+                request_id: String::new(),
+                turn_id: String::new(),
+            })
+        })
+        .lock()
+        .unwrap()
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadlessInput {
+    request_id: String,
+    #[serde(default, rename = "type")]
+    input_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    control_token: Option<String>,
+}
+
+fn headless_input_text(input: &HeadlessInput) -> Option<String> {
+    input
+        .text
+        .clone()
+        .or_else(|| input.prompt.clone())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn enqueue_headless_pending_input(
+    queue: &SharedPendingInputQueue,
+    input: &HeadlessInput,
+    delivery: PendingInputDelivery,
+) -> Result<(), String> {
+    let text = headless_input_text(input)
+        .ok_or_else(|| "headless queued input must include non-empty text".to_string())?;
+    let input_type = match delivery {
+        PendingInputDelivery::InjectAtNextBoundary => "user.guidance",
+        PendingInputDelivery::QueueAfterTurn => "user.queued",
+    };
+    let mut envelope = InputEnvelope::new(InputSource::UserTerminal, input_type, text);
+    envelope.client_token = Some(input.request_id.clone());
+    envelope.requires_attention = matches!(delivery, PendingInputDelivery::InjectAtNextBoundary);
+    queue.push(PendingInput { envelope, delivery });
+    Ok(())
+}
+
+fn headless_control_token() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("ctl-{}-{}", std::process::id(), now)
+}
+
+fn handle_headless_control_input(
+    input_data: HeadlessInput,
+    expected_token: &str,
+    queue: &SharedPendingInputQueue,
+    prompt_tx: &Sender<Result<HeadlessInput, String>>,
+) -> bool {
+    if input_data.control_token.as_deref() != Some(expected_token) {
+        let _ = prompt_tx.send(Err("invalid headless control token".to_string()));
+        return true;
+    }
+
+    match input_data.input_type.as_deref().unwrap_or("user_prompt") {
+        "user_prompt" => prompt_tx.send(Ok(input_data)).is_ok(),
+        "user_queued" => {
+            if let Err(error) = enqueue_headless_pending_input(
+                queue,
+                &input_data,
+                PendingInputDelivery::QueueAfterTurn,
+            ) {
+                let _ = prompt_tx.send(Err(error));
+            }
+            true
+        }
+        "user_guidance" => {
+            if let Err(error) = enqueue_headless_pending_input(
+                queue,
+                &input_data,
+                PendingInputDelivery::InjectAtNextBoundary,
+            ) {
+                let _ = prompt_tx.send(Err(error));
+            }
+            true
+        }
+        "promote_input" => {
+            if !queue.promote_client_token_to_boundary(&input_data.request_id) {
+                eprintln!(
+                    "queued input not found for request_id: {}",
+                    input_data.request_id
+                );
+            }
+            true
+        }
+        other => {
+            let _ = prompt_tx.send(Err(format!("unsupported headless input type: {other}")));
+            true
+        }
+    }
+}
+
+fn headless_turn_id() -> String {
+    format!(
+        "turn-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    )
+}
+
+fn emit_headless_json(event: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string(event)?);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn current_headless_request() -> Option<(String, String)> {
+    let headless = get_headless_context();
+    if !headless.enabled {
+        return None;
+    }
+    Some((headless.request_id.clone(), headless.turn_id.clone()))
+}
+
+fn emit_headless_tool_start(id: &str, tool_name: &str) {
+    if let Some((request_id, turn_id)) = current_headless_request() {
+        let _ = emit_headless_json(&json!({
+            "type": "tool_start",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "id": id,
+            "tool_name": tool_name,
+        }));
+    }
+}
+
+fn emit_headless_tool_result(tool_name: &str, is_error: bool) {
+    if let Some((request_id, turn_id)) = current_headless_request() {
+        let _ = emit_headless_json(&json!({
+            "type": "tool_result",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "tool_name": tool_name,
+            "is_error": is_error,
+        }));
+    }
+}
+
+fn run_headless(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<&str>,
+    session_path: Option<&Path>,
+    appfs_idle_wake: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_stale_base_preflight(base_commit);
+    let resolved_model = resolve_repl_model(model);
+    let mut cli = if let Some(session_path) = session_path {
+        LiveCli::new_from_session_headless(
+            resolved_model,
+            allowed_tools,
+            permission_mode,
+            session_path,
+        )?
+    } else {
+        LiveCli::new_headless(resolved_model, allowed_tools, permission_mode)?
+    };
+
+    let control_listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let control_addr = control_listener.local_addr()?;
+    let control_token = headless_control_token();
+
+    // Emit session started event
+    let principal_id = cli.runtime.session().appfs_principal_id.clone();
+    let start_ev = json!({
+        "type": "session_started",
+        "session_id": cli.session.id,
+        "session_path": cli.session.path.display().to_string(),
+        "principal_id": principal_id,
+        "control": {
+            "kind": "tcp_jsonl",
+            "host": control_addr.ip().to_string(),
+            "port": control_addr.port(),
+            "token": control_token.clone(),
+        },
+    });
+    println!("{}", serde_json::to_string(&start_ev)?);
+    io::stdout().flush()?;
+
+    let shared_queue = SharedPendingInputQueue::default();
+
+    if appfs_idle_wake {
+        cli.drive_appfs_idle_wake_headless(shared_queue.clone())?;
+    }
+
+    let (control_tx, control_rx) = mpsc::channel::<Result<HeadlessInput, String>>();
+    let control_queue = shared_queue.clone();
+    let control_token_for_thread = control_token.clone();
+    thread::spawn(move || {
+        for stream in control_listener.incoming() {
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ =
+                        control_tx.send(Err(format!("headless control listener error: {error}")));
+                    break;
+                }
+            };
+
+            let reader = BufReader::new(stream);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = control_tx.send(Err(format!(
+                            "failed to read headless control input: {error}"
+                        )));
+                        break;
+                    }
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let input_data: HeadlessInput = match serde_json::from_str(trimmed) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = control_tx.send(Err(format!(
+                            "failed to parse headless control JSONL input: {error}"
+                        )));
+                        continue;
+                    }
+                };
+
+                if !handle_headless_control_input(
+                    input_data,
+                    &control_token_for_thread,
+                    &control_queue,
+                    &control_tx,
+                ) {
+                    return;
+                }
+            }
+        }
+    });
+
+    loop {
+        let line_res = if appfs_idle_wake {
+            match control_rx.recv_timeout(HEADLESS_IDLE_WAKE_POLL_INTERVAL) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Err(e) = cli.drive_appfs_idle_wake_headless(shared_queue.clone()) {
+                        eprintln!("Warning: drive_appfs_idle_wake_headless error: {e}");
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match control_rx.recv() {
+                Ok(line) => line,
+                Err(_) => break,
+            }
+        };
+
+        let input_data = match line_res {
+            Ok(input_data) => input_data,
+            Err(e) => {
+                let err_ev = json!({
+                    "type": "error",
+                    "message": e,
+                });
+                println!("{}", serde_json::to_string(&err_ev)?);
+                let _ = io::stdout().flush();
+                continue;
+            }
+        };
+
+        let request_id = input_data.request_id.clone();
+        if let Some(input_type) = input_data.input_type.as_deref() {
+            if input_type != "user_prompt" {
+                let err_ev = json!({
+                    "type": "error",
+                    "request_id": request_id,
+                    "message": format!("unsupported headless input type: {input_type}"),
+                });
+                println!("{}", serde_json::to_string(&err_ev)?);
+                let _ = io::stdout().flush();
+                continue;
+            }
+        }
+        let Some(prompt_text) = headless_input_text(&input_data) else {
+            let err_ev = json!({
+                "type": "error",
+                "request_id": request_id,
+                "message": "headless input must include text",
+            });
+            println!("{}", serde_json::to_string(&err_ev)?);
+            let _ = io::stdout().flush();
+            continue;
+        };
+
+        // Generate a turn_id
+        let turn_id = headless_turn_id();
+
+        if appfs_idle_wake {
+            if let Err(e) = cli.drive_appfs_idle_wake_headless(shared_queue.clone()) {
+                eprintln!("Warning: drive_appfs_idle_wake_headless error: {e}");
+            }
+        }
+
+        cli.record_prompt_history(&prompt_text);
+        cli.run_turn_headless_with_external_inputs(
+            &prompt_text,
+            shared_queue.clone(),
+            &request_id,
+            &turn_id,
+        )?;
+        let _ = cli.drain_and_run_queued_inputs_headless(shared_queue.clone())?;
+
+        if appfs_idle_wake {
+            if let Err(e) = cli.drive_appfs_idle_wake_headless(shared_queue.clone()) {
+                eprintln!("Warning: drive_appfs_idle_wake_headless error: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct SessionHandle {
     id: String,
@@ -3666,6 +4047,12 @@ struct RuntimeMcpState {
     manager: McpServerManager,
     pending_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+}
+
+struct AppfsIdleWakeBatch {
+    event_count: usize,
+    auto_marked_read: usize,
+    rendered_inputs: String,
 }
 
 struct BuiltRuntime {
@@ -4323,6 +4710,103 @@ impl LiveCli {
         Ok(cli)
     }
 
+    fn new_headless(
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
+        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
+            attach_live_cli_appfs_principal()
+        } else {
+            None
+        };
+        if appfs_attach_lease.is_some() {
+            warmup_live_cli_appfs_private_apps();
+        }
+        let system_prompt = build_system_prompt()?;
+        let mut session_state = Session::new().with_model(&model);
+        if let Some(lease) = &appfs_attach_lease {
+            session_state = session_state.with_appfs_principal_id(lease.principal_id.as_str());
+        }
+        let session = create_managed_session_handle(&session_state.session_id)?;
+        let runtime = build_runtime(
+            session_state.with_persistence_path(session.path.clone()),
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            true,
+            false,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+            None,
+        )?;
+        let cli = Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+            prompt_history: Vec::new(),
+            appfs_attach_ensure,
+            appfs_attach_lease,
+            redraw_handle: None,
+        };
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    fn new_from_session_headless(
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        session_reference: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
+        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
+            attach_live_cli_appfs_principal()
+        } else {
+            None
+        };
+        if appfs_attach_lease.is_some() {
+            warmup_live_cli_appfs_private_apps();
+        }
+        let system_prompt = build_system_prompt()?;
+        let handle = resolve_session_path_or_reference(session_reference)?;
+        let session_state = Session::load_from_path(&handle.path)?;
+        let session = SessionHandle {
+            id: session_state.session_id.clone(),
+            path: handle.path,
+        };
+        let runtime = build_runtime(
+            session_state,
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            true,
+            false,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+            None,
+        )?;
+        let cli = Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+            prompt_history: Vec::new(),
+            appfs_attach_ensure,
+            appfs_attach_lease,
+            redraw_handle: None,
+        };
+        Ok(cli)
+    }
+
     fn startup_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
@@ -4487,6 +4971,27 @@ impl LiveCli {
         )
     }
 
+    fn run_turn_headless_with_external_inputs(
+        &mut self,
+        input: &str,
+        external_queue: SharedPendingInputQueue,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let runtime = runtime.with_external_pending_inputs(external_queue);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.run_prepared_headless_turn(
+            runtime,
+            hook_abort_monitor,
+            request_id,
+            turn_id,
+            None,
+            |runtime, prompter| runtime.run_turn(input, Some(prompter)),
+            Some(&mut permission_prompter),
+        )
+    }
+
     fn drain_and_run_queued_inputs_with_external_inputs(
         &mut self,
         terminal: &TerminalControllerHandle,
@@ -4538,6 +5043,61 @@ impl LiveCli {
         })();
         let _ = terminal.send(TerminalCommand::SetMode(TerminalMode::IdlePrompt));
         result
+    }
+
+    fn drain_and_run_queued_inputs_headless(
+        &mut self,
+        external_queue: SharedPendingInputQueue,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        const MAX_QUEUED_AFTER_TURN_TURNS: usize = 16;
+
+        let queued_inputs = external_queue.drain_after_turn_pending_inputs();
+        if queued_inputs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut processed = 0usize;
+        let mut pending_inputs = VecDeque::from(queued_inputs);
+        while let Some(pending_input) = pending_inputs.pop_front() {
+            let queued_text = pending_input.envelope.text.trim().to_string();
+            if queued_text.is_empty() {
+                continue;
+            }
+            if processed >= MAX_QUEUED_AFTER_TURN_TURNS {
+                let mut restore = vec![pending_input];
+                restore.extend(pending_inputs.into_iter());
+                external_queue.restore_front(restore);
+                break;
+            }
+
+            let request_id = format!(
+                "queued-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            );
+            let turn_id = headless_turn_id();
+            self.record_prompt_history(&queued_text);
+            if let Err(error) = self.run_turn_headless_with_external_inputs(
+                &queued_text,
+                external_queue.clone(),
+                &request_id,
+                &turn_id,
+            ) {
+                let mut restore = vec![pending_input];
+                restore.extend(pending_inputs.into_iter());
+                external_queue.restore_front(restore);
+                return Err(error);
+            }
+
+            processed += 1;
+            let new_queued_inputs = external_queue.drain_after_turn_pending_inputs();
+            if !new_queued_inputs.is_empty() {
+                pending_inputs.extend(new_queued_inputs);
+            }
+        }
+        Ok(processed)
     }
 
     fn run_prepared_turn(
@@ -4618,6 +5178,104 @@ impl LiveCli {
         }
     }
 
+    fn run_prepared_headless_turn(
+        &mut self,
+        mut runtime: BuiltRuntime,
+        hook_abort_monitor: HookAbortMonitor,
+        request_id: &str,
+        turn_id: &str,
+        source: Option<&str>,
+        runner: impl FnOnce(
+            &mut BuiltRuntime,
+            &mut dyn runtime::PermissionPrompter,
+        ) -> Result<runtime::TurnSummary, RuntimeError>,
+        prompter: Option<&mut dyn runtime::PermissionPrompter>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut turn_start = json!({
+            "type": "turn_start",
+            "request_id": request_id,
+            "turn_id": turn_id,
+        });
+        if let Some(source) = source {
+            turn_start["source"] = json!(source);
+        }
+        emit_headless_json(&turn_start)?;
+
+        {
+            let mut headless_ctx = get_headless_context();
+            headless_ctx.enabled = true;
+            headless_ctx.request_id = request_id.to_string();
+            headless_ctx.turn_id = turn_id.to_string();
+        }
+
+        let mut fallback_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let prompter = prompter.unwrap_or(&mut fallback_prompter);
+        let result = runner(&mut runtime, prompter);
+        hook_abort_monitor.stop();
+
+        {
+            let mut headless_ctx = get_headless_context();
+            headless_ctx.enabled = false;
+            headless_ctx.request_id.clear();
+            headless_ctx.turn_id.clear();
+        }
+
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                if let Some(event) = &summary.auto_compaction {
+                    #[cfg(feature = "debug-dump")]
+                    if !event.removed_messages.is_empty() {
+                        crate::debug_dump::write_compaction_archive(
+                            &self.session.path,
+                            &event.removed_messages,
+                            self.runtime
+                                .session()
+                                .compaction
+                                .as_ref()
+                                .map_or(1, |c| c.count),
+                        );
+                    }
+                }
+                self.persist_session()?;
+                let mut done_ev = json!({
+                    "type": "turn_done",
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "session_id": self.session.id,
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": summary.usage.input_tokens,
+                        "output_tokens": summary.usage.output_tokens,
+                        "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    },
+                });
+                if let Some(source) = source {
+                    done_ev["source"] = json!(source);
+                }
+                emit_headless_json(&done_ev)?;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(err_shutdown) = runtime.shutdown_plugins() {
+                    eprintln!("Warning: failed to shutdown plugins: {err_shutdown}");
+                }
+                let mut err_ev = json!({
+                    "type": "error",
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "message": format!("run turn failed: {error}"),
+                });
+                if let Some(source) = source {
+                    err_ev["source"] = json!(source);
+                }
+                emit_headless_json(&err_ev)?;
+                Ok(())
+            }
+        }
+    }
+
     fn sync_appfs_events_for_idle(
         &mut self,
     ) -> Result<Vec<PendingInput>, Box<dyn std::error::Error>> {
@@ -4627,6 +5285,30 @@ impl LiveCli {
             self.persist_session()?;
         }
         Ok(outcome.pending_inputs)
+    }
+
+    fn collect_appfs_idle_wake_into_external_queue(
+        &mut self,
+        external_queue: &SharedPendingInputQueue,
+    ) -> Result<Option<AppfsIdleWakeBatch>, Box<dyn std::error::Error>> {
+        let pending_inputs = self.sync_appfs_events_for_idle()?;
+        if pending_inputs.is_empty() {
+            return Ok(None);
+        }
+
+        let cwd = env::current_dir()?;
+        let auto_marked_read = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
+        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
+        let event_count = pending_inputs.len();
+        for pending_input in pending_inputs {
+            external_queue.push(pending_input);
+        }
+
+        Ok(Some(AppfsIdleWakeBatch {
+            event_count,
+            auto_marked_read,
+            rendered_inputs,
+        }))
     }
 
     fn drive_appfs_idle_wake(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
@@ -4668,48 +5350,78 @@ impl LiveCli {
         Ok(true)
     }
 
+    fn drive_appfs_idle_wake_headless(
+        &mut self,
+        external_queue: SharedPendingInputQueue,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(batch) = self.collect_appfs_idle_wake_into_external_queue(&external_queue)? else {
+            return Ok(false);
+        };
+        let request_id = format!(
+            "wake-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let turn_id = headless_turn_id();
+        emit_headless_json(&json!({
+            "type": "wake_detected",
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "source": "appfs_idle_wake",
+            "event_count": batch.event_count,
+            "auto_marked_read": batch.auto_marked_read,
+        }))?;
+
+        self.run_event_turn_headless_with_external_inputs(
+            external_queue.clone(),
+            &request_id,
+            &turn_id,
+        )?;
+        let _ = self.drain_and_run_queued_inputs_headless(external_queue)?;
+        Ok(true)
+    }
+
     fn drive_appfs_idle_wake_with_external_inputs(
         &mut self,
         terminal: &TerminalControllerHandle,
         external_queue: SharedPendingInputQueue,
         permission_tx: Sender<PermissionPromptTicket>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let pending_inputs = self.sync_appfs_events_for_idle()?;
-        let new_event_count = pending_inputs.len();
-        if pending_inputs.is_empty() {
+        let Some(batch) = self.collect_appfs_idle_wake_into_external_queue(&external_queue)? else {
             return Ok(false);
-        }
-
-        // Auto mark received messages as read before waking the agent.
-        let cwd = env::current_dir()?;
-        let marked = auto_mark_read_for_wake_inputs(&pending_inputs, &cwd);
-        if marked > 0 {
+        };
+        if batch.auto_marked_read > 0 {
             if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle
-                    .write_output(format!("AppFS auto-marked {marked} message(s) as read.\n"));
+                redraw_handle.write_output(format!(
+                    "AppFS auto-marked {} message(s) as read.\n",
+                    batch.auto_marked_read
+                ));
             } else {
-                println!("AppFS auto-marked {marked} message(s) as read.");
+                println!(
+                    "AppFS auto-marked {} message(s) as read.",
+                    batch.auto_marked_read
+                );
             }
         }
 
-        let rendered_inputs = render_pending_input_echoes(&pending_inputs);
-        if !rendered_inputs.is_empty() {
+        if !batch.rendered_inputs.is_empty() {
             if let Some(redraw_handle) = &self.redraw_handle {
-                redraw_handle.write_output(format!("{rendered_inputs}\n\n"));
+                redraw_handle.write_output(format!("{}\n\n", batch.rendered_inputs));
             } else {
-                println!("\n{rendered_inputs}\n");
+                println!("\n{}\n", batch.rendered_inputs);
             }
         } else if let Some(redraw_handle) = &self.redraw_handle {
             redraw_handle.write_output(format!(
-                "AppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent.\n"
+                "AppFS idle wake received {} attention-worthy event(s); waking the agent.\n",
+                batch.event_count
             ));
         } else {
             println!(
-                "\nAppFS idle wake received {new_event_count} attention-worthy event(s); waking the agent."
+                "\nAppFS idle wake received {} attention-worthy event(s); waking the agent.",
+                batch.event_count
             );
-        }
-        for pending_input in pending_inputs {
-            external_queue.push(pending_input);
         }
         terminal.send(TerminalCommand::SetMode(TerminalMode::RunningGuidance))?;
         let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
@@ -4786,6 +5498,26 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn run_event_turn_headless_with_external_inputs(
+        &mut self,
+        external_queue: SharedPendingInputQueue,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let runtime = runtime.with_external_pending_inputs(external_queue);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.run_prepared_headless_turn(
+            runtime,
+            hook_abort_monitor,
+            request_id,
+            turn_id,
+            Some("appfs_idle_wake"),
+            |runtime, prompter| runtime.run_event_turn(Some(prompter)),
+            Some(&mut permission_prompter),
+        )
     }
 
     fn run_event_turn_with_external_inputs(
@@ -8796,6 +9528,19 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
+                            let headless = get_headless_context();
+                            if headless.enabled {
+                                let ev = json!({
+                                    "type": "assistant_delta",
+                                    "request_id": headless.request_id,
+                                    "turn_id": headless.turn_id,
+                                    "text": text
+                                });
+                                if let Ok(line) = serde_json::to_string(&ev) {
+                                    println!("{}", line);
+                                    let _ = io::stdout().flush();
+                                }
+                            }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
@@ -8843,6 +9588,7 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
+                        emit_headless_tool_start(&id, &name);
                         // Display tool call now that input is fully accumulated
                         if let Some(redraw_handle) = &self.redraw_handle {
                             redraw_handle.write_output(format!(
@@ -9901,6 +10647,7 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                emit_headless_tool_result(resolved_tool_name, false);
                 if self.emit_output {
                     let markdown = format_tool_result(resolved_tool_name, &output.output, false);
                     let rendered = self.renderer.markdown_to_ansi_stream_chunk(&markdown);
@@ -9915,6 +10662,7 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                emit_headless_tool_result(resolved_tool_name, true);
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
                     let rendered = self.renderer.markdown_to_ansi_stream_chunk(&markdown);
@@ -10616,6 +11364,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: false,
+                headless: false,
             }
         );
     }
@@ -11156,6 +11905,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: false,
+                headless: false,
             }
         );
     }
@@ -11186,6 +11936,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: true,
                 running_input: false,
+                headless: false,
             }
         );
     }
@@ -11206,6 +11957,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: true,
+                headless: false,
             }
         );
     }
@@ -11259,6 +12011,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: false,
+                headless: false,
             }
         );
     }
@@ -11378,6 +12131,7 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: false,
+                headless: false,
             }
         );
     }
@@ -11437,6 +12191,28 @@ mod tests {
                 reasoning_effort: None,
                 appfs_idle_wake: false,
                 running_input: false,
+                headless: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_headless_flag_for_headless_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--headless".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                session_path: None,
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
+                headless: true,
             }
         );
     }

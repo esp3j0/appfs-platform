@@ -269,6 +269,7 @@ pub struct ConversationRuntime<C, T> {
     pending_inputs: PendingInputQueue,
     external_pending_inputs: Option<SharedPendingInputQueue>,
     pending_appfs_event_cursor_updates: BTreeMap<String, i64>,
+    pending_appfs_wake_event_cursor_updates: BTreeMap<String, i64>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -321,6 +322,7 @@ where
             pending_inputs: PendingInputQueue::default(),
             external_pending_inputs: None,
             pending_appfs_event_cursor_updates: BTreeMap::new(),
+            pending_appfs_wake_event_cursor_updates: BTreeMap::new(),
         }
     }
 
@@ -760,6 +762,8 @@ where
         }
         self.pending_appfs_event_cursor_updates
             .extend(sync.cursor_updates);
+        self.pending_appfs_wake_event_cursor_updates
+            .extend(sync.wake_cursor_updates);
         Ok(())
     }
 
@@ -800,16 +804,30 @@ where
 
     fn flush_pending_appfs_event_cursor_updates(&mut self) -> Result<(), RuntimeError> {
         if self.pending_appfs_event_cursor_updates.is_empty() {
-            return Ok(());
+            if self.pending_appfs_wake_event_cursor_updates.is_empty() {
+                return Ok(());
+            }
         }
-        let cursor_updates = std::mem::take(&mut self.pending_appfs_event_cursor_updates);
+        if !self.pending_appfs_event_cursor_updates.is_empty() {
+            let cursor_updates = std::mem::take(&mut self.pending_appfs_event_cursor_updates);
+            if let Err(error) = self
+                .session
+                .update_appfs_event_cursors(cursor_updates.clone())
+            {
+                self.pending_appfs_event_cursor_updates = cursor_updates;
+                return Err(RuntimeError::new(format!(
+                    "failed to update AppFS event cursors: {error}"
+                )));
+            }
+        }
+        let cursor_updates = std::mem::take(&mut self.pending_appfs_wake_event_cursor_updates);
         if let Err(error) = self
             .session
-            .update_appfs_event_cursors(cursor_updates.clone())
+            .update_appfs_wake_event_cursors(cursor_updates.clone())
         {
-            self.pending_appfs_event_cursor_updates = cursor_updates;
+            self.pending_appfs_wake_event_cursor_updates = cursor_updates;
             return Err(RuntimeError::new(format!(
-                "failed to update AppFS event cursors: {error}"
+                "failed to update AppFS wake event cursors: {error}"
             )));
         }
         Ok(())

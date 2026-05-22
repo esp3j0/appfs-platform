@@ -701,6 +701,7 @@ pub struct AppfsEventSyncOutcome {
 pub struct AppfsPendingInputSync {
     pub pending_inputs: Vec<PendingInput>,
     pub cursor_updates: BTreeMap<String, i64>,
+    pub wake_cursor_updates: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1180,6 +1181,9 @@ pub fn sync_appfs_event_reminders_with_outcome(
     if !sync.cursor_updates.is_empty() {
         session.update_appfs_event_cursors(sync.cursor_updates)?;
     }
+    if !sync.wake_cursor_updates.is_empty() {
+        session.update_appfs_wake_event_cursors(sync.wake_cursor_updates)?;
+    }
 
     Ok(AppfsEventSyncOutcome {
         new_event_count,
@@ -1315,6 +1319,7 @@ fn collect_pending_inputs_from_appfs_environment(
     let render_metadata = read_appfs_event_render_metadata(environment);
 
     let mut cursor_updates = BTreeMap::new();
+    let mut wake_cursor_updates = BTreeMap::new();
     let mut pending_inputs = Vec::new();
     for stream in streams {
         let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
@@ -1342,23 +1347,30 @@ fn collect_pending_inputs_from_appfs_environment(
                 if max_seq > last_seq {
                     cursor_updates.insert(stream.stream_id.clone(), max_seq);
                 }
-                pending_inputs.extend(
-                    records
-                        .into_iter()
-                        .filter(|record| record.seq > last_seq)
-                        .filter_map(|record| {
-                            let event_metadata = event_render_metadata_for(&render_metadata, &record);
-                            pending_input_from_appfs_event(
-                                &record,
-                                classify_appfs_event_with_render_metadata(
-                                    &record,
-                                    event_metadata.as_ref(),
-                                )
-                                .running_delivery,
-                                event_metadata,
-                            )
-                        }),
-                );
+                for record in records.into_iter().filter(|record| record.seq > last_seq) {
+                    let event_metadata = event_render_metadata_for(&render_metadata, &record);
+                    let classification =
+                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref());
+                    let Some(pending_input) = pending_input_from_appfs_event(
+                        &record,
+                        classification.running_delivery,
+                        event_metadata,
+                    ) else {
+                        continue;
+                    };
+                    if matches!(classification.idle_delivery, AppfsDeliveryMode::WakeIfIdle)
+                        && record.seq
+                            > session
+                                .appfs_wake_event_cursor(&stream.stream_id)
+                                .unwrap_or_default()
+                    {
+                        wake_cursor_updates
+                            .entry(stream.stream_id.clone())
+                            .and_modify(|seq: &mut i64| *seq = (*seq).max(record.seq))
+                            .or_insert(record.seq);
+                    }
+                    pending_inputs.push(pending_input);
+                }
             }
             None => {
                 // First attach establishes a baseline so old event backlog does not
@@ -1371,6 +1383,7 @@ fn collect_pending_inputs_from_appfs_environment(
     AppfsPendingInputSync {
         pending_inputs,
         cursor_updates,
+        wake_cursor_updates,
     }
 }
 
@@ -3524,17 +3537,16 @@ mod tests {
         attach_appfs_principal_from_environment, build_appfs_prompt_section, classify_appfs_event,
         classify_appfs_event_with_render_metadata, collect_appfs_pending_inputs,
         create_appfs_principal, detach_appfs_principal, detect_appfs_environment,
-        ensure_appfs_attach_identity,
-        ensure_appfs_attach_identity_with_attach_env, extract_appfs_act_tokens,
-        event_render_metadata_for, read_appfs_event_render_metadata, AppfsEnvironment,
-        AppfsRegisteredApp,
-        prepare_appfs_act_event_wait_with_options, render_appfs_event_reminder,
-        resolve_appfs_environment_with_attach_env, scan_appfs_attention_events_for_idle_wake,
-        sync_appfs_event_reminders, sync_appfs_event_reminders_with_outcome,
-        wait_for_appfs_act_event_completion, warmup_private_apps_from_environment,
-        AppfsAttachEnsureStatus, AppfsAttachEnv, AppfsAttachSource, AppfsDeliveryMode,
-        AppfsEventRecord, AppfsInputClass, AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus,
-        AppfsPrivateAppWarmupStatus, AppfsRegisteredAppVisibility, AppfsRuntimeManifest,
+        ensure_appfs_attach_identity, ensure_appfs_attach_identity_with_attach_env,
+        event_render_metadata_for, extract_appfs_act_tokens,
+        prepare_appfs_act_event_wait_with_options, read_appfs_event_render_metadata,
+        render_appfs_event_reminder, resolve_appfs_environment_with_attach_env,
+        scan_appfs_attention_events_for_idle_wake, sync_appfs_event_reminders,
+        sync_appfs_event_reminders_with_outcome, wait_for_appfs_act_event_completion,
+        warmup_private_apps_from_environment, AppfsAttachEnsureStatus, AppfsAttachEnv,
+        AppfsAttachSource, AppfsDeliveryMode, AppfsEnvironment, AppfsEventRecord, AppfsInputClass,
+        AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
+        AppfsRegisteredApp, AppfsRegisteredAppVisibility, AppfsRuntimeManifest,
         AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
         APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
         APPFS_SCHEMA_VERSION,
@@ -4993,7 +5005,8 @@ PY"#,
         let overrides_path = mount_root
             .join(".claw")
             .join("appfs-event-render-overrides.json");
-        fs::create_dir_all(overrides_path.parent().expect("override parent")).expect("create override dir");
+        fs::create_dir_all(overrides_path.parent().expect("override parent"))
+            .expect("create override dir");
         fs::write(
             &overrides_path,
             r#"{"version":1,"apps":{"tinode":{"events":{"message.received":{"wake":false,"idle_delivery":"context_only","model_render":{"template":"OVERRIDE {{content.text_preview}}"}}}}}}"#,
@@ -5010,13 +5023,28 @@ PY"#,
             multi_agent_mode: APPFS_MULTI_AGENT_MODE_SHARED.to_string(),
             manifest_path: None,
             control_dir: Some(mount_root.join("_appfs")),
-            control_events_path: Some(mount_root.join("_appfs").join("_stream").join("events.evt.jsonl")),
+            control_events_path: Some(
+                mount_root
+                    .join("_appfs")
+                    .join("_stream")
+                    .join("events.evt.jsonl"),
+            ),
             registry_path: Some(mount_root.join("_appfs").join("apps.registry.json")),
             register_app_path: Some(mount_root.join("_appfs").join("register_app.act")),
             unregister_app_path: Some(mount_root.join("_appfs").join("unregister_app.act")),
             list_apps_path: Some(mount_root.join("_appfs").join("list_apps.act")),
-            attach_principal_path: Some(mount_root.join("_appfs").join("principals").join("attach_principal.act")),
-            detach_principal_path: Some(mount_root.join("_appfs").join("principals").join("detach_principal.act")),
+            attach_principal_path: Some(
+                mount_root
+                    .join("_appfs")
+                    .join("principals")
+                    .join("attach_principal.act"),
+            ),
+            detach_principal_path: Some(
+                mount_root
+                    .join("_appfs")
+                    .join("principals")
+                    .join("detach_principal.act"),
+            ),
             current_app_id: None,
             current_app_root: None,
             current_app_events_path: None,
@@ -5040,25 +5068,16 @@ PY"#,
             Some(serde_json::json!({ "text_preview": "hello" })),
             None,
         );
-        let merged = event_render_metadata_for(&render_metadata, &event)
-            .expect("merged render metadata");
+        let merged =
+            event_render_metadata_for(&render_metadata, &event).expect("merged render metadata");
 
+        assert_eq!(merged.get("wake").and_then(Value::as_bool), Some(false));
         assert_eq!(
-            merged
-                .get("wake")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            merged
-                .get("idle_delivery")
-                .and_then(Value::as_str),
+            merged.get("idle_delivery").and_then(Value::as_str),
             Some("context_only")
         );
         assert_eq!(
-            merged
-                .get("running_delivery")
-                .and_then(Value::as_str),
+            merged.get("running_delivery").and_then(Value::as_str),
             Some("inject_at_next_boundary")
         );
         assert_eq!(
@@ -5073,7 +5092,9 @@ PY"#,
             merged
                 .get("model_render")
                 .and_then(Value::as_object)
-                .and_then(|model_render: &serde_json::Map<String, Value>| model_render.get("template"))
+                .and_then(
+                    |model_render: &serde_json::Map<String, Value>| model_render.get("template")
+                )
                 .and_then(Value::as_str),
             Some("OVERRIDE {{content.text_preview}}")
         );
@@ -5177,6 +5198,63 @@ PY"#,
             session.messages.len(),
             0,
             "attention event should wake only once"
+        );
+    }
+
+    #[test]
+    fn running_boundary_attention_input_does_not_wake_again_when_turn_goes_idle() {
+        let temp = TempDirGuard::new("appfs-running-boundary-idle-wake");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+
+        fs::write(
+            &events_path,
+            r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+        )
+        .expect("write baseline event");
+        fs::write(&cursor_path, r#"{"max_seq":1}"#).expect("write baseline cursor");
+
+        let mut session = Session::new();
+        scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("idle scan should establish wake and model baselines");
+
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"type":"message.received","app":"tinode","path":"contacts/coder/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"reply while default is running"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write running reply");
+        fs::write(&cursor_path, r#"{"max_seq":2}"#).expect("advance cursor");
+
+        let boundary = sync_appfs_event_reminders_with_outcome(&mut session, &mount_root)
+            .expect("running boundary should route the reply");
+        assert_eq!(boundary.new_event_count, 1);
+        assert_eq!(session.appfs_event_cursor("app:tinode--default"), Some(2));
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(2),
+            "wake cursor should acknowledge a wake-worthy event once it is routed while running"
+        );
+
+        let idle = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("idle scan after the turn");
+        assert_eq!(
+            idle.wake_event_count, 0,
+            "the same reply should not create a second turn after the running turn handled it"
         );
     }
 

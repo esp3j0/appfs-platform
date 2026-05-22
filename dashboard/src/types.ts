@@ -2,11 +2,13 @@ export interface AgentInfo {
   name: string;
   principalId: string;
   sessionId: string;
+  workspaceFingerprint?: string;
   model: string;
   pid: number;
   startedAt: number;
   sessionJsonlPath: string;
   status: 'online' | 'offline';
+  controlMode: 'managed' | 'external';
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -99,6 +101,7 @@ export interface DebugDumpRecord {
 
 export interface TimelineEntry {
   id: string;
+  sessionId?: string;
   agentName: string;
   timestamp: number;
   source: 'session' | 'debug-dump' | 'compaction-archive';
@@ -135,6 +138,63 @@ export interface TimelineResponse {
   entries: TimelineEntry[];
   interactions: CrossAgentInteraction[];
   compactionBoundaries: TimelineCompactionBoundary[];
+}
+
+export interface ChatThread {
+  sessionId: string;
+  items: ChatItem[];
+}
+
+export type ChatItem = ChatMessageItem | ChatToolItem;
+
+export interface ChatMessageItem {
+  kind: 'message';
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: number;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
+}
+
+export interface ChatToolItem {
+  kind: 'tool';
+  id: string;
+  toolCallId?: string;
+  toolName: string;
+  status: 'pending' | 'completed' | 'error';
+  summary?: string;
+  isError?: boolean;
+  timestamp: number;
+}
+
+export type AgentLaunchSpec =
+  | {
+      kind: 'cargo';
+      manifestPath: string;
+      targetDir?: string;
+      package: string;
+      features?: string[];
+    }
+  | {
+      kind: 'binary';
+      binaryPath: string;
+    };
+
+export interface SpawnConfig {
+  cwd: string;
+  principalId: string;
+  model: string;
+  permissionMode: string;
+  appfsMountRoot: string;
+  launchSpec: AgentLaunchSpec;
+  env: Record<string, string>;
+  appfsIdleWake?: boolean;
+  sessionPath?: string;
 }
 
 export interface AppEventRenderScopeOverride {

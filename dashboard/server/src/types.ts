@@ -146,11 +146,13 @@ export interface AgentInfo {
   name: string;
   principalId: string;
   sessionId: string;
+  workspaceFingerprint?: string;
   model: string;
   pid: number;
   startedAt: number;
   sessionJsonlPath: string;
   status: 'online' | 'offline';
+  controlMode: 'managed' | 'external';
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -158,6 +160,7 @@ export interface AgentInfo {
 
 export interface TimelineEntry {
   id: string;
+  sessionId?: string;
   agentName: string;
   timestamp: number;
   source: 'session' | 'debug-dump' | 'compaction-archive';

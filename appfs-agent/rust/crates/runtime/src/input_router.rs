@@ -293,6 +293,18 @@ impl PendingInputQueue {
         restored.append(&mut self.items);
         self.items = restored;
     }
+
+    pub fn promote_client_token_to_boundary(&mut self, client_token: &str) -> bool {
+        for input in &mut self.items {
+            if input.envelope.client_token.as_deref() == Some(client_token) {
+                input.delivery = PendingInputDelivery::InjectAtNextBoundary;
+                input.envelope.input_type = "user.guidance".to_string();
+                input.envelope.requires_attention = true;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,6 +340,10 @@ impl SharedPendingInputQueue {
         I: IntoIterator<Item = PendingInput>,
     {
         self.with_queue_mut(|queue| queue.restore_front(inputs));
+    }
+
+    pub fn promote_client_token_to_boundary(&self, client_token: &str) -> bool {
+        self.with_queue_mut(|queue| queue.promote_client_token_to_boundary(client_token))
     }
 
     fn with_queue<T>(&self, f: impl FnOnce(&PendingInputQueue) -> T) -> T {
@@ -1181,9 +1197,9 @@ fn sanitize_router_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_pending_input_reminder, EventTemplateTarget, InputEnvelope, InputSource,
-        PendingInput, PendingInputDelivery, PendingInputQueue, SharedPendingInputQueue,
-        render_event_template_for_target,
+        render_event_template_for_target, render_pending_input_reminder, EventTemplateTarget,
+        InputEnvelope, InputSource, PendingInput, PendingInputDelivery, PendingInputQueue,
+        SharedPendingInputQueue,
     };
     use serde_json::json;
 
@@ -1286,6 +1302,26 @@ mod tests {
         let boundary = clone.drain_boundary_pending_inputs();
         assert_eq!(boundary, vec![first]);
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn shared_pending_input_queue_promotes_client_token_to_boundary() {
+        let queue = SharedPendingInputQueue::default();
+        let mut queued = pending_input("guide this", PendingInputDelivery::QueueAfterTurn);
+        queued.envelope.input_type = "user.queued".to_string();
+        queued.envelope.client_token = Some("req-1".to_string());
+
+        queue.push(queued);
+
+        assert!(queue.promote_client_token_to_boundary("req-1"));
+        let boundary = queue.drain_boundary_pending_inputs();
+        assert_eq!(boundary.len(), 1);
+        assert_eq!(boundary[0].envelope.input_type, "user.guidance");
+        assert_eq!(
+            boundary[0].delivery,
+            PendingInputDelivery::InjectAtNextBoundary
+        );
+        assert!(queue.drain_after_turn_pending_inputs().is_empty());
     }
 
     #[test]
@@ -1685,7 +1721,8 @@ mod tests {
 
     #[test]
     fn event_template_omits_ansi_for_model_target() {
-        let mut envelope = InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
+        let mut envelope =
+            InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
         envelope.app_id = Some("tinode".to_string());
         envelope.payload = Some(json!({
             "from_display_name": "AppFS Agent default",
@@ -1703,7 +1740,8 @@ mod tests {
 
     #[test]
     fn event_template_allows_ansi_for_terminal_target() {
-        let mut envelope = InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
+        let mut envelope =
+            InputEnvelope::new(InputSource::AppfsEvent, "message.received", "fallback body");
         envelope.app_id = Some("tinode".to_string());
         envelope.payload = Some(json!({
             "from_display_name": "AppFS Agent default",
@@ -1719,4 +1757,3 @@ mod tests {
         assert_eq!(rendered, "\x1b[36mAppFS Agent default\x1b[0m: hello");
     }
 }
-

@@ -102,8 +102,8 @@ pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
 pub use input_router::{
-    render_input_router_block, EventTemplateTarget, InputEnvelope, InputSource, PendingInput,
-    PendingInputDelivery, SharedPendingInputQueue, render_event_template_for_target,
+    render_event_template_for_target, render_input_router_block, EventTemplateTarget,
+    InputEnvelope, InputSource, PendingInput, PendingInputDelivery, SharedPendingInputQueue,
 };
 pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
