@@ -2,11 +2,13 @@ export interface AgentInfo {
   name: string;
   principalId: string;
   sessionId: string;
+  workspaceFingerprint?: string;
   model: string;
   pid: number;
   startedAt: number;
   sessionJsonlPath: string;
   status: 'online' | 'offline';
+  controlMode: 'managed' | 'external';
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -29,6 +31,10 @@ export interface InputRouterBlockInput {
   source: string;
   input_type: string;
   text: string;
+  event_id?: string;
+  ts?: string;
+  client_token?: string;
+  event_path?: string;
   principal_id?: string;
   app_id?: string;
   stream_id?: string;
@@ -37,6 +43,8 @@ export interface InputRouterBlockInput {
   requires_attention?: boolean;
   delivery?: string;
   payload?: unknown;
+  raw_event?: unknown;
+  event_render_metadata?: unknown;
 }
 
 export interface ConversationMessage {
@@ -93,6 +101,7 @@ export interface DebugDumpRecord {
 
 export interface TimelineEntry {
   id: string;
+  sessionId?: string;
   agentName: string;
   timestamp: number;
   source: 'session' | 'debug-dump' | 'compaction-archive';
@@ -129,6 +138,79 @@ export interface TimelineResponse {
   entries: TimelineEntry[];
   interactions: CrossAgentInteraction[];
   compactionBoundaries: TimelineCompactionBoundary[];
+}
+
+export interface ChatThread {
+  sessionId: string;
+  items: ChatItem[];
+}
+
+export type ChatItem = ChatMessageItem | ChatToolItem;
+
+export interface ChatMessageItem {
+  kind: 'message';
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: number;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
+}
+
+export interface ChatToolItem {
+  kind: 'tool';
+  id: string;
+  toolCallId?: string;
+  toolName: string;
+  status: 'pending' | 'completed' | 'error';
+  summary?: string;
+  isError?: boolean;
+  timestamp: number;
+}
+
+export type AgentLaunchSpec =
+  | {
+      kind: 'cargo';
+      manifestPath: string;
+      targetDir?: string;
+      package: string;
+      features?: string[];
+    }
+  | {
+      kind: 'binary';
+      binaryPath: string;
+    };
+
+export interface SpawnConfig {
+  cwd: string;
+  principalId: string;
+  model: string;
+  permissionMode: string;
+  appfsMountRoot: string;
+  launchSpec: AgentLaunchSpec;
+  env: Record<string, string>;
+  appfsIdleWake?: boolean;
+  sessionPath?: string;
+}
+
+export interface AppEventRenderScopeOverride {
+  events: Record<string, unknown>;
+}
+
+export interface AppEventRenderOverridesDoc {
+  version: number;
+  streams?: Record<string, AppEventRenderScopeOverride>;
+  apps?: Record<string, AppEventRenderScopeOverride>;
+  platform?: AppEventRenderScopeOverride;
+  discoveredApps?: Record<string, {
+    appId: string;
+    principalId: string;
+    events: Record<string, unknown>;
+  }>;
 }
 
 export const AGENT_COLORS = ['#58a6ff', '#3fb950', '#d2a8ff', '#d29922', '#39d2c0', '#f778ba'] as const;

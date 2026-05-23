@@ -1,22 +1,25 @@
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import type { AgentRegistry } from '../agent-registry.js';
 import type { MessageRecord, TimelineEntry, ContentBlock } from '../types.js';
 import { FileWatcher } from '../file-watcher.js';
-
-const SSE_CLIENTS: Set<FastifyReply> = new Set();
-
-function sseSend(reply: FastifyReply, event: string, data: unknown): void {
-  reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
+import { EventBus } from '../event-bus.js';
 
 export function registerEventsRoute(app: FastifyInstance, registry: AgentRegistry): void {
+  const eventBus = EventBus.getInstance();
   const watcher = new FileWatcher(registry);
 
-  watcher.start((agentName: string, newRecords: MessageRecord[]) => {
+  // Register watcher on the registry so other components can dynamically add paths to it
+  registry.setFileWatcher(watcher);
+
+  watcher.start((sessionId: string, newRecords: MessageRecord[]) => {
+    const agent = registry.getAgent(sessionId);
+    const agentName = agent?.name ?? sessionId;
+
     for (const rec of newRecords) {
       const msg = rec.message;
       const entry: TimelineEntry = {
-        id: `${agentName}:${msg.uuid}`,
+        id: `${sessionId}:${msg.uuid}`,
+        sessionId,
         agentName,
         timestamp: msg.timestamp_ms ?? Date.now(),
         source: 'session',
@@ -25,25 +28,14 @@ export function registerEventsRoute(app: FastifyInstance, registry: AgentRegistr
         raw: msg,
         usage: msg.usage,
       };
-      for (const client of SSE_CLIENTS) {
-        sseSend(client, 'message', entry);
-      }
+
+      // Broadcast to SSE clients via the unified EventBus
+      eventBus.broadcast('message', entry);
     }
   });
 
   app.get('/api/events', async (request, reply) => {
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    reply.raw.write('\n');
-    SSE_CLIENTS.add(reply);
-
-    request.raw.on('close', () => {
-      SSE_CLIENTS.delete(reply);
-    });
-
+    eventBus.registerClient(request, reply);
     // Keep the response open
     await new Promise(() => {});
   });

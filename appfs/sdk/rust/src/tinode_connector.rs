@@ -196,6 +196,7 @@ impl TinodeConnectorConfig {
 struct TinodeSharedState {
     credentials: HashMap<String, ConnectorCredentialRecord>,
     principal_profiles: HashMap<String, String>,
+    completed_actions: HashMap<String, JsonValue>,
 }
 
 static TINODE_SHARED_STATE: OnceLock<Mutex<TinodeSharedState>> = OnceLock::new();
@@ -298,6 +299,7 @@ impl TinodeConnector {
             dir("_app"),
             static_json("_app/actions.res.json", self.actions_resource()),
             static_json("_app/control.res.json", self.control_resource()),
+            static_json("_app/events.res.json", self.events_resource()),
             static_json("_app/skill.res.json", self.skill_resource()),
             static_json("_app/self.res.json", self.self_resource(ctx)),
             action("_app/ensure_credentials.act"),
@@ -370,18 +372,18 @@ impl TinodeConnector {
             "app_id": TINODE_APP_ID,
             "description": "Tinode private chat app for the current AppFS principal.",
             "when_to_use": [
-                "Use when the user wants to send messages through Tinode to a person or another agent.",
-                "Use when a Tinode message is received for the current principal and should be handled now.",
-                "Use when the user wants to inspect the current principal's Tinode inbox, contacts, or groups.",
-                "Load this skill before performing Tinode private-app action-file operations."
+                "Use when the user wants to send a Tinode message to a person or another agent.",
+                "Use when a Tinode message arrives for the current principal and should be handled now.",
+                "Use when the user wants to inspect the current principal's Tinode inbox, contacts, or groups."
             ],
-            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Each principal has an independent Tinode profile and credentials. Treat `_stream/events.evt.jsonl` as the live wake boundary. If `message.received` arrives with `requires_attention=true`, handle it as a current-turn task first. Do not reread inbox or message history just to confirm a reminder that already contains the task; use `inbox/recent.res.jsonl` and `inbox/unread.res.jsonl` only as summary views or catch-up aids. Use `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` only when you need full history context. For `send_message.act`, set `requires_response` explicitly when the sender does or does not expect a Tinode reply, and append payloads with Python `json.dumps` or PowerShell `ConvertTo-Json` instead of bare `printf` so multiline text, quotes, and Windows paths are escaped correctly. The bash tool sets `PYTHONIOENCODING=utf-8` so Python output is valid UTF-8 JSONL. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
+            "overview_markdown": "Tinode is the current AppFS principal's private chat app. Use `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl` only when you need full history context. For `send_message.act`, set `requires_response` explicitly. Short single-line messages can use `printf`; use heredoc or JSON serialization for multiline text or tricky escaping. Operate only under the current app root, usually `private/<principal-id>/tinode`.",
             "allowed_tools": ["bash", "read_file", "glob_search"],
             "include_generated_sections": {
+                "appfs_action_rules": false,
                 "scope_summary": false,
-                "control_actions": true,
+                "control_actions": false,
                 "recommended_actions": true,
-                "contact_routing": true
+                "contact_routing": false
             }
         })
     }
@@ -414,17 +416,6 @@ impl TinodeConnector {
                     "use_when": [
                         "The current principal is being deleted or the operator wants to reset the Tinode profile lifecycle."
                     ]
-                },
-                {
-                    "name": "refresh_inbox",
-                    "path": "_app/refresh_inbox.act",
-                    "summary": "Refresh inbox summary resources for the current Tinode profile.",
-                    "example_payload": {
-                        "client_token": "refresh-inbox-001"
-                    },
-                    "use_when": [
-                        "Inbox summary looks stale, the agent has just attached, or the agent needs a catch-up view before reading full history."
-                    ]
                 }
             ]
         })
@@ -437,15 +428,14 @@ impl TinodeConnector {
                 {
                     "name": "send_direct_message",
                     "path": "contacts/send_message.act",
-                    "summary": "Send a Tinode direct message. Use `to` with `basic:<login>`, `tinode_user:<usr-id>`, or `principal:<principal-id>`.",
+                    "summary": "Send a Tinode direct message. Use `to` with `principal:<principal-id>`.",
                     "example_payload": {
                         "to": "principal:code-implementer",
-                        "text": "请接手实现这个任务。",
+                        "text": "你好，跟你打个招呼。",
                         "requires_response": true
                     },
                     "use_when": [
-                        "The user asks to message another agent or a Tinode contact and the exact contact path is unknown.",
-                        "The user asks default to delegate work to a forked principal such as code-implementer."
+                        "The user asks to message another agent or a Tinode contact."
                     ]
                 },
                 {
@@ -454,22 +444,10 @@ impl TinodeConnector {
                     "summary": "Create a Tinode group and invite members.",
                     "example_payload": {
                         "title": "multi-agent-smoke",
-                        "members": ["principal:code-implementer"],
-                        "client_token": "grp-multi-agent-001"
+                        "members": ["principal:code-implementer"]
                     },
                     "use_when": [
                         "The user wants multiple agents or contacts to collaborate in one Tinode group."
-                    ]
-                },
-                {
-                    "name": "mark_inbox_read",
-                    "path": "inbox/mark_read.act",
-                    "summary": "Mark inbox messages as handled for the current principal.",
-                    "example_payload": {
-                        "client_token": "mark-read-001"
-                    },
-                    "use_when": [
-                        "The user asks to acknowledge or clear local unread state for Tinode inbox messages."
                     ]
                 }
             ],
@@ -479,6 +457,50 @@ impl TinodeConnector {
                     "send_message_path": "contacts/send_message.act"
                 }
             ]
+        })
+    }
+
+    fn events_resource(&self) -> JsonValue {
+        json!({
+            "version": 1,
+            "app_id": TINODE_APP_ID,
+            "events": {
+                "message.received": {
+                    "class": "external_message",
+                    "model_render": {
+                        "mode": "body_with_source_reminder",
+                        "body_template": "{{content.text}}",
+                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+                    }
+                },
+                "message.sent": {
+                    "class": "receipt",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 消息已发送给 {{content.to_display_name}}：{{content.text_preview}}。"
+                    }
+                },
+                "action.failed": {
+                    "class": "failure",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 操作失败：{{error.code}}，{{error.message}}。"
+                    }
+                },
+                "profile.credentials.ready": {
+                    "class": "status",
+                    "model_render": {
+                        "mode": "summary",
+                        "template": "{{app.display_name}}: 凭据已就绪（profile_id={{content.profile_id}}）。"
+                    }
+                },
+                "inbox.updated": {
+                    "class": "noise",
+                    "model_render": {
+                        "mode": "debug_only"
+                    }
+                }
+            }
         })
     }
 
@@ -745,7 +767,57 @@ impl TinodeConnector {
             .retain(|principal_key, mapped_profile| {
                 !principal_key.starts_with(&principal_prefix) || mapped_profile != profile_id
             });
+        let action_prefix = shared_action_result_prefix(&self.shared_namespace, profile_id);
+        state
+            .completed_actions
+            .retain(|action_key, _| !action_key.starts_with(&action_prefix));
         Ok(())
+    }
+
+    fn replay_completed_action(
+        &self,
+        ctx: &ConnectorContext,
+    ) -> std::result::Result<Option<JsonValue>, ConnectorError> {
+        let Some(client_token) = ctx.client_token.as_deref() else {
+            return Ok(None);
+        };
+        let profile_id = effective_profile_id(ctx)?;
+        let state = tinode_shared_state().lock().map_err(|_| {
+            connector_err(
+                connector_error_codes::INTERNAL,
+                "Tinode shared action state is poisoned",
+                true,
+            )
+        })?;
+        Ok(state
+            .completed_actions
+            .get(&shared_action_result_key(
+                &self.shared_namespace,
+                &profile_id,
+                client_token,
+            ))
+            .cloned())
+    }
+
+    fn store_completed_action(
+        &self,
+        profile_id: &str,
+        client_token: Option<&str>,
+        content: &JsonValue,
+    ) {
+        let Some(client_token) = client_token else {
+            return;
+        };
+        if let Ok(mut state) = tinode_shared_state().lock() {
+            let mut terminal_content = content.clone();
+            if let Some(object) = terminal_content.as_object_mut() {
+                object.remove(CONNECTOR_SIDE_EVENTS_FIELD);
+            }
+            state.completed_actions.insert(
+                shared_action_result_key(&self.shared_namespace, profile_id, client_token),
+                terminal_content,
+            );
+        }
     }
 
     fn remember_principal_profile(&self, principal_id: &str, record: &ConnectorCredentialRecord) {
@@ -1015,6 +1087,10 @@ impl TinodeConnector {
         request: SubmitActionRequest,
         ctx: &ConnectorContext,
     ) -> std::result::Result<SubmitActionResponse, ConnectorError> {
+        if let Some(content) = self.replay_completed_action(ctx)? {
+            return Ok(completed_response(ctx, content));
+        }
+
         let normalized_path = normalize_path(&request.path);
         let (reference, intent) = message_target_and_intent(&normalized_path, &request.payload)?;
         let (record, created_credentials) = self.ensure_credentials(ctx)?;
@@ -1101,6 +1177,11 @@ impl TinodeConnector {
             true,
         );
 
+        self.store_completed_action(
+            &safe_summary.profile_id,
+            ctx.client_token.as_deref(),
+            &content,
+        );
         Ok(completed_response(ctx, content))
     }
 
@@ -3221,6 +3302,18 @@ fn shared_principal_key(namespace: &str, principal_id: &str) -> String {
     format!("{namespace}|principal:{principal_id}")
 }
 
+fn shared_action_result_prefix(namespace: &str, profile_id: &str) -> String {
+    format!("{namespace}|profile:{profile_id}|client_token:")
+}
+
+fn shared_action_result_key(namespace: &str, profile_id: &str, client_token: &str) -> String {
+    format!(
+        "{}{}",
+        shared_action_result_prefix(namespace, profile_id),
+        client_token
+    )
+}
+
 fn sanitize_tinode_login(value: &str) -> String {
     let mut out = value
         .to_ascii_lowercase()
@@ -4315,6 +4408,7 @@ mod tests {
         for expected in [
             "_app/actions.res.json",
             "_app/control.res.json",
+            "_app/events.res.json",
             "_app/self.res.json",
             "_app/skill.res.json",
             "_app/ensure_credentials.act",
@@ -4346,10 +4440,23 @@ mod tests {
             skill_doc["description"],
             "Tinode private chat app for the current AppFS principal."
         );
-        assert!(skill_doc["overview_markdown"]
+        assert_eq!(
+            skill_doc["include_generated_sections"]["appfs_action_rules"],
+            false
+        );
+        assert_eq!(
+            skill_doc["include_generated_sections"]["control_actions"],
+            false
+        );
+        assert_eq!(
+            skill_doc["include_generated_sections"]["contact_routing"],
+            false
+        );
+        let overview = skill_doc["overview_markdown"]
             .as_str()
-            .expect("overview markdown")
-            .contains("PYTHONIOENCODING=utf-8"));
+            .expect("overview markdown");
+        assert!(overview.contains("Operate only under the current app root"));
+        assert!(overview.contains("requires_response"));
         let actions_doc = snapshot
             .nodes
             .iter()
@@ -4361,6 +4468,57 @@ mod tests {
             .expect("recommended actions")
             .iter()
             .any(|action| action["path"] == "contacts/send_message.act"));
+        assert!(actions_doc["recommended_actions"]
+            .as_array()
+            .expect("recommended actions")
+            .iter()
+            .any(|action| action["path"] == "groups/create_group.act"));
+        assert!(!actions_doc["recommended_actions"]
+            .as_array()
+            .expect("recommended actions")
+            .iter()
+            .any(|action| action["path"] == "inbox/mark_read.act"));
+        let send_direct_message = actions_doc["recommended_actions"]
+            .as_array()
+            .expect("recommended actions")
+            .iter()
+            .find(|action| action["path"] == "contacts/send_message.act")
+            .expect("send_direct_message action");
+        let send_summary = send_direct_message["summary"]
+            .as_str()
+            .expect("send summary");
+        assert!(send_summary.contains("principal:<principal-id>"));
+        assert!(!send_summary.contains("basic:<login>"));
+        assert!(!send_summary.contains("tinode_user:<usr-id>"));
+        let create_group = actions_doc["recommended_actions"]
+            .as_array()
+            .expect("recommended actions")
+            .iter()
+            .find(|action| action["path"] == "groups/create_group.act")
+            .expect("create_group action");
+        assert!(create_group["example_payload"]["client_token"].is_null());
+        assert_eq!(
+            send_direct_message["example_payload"]["text"],
+            "你好，跟你打个招呼。"
+        );
+        let events_doc = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.path == "_app/events.res.json")
+            .and_then(|node| node.seed_content.as_ref())
+            .expect("tinode events seed content");
+        assert_eq!(
+            events_doc["events"]["message.received"]["model_render"]["mode"],
+            "body_with_source_reminder"
+        );
+        assert_eq!(
+            events_doc["events"]["message.received"]["model_render"]["body_template"],
+            "{{content.text}}"
+        );
+        assert_eq!(
+            events_doc["events"]["inbox.updated"]["model_render"]["mode"],
+            "debug_only"
+        );
     }
 
     #[test]
@@ -4475,6 +4633,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_send_message_replays_completed_action_for_same_client_token() {
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut connector = connector_with_mock(Arc::clone(&state));
+        let request = SubmitActionRequest {
+            path: "/contacts/send_message.act".to_string(),
+            payload: json!({"to":"basic:zhangsan","text":"hello"}),
+            execution_mode: ActionExecutionMode::Inline,
+        };
+
+        let first = connector
+            .submit_action(request.clone(), &ctx())
+            .expect("first send");
+        let mut retry_ctx = ctx();
+        retry_ctx.request_id = "req-retry".to_string();
+        let replay = connector
+            .submit_action(request, &retry_ctx)
+            .expect("replayed send");
+
+        assert_eq!(replay.request_id, "req-retry");
+        let first = completed_content(first);
+        let replay = completed_content(replay);
+        assert_eq!(first["message_id"], replay["message_id"]);
+        assert!(first.get(CONNECTOR_SIDE_EVENTS_FIELD).is_some());
+        assert!(
+            replay.get(CONNECTOR_SIDE_EVENTS_FIELD).is_none(),
+            "terminal replay must not duplicate connector side events"
+        );
+        let state = state.lock().expect("mock state");
+        assert_eq!(state.sent.len(), 1, "replay must not republish to Tinode");
+    }
+
+    #[test]
     fn send_message_rejects_non_boolean_requires_response() {
         let state = Arc::new(Mutex::new(MockGatewayState::default()));
         let mut connector = connector_with_mock(Arc::clone(&state));
@@ -4517,6 +4707,8 @@ mod tests {
         );
         assert_eq!(first["structure_changed"], true);
 
+        let mut second_ctx = ctx();
+        second_ctx.client_token = Some("client-2".to_string());
         let second = completed_content(
             connector
                 .submit_action(
@@ -4525,7 +4717,7 @@ mod tests {
                         payload: json!({"to":"basic:zhangsan","text":"two"}),
                         execution_mode: ActionExecutionMode::Inline,
                     },
-                    &ctx(),
+                    &second_ctx,
                 )
                 .expect("second send"),
         );
@@ -4539,7 +4731,9 @@ mod tests {
     fn root_send_message_reuses_existing_credentials() {
         let state = Arc::new(Mutex::new(MockGatewayState::default()));
         let mut connector = connector_with_mock(Arc::clone(&state));
-        for text in ["one", "two"] {
+        for (index, text) in ["one", "two"].into_iter().enumerate() {
+            let mut send_ctx = ctx();
+            send_ctx.client_token = Some(format!("client-{index}"));
             connector
                 .submit_action(
                     SubmitActionRequest {
@@ -4547,7 +4741,7 @@ mod tests {
                         payload: json!({"to":"basic:zhangsan","text":text}),
                         execution_mode: ActionExecutionMode::Inline,
                     },
-                    &ctx(),
+                    &send_ctx,
                 )
                 .expect("send message");
         }

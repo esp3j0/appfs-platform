@@ -785,7 +785,19 @@ impl AppfsAdapter {
                 }
             }
 
-            match self.process_action(&rel, &spec, &payload, client_token_override)? {
+            let client_token = client_token_override
+                .or_else(|| extract_client_token(&payload))
+                .or_else(|| {
+                    Some(stable_action_line_client_token(
+                        &self.app_id,
+                        &self.session_id,
+                        &rel,
+                        cursor.offset,
+                        &payload,
+                    ))
+                });
+
+            match self.process_action(&rel, &spec, &payload, client_token)? {
                 ProcessOutcome::Consumed => {
                     cursor.offset = payload_line_end as u64;
                     cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
@@ -1281,6 +1293,34 @@ struct ConnectorSideEvent {
     path: Option<String>,
     content: Option<JsonValue>,
     error: Option<JsonValue>,
+}
+
+fn stable_action_line_client_token(
+    app_id: &str,
+    session_id: &str,
+    rel: &str,
+    offset: u64,
+    payload: &str,
+) -> String {
+    // Action retries must keep a stable idempotency key even when the caller
+    // intentionally keeps the JSONL action payload terse.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let offset = offset.to_string();
+    for part in [
+        app_id.as_bytes(),
+        session_id.as_bytes(),
+        rel.as_bytes(),
+        offset.as_bytes(),
+        payload.as_bytes(),
+    ] {
+        for byte in part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= u64::from(b'|');
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("appfs-act-{hash:016x}")
 }
 
 fn split_connector_side_events(mut content: JsonValue) -> (JsonValue, Vec<ConnectorSideEvent>) {
@@ -3010,6 +3050,32 @@ mod tests {
                 .and_then(|value| value.get("message_id"))
                 .and_then(|value| value.as_str()),
             Some("m1")
+        );
+    }
+
+    #[test]
+    fn action_without_client_token_gets_stable_adapter_token() {
+        let (_temp, mut adapter) = fixture_adapter();
+        adapter.prepare_action_sinks().expect("prepare sinks");
+
+        let rel = "contacts/zhangsan/send_message.act";
+        let action_path = adapter.app_dir.join(rel);
+        let events_path = adapter.app_dir.join("_stream/events.evt.jsonl");
+        let payload = "{\"text\":\"hello\"}";
+        append_text(&action_path, &format!("{payload}\n"));
+
+        adapter.poll_once().expect("poll action");
+
+        let events = fs::read_to_string(events_path).expect("read events");
+        let completed = events
+            .lines()
+            .map(|line| serde_json::from_str::<JsonValue>(line).expect("event json"))
+            .find(|event| event["type"] == "action.completed")
+            .expect("completed event");
+        let expected = super::stable_action_line_client_token("aiim", "sess-test", rel, 0, payload);
+        assert_eq!(
+            completed.get("client_token").and_then(JsonValue::as_str),
+            Some(expected.as_str())
         );
     }
 

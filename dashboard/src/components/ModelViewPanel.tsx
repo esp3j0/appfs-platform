@@ -25,7 +25,7 @@ export function ModelViewPanel({ selectedAgents, entries, compactionBoundaries }
     ? selectSegmentFinalDumps(dumps, compactionBoundaries, selectedAgents)
     : { entries: dumps, reasons: new Map<string, string>() };
   const visibleDumps = selection.entries;
-  const laneLayout = selectedAgents.length > 1;
+  const laneLayout = selectedAgents.length >= 1;
   const laneAgents = laneLayout ? selectedAgents : [];
   const boundaryCount = compactionBoundaries.filter(boundary => selectedAgents.includes(boundary.agentName)).length;
   const requestMeta = modelFilter === 'segment-final' && visibleDumps.length !== dumps.length

@@ -11,6 +11,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
 
+use crate::appfs::{prepare_appfs_act_event_wait, wait_for_appfs_act_event_completion};
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
@@ -185,8 +186,15 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
+    let appfs_act_wait = prepare_appfs_act_event_wait(&cwd, &input.command);
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    let output = runtime.block_on(execute_bash_async(input, sandbox_status, cwd))?;
+    if !output.interrupted && output.return_code_interpretation.is_none() {
+        if let Some(wait_plan) = &appfs_act_wait {
+            wait_for_appfs_act_event_completion(wait_plan);
+        }
+    }
+    Ok(output)
 }
 
 async fn execute_bash_async(

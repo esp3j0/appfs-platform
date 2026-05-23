@@ -822,7 +822,7 @@ The generated `appfs-tinode` skill should teach the model these rules:
 8. For unread summaries after attach or reconnect, read `inbox/unread.res.jsonl` or `inbox/recent.res.jsonl`.
 9. For full conversation history, read `contacts/<contact-key>/messages.res.jsonl` or `groups/<group-key>/messages.res.jsonl`.
 10. For group creation, append one JSON line to `groups/create_group.act`.
-11. To clear local unread state, use `inbox/mark_read.act` with `scope = message`, `thread`, or `all`.
+11. Unread state is handled automatically in the normal flow; do not teach manual read-state updates as a routine action.
 12. For `send_message.act`, use Python `json.dumps` or PowerShell `ConvertTo-Json` to serialize payloads before appending. Do not teach bare `printf` for message payloads because multiline text, quotes, backslashes, Windows paths, and Windows console encodings are easy to corrupt. The bash tool injects `PYTHONIOENCODING=utf-8` so Python `print()` writes valid UTF-8 JSONL.
 13. After any action, rely on AppFS event reminders or read `_stream/events.evt.jsonl` for debugging.
 
@@ -979,6 +979,9 @@ Error event example:
 
 1. The connector should keep Tinode credentials in connector private state keyed by `profile_id`.
 2. The connector should keep idempotency records keyed by `profile_id + client_token`.
+   For JSONL app actions that omit a user-authored `client_token`, the AppFS
+   adapter supplies a stable action-line token so retrying the same `.act` line
+   does not require the model to mint idempotency tokens manually.
 3. The connector should maintain per-topic cursors keyed by `profile_id + topic_id`.
 4. The connector should expose safe resources only.
 5. Dynamic contact/group directories require app structure revision updates.
