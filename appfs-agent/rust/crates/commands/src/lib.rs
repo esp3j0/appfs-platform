@@ -3668,6 +3668,7 @@ fn build_appfs_skill_markdown(
         lines.push(String::new());
         lines.push("## AppFS action rules".to_string());
         lines.push("- Every `*.act` file is an append-only JSONL sink.".to_string());
+        lines.push("- Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; when the reminder includes `message.received` with attention required, treat it as an active task to answer or act on in this turn. Inspect `_stream/events.evt.jsonl` manually only for debugging or if no reminder appears.".to_string());
         lines.push("- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string());
         lines.push("- Use `bash` with Python JSON serialization, or PowerShell `ConvertTo-Json`, to append exactly one JSON object plus a trailing newline.".to_string());
     }
