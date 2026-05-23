@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt::{Display, Formatter};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
-use crate::appfs::collect_appfs_pending_inputs;
+use crate::appfs::{collect_appfs_pending_inputs, detect_appfs_environment};
 use crate::compact::{
     build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
     select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
@@ -14,8 +13,8 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::input_router::{
-    input_router_block_from_pending_inputs, InputSource, PendingInput, PendingInputQueue,
-    SharedPendingInputQueue,
+    input_router_block_from_pending_inputs, InputEnvelope, InputSource, PendingInput,
+    PendingInputDelivery, PendingInputQueue, SharedPendingInputQueue,
 };
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
@@ -270,6 +269,7 @@ pub struct ConversationRuntime<C, T> {
     external_pending_inputs: Option<SharedPendingInputQueue>,
     pending_appfs_event_cursor_updates: BTreeMap<String, i64>,
     pending_appfs_wake_event_cursor_updates: BTreeMap<String, i64>,
+    last_principal_registry_revision: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -305,6 +305,8 @@ where
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
+        let last_principal_registry_revision = None;
+
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
             session,
@@ -323,6 +325,7 @@ where
             external_pending_inputs: None,
             pending_appfs_event_cursor_updates: BTreeMap::new(),
             pending_appfs_wake_event_cursor_updates: BTreeMap::new(),
+            last_principal_registry_revision,
         }
     }
 
@@ -741,7 +744,13 @@ where
     }
 
     fn enqueue_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
-        let Ok(cwd) = env::current_dir() else {
+        let root_path = self
+            .session
+            .workspace_root()
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+
+        let Some(cwd) = root_path else {
             return Ok(());
         };
         let sync = collect_appfs_pending_inputs(&self.session, &cwd).map_err(|error| {
@@ -768,6 +777,61 @@ where
     }
 
     fn sync_pending_inputs_before_model_call(&mut self) -> Result<(), RuntimeError> {
+        let root_path = self
+            .session
+            .workspace_root()
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+
+        if let Some(cwd) = root_path {
+            if let Some(env) = detect_appfs_environment(&cwd) {
+                let current = env.principal_registry_revision.clone();
+                let mut should_inject = false;
+                let roster = env
+                    .known_principals
+                    .iter()
+                    .map(|p| p.principal_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                if let Some(last) = &self.last_principal_registry_revision {
+                    if last != &current {
+                        should_inject = true;
+                    }
+                } else {
+                    // First model boundary: check if any principal is missing from the system prompt.
+                    // If any principal is missing, it means another agent was spawned between
+                    // system prompt creation and runtime initialization, so we must inject a reminder.
+                    for principal in &env.known_principals {
+                        let id_pattern = format!("`{}`", principal.principal_id);
+                        let is_present = self
+                            .system_prompt
+                            .iter()
+                            .any(|section| section.contains(&id_pattern));
+                        if !is_present {
+                            should_inject = true;
+                            break;
+                        }
+                    }
+                }
+
+                if should_inject {
+                    self.pending_inputs.push(PendingInput {
+                        envelope: InputEnvelope::new(
+                            InputSource::System,
+                            "principal_registry.updated",
+                            format!(
+                                "registry updated\nnew principals available\ncurrent roster: {}\nrefresh current roster",
+                                roster
+                            ),
+                        ),
+                        delivery: PendingInputDelivery::InjectAtNextBoundary,
+                    });
+                }
+                self.last_principal_registry_revision = Some(current);
+            }
+        }
+
         let local_pending_inputs = self.pending_inputs.drain_boundary_pending_inputs();
         let external_pending_inputs = self
             .external_pending_inputs
@@ -1392,7 +1456,7 @@ mod tests {
             .with_os("linux", "6.8")
             .build();
         let mut runtime = ConversationRuntime::new(
-            Session::new(),
+            Session::new().with_workspace_root("/nonexistent/path/for/test"),
             api_client,
             tool_executor,
             permission_policy,
@@ -1498,6 +1562,114 @@ mod tests {
         assert!(pending_text.contains("type=user.guidance"));
         assert!(pending_text.contains("guide now"));
         assert!(!pending_text.contains("later"));
+    }
+
+    #[test]
+    fn run_turn_injects_principal_registry_reminder_on_revision_change() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "appfs-conv-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let control_dir = temp_dir.join("_appfs");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        std::fs::write(control_dir.join("register_app.act"), "").unwrap();
+        std::fs::write(control_dir.join("unregister_app.act"), "").unwrap();
+        std::fs::write(control_dir.join("list_apps.act"), "").unwrap();
+        std::fs::write(control_dir.join("apps.registry.json"), "[]").unwrap();
+        std::fs::write(
+            control_dir.join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
+        ).unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(original_cwd);
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        #[derive(Clone)]
+        struct RecordingApiClient {
+            seen_request: Rc<RefCell<Option<ApiRequest>>>,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                *self.seen_request.borrow_mut() = Some(request);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ack".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let seen_request = Rc::new(RefCell::new(None));
+        let api_client = RecordingApiClient {
+            seen_request: seen_request.clone(),
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system - Known AppFS principals in this project: `default`.".to_string()],
+        );
+
+        // Turn 1: Initial load, should NOT alert because last_principal_registry_revision is None
+        runtime.run_turn("first turn", None).expect("turn 1");
+        {
+            let req = seen_request.borrow();
+            let req = req.as_ref().unwrap();
+            let has_reminder = req.messages.iter().any(|m| {
+                m.blocks.iter().any(|b| match b {
+                    ContentBlock::InputRouter { inputs } => {
+                        let text = render_input_router_block(inputs);
+                        text.contains("principal_registry.updated")
+                    }
+                    _ => false,
+                })
+            });
+            assert!(!has_reminder, "Should not contain reminder on initial turn");
+        }
+
+        // Wait a tiny bit and change principals.registry.json to trigger a revision change
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            control_dir.join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"},{"principal_id":"agent-c","display_name":"Agent C","description":"The third agent.","kind":"agent","created_at":"2026-05-22T00:00:00Z","updated_at":"2026-05-22T00:00:00Z"}]}"#,
+        ).unwrap();
+
+        // Turn 2: Roster has updated, should inject the reminder!
+        runtime.run_turn("second turn", None).expect("turn 2");
+        {
+            let req = seen_request.borrow();
+            let req = req.as_ref().unwrap();
+            let has_reminder = req.messages.iter().any(|m| {
+                m.blocks.iter().any(|b| match b {
+                    ContentBlock::InputRouter { inputs } => {
+                        let text = render_input_router_block(inputs);
+                        text.contains("principal_registry.updated")
+                            && text.contains("new principals available")
+                            && text.contains("agent-c")
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                has_reminder,
+                "Should contain registry updated reminder on turn 2"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -2618,7 +2790,9 @@ mod tests {
         }
 
         let path = temp_session_path("persisted-turn");
-        let session = Session::new().with_persistence_path(path.clone());
+        let session = Session::new()
+            .with_persistence_path(path.clone())
+            .with_workspace_root("/nonexistent/path/for/test");
         let mut runtime = ConversationRuntime::new(
             session,
             SimpleApi,
@@ -2814,7 +2988,7 @@ mod tests {
         }
 
         let mut runtime = ConversationRuntime::new(
-            Session::new(),
+            Session::new().with_workspace_root("/nonexistent/path/for/test"),
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),

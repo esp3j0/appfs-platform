@@ -10,6 +10,7 @@ import { registerEventsRoute } from './routes/events.js';
 import { registerAppEventOverridesRoute } from './routes/app-event-overrides.js';
 import { registerMountedAppsRoute } from './routes/mounted-apps.js';
 import { registerProcessRoute } from './routes/process.js';
+import { registerPrincipalsRoute } from './routes/principals.js';
 
 const PORT = parseInt(process.env.PORT ?? '3100', 10);
 const HOST = process.env.HOST ?? '127.0.0.1';
@@ -51,6 +52,7 @@ async function main() {
   registerAppEventOverridesRoute(app, registry);
   registerMountedAppsRoute(app, registry);
   registerProcessRoute(app, processManager);
+  registerPrincipalsRoute(app, registry, processManager);
 
   // Graceful shutdown
   const shutdownHandler = async () => {

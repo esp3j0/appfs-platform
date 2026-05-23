@@ -174,6 +174,7 @@ pub struct AppfsEnvironment {
     pub current_app_events_path: Option<PathBuf>,
     pub registered_apps: Vec<AppfsRegisteredApp>,
     pub known_principals: Vec<AppfsPrincipalSummary>,
+    pub principal_registry_revision: String,
     pub warnings: Vec<String>,
 }
 
@@ -2474,9 +2475,9 @@ fn build_env_environment(
     );
     let current_detection = detect_current_registered_app(&mount_root, cwd, &registered_apps)
         .unwrap_or_else(|| detect_current_app(&mount_root, cwd));
-    let known_principals = load_principal_summaries_from_paths(
-        principal_registry_path_from_control_paths(&control_paths).as_deref(),
-    );
+    let registry_path = principal_registry_path_from_control_paths(&control_paths);
+    let principal_registry_revision = get_principal_registry_revision(registry_path.as_deref());
+    let known_principals = load_principal_summaries_from_paths(registry_path.as_deref());
 
     Some(AppfsEnvironment {
         attach_source: AppfsAttachSource::Env,
@@ -2500,6 +2501,7 @@ fn build_env_environment(
         current_app_events_path: current_detection.current_app_events_path,
         registered_apps,
         known_principals,
+        principal_registry_revision,
         warnings,
     })
 }
@@ -2522,9 +2524,9 @@ fn build_manifest_environment(
         load_registered_apps_from_paths(control_paths.registry_path.as_deref(), &principal_id);
     let current_detection = detect_current_registered_app(&mount_root, cwd, &registered_apps)
         .unwrap_or_else(|| detect_current_app(&mount_root, cwd));
-    let known_principals = load_principal_summaries_from_paths(
-        principal_registry_path_from_control_paths(&control_paths).as_deref(),
-    );
+    let registry_path = principal_registry_path_from_control_paths(&control_paths);
+    let principal_registry_revision = get_principal_registry_revision(registry_path.as_deref());
+    let known_principals = load_principal_summaries_from_paths(registry_path.as_deref());
 
     Some(AppfsEnvironment {
         attach_source: AppfsAttachSource::Manifest,
@@ -2548,6 +2550,7 @@ fn build_manifest_environment(
         current_app_events_path: current_detection.current_app_events_path,
         registered_apps,
         known_principals,
+        principal_registry_revision,
         warnings,
     })
 }
@@ -2556,6 +2559,8 @@ fn build_heuristic_environment(
     detection: HeuristicDetection,
     warnings: Vec<String>,
 ) -> AppfsEnvironment {
+    let registry_path = detection.control_dir.join(PRINCIPALS_FILE);
+    let principal_registry_revision = get_principal_registry_revision(Some(&registry_path));
     AppfsEnvironment {
         attach_source: AppfsAttachSource::Heuristic,
         mount_root: detection.mount_root,
@@ -2578,6 +2583,7 @@ fn build_heuristic_environment(
         current_app_events_path: detection.current_app_events_path,
         registered_apps: detection.registered_apps,
         known_principals: detection.known_principals,
+        principal_registry_revision,
         warnings,
     }
 }
@@ -2892,6 +2898,19 @@ fn load_registered_apps(
             })
         })
         .collect()
+}
+
+fn get_principal_registry_revision(registry_path: Option<&Path>) -> String {
+    let Some(path) = registry_path else {
+        return "none".to_string();
+    };
+    if let Ok(bytes) = fs::read(path) {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        return format!("{:x}", hasher.finalize());
+    }
+    "none".to_string()
 }
 
 fn load_principal_summaries_from_paths(registry_path: Option<&Path>) -> Vec<AppfsPrincipalSummary> {
@@ -5059,6 +5078,7 @@ PY"#,
                 active_scope: None,
             }],
             known_principals: vec![],
+            principal_registry_revision: "test-rev".to_string(),
             warnings: vec![],
         };
 
@@ -5789,6 +5809,39 @@ PY"#,
         assert!(reminder.contains("code='CREDENTIALS_FAILED'"));
         assert!(reminder.contains("message='duplicate credential'"));
         assert!(reminder.contains("retryable=false"));
+    }
+
+    #[test]
+    fn test_principal_registry_revision_refresh() {
+        let temp = TempDirGuard::new("principal-refresh");
+        let mount_root = temp.path().join("mnt");
+        let cwd = mount_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        seed_heuristic_mount(&mount_root);
+
+        // Load the initial environment
+        let initial_env = detect_appfs_environment(&cwd).expect("detect env");
+        let initial_rev = initial_env.principal_registry_revision.clone();
+        assert_eq!(initial_env.known_principals.len(), 1);
+        assert_eq!(initial_env.known_principals[0].principal_id, "default");
+
+        // Now modify principals.registry.json to add a new principal
+        let control_dir = mount_root.join("_appfs");
+        fs::write(
+            control_dir.join("principals.registry.json"),
+            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"},{"principal_id":"agent-b","display_name":"Agent B","description":"The second agent.","kind":"agent","created_at":"2026-05-22T00:00:00Z","updated_at":"2026-05-22T00:00:00Z"}]}"#,
+        )
+        .expect("write updated principals registry");
+
+        // Detect the environment again
+        let updated_env = detect_appfs_environment(&cwd).expect("detect env");
+        let updated_rev = updated_env.principal_registry_revision.clone();
+
+        // Verify the revision changed, the current principal is unchanged, and known_principals updated
+        assert_ne!(initial_rev, updated_rev);
+        assert_eq!(updated_env.principal_id, "default");
+        assert_eq!(updated_env.known_principals.len(), 2);
+        assert_eq!(updated_env.known_principals[1].principal_id, "agent-b");
     }
 
     #[test]

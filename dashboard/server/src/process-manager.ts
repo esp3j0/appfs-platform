@@ -288,6 +288,24 @@ export class AgentProcessManager {
       .map(a => a.sessionId!);
   }
 
+  getManagedAgents(): Array<{
+    pid?: number;
+    sessionId: string | null;
+    status: 'starting' | 'idle' | 'busy';
+    principalId: string;
+    model: string;
+    permissionMode: string;
+  }> {
+    return Array.from(this.agents.values()).map(a => ({
+      pid: a.process.pid,
+      sessionId: a.sessionId,
+      status: a.status,
+      principalId: a.spawnConfig.principalId,
+      model: a.spawnConfig.model,
+      permissionMode: a.spawnConfig.permissionMode,
+    }));
+  }
+
   getDefaultSpawnConfig(): SpawnConfig {
     const platformRoot = resolvePlatformRoot();
     return {
