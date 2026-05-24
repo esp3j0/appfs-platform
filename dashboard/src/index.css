@@ -1435,10 +1435,79 @@ body { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; backgroun
   letter-spacing: 0.5px;
 }
 
-/* ── Sidebar Usage ── */
+/* ── Sidebar Usage & Spawn Logs ── */
 .sidebar-usage .usage-header {
   padding: 0 !important;
   border: none !important;
   margin-bottom: 8px !important;
+}
+
+.spawn-log-empty {
+  color: #6e7681;
+  font-size: 11px;
+  font-style: italic;
+  padding: 4px 2px;
+}
+
+.spawn-agent-log-container {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.spawn-log-item {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #c9d1d9;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.spawn-log-item.online {
+  background: #11261a;
+}
+
+.spawn-log-item.offline {
+  background: #2b1114;
+}
+
+.spawn-log-item.log {
+  background: #161b22;
+}
+
+.spawn-log-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.spawn-log-kind {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 9px;
+}
+
+.spawn-log-kind.online {
+  color: #3fb950;
+}
+
+.spawn-log-kind.offline {
+  color: #ff7b72;
+}
+
+.spawn-log-kind.log {
+  color: #8b949e;
+}
+
+.spawn-log-id {
+  color: #6e7681;
+  font-size: 9px;
 }
 

@@ -464,39 +464,22 @@ function SpawnAgentPanel({
           <div className="spawn-agent-log-panel">
             <div className="spawn-agent-resume-title">Startup logs</div>
             {processLogs.length === 0 ? (
-              <div style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic', padding: '4px 2px' }}>
+              <div className="spawn-log-empty">
                 Spawn an agent to see live stdout / stderr here.
               </div>
             ) : (
-              <div style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '6px',
-                maxHeight: '180px',
-                overflowY: 'auto',
-                paddingRight: '4px',
-              }}>
+              <div className="spawn-agent-log-container">
                 {processLogs.map(log => (
                   <div
                     key={log.id}
-                    style={{
-                      border: '1px solid #30363d',
-                      borderRadius: '6px',
-                      background: log.kind === 'online' ? '#11261a' : log.kind === 'offline' ? '#2b1114' : '#161b22',
-                      padding: '6px 8px',
-                      fontSize: '11px',
-                      lineHeight: 1.45,
-                      color: '#c9d1d9',
-                      wordBreak: 'break-word',
-                      whiteSpace: 'pre-wrap',
-                    }}
+                    className={`spawn-log-item ${log.kind}`}
                     title={[log.agentId, log.spawnId, log.stream].filter(Boolean).join(' · ')}
                   >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginBottom: '2px' }}>
-                      <span style={{ color: log.kind === 'online' ? '#3fb950' : log.kind === 'offline' ? '#ff7b72' : '#8b949e', fontWeight: 600, textTransform: 'uppercase', fontSize: '9px' }}>
+                    <div className="spawn-log-header">
+                      <span className={`spawn-log-kind ${log.kind}`}>
                         {log.kind === 'log' ? log.stream : log.kind}
                       </span>
-                      <span style={{ color: '#6e7681', fontSize: '9px' }}>
+                      <span className="spawn-log-id">
                         {log.spawnId}
                       </span>
                     </div>
