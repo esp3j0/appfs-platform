@@ -156,6 +156,8 @@ export interface AgentInfo {
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  projectId?: string;
+  projectRoot?: string;
 }
 
 export interface TimelineEntry {

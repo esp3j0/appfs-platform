@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface, Interface as ReadlineInterface } from 'node:readline';
 import { EventBus } from './event-bus.js';
 import type { AgentRegistry } from './agent-registry.js';
+import type { ProjectRegistry } from './project-registry.js';
 import type { AgentInfo } from './types.js';
 
 // ── Launch specification types ──
@@ -25,6 +26,26 @@ export interface SpawnConfig {
   env: Record<string, string>;
   appfsIdleWake?: boolean;
   sessionPath?: string;
+  projectId?: string;
+  projectRoot?: string;
+}
+
+export function resolveProjectScopedSpawnConfig(
+  spawnConfig: SpawnConfig,
+  projectRegistry?: ProjectRegistry,
+): SpawnConfig {
+  const resolvedConfig: SpawnConfig = { ...spawnConfig };
+
+  if (resolvedConfig.projectId && projectRegistry) {
+    const project = projectRegistry.getProject(resolvedConfig.projectId);
+    if (project) {
+      resolvedConfig.cwd = project.projectRoot;
+      resolvedConfig.appfsMountRoot = project.mountRoot;
+      resolvedConfig.projectRoot = project.projectRoot;
+    }
+  }
+
+  return resolvedConfig;
 }
 
 export type PromptDelivery = 'prompt' | 'queue' | 'guidance';
@@ -96,15 +117,20 @@ export class AgentProcessManager {
   spawn(spawnConfig: SpawnConfig): { spawnId: string } {
     const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const args = this.buildArgs(spawnConfig);
-    const cmd = this.buildCommand(spawnConfig.launchSpec);
+    const effectiveSpawnConfig = resolveProjectScopedSpawnConfig(
+      spawnConfig,
+      this.registry.projectRegistry,
+    );
+
+    const args = this.buildArgs(effectiveSpawnConfig);
+    const cmd = this.buildCommand(effectiveSpawnConfig.launchSpec);
 
     console.log(`[ProcessManager] Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`);
 
     const childProcess = spawn(cmd, args, {
-      cwd: spawnConfig.cwd,
+      cwd: effectiveSpawnConfig.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: this.buildEnvironment(spawnConfig),
+      env: this.buildEnvironment(effectiveSpawnConfig),
       shell: false,
     });
 
@@ -114,7 +140,7 @@ export class AgentProcessManager {
     const managedAgent: ManagedAgent = {
       process: childProcess,
       sessionId: null,
-      spawnConfig,
+      spawnConfig: effectiveSpawnConfig,
       status: 'starting',
       currentRequestId: null,
       controlEndpoint: null,
@@ -163,6 +189,10 @@ export class AgentProcessManager {
       // Clean up
       stdoutReader.close();
       stderrReader.close();
+      childProcess.stdout?.destroy();
+      childProcess.stderr?.destroy();
+      childProcess.stdin?.end();
+      childProcess.stdin?.destroy();
       this.agents.delete(spawnId);
       if (managedAgent.sessionId) {
         this.pendingSpawnMap.delete(managedAgent.sessionId);
@@ -177,6 +207,13 @@ export class AgentProcessManager {
         stream: 'error',
         text: `Spawn error: ${err.message}`,
       });
+      stdoutReader.close();
+      stderrReader.close();
+      childProcess.stdout?.destroy();
+      childProcess.stderr?.destroy();
+      childProcess.stdin?.end();
+      childProcess.stdin?.destroy();
+      this.agents.delete(spawnId);
     });
 
     return { spawnId };
@@ -427,6 +464,8 @@ export class AgentProcessManager {
             messageCount: 0,
             totalInputTokens: 0,
             totalOutputTokens: 0,
+            projectId: managed.spawnConfig.projectId,
+            projectRoot: managed.spawnConfig.projectRoot,
           };
           this.registry.registerAgent(agentInfo);
 

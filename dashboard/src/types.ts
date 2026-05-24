@@ -12,6 +12,18 @@ export interface AgentInfo {
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  projectId?: string;
+  projectRoot?: string;
+}
+
+export interface ProjectRecord {
+  projectId: string;
+  projectRoot: string;
+  composeFilePath: string;
+  mountRoot: string;
+  status: 'stopped' | 'starting' | 'running' | 'error';
+  agentSessionIds: string[];
+  managedAgentSessionIds: string[];
 }
 
 export interface ContentBlock {

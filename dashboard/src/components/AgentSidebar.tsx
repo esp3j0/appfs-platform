@@ -1,5 +1,5 @@
 import React from 'react';
-import type { AgentInfo, SpawnConfig } from '../types';
+import type { AgentInfo, SpawnConfig, ProjectRecord } from '../types';
 import { AgentItem } from './AgentItem';
 
 interface Props {
@@ -10,26 +10,201 @@ interface Props {
 }
 
 export function AgentSidebar({ agents, selected, onToggle, onRefreshAgents }: Props) {
+  const [projects, setProjects] = React.useState<ProjectRecord[]>([]);
+  const [expandedProjects, setExpandedProjects] = React.useState<Record<string, boolean>>({});
+
   const totalInput = agents.reduce((s, a) => s + a.totalInputTokens, 0);
   const totalOutput = agents.reduce((s, a) => s + a.totalOutputTokens, 0);
   const maxTokens = Math.max(totalInput, totalOutput, 1);
+
+  const loadProjects = React.useCallback(() => {
+    fetch('/api/projects')
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data: { projects: ProjectRecord[] }) => {
+        if (data && data.projects) {
+          setProjects(data.projects);
+        }
+      })
+      .catch((err) => {
+        console.error('[AgentSidebar] Failed to load projects:', err);
+      });
+  }, []);
+
+  React.useEffect(() => {
+    loadProjects();
+    const interval = setInterval(loadProjects, 5000);
+    return () => clearInterval(interval);
+  }, [loadProjects]);
+
+  const getProjectFolderName = (projectRoot: string) => {
+    const parts = projectRoot.replace(/\\/g, '/').split('/');
+    return parts[parts.length - 1] || projectRoot;
+  };
+
+  const groupedAgents = React.useMemo(() => {
+    const groups: Record<string, { agent: AgentInfo; index: number }[]> = {};
+    const ungrouped: { agent: AgentInfo; index: number }[] = [];
+
+    agents.forEach((agent, i) => {
+      if (agent.projectId) {
+        if (!groups[agent.projectId]) {
+          groups[agent.projectId] = [];
+        }
+        groups[agent.projectId].push({ agent, index: i });
+      } else {
+        ungrouped.push({ agent, index: i });
+      }
+    });
+
+    return { groups, ungrouped };
+  }, [agents]);
+
+  // Union of all projects to render
+  const renderedProjects = React.useMemo(() => {
+    const list: {
+      projectId: string;
+      projectRoot: string;
+      status: 'stopped' | 'starting' | 'running' | 'error';
+      agents: { agent: AgentInfo; index: number }[];
+      isFallback: boolean;
+    }[] = [];
+
+    const processedIds = new Set<string>();
+
+    // 1. Process known projects from fetched projects list
+    projects.forEach(p => {
+      processedIds.add(p.projectId);
+      const projectAgents = groupedAgents.groups[p.projectId] || [];
+      list.push({
+        projectId: p.projectId,
+        projectRoot: p.projectRoot,
+        status: p.status,
+        agents: projectAgents,
+        isFallback: false,
+      });
+    });
+
+    // 2. Process any other projectIds that appear in agents but are missing from projects list
+    Object.keys(groupedAgents.groups).forEach(pId => {
+      if (!processedIds.has(pId)) {
+        processedIds.add(pId);
+        const projectAgents = groupedAgents.groups[pId] || [];
+        const projectRoot = projectAgents[0]?.agent.projectRoot || pId;
+        list.push({
+          projectId: pId,
+          projectRoot,
+          status: 'stopped', // fallback status
+          agents: projectAgents,
+          isFallback: true,
+        });
+      }
+    });
+
+    return list;
+  }, [projects, groupedAgents]);
+
+  const toggleProject = (projectId: string) => {
+    setExpandedProjects(prev => ({
+      ...prev,
+      [projectId]: !prev[projectId],
+    }));
+  };
+
+  const handleRefresh = () => {
+    loadProjects();
+    onRefreshAgents?.();
+  };
 
   return (
     <div className="sidebar">
       <div className="sidebar-header">Agents (multi-select)</div>
       <div className="select-hint">Click to toggle. Select 2+ for merged timeline.</div>
+      
       <div className="agent-list">
-        {agents.map((agent, i) => (
-          <AgentItem key={agent.sessionId || agent.name} agent={agent} checked={selected.has(agent.name)} colorIndex={i} onToggle={() => onToggle(agent.name)} />
-        ))}
+        {renderedProjects.map(project => {
+          const isExpanded = expandedProjects[project.projectId] ?? true;
+
+          return (
+            <div key={project.projectId} className="project-group">
+              <button
+                type="button"
+                className="project-header"
+                onClick={() => toggleProject(project.projectId)}
+                aria-expanded={isExpanded}
+                aria-controls={`project-content-${project.projectId}`}
+              >
+                <div className="project-header-left">
+                  <span className={`project-arrow ${isExpanded ? 'expanded' : ''}`}>▸</span>
+                  <div className="project-header-titles">
+                    <div className="project-header-row">
+                      <span className="project-name">
+                        {getProjectFolderName(project.projectRoot)}
+                      </span>
+                      <span className={`project-badge ${project.status}`}>{project.status}</span>
+                    </div>
+                    <div className="project-root-subtitle" title={project.projectRoot}>
+                      {project.projectRoot}
+                    </div>
+                  </div>
+                </div>
+                <div className="project-header-right">
+                  <span className="project-agent-count">{project.agents.length}</span>
+                </div>
+              </button>
+              
+              <div
+                id={`project-content-${project.projectId}`}
+                className="project-content"
+                hidden={!isExpanded}
+              >
+                {project.agents.length === 0 ? (
+                  <div className="project-empty-agents">No active agents in project</div>
+                ) : (
+                  project.agents.map(({ agent, index }) => (
+                    <AgentItem
+                      key={agent.sessionId || agent.name}
+                      agent={agent}
+                      checked={selected.has(agent.name)}
+                      colorIndex={index}
+                      onToggle={() => onToggle(agent.name)}
+                    />
+                  ))
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {groupedAgents.ungrouped.length > 0 && (
+          <div className="project-group">
+            <div className="legacy-header">
+              Legacy / Flat Sessions ({groupedAgents.ungrouped.length})
+            </div>
+            <div className="project-content">
+              {groupedAgents.ungrouped.map(({ agent, index }) => (
+                <AgentItem
+                  key={agent.sessionId || agent.name}
+                  agent={agent}
+                  checked={selected.has(agent.name)}
+                  colorIndex={index}
+                  onToggle={() => onToggle(agent.name)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </div>
+
       <SpawnAgentPanel
         agents={agents}
         selected={selected}
-        onSpawnAccepted={onRefreshAgents}
+        onSpawnAccepted={handleRefresh}
       />
       <div className="sidebar-usage">
-        <div className="sidebar-header" style={{ padding: 0, border: 'none', marginBottom: 8 }}>Total Usage</div>
+        <div className="sidebar-header usage-header">Total Usage</div>
         <div className="usage-row"><span className="usage-label">Input</span><span className="usage-value">{totalInput.toLocaleString()} tok</span></div>
         <div className="usage-bar"><div className="usage-fill input" style={{ width: `${(totalInput / maxTokens) * 100}%` }} /></div>
         <div className="usage-row" style={{ marginTop: 6 }}><span className="usage-label">Output</span><span className="usage-value">{totalOutput.toLocaleString()} tok</span></div>
