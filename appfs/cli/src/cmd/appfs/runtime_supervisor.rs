@@ -674,10 +674,12 @@ impl AppfsRuntimeSupervisor {
                 .as_deref()
                 .map(|template| render_principal_template(template, &principal.principal_id))
                 .unwrap_or_else(|| format!("{}:{}", policy.app_id, principal.principal_id));
+            let mut bridge = registry::bridge_args_from_transport_doc(&policy.transport);
+            bridge.connector_config = policy.connector_config.clone();
             let runtime = ResolvedAppfsRuntimeCliArgs {
                 app_id: policy.app_id.clone(),
                 session_id: super::normalize_appfs_session_id(None),
-                bridge: registry::bridge_args_from_transport_doc(&policy.transport),
+                bridge,
             };
             let metadata = AppRuntimeRegistryMetadata {
                 instance_id: instance_id.clone(),
@@ -687,6 +689,7 @@ impl AppfsRuntimeSupervisor {
                 profile_id: Some(profile_id.clone()),
                 path: path.clone(),
                 inbound_poll_ms: policy.inbound_poll_ms.unwrap_or(0),
+                connector_config: policy.connector_config.clone(),
             };
             let mut entry = build_runtime_entry_with_metadata(&self.root, runtime, metadata, None)?;
             entry.adapter.prepare_action_sinks()?;

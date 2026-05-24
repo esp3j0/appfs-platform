@@ -4523,6 +4523,7 @@ impl HookAbortMonitor {
 
 fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     let cwd = env::current_dir().ok()?;
+    eprintln!("AppFS attach: checking identity and private apps...");
     let outcome = ensure_appfs_attach_identity(&cwd);
     if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
         return None;
@@ -4535,8 +4536,15 @@ fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
 
 fn attach_live_cli_appfs_principal() -> Option<AppfsAttachLease> {
     let cwd = env::current_dir().ok()?;
+    eprintln!("AppFS attach: registering attach lease...");
     match attach_appfs_principal(&cwd) {
-        Ok(lease) => Some(lease),
+        Ok(lease) => {
+            eprintln!(
+                "AppFS attach: attach lease registered for principal {}",
+                lease.principal_id
+            );
+            Some(lease)
+        }
         Err(error) => {
             eprintln!("AppFS attach warning: failed to register attach lease: {error}");
             None
@@ -4548,8 +4556,10 @@ fn warmup_live_cli_appfs_private_apps() {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
+    eprintln!("AppFS attach: warming up private apps...");
     match warmup_appfs_private_apps(&cwd) {
         Ok(outcomes) => {
+            let warmed_app_count = outcomes.len();
             for outcome in outcomes {
                 match outcome.status {
                     AppfsPrivateAppWarmupStatus::Ready => {}
@@ -4567,6 +4577,10 @@ fn warmup_live_cli_appfs_private_apps() {
                     }
                 }
             }
+            eprintln!(
+                "AppFS attach: private app warmup complete ({} app(s))",
+                warmed_app_count
+            );
         }
         Err(error) => {
             eprintln!("AppFS attach warning: failed to warm up private apps: {error}");

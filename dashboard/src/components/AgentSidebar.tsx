@@ -1,6 +1,7 @@
 import React from 'react';
 import type { AgentInfo, SpawnConfig, ProjectRecord } from '../types';
 import { AgentItem } from './AgentItem';
+import { useDashboardSSE } from '../hooks/useDashboardSSE';
 
 interface Props {
   agents: AgentInfo[];
@@ -227,6 +228,38 @@ function SpawnAgentPanel({
   const [expanded, setExpanded] = React.useState(false);
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [status, setStatus] = React.useState<{ kind: 'idle' | 'loading' | 'success' | 'error'; text?: string }>({ kind: 'loading' });
+  const [processLogs, setProcessLogs] = React.useState<SpawnLogEntry[]>([]);
+
+  useDashboardSSE('/api/events', {
+    onProcessLog: payload => {
+      setProcessLogs(prev => [{
+        id: `process-log-${Date.now()}-${prev.length}`,
+        kind: 'log',
+        agentId: payload.agentId,
+        spawnId: payload.spawnId,
+        stream: payload.stream,
+        text: payload.text,
+      }, ...prev].slice(0, 12));
+    },
+    onAgentOnline: payload => {
+      setProcessLogs(prev => [{
+        id: `agent-online-${Date.now()}-${prev.length}`,
+        kind: 'online',
+        agentId: payload.sessionId,
+        spawnId: payload.spawnId,
+        text: `agent online${payload.sessionId ? `: ${payload.sessionId}` : ''}`,
+      }, ...prev].slice(0, 12));
+    },
+    onAgentOffline: payload => {
+      setProcessLogs(prev => [{
+        id: `agent-offline-${Date.now()}-${prev.length}`,
+        kind: 'offline',
+        agentId: payload.sessionId,
+        spawnId: payload.spawnId,
+        text: `agent offline${payload.sessionId ? `: ${payload.sessionId}` : ''}`,
+      }, ...prev].slice(0, 12));
+    },
+  });
 
   const selectedExternalAgents = agents.filter(agent =>
     selected.has(agent.name) && agent.controlMode === 'external' && agent.sessionJsonlPath
@@ -428,6 +461,52 @@ function SpawnAgentPanel({
             </div>
           )}
 
+          <div className="spawn-agent-log-panel">
+            <div className="spawn-agent-resume-title">Startup logs</div>
+            {processLogs.length === 0 ? (
+              <div style={{ color: '#6e7681', fontSize: 11, fontStyle: 'italic', padding: '4px 2px' }}>
+                Spawn an agent to see live stdout / stderr here.
+              </div>
+            ) : (
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                maxHeight: '180px',
+                overflowY: 'auto',
+                paddingRight: '4px',
+              }}>
+                {processLogs.map(log => (
+                  <div
+                    key={log.id}
+                    style={{
+                      border: '1px solid #30363d',
+                      borderRadius: '6px',
+                      background: log.kind === 'online' ? '#11261a' : log.kind === 'offline' ? '#2b1114' : '#161b22',
+                      padding: '6px 8px',
+                      fontSize: '11px',
+                      lineHeight: 1.45,
+                      color: '#c9d1d9',
+                      wordBreak: 'break-word',
+                      whiteSpace: 'pre-wrap',
+                    }}
+                    title={[log.agentId, log.spawnId, log.stream].filter(Boolean).join(' · ')}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginBottom: '2px' }}>
+                      <span style={{ color: log.kind === 'online' ? '#3fb950' : log.kind === 'offline' ? '#ff7b72' : '#8b949e', fontWeight: 600, textTransform: 'uppercase', fontSize: '9px' }}>
+                        {log.kind === 'log' ? log.stream : log.kind}
+                      </span>
+                      <span style={{ color: '#6e7681', fontSize: '9px' }}>
+                        {log.spawnId}
+                      </span>
+                    </div>
+                    <div>{log.text}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {selectedExternalAgents.length > 0 && (
             <div className="spawn-agent-resume">
               <div className="spawn-agent-resume-title">Resume selected external</div>
@@ -448,4 +527,13 @@ function SpawnAgentPanel({
       )}
     </div>
   );
+}
+
+interface SpawnLogEntry {
+  id: string;
+  kind: 'log' | 'online' | 'offline';
+  agentId?: string;
+  spawnId?: string;
+  stream?: string;
+  text: string;
 }

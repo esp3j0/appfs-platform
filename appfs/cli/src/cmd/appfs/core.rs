@@ -1264,13 +1264,22 @@ pub(super) fn build_app_connector(
             bridge_config.runtime_options,
         ))
     } else if app_id == "tinode" {
-        Box::new(TinodeConnector::from_env().map_err(|err| {
+        let config = if let Some(cc) = &bridge_config.connector_config {
+            agentfs_sdk::TinodeConnectorConfig::from_registry(
+                &cc.endpoint,
+                &cc.login_prefix,
+                cc.credential_policy.as_deref(),
+            )
+        } else {
+            agentfs_sdk::TinodeConnectorConfig::from_env()
+        };
+        Box::new(TinodeConnector::new(config.map_err(|err| {
             anyhow::anyhow!(
-                "failed to initialize Tinode connector: {}: {}",
+                "failed to initialize Tinode connector config: {}: {}",
                 err.code,
                 err.message
             )
-        })?)
+        })?))
     } else {
         Box::new(DemoAppConnector::new(app_id.to_string()))
     };
@@ -2230,6 +2239,7 @@ mod tests {
             adapter_grpc_endpoint: None,
             adapter_grpc_timeout_ms: 5_000,
             runtime_options: BridgeRuntimeOptions::from_cli(2, 100, 1_000, 5, 3_000),
+            connector_config: None,
         }
     }
 
@@ -2240,6 +2250,7 @@ mod tests {
             adapter_grpc_endpoint: None,
             adapter_grpc_timeout_ms: 5_000,
             runtime_options: BridgeRuntimeOptions::from_cli(2, 100, 1_000, 5, 3_000),
+            connector_config: None,
         }
     }
 
@@ -2250,6 +2261,7 @@ mod tests {
             adapter_grpc_endpoint: Some(endpoint),
             adapter_grpc_timeout_ms: 5_000,
             runtime_options: BridgeRuntimeOptions::from_cli(2, 100, 1_000, 5, 3_000),
+            connector_config: None,
         }
     }
 

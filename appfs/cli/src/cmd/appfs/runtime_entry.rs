@@ -22,6 +22,7 @@ pub(super) struct AppRuntimeRegistryMetadata {
     pub(super) profile_id: Option<String>,
     pub(super) path: String,
     pub(super) inbound_poll_ms: u64,
+    pub(super) connector_config: Option<crate::cmd::appfs::registry::AppfsRegistryConnectorConfig>,
 }
 
 pub(super) fn build_runtime_entry(
@@ -70,6 +71,7 @@ impl AppRuntimeRegistryMetadata {
             profile_id: None,
             path: app_id,
             inbound_poll_ms: 0,
+            connector_config: None,
         }
     }
 
@@ -84,6 +86,7 @@ impl AppRuntimeRegistryMetadata {
             profile_id: app.profile_id.clone(),
             path: app.path.clone(),
             inbound_poll_ms: app.inbound_poll_ms.unwrap_or(0),
+            connector_config: app.connector_config.clone(),
         }
     }
 }

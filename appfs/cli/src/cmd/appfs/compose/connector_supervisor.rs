@@ -1,7 +1,7 @@
 use super::schema::{
     AppfsComposeAppTransport, AppfsComposeAppVisibility, AppfsComposeConnector,
-    AppfsComposeConnectorHealthcheck, AppfsComposeConnectorMode, AppfsComposeDoc,
-    AppfsComposeTransportKind,
+    AppfsComposeConnectorConfig, AppfsComposeConnectorHealthcheck, AppfsComposeConnectorMode,
+    AppfsComposeDoc, AppfsComposeTransportKind,
 };
 use crate::cmd::appfs::core::build_app_connector;
 use crate::cmd::appfs::{build_appfs_bridge_config, AppfsBridgeCliArgs};
@@ -42,6 +42,7 @@ pub(crate) struct ResolvedComposeApp {
     pub(crate) profile_template: Option<String>,
     pub(crate) credential_policy: Option<String>,
     pub(crate) inbound_poll_ms: u64,
+    pub(crate) connector_config: Option<AppfsComposeConnectorConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,10 +52,58 @@ struct ResolvedHealthcheck {
     max_attempts: u32,
 }
 
+fn extract_run_id_from_existing(template: &str, existing_prefix: &str) -> Option<String> {
+    let parts: Vec<&str> = template.split("{compose_run_id}").collect();
+    if parts.len() == 2 {
+        let prefix = parts[0];
+        let suffix = parts[1];
+        if existing_prefix.starts_with(prefix) && existing_prefix.ends_with(suffix) {
+            let start = prefix.len();
+            let end = existing_prefix.len() - suffix.len();
+            if end >= start {
+                let run_id = &existing_prefix[start..end];
+                if run_id.len() == 8 {
+                    return Some(run_id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 impl ComposeConnectorSupervisor {
     pub(crate) fn resolve_apps(
         compose: &AppfsComposeDoc,
+        existing_registry: Option<&crate::cmd::appfs::registry::AppfsAppsRegistryDoc>,
     ) -> Result<(Self, BTreeMap<String, ResolvedComposeApp>)> {
+        let mut compose_run_id = None;
+        if let Some(existing) = existing_registry {
+            for (app_id, app) in &compose.apps {
+                if let Some(connector) = compose.connectors.get(&app.connector) {
+                    if let Some(config) = &connector.config {
+                        if let Some(existing_app) =
+                            existing.apps.iter().find(|ea| ea.app_id == *app_id)
+                        {
+                            if let Some(existing_cc) = &existing_app.connector_config {
+                                if let Some(extracted) = extract_run_id_from_existing(
+                                    &config.login_prefix_template,
+                                    &existing_cc.login_prefix,
+                                ) {
+                                    compose_run_id = Some(extracted);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let compose_run_id = compose_run_id.unwrap_or_else(|| {
+            let uuid = Uuid::new_v4().simple().to_string();
+            uuid[..8].to_string()
+        });
+
         let mut supervisor = Self {
             owned_children: Vec::new(),
         };
@@ -68,13 +117,18 @@ impl ComposeConnectorSupervisor {
                     app.connector
                 )
             })?;
-            let resolved = match supervisor.resolve_app_connector(app_id, app, connector) {
+            let mut resolved = match supervisor.resolve_app_connector(app_id, app, connector) {
                 Ok(resolved) => resolved,
                 Err(err) => {
                     supervisor.shutdown();
                     return Err(err);
                 }
             };
+            if let Some(config) = &mut resolved.connector_config {
+                config.login_prefix_template = config
+                    .login_prefix_template
+                    .replace("{compose_run_id}", &compose_run_id);
+            }
             resolved_apps.insert(app_id.clone(), resolved);
         }
 
@@ -151,6 +205,7 @@ impl ComposeConnectorSupervisor {
             profile_template: app.profile_template.clone(),
             credential_policy: app.credential_policy.clone(),
             inbound_poll_ms: app.inbound_poll_ms,
+            connector_config: connector.config.clone(),
         })
     }
 }
@@ -270,6 +325,7 @@ fn build_health_bridge_config(
         adapter_bridge_max_backoff_ms: 1,
         adapter_bridge_circuit_breaker_failures: 0,
         adapter_bridge_circuit_breaker_cooldown_ms: 1,
+        connector_config: None,
     })
 }
 
@@ -375,7 +431,7 @@ apps:
         .expect("compose should parse");
 
         let (_supervisor, resolved) =
-            ComposeConnectorSupervisor::resolve_apps(&doc).expect("compose should resolve");
+            ComposeConnectorSupervisor::resolve_apps(&doc, None).expect("compose should resolve");
 
         let resolved_aiim = resolved.get("aiim").expect("resolved app");
         assert_eq!(
@@ -393,6 +449,7 @@ apps:
                 profile_template: None,
                 credential_policy: None,
                 inbound_poll_ms: 0,
+                connector_config: None,
             }
         );
     }
@@ -445,7 +502,7 @@ apps:
         .expect("compose should parse");
 
         let (mut supervisor, resolved) =
-            ComposeConnectorSupervisor::resolve_apps(&doc).expect("compose should resolve");
+            ComposeConnectorSupervisor::resolve_apps(&doc, None).expect("compose should resolve");
         assert!(signal_path.exists());
         assert!(server_started.load(Ordering::SeqCst));
         assert_eq!(resolved.get("aiim").expect("resolved").endpoint, endpoint);
@@ -503,7 +560,7 @@ apps:
         .expect("compose should parse");
 
         let (mut supervisor, _resolved) =
-            ComposeConnectorSupervisor::resolve_apps(&doc).expect("compose should resolve");
+            ComposeConnectorSupervisor::resolve_apps(&doc, None).expect("compose should resolve");
         assert!(signal_path.exists());
         assert_eq!(supervisor.owned_pids().len(), 1);
         supervisor.shutdown();

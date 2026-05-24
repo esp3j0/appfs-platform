@@ -715,6 +715,7 @@ async fn handle_appfs_adapter_command_with_startup_context(
         adapter_bridge_max_backoff_ms,
         adapter_bridge_circuit_breaker_failures,
         adapter_bridge_circuit_breaker_cooldown_ms,
+        connector_config: None,
     };
     let (resolved_runtime_args, existing_registry) = if managed {
         if let Some(context) = startup_context.as_ref() {
@@ -1222,10 +1223,20 @@ pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> R
     let compose_doc = compose::loader::load_compose_doc(compose_path.as_deref(), &cwd)?;
     let db_path = prepare_compose_runtime(&compose_doc.runtime).await?;
 
-    let (mut connector_supervisor, resolved_apps) =
-        compose::connector_supervisor::ComposeConnectorSupervisor::resolve_apps(&compose_doc)?;
-
     let agent = agentfs_sdk::AgentFS::open(AgentFSOptions::with_path(db_path.clone())).await?;
+    let existing = match agent.fs.read_file("/_appfs/apps.registry.json").await? {
+        Some(bytes) => Some(crate::cmd::appfs::registry::parse_app_registry_bytes(
+            &bytes,
+        )?),
+        None => None,
+    };
+
+    let (mut connector_supervisor, resolved_apps) =
+        compose::connector_supervisor::ComposeConnectorSupervisor::resolve_apps(
+            &compose_doc,
+            existing.as_ref(),
+        )?;
+
     let registry_doc = compose::reconcile::bootstrap_registry_from_resolved_apps_in_agentfs(
         &agent,
         &resolved_apps,
@@ -1309,6 +1320,14 @@ fn bridge_args_from_resolved_compose_app(
         adapter_bridge_circuit_breaker_cooldown_ms: app
             .transport
             .bridge_circuit_breaker_cooldown_ms,
+        connector_config: app.connector_config.as_ref().map(|cc| {
+            crate::cmd::appfs::registry::AppfsRegistryConnectorConfig {
+                kind: cc.kind.clone(),
+                endpoint: cc.endpoint.clone(),
+                login_prefix: cc.login_prefix_template.clone(),
+                credential_policy: app.credential_policy.clone(),
+            }
+        }),
     }
 }
 
@@ -1590,6 +1609,7 @@ mod supervisor_tests {
             adapter_bridge_max_backoff_ms: 1_000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+            connector_config: None,
         }
     }
 
@@ -1624,6 +1644,7 @@ mod supervisor_tests {
                     profile_template: Some("tinode:{principal_id}".to_string()),
                     credential_policy: Some("auto-create".to_string()),
                     inbound_poll_ms: Some(1_000),
+                    connector_config: None,
                 }],
             },
         )
@@ -2141,6 +2162,7 @@ mod supervisor_tests {
                 registered_at: "2026-03-25T00:00:00Z".to_string(),
                 active_scope: Some("chat-001".to_string()),
                 inbound_poll_ms: None,
+                connector_config: None,
             }],
         };
         registry::write_app_registry(temp.path(), &existing).expect("seed registry");

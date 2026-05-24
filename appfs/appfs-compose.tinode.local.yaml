@@ -13,6 +13,10 @@ connectors:
   tinode-in-process:
     mode: in_process
     transport: in_process
+    config:
+      kind: tinode
+      endpoint: http://101.34.216.193:6060
+      login_prefix_template: dash{compose_run_id}
 
 apps:
   tinode:

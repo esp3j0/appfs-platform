@@ -17,7 +17,14 @@ pub(crate) struct AppfsAppsRegistryDoc {
     #[serde(default)]
     pub(crate) apps: Vec<AppfsRegisteredAppDoc>,
 }
-
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AppfsRegistryConnectorConfig {
+    pub(crate) kind: String,
+    pub(crate) endpoint: String,
+    pub(crate) login_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) credential_policy: Option<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AppfsRegisteredAppDoc {
     pub(crate) instance_id: String,
@@ -37,6 +44,8 @@ pub(crate) struct AppfsRegisteredAppDoc {
     pub(crate) active_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) inbound_poll_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connector_config: Option<AppfsRegistryConnectorConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +78,8 @@ pub(crate) struct AppfsAppPolicyRecord {
     pub(crate) credential_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) inbound_poll_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connector_config: Option<AppfsRegistryConnectorConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +307,7 @@ pub(crate) fn build_app_registry_doc(
                     .unwrap_or_else(|| now.clone()),
                 active_scope: active_scopes.get(&runtime.app_id).cloned().flatten(),
                 inbound_poll_ms: None,
+                connector_config: runtime.bridge.connector_config.clone(),
             })
             .collect(),
     }
@@ -308,10 +320,14 @@ pub(crate) fn runtime_args_from_registry(
     Ok(doc
         .apps
         .iter()
-        .map(|app| AppfsRuntimeCliArgs {
-            app_id: app.app_id.clone(),
-            session_id: Some(app.session_id.clone()),
-            bridge: bridge_args_from_transport_doc(&app.transport),
+        .map(|app| {
+            let mut bridge = bridge_args_from_transport_doc(&app.transport);
+            bridge.connector_config = app.connector_config.clone();
+            AppfsRuntimeCliArgs {
+                app_id: app.app_id.clone(),
+                session_id: Some(app.session_id.clone()),
+                bridge,
+            }
         })
         .collect())
 }
@@ -357,6 +373,7 @@ pub(crate) fn bridge_args_from_transport_doc(
         adapter_bridge_max_backoff_ms: doc.bridge_max_backoff_ms,
         adapter_bridge_circuit_breaker_failures: doc.bridge_circuit_breaker_failures,
         adapter_bridge_circuit_breaker_cooldown_ms: doc.bridge_circuit_breaker_cooldown_ms,
+        connector_config: None,
     }
 }
 
@@ -637,6 +654,7 @@ mod tests {
             adapter_bridge_max_backoff_ms: 1000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3000,
+            connector_config: None,
         }
     }
 

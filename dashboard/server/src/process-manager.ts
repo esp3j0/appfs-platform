@@ -126,6 +126,12 @@ export class AgentProcessManager {
     const cmd = this.buildCommand(effectiveSpawnConfig.launchSpec);
 
     console.log(`[ProcessManager] Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`);
+    this.eventBus.broadcast('process-log', {
+      agentId: spawnId,
+      spawnId,
+      stream: 'spawn',
+      text: `Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`,
+    });
 
     const childProcess = spawn(cmd, args, {
       cwd: effectiveSpawnConfig.cwd,
@@ -470,6 +476,12 @@ export class AgentProcessManager {
           this.registry.registerAgent(agentInfo);
 
           console.log(`[ProcessManager] Agent ${spawnId} started with sessionId=${sessionId}`);
+          this.eventBus.broadcast('process-log', {
+            agentId: sessionId,
+            spawnId,
+            stream: 'stdout',
+            text: `session_started sessionId=${sessionId} principal=${principalId} sessionPath=${sessionJsonlPath || '<none>'}`,
+          });
 
           this.eventBus.broadcast('agent-online', {
             ...agentInfo,
