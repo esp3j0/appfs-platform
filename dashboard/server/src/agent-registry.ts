@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { AgentInfo, AgentMeta, CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, MessageRecord, SessionMetaRecord } from './types.js';
 import { parseCompactionArchives, parseCompactionBoundaries, parseDebugDumps, parseMessages, parseMeta } from './jsonl-parser.js';
 import type { FileWatcher } from './file-watcher.js';
+import type { ProjectRegistry, ProjectRecord } from './project-registry.js';
 
 export class AgentRegistry {
   private agents = new Map<string, AgentInfo>();
@@ -12,9 +13,11 @@ export class AgentRegistry {
   private compactionBoundaries = new Map<string, CompactionBoundaryRecord[]>();
   private dumpDir: string;
   private fileWatcher: FileWatcher | null = null;
+  public projectRegistry: ProjectRegistry;
 
-  constructor(dumpDir: string) {
+  constructor(dumpDir: string, projectRegistry: ProjectRegistry) {
     this.dumpDir = dumpDir;
+    this.projectRegistry = projectRegistry;
   }
 
   setFileWatcher(watcher: FileWatcher): void {
@@ -144,7 +147,7 @@ export class AgentRegistry {
     }
 
     const name = meta.agent_name;
-    this.agents.set(sessionId, {
+    const agentInfo: AgentInfo = {
       name,
       principalId: meta.principal_id,
       sessionId,
@@ -157,7 +160,9 @@ export class AgentRegistry {
       controlMode: 'external', // Managed agents will override this explicitly
       messageCount: msgs.length,
       ...this.sumUsage(msgs),
-    });
+    };
+    this.fillProjectInfo(agentInfo);
+    this.agents.set(sessionId, agentInfo);
     this.messages.set(sessionId, msgs);
     this.debugDumps.set(sessionId, dumps);
     this.compactionArchives.set(sessionId, archives);
@@ -184,7 +189,7 @@ export class AgentRegistry {
     const name = principalId ?? sess?.session_id ?? path.basename(fullPath, '.jsonl');
     const sessionId = sess?.session_id ?? name;
 
-    this.agents.set(sessionId, {
+    const agentInfo: AgentInfo = {
       name,
       principalId: principalId ?? name,
       sessionId,
@@ -197,7 +202,9 @@ export class AgentRegistry {
       controlMode: 'external',
       messageCount: msgs.length,
       ...this.sumUsage(msgs),
-    });
+    };
+    this.fillProjectInfo(agentInfo);
+    this.agents.set(sessionId, agentInfo);
     this.messages.set(sessionId, msgs);
     this.debugDumps.set(sessionId, dumps);
     this.compactionArchives.set(sessionId, archives);
@@ -210,10 +217,12 @@ export class AgentRegistry {
    */
   registerAgent(agentInfo: AgentInfo, msgs?: MessageRecord[]): void {
     const sessionId = agentInfo.sessionId;
-    this.agents.set(sessionId, agentInfo);
+    const normalizedAgentInfo: AgentInfo = { ...agentInfo };
+    this.fillProjectInfo(normalizedAgentInfo);
+    this.agents.set(sessionId, normalizedAgentInfo);
     if (msgs) {
       this.messages.set(sessionId, msgs);
-    } else if (!this.messages.has(sessionId) && agentInfo.sessionJsonlPath && fs.existsSync(agentInfo.sessionJsonlPath)) {
+    } else if (!this.messages.has(sessionId) && normalizedAgentInfo.sessionJsonlPath && fs.existsSync(normalizedAgentInfo.sessionJsonlPath)) {
       this.reloadAgent(sessionId);
     } else if (!this.messages.has(sessionId)) {
       this.messages.set(sessionId, []);
@@ -223,8 +232,8 @@ export class AgentRegistry {
     if (!this.compactionBoundaries.has(sessionId)) this.compactionBoundaries.set(sessionId, []);
 
     // Dynamically watch the file if a watcher exists
-    if (this.fileWatcher && agentInfo.sessionJsonlPath) {
-      this.fileWatcher.addPath(agentInfo.sessionJsonlPath);
+    if (this.fileWatcher && normalizedAgentInfo.sessionJsonlPath) {
+      this.fileWatcher.addPath(normalizedAgentInfo.sessionJsonlPath);
     }
   }
 
@@ -326,6 +335,67 @@ export class AgentRegistry {
 
   getSessionPaths(): string[] {
     return Array.from(this.agents.values()).map(a => a.sessionJsonlPath).filter(Boolean);
+  }
+
+  private fillProjectInfo(agentInfo: AgentInfo): void {
+    const sessionId = agentInfo.sessionId;
+    const oldAgent = this.agents.get(sessionId);
+    const oldProjectId = oldAgent?.projectId;
+
+    let targetProject: ProjectRecord | undefined = undefined;
+
+    // 1. If projectId exists, check if it exists in projectRegistry
+    if (agentInfo.projectId) {
+      const proj = this.projectRegistry.getProject(agentInfo.projectId);
+      if (proj) {
+        targetProject = proj;
+      }
+    }
+
+    // 2. If targetProject not found, try to infer from projectRoot
+    if (!targetProject && agentInfo.projectRoot) {
+      try {
+        targetProject = this.projectRegistry.registerProject(agentInfo.projectRoot);
+      } catch {
+        targetProject = this.projectRegistry.getProjectByRoot(agentInfo.projectRoot);
+      }
+    }
+
+    // 3. If targetProject still not found, try to infer from sessionJsonlPath
+    if (!targetProject && agentInfo.sessionJsonlPath) {
+      const normalizedPath = path.resolve(agentInfo.sessionJsonlPath).replace(/\\/g, '/');
+      const clawIndex = normalizedPath.lastIndexOf('/.claw/sessions/');
+      if (clawIndex !== -1) {
+        const inferredProjectRoot = path.resolve(normalizedPath.substring(0, clawIndex));
+        try {
+          targetProject = this.projectRegistry.registerProject(inferredProjectRoot);
+        } catch {
+          targetProject = this.projectRegistry.getProjectByRoot(inferredProjectRoot);
+        }
+      }
+    }
+
+    // 4. Update the relationship
+    if (targetProject) {
+      const newProjectId = targetProject.projectId;
+
+      // If project changed, detach from old project
+      if (oldProjectId && oldProjectId !== newProjectId) {
+        this.projectRegistry.detachAgent(oldProjectId, sessionId);
+      }
+
+      agentInfo.projectId = newProjectId;
+      agentInfo.projectRoot = targetProject.projectRoot;
+      this.projectRegistry.attachAgent(newProjectId, sessionId, agentInfo.controlMode);
+    } else {
+      // If we failed to map, and there was an old project, detach it
+      if (oldProjectId) {
+        this.projectRegistry.detachAgent(oldProjectId, sessionId);
+      }
+      // Ensure we don't carry any stale projectId or projectRoot
+      delete agentInfo.projectId;
+      delete agentInfo.projectRoot;
+    }
   }
 }
 
