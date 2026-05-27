@@ -1,3 +1,4 @@
+use crate::compact::estimate_message_tokens;
 use crate::session::Session;
 
 const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
@@ -83,6 +84,11 @@ impl TokenUsage {
             + self.output_tokens
             + self.cache_creation_input_tokens
             + self.cache_read_input_tokens
+    }
+
+    #[must_use]
+    pub fn context_window_tokens(self) -> u32 {
+        self.total_tokens()
     }
 
     #[must_use]
@@ -181,6 +187,28 @@ impl UsageTracker {
             }
         }
         tracker
+    }
+
+    #[must_use]
+    pub fn estimated_context_window_tokens(session: &Session) -> u32 {
+        for (index, message) in session.messages.iter().enumerate().rev() {
+            let Some(usage) = message.usage else {
+                continue;
+            };
+            let tail_estimate = session.messages[index + 1..]
+                .iter()
+                .map(estimate_message_tokens)
+                .sum::<usize>();
+            let tail_estimate = u32::try_from(tail_estimate).unwrap_or(u32::MAX);
+            return usage.context_window_tokens().saturating_add(tail_estimate);
+        }
+
+        let estimate = session
+            .messages
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>();
+        u32::try_from(estimate).unwrap_or(u32::MAX)
     }
 
     pub fn record(&mut self, usage: TokenUsage) {
@@ -302,5 +330,42 @@ mod tests {
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
+    }
+
+    #[test]
+    fn estimates_current_context_from_last_usage_plus_tail() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::assistant_with_usage(
+                vec![ContentBlock::Text {
+                    text: "older".to_string(),
+                }],
+                Some(TokenUsage {
+                    input_tokens: 80_000,
+                    output_tokens: 1_000,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+            ),
+            ConversationMessage::assistant_with_usage(
+                vec![ContentBlock::Text {
+                    text: "latest".to_string(),
+                }],
+                Some(TokenUsage {
+                    input_tokens: 10_000,
+                    output_tokens: 500,
+                    cache_creation_input_tokens: 100,
+                    cache_read_input_tokens: 50,
+                }),
+            ),
+            ConversationMessage::user_text("tail message after usage"),
+        ];
+
+        let estimate = UsageTracker::estimated_context_window_tokens(&session);
+
+        assert!(
+            (10_650..10_700).contains(&estimate),
+            "estimate should use the latest usage plus tail estimate, got {estimate}"
+        );
     }
 }

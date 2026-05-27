@@ -26,10 +26,15 @@ use crate::session::{
 use crate::tool_session::{with_tool_session_context, with_tool_session_snapshot};
 use crate::usage::{TokenUsage, UsageTracker};
 
-const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const DEFAULT_AUTO_COMPACTION_CONTEXT_WINDOW_TOKENS: u32 = 200_000;
+const MAX_OUTPUT_TOKENS_FOR_SUMMARY: u32 = 20_000;
+const AUTOCOMPACT_BUFFER_TOKENS: u32 = 13_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+const AUTO_COMPACTION_PCT_ENV_VAR: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
+const CANCELLED_ASSISTANT_NOTE: &str = "\n\n[Response stopped by user before completion.]";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
@@ -37,6 +42,7 @@ pub struct ApiRequest {
     pub allow_tools: bool,
     pub model_override: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub abort_signal: Option<HookAbortSignal>,
 }
 
 impl ApiRequest {
@@ -48,6 +54,7 @@ impl ApiRequest {
             allow_tools: true,
             model_override: None,
             reasoning_effort: None,
+            abort_signal: None,
         }
     }
 
@@ -59,6 +66,7 @@ impl ApiRequest {
             allow_tools: false,
             model_override: None,
             reasoning_effort: None,
+            abort_signal: None,
         }
     }
 }
@@ -66,6 +74,9 @@ impl ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    ThinkingDelta(String),
+    ThinkingSignature(String),
+    RedactedThinking(Value),
     ToolUse {
         id: String,
         name: String,
@@ -118,6 +129,7 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    cancelled: bool,
 }
 
 impl RuntimeError {
@@ -125,7 +137,21 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "turn cancelled".to_string(),
+            cancelled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 }
 
@@ -242,6 +268,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +277,25 @@ pub struct AutoCompactionEvent {
     /// Messages that were removed during auto-compaction.
     /// Available for external archiving (e.g., debug dashboard).
     pub removed_messages: Vec<ConversationMessage>,
+    pub estimated_context_tokens: u32,
+    pub threshold_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoCompactionConfig {
+    pub context_window_tokens: Option<u32>,
+    pub max_output_tokens: u32,
+    pub fixed_threshold_tokens: Option<u32>,
+}
+
+impl Default for AutoCompactionConfig {
+    fn default() -> Self {
+        Self {
+            context_window_tokens: Some(DEFAULT_AUTO_COMPACTION_CONTEXT_WINDOW_TOKENS),
+            max_output_tokens: MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+            fixed_threshold_tokens: None,
+        }
+    }
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -261,7 +307,7 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
-    auto_compaction_input_tokens_threshold: u32,
+    auto_compaction_config: AutoCompactionConfig,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -317,7 +363,7 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
-            auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            auto_compaction_config: AutoCompactionConfig::default(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -337,7 +383,17 @@ where
 
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
-        self.auto_compaction_input_tokens_threshold = threshold;
+        self.auto_compaction_config = AutoCompactionConfig {
+            context_window_tokens: None,
+            max_output_tokens: 0,
+            fixed_threshold_tokens: Some(threshold),
+        };
+        self
+    }
+
+    #[must_use]
+    pub fn with_auto_compaction_config(mut self, config: AutoCompactionConfig) -> Self {
+        self.auto_compaction_config = config;
         self
     }
 
@@ -508,6 +564,15 @@ where
 
         loop {
             iterations += 1;
+            if self.hook_abort_signal.is_aborted() {
+                return Ok(self.cancelled_turn_summary(
+                    assistant_messages,
+                    tool_results,
+                    prompt_cache_events,
+                    iterations,
+                ));
+            }
+
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
@@ -525,22 +590,39 @@ where
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
+            if self.hook_abort_signal.is_aborted() {
+                return Ok(self.cancelled_turn_summary(
+                    assistant_messages,
+                    tool_results,
+                    prompt_cache_events,
+                    iterations,
+                ));
+            }
 
             let mut request =
                 ApiRequest::conversation(self.system_prompt.clone(), self.session.messages.clone());
             tool_context.apply_to_api_request(&mut request);
+            request.abort_signal = Some(self.hook_abort_signal.clone());
             let events = match with_tool_session_context(
                 &self.session.session_id,
                 self.session.persistence_path(),
                 || self.api_client.stream(request),
             ) {
                 Ok(events) => events,
+                Err(error) if error.is_cancelled() => {
+                    return Ok(self.cancelled_turn_summary(
+                        assistant_messages,
+                        tool_results,
+                        prompt_cache_events,
+                        iterations,
+                    ));
+                }
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }
             };
-            let (assistant_message, usage, turn_prompt_cache_events) =
+            let (mut assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -548,6 +630,7 @@ where
                         return Err(error);
                     }
                 };
+            let assistant_stream_cancelled = self.hook_abort_signal.is_aborted();
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -562,6 +645,9 @@ where
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            if assistant_stream_cancelled {
+                append_cancelled_assistant_note(&mut assistant_message);
+            }
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
@@ -573,12 +659,53 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
 
+            if assistant_stream_cancelled {
+                if !pending_tool_uses.is_empty() {
+                    self.cancel_pending_tool_uses(
+                        iterations,
+                        pending_tool_uses,
+                        &mut tool_results,
+                    )?;
+                }
+                return Ok(self.cancelled_turn_summary(
+                    assistant_messages,
+                    tool_results,
+                    prompt_cache_events,
+                    iterations,
+                ));
+            }
+
             if pending_tool_uses.is_empty() {
                 break;
             }
 
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
+            let mut pending_tool_uses = pending_tool_uses.into_iter().peekable();
+            while let Some((tool_use_id, tool_name, input)) = pending_tool_uses.next() {
+                if self.hook_abort_signal.is_aborted() {
+                    let mut remaining = vec![(tool_use_id, tool_name, input)];
+                    remaining.extend(pending_tool_uses);
+                    self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
+                    return Ok(self.cancelled_turn_summary(
+                        assistant_messages,
+                        tool_results,
+                        prompt_cache_events,
+                        iterations,
+                    ));
+                }
+
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+                if self.hook_abort_signal.is_aborted() {
+                    let mut remaining = vec![(tool_use_id, tool_name, input)];
+                    remaining.extend(pending_tool_uses);
+                    self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
+                    return Ok(self.cancelled_turn_summary(
+                        assistant_messages,
+                        tool_results,
+                        prompt_cache_events,
+                        iterations,
+                    ));
+                }
+
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
@@ -711,6 +838,22 @@ where
                                 .push_message(message)
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
+                        if self.hook_abort_signal.is_aborted() {
+                            let remaining = pending_tool_uses.collect::<Vec<_>>();
+                            if !remaining.is_empty() {
+                                self.cancel_pending_tool_uses(
+                                    iterations,
+                                    remaining,
+                                    &mut tool_results,
+                                )?;
+                            }
+                            return Ok(self.cancelled_turn_summary(
+                                assistant_messages,
+                                tool_results,
+                                prompt_cache_events,
+                                iterations,
+                            ));
+                        }
                         continue;
                     }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
@@ -725,6 +868,18 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+                if self.hook_abort_signal.is_aborted() {
+                    let remaining = pending_tool_uses.collect::<Vec<_>>();
+                    if !remaining.is_empty() {
+                        self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
+                    }
+                    return Ok(self.cancelled_turn_summary(
+                        assistant_messages,
+                        tool_results,
+                        prompt_cache_events,
+                        iterations,
+                    ));
+                }
             }
         }
 
@@ -737,10 +892,53 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            cancelled: false,
         };
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    fn cancelled_turn_summary(
+        &self,
+        assistant_messages: Vec<ConversationMessage>,
+        tool_results: Vec<ConversationMessage>,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+        iterations: usize,
+    ) -> TurnSummary {
+        let summary = TurnSummary {
+            assistant_messages,
+            tool_results,
+            prompt_cache_events,
+            iterations,
+            usage: self.usage_tracker.cumulative_usage(),
+            auto_compaction: None,
+            cancelled: true,
+        };
+        self.record_turn_completed(&summary);
+        summary
+    }
+
+    fn cancel_pending_tool_uses(
+        &mut self,
+        iteration: usize,
+        pending_tool_uses: Vec<(String, String, String)>,
+        tool_results: &mut Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        for (tool_use_id, tool_name, _input) in pending_tool_uses {
+            let result_message = ConversationMessage::tool_result(
+                tool_use_id,
+                tool_name,
+                "Tool execution cancelled before start.",
+                true,
+            );
+            self.session
+                .push_message(result_message.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            self.record_tool_finished(iteration, &result_message);
+            tool_results.push(result_message);
+        }
+        Ok(())
     }
 
     fn enqueue_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
@@ -968,7 +1166,8 @@ where
         messages.push(ConversationMessage::user_text(get_compact_prompt(
             custom_instructions,
         )));
-        let request = ApiRequest::text_only(self.system_prompt.clone(), messages);
+        let mut request = ApiRequest::text_only(self.system_prompt.clone(), messages);
+        request.abort_signal = Some(self.hook_abort_signal.clone());
         let events = with_tool_session_context(
             &self.session.session_id,
             self.session.persistence_path(),
@@ -1014,9 +1213,9 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        let estimated_context_tokens = UsageTracker::estimated_context_window_tokens(&self.session);
+        let threshold_tokens = auto_compaction_threshold(self.auto_compaction_config);
+        if estimated_context_tokens < threshold_tokens {
             return None;
         }
 
@@ -1027,9 +1226,12 @@ where
         }
 
         self.session = result.compacted_session;
+        self.usage_tracker = UsageTracker::from_session(&self.session);
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
             removed_messages: result.removed_messages,
+            estimated_context_tokens,
+            threshold_tokens,
         })
     }
 
@@ -1126,6 +1328,7 @@ where
             "prompt_cache_events".to_string(),
             Value::from(summary.prompt_cache_events.len() as u64),
         );
+        attributes.insert("cancelled".to_string(), Value::Bool(summary.cancelled));
         session_tracer.record("turn_completed", attributes);
     }
 
@@ -1143,19 +1346,94 @@ where
 
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
+    auto_compaction_threshold(AutoCompactionConfig::default())
+}
+
+#[must_use]
+fn auto_compaction_threshold(config: AutoCompactionConfig) -> u32 {
+    auto_compaction_threshold_with_overrides(
+        config,
+        parse_positive_u32_env(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
+            .or(config.fixed_threshold_tokens.filter(|value| *value > 0)),
+        parse_positive_u32_env(AUTO_COMPACTION_WINDOW_ENV_VAR),
+        parse_auto_compaction_percent_override(
+            std::env::var(AUTO_COMPACTION_PCT_ENV_VAR).ok().as_deref(),
+        ),
     )
 }
 
 #[must_use]
-fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+fn auto_compaction_threshold_with_overrides(
+    config: AutoCompactionConfig,
+    fixed_threshold_override: Option<u32>,
+    window_override: Option<u32>,
+    percent_override: Option<f64>,
+) -> u32 {
+    if let Some(threshold) = fixed_threshold_override {
+        return threshold;
+    }
+
+    let effective_context_window =
+        effective_auto_compaction_context_window(config, window_override);
+    let reserved_summary_output = config
+        .max_output_tokens
+        .min(MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+        .min(effective_context_window);
+    let base_threshold = effective_context_window
+        .saturating_sub(reserved_summary_output)
+        .saturating_sub(AUTOCOMPACT_BUFFER_TOKENS);
+    let base_threshold = if base_threshold > 0 {
+        base_threshold
+    } else {
+        effective_context_window.saturating_mul(4) / 5
+    }
+    .max(1);
+
+    if let Some(percent) = percent_override {
+        let percent_threshold =
+            ((f64::from(effective_context_window) * percent) / 100.0).floor() as u32;
+        return percent_threshold.max(1).min(base_threshold);
+    }
+
+    base_threshold
+}
+
+#[must_use]
+fn effective_auto_compaction_context_window(
+    config: AutoCompactionConfig,
+    window_override: Option<u32>,
+) -> u32 {
+    let configured = config
+        .context_window_tokens
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTO_COMPACTION_CONTEXT_WINDOW_TOKENS);
+    window_override.map_or(configured, |override_window| {
+        configured.min(override_window)
+    })
+}
+
+#[must_use]
+fn parse_positive_u32_env(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(parse_positive_u32)
+}
+
+#[must_use]
+fn parse_positive_u32(value: &str) -> Option<u32> {
     value
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .trim()
+        .parse::<u32>()
+        .ok()
         .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+#[must_use]
+fn parse_auto_compaction_percent_override(value: Option<&str>) -> Option<f64> {
+    value
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|percent| *percent > 0.0 && *percent <= 100.0)
 }
 
 fn build_assistant_message(
@@ -1169,6 +1447,8 @@ fn build_assistant_message(
     RuntimeError,
 > {
     let mut text = String::new();
+    let mut thinking = String::new();
+    let mut thinking_signature = None;
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
@@ -1176,9 +1456,27 @@ fn build_assistant_message(
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
+                text.push_str(&delta);
+            }
+            AssistantEvent::ThinkingDelta(delta) => {
+                flush_text_block(&mut text, &mut blocks);
+                thinking.push_str(&delta);
+            }
+            AssistantEvent::ThinkingSignature(signature) => {
+                thinking_signature = Some(signature);
+            }
+            AssistantEvent::RedactedThinking(data) => {
+                flush_text_block(&mut text, &mut blocks);
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
+                blocks.push(ContentBlock::RedactedThinking {
+                    data: serde_json_value_to_session_json(data),
+                });
+            }
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -1190,6 +1488,7 @@ fn build_assistant_message(
     }
 
     flush_text_block(&mut text, &mut blocks);
+    flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -1214,6 +1513,8 @@ fn assistant_text(message: &ConversationMessage) -> Option<String> {
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
             ContentBlock::InputRouter { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
         })
@@ -1229,6 +1530,62 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
         });
+    }
+}
+
+fn append_cancelled_assistant_note(message: &mut ConversationMessage) {
+    if let Some(text) = message
+        .blocks
+        .iter_mut()
+        .rev()
+        .find_map(|block| match block {
+            ContentBlock::Text { text } => Some(text),
+            ContentBlock::InputRouter { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => None,
+        })
+    {
+        text.push_str(CANCELLED_ASSISTANT_NOTE);
+    } else {
+        message.blocks.push(ContentBlock::Text {
+            text: CANCELLED_ASSISTANT_NOTE.trim().to_string(),
+        });
+    }
+}
+
+fn flush_thinking_block(
+    thinking: &mut String,
+    signature: &mut Option<String>,
+    blocks: &mut Vec<ContentBlock>,
+) {
+    if !thinking.is_empty() || signature.is_some() {
+        blocks.push(ContentBlock::Thinking {
+            thinking: std::mem::take(thinking),
+            signature: signature.take(),
+        });
+    }
+}
+
+fn serde_json_value_to_session_json(value: Value) -> crate::json::JsonValue {
+    match value {
+        Value::Null => crate::json::JsonValue::Null,
+        Value::Bool(value) => crate::json::JsonValue::Bool(value),
+        Value::Number(value) => crate::json::JsonValue::Number(value.as_i64().unwrap_or(0)),
+        Value::String(value) => crate::json::JsonValue::String(value),
+        Value::Array(values) => crate::json::JsonValue::Array(
+            values
+                .into_iter()
+                .map(serde_json_value_to_session_json)
+                .collect(),
+        ),
+        Value::Object(values) => crate::json::JsonValue::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, serde_json_value_to_session_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -1325,10 +1682,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_text, build_assistant_message, parse_auto_compaction_threshold, ApiClient,
-        ApiRequest, AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        assistant_text, auto_compaction_threshold_with_overrides, build_assistant_message,
+        parse_auto_compaction_percent_override, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionConfig, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1349,9 +1706,9 @@ mod tests {
         current_tool_session_compaction_summary, current_tool_session_messages,
     };
     use crate::usage::TokenUsage;
-    use crate::ToolError;
     #[cfg(windows)]
     use crate::{bash_shell_path, set_shell_if_windows};
+    use crate::{HookAbortSignal, ToolError};
     use std::cell::RefCell;
     use std::fs;
     use std::path::PathBuf;
@@ -1562,6 +1919,165 @@ mod tests {
         assert!(pending_text.contains("type=user.guidance"));
         assert!(pending_text.contains("guide now"));
         assert!(!pending_text.contains("later"));
+    }
+
+    #[test]
+    fn run_turn_cancelled_before_model_call_preserves_user_message() {
+        struct PanicApiClient;
+
+        impl ApiClient for PanicApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("cancelled turn should not call the model");
+            }
+        }
+
+        let abort_signal = HookAbortSignal::new();
+        abort_signal.abort();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PanicApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_hook_abort_signal(abort_signal);
+
+        let summary = runtime
+            .run_turn("please stop", None)
+            .expect("cancelled turn should resolve as a turn summary");
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.assistant_messages.len(), 0);
+        assert_eq!(runtime.session().messages.len(), 1);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn run_turn_cancelled_from_model_stream_preserves_session_state() {
+        struct CancellingApiClient;
+
+        impl ApiClient for CancellingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                request
+                    .abort_signal
+                    .as_ref()
+                    .expect("model request should carry abort signal")
+                    .abort();
+                Err(RuntimeError::cancelled())
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CancellingApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("cancel while streaming", None)
+            .expect("stream cancellation should resolve as a turn summary");
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.assistant_messages.len(), 0);
+        assert_eq!(summary.tool_results.len(), 0);
+        assert_eq!(runtime.session().messages.len(), 1);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn run_turn_cancelled_after_partial_text_preserves_assistant_output() {
+        struct PartialTextThenCancelApiClient;
+
+        impl ApiClient for PartialTextThenCancelApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                request
+                    .abort_signal
+                    .as_ref()
+                    .expect("model request should carry abort signal")
+                    .abort();
+                Ok(vec![
+                    AssistantEvent::TextDelta("Once upon a partial stream".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PartialTextThenCancelApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("cancel while text is streaming", None)
+            .expect("partial text cancellation should resolve as a turn summary");
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.assistant_messages.len(), 1);
+        assert_eq!(summary.tool_results.len(), 0);
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.session().messages[1].role, MessageRole::Assistant);
+        let text = assistant_text(&runtime.session().messages[1])
+            .expect("partial assistant text should be persisted");
+        assert!(text.contains("Once upon a partial stream"));
+        assert!(text.contains("Response stopped by user before completion."));
+    }
+
+    #[test]
+    fn run_turn_cancelled_after_tool_use_records_cancelled_tool_result() {
+        struct ToolUseThenCancelApiClient;
+
+        impl ApiClient for ToolUseThenCancelApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                request
+                    .abort_signal
+                    .as_ref()
+                    .expect("model request should carry abort signal")
+                    .abort();
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "danger".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolUseThenCancelApiClient,
+            StaticToolExecutor::new().register("danger", |_input| -> Result<String, ToolError> {
+                panic!("cancelled turn should not execute the tool")
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("call tool then stop", None)
+            .expect("tool-boundary cancellation should resolve as a turn summary");
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.assistant_messages.len(), 1);
+        assert_eq!(summary.tool_results.len(), 1);
+        assert_eq!(runtime.session().messages.len(), 3);
+        assert!(matches!(
+            runtime.session().messages[1].blocks[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            runtime.session().messages[2].blocks[0],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
     }
 
     #[test]
@@ -2597,6 +3113,8 @@ mod tests {
             .and_then(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 ContentBlock::InputRouter { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::ToolResult { .. } => None,
             })
@@ -2760,6 +3278,8 @@ mod tests {
             .and_then(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 ContentBlock::InputRouter { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::ToolResult { .. } => None,
             })
@@ -2883,7 +3403,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_current_context_threshold_is_crossed() {
         #[derive(Clone)]
         struct SimpleApi {
             requests: Rc<RefCell<Vec<ApiRequest>>>,
@@ -2949,9 +3469,12 @@ mod tests {
             .expect("auto-compaction should report archived messages");
         assert_eq!(auto_compaction.removed_message_count, 6);
         assert_eq!(auto_compaction.removed_messages.len(), 6);
+        assert_eq!(auto_compaction.estimated_context_tokens, 120_004);
+        assert_eq!(auto_compaction.threshold_tokens, 100_000);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
         assert_eq!(runtime.session().messages.len(), 2);
         assert_eq!(runtime.session().messages[1].role, MessageRole::User);
+        assert_eq!(runtime.usage().cumulative_usage().input_tokens, 0);
         assert!(matches!(
             runtime.session().messages[0].compact_metadata.as_ref(),
             Some(metadata) if metadata.trigger == CompactTrigger::Auto
@@ -2977,7 +3500,7 @@ mod tests {
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),
                     AssistantEvent::Usage(TokenUsage {
-                        input_tokens: 99_999,
+                        input_tokens: 99_000,
                         output_tokens: 4,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
@@ -3004,19 +3527,95 @@ mod tests {
     }
 
     #[test]
-    fn auto_compaction_threshold_defaults_and_parses_values() {
+    fn skips_auto_compaction_when_cumulative_usage_exceeds_legacy_threshold_but_context_is_small() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request.allow_tools {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 20_000,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    panic!("compact request should not run for small current context")
+                }
+            }
+        }
+
+        let mut session = Session::new().with_workspace_root("/nonexistent/path/for/test");
+        session.messages = vec![ConversationMessage::assistant_with_usage(
+            vec![ContentBlock::Text {
+                text: "older context".to_string(),
+            }],
+            Some(TokenUsage {
+                input_tokens: 90_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+        )];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_config(AutoCompactionConfig {
+            context_window_tokens: Some(200_000),
+            max_output_tokens: 20_000,
+            fixed_threshold_tokens: None,
+        });
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(summary.usage.input_tokens, 110_000);
+        assert_eq!(runtime.session().messages.len(), 3);
+    }
+
+    #[test]
+    fn auto_compaction_threshold_uses_context_window_and_overrides() {
+        let config = AutoCompactionConfig {
+            context_window_tokens: Some(200_000),
+            max_output_tokens: 64_000,
+            fixed_threshold_tokens: None,
+        };
+
         assert_eq!(
-            parse_auto_compaction_threshold(None),
-            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+            auto_compaction_threshold_with_overrides(config, None, None, None),
+            167_000
         );
-        assert_eq!(parse_auto_compaction_threshold(Some("4321")), 4321);
         assert_eq!(
-            parse_auto_compaction_threshold(Some("0")),
-            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+            auto_compaction_threshold_with_overrides(config, Some(4_321), None, None),
+            4_321
         );
         assert_eq!(
-            parse_auto_compaction_threshold(Some("not-a-number")),
-            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+            auto_compaction_threshold_with_overrides(config, None, Some(120_000), None),
+            87_000
+        );
+        assert_eq!(
+            auto_compaction_threshold_with_overrides(config, None, None, Some(50.0)),
+            100_000
+        );
+        assert_eq!(
+            parse_auto_compaction_percent_override(Some("25")),
+            Some(25.0)
+        );
+        assert_eq!(parse_auto_compaction_percent_override(Some("0")), None);
+        assert_eq!(parse_auto_compaction_percent_override(Some("101")), None);
+        assert_eq!(
+            parse_auto_compaction_percent_override(Some("not-a-number")),
+            None
         );
     }
 
@@ -3048,6 +3647,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+    }
+
+    #[test]
+    fn build_assistant_message_preserves_thinking_before_tool_use() {
+        let events = vec![
+            AssistantEvent::ThinkingDelta("hidden reasoning".to_string()),
+            AssistantEvent::ThinkingSignature("sig-1".to_string()),
+            AssistantEvent::ToolUse {
+                id: "tool_1".to_string(),
+                name: "Skill".to_string(),
+                input: r#"{"skill":"appfs-tinode"}"#.to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ];
+
+        let (message, _, _) = build_assistant_message(events).expect("assistant message");
+
+        assert!(matches!(
+            &message.blocks[0],
+            ContentBlock::Thinking {
+                thinking,
+                signature: Some(signature),
+            } if thinking == "hidden reasoning" && signature == "sig-1"
+        ));
+        assert!(matches!(
+            &message.blocks[1],
+            ContentBlock::ToolUse { name, .. } if name == "Skill"
+        ));
     }
 
     #[test]

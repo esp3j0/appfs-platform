@@ -197,7 +197,7 @@ Receipt/status items are context.
       "model_render": {
         "mode": "body_with_source_reminder",
         "body_template": "{{content.text_preview}}",
-        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
       }
     },
     "message.sent": {

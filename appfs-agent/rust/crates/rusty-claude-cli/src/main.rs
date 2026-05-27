@@ -57,13 +57,14 @@ use runtime::{
     scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
     ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
     AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, InputEnvelope, InputSource, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PendingInput, PendingInputDelivery, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, SharedPendingInputQueue,
-    TokenUsage, ToolError, ToolExecutionResult, ToolExecutor, UsageTracker,
+    AssistantEvent, AutoCompactionConfig, AutoCompactionEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, InputEnvelope,
+    InputSource, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PendingInput,
+    PendingInputDelivery, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
+    ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -83,6 +84,20 @@ fn max_tokens_for_model(model: &str) -> u32 {
         32_000
     } else {
         64_000
+    }
+}
+
+fn auto_compaction_config_for_model(
+    model: &str,
+    runtime_model_config: Option<&RuntimeModelConfigOverride>,
+) -> AutoCompactionConfig {
+    let effective_model = runtime_model_config.map_or(model, |config| config.model_name.as_str());
+    AutoCompactionConfig {
+        context_window_tokens: runtime_model_config.and_then(|config| config.context_window_tokens),
+        max_output_tokens: runtime_model_config
+            .and_then(|config| config.max_output_tokens)
+            .unwrap_or_else(|| max_tokens_for_model(effective_model)),
+        fixed_threshold_tokens: None,
     }
 }
 const DEFAULT_DATE: &str = "2026-03-31";
@@ -116,8 +131,45 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--running-input",
     "--base-commit",
     "--headless",
+    "--model-config",
     "-p",
 ];
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeModelConfigFile {
+    version: u32,
+    provider: RuntimeModelProviderConfigFile,
+    model: RuntimeModelConfigModelFile,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeModelProviderConfigFile {
+    #[serde(rename = "type")]
+    provider_type: String,
+    #[serde(default, rename = "baseUrl")]
+    base_url: Option<String>,
+    #[serde(default, rename = "apiKeyEnv")]
+    api_key_env: Option<String>,
+    #[serde(default, rename = "authTokenEnv")]
+    auth_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeModelConfigModelFile {
+    name: String,
+    #[serde(default, rename = "contextWindowTokens")]
+    context_window_tokens: Option<u32>,
+    #[serde(default, rename = "maxOutputTokens")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeModelConfigOverride {
+    model_name: String,
+    provider_override: ProviderOverride,
+    context_window_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
 
 type AllowedToolSet = BTreeSet<String>;
 type RuntimePluginStateBuildOutput = (
@@ -245,11 +297,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 };
                 let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-                LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
-                    &effective_prompt,
-                    output_format,
-                    compact,
-                )
+                LiveCli::new(model, true, allowed_tools, permission_mode, None)?
+                    .run_turn_with_output(&effective_prompt, output_format, compact)
             })?;
         }
         CliAction::Login { output_format } => run_login(output_format)?,
@@ -271,6 +320,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             appfs_idle_wake,
             running_input,
             headless,
+            model_config_path,
             ..
         } => {
             if headless {
@@ -281,6 +331,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     base_commit.as_deref(),
                     session_path.as_deref(),
                     appfs_idle_wake,
+                    model_config_path.as_deref(),
                 )?;
             } else if running_input {
                 run_repl_with_running_input(
@@ -392,6 +443,7 @@ enum CliAction {
         appfs_idle_wake: bool,
         running_input: bool,
         headless: bool,
+        model_config_path: Option<PathBuf>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -439,6 +491,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut session_path: Option<PathBuf> = None;
+    let mut model_config_path: Option<PathBuf> = None;
     let mut appfs_idle_wake = false;
     let mut running_input = false;
     let mut headless = false;
@@ -585,6 +638,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 session_path = Some(PathBuf::from(&flag[10..]));
                 index += 1;
             }
+            "--model-config" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --model-config".to_string())?;
+                model_config_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--model-config=") => {
+                model_config_path = Some(PathBuf::from(&flag[15..]));
+                index += 1;
+            }
             "--allowedTools" | "--allowed-tools" => {
                 let value = args
                     .get(index + 1)
@@ -640,6 +704,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Err("--running-input cannot be combined with --headless".to_string());
     }
 
+    if model_config_path.is_some() && !headless {
+        return Err("--model-config can only be used with --headless".to_string());
+    }
+
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
@@ -652,6 +720,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             appfs_idle_wake,
             running_input,
             headless,
+            model_config_path,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -1166,6 +1235,56 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
     }
+}
+
+fn load_runtime_model_config_override(
+    path: &Path,
+) -> Result<RuntimeModelConfigOverride, Box<dyn std::error::Error>> {
+    let contents = fs::read_to_string(path)?;
+    let parsed: RuntimeModelConfigFile = serde_json::from_str(&contents)?;
+    if parsed.version != 1 {
+        return Err(format!(
+            "unsupported model config version {} in {}",
+            parsed.version,
+            path.display()
+        )
+        .into());
+    }
+    let provider = match parsed.provider.provider_type.as_str() {
+        "anthropic" | "claw" | "claw-api" => ProviderKind::Anthropic,
+        "openai" | "openai-compatible" => ProviderKind::OpenAi,
+        "xai" => ProviderKind::Xai,
+        other => {
+            return Err(format!("unsupported model config provider type: {other}").into());
+        }
+    };
+    if parsed.provider.auth_token_env.is_some() && provider != ProviderKind::Anthropic {
+        return Err("model config authTokenEnv is only supported for anthropic providers".into());
+    }
+    let model_name = parsed.model.name.trim().to_string();
+    if model_name.is_empty() {
+        return Err("model config model.name is required".into());
+    }
+    Ok(RuntimeModelConfigOverride {
+        model_name,
+        provider_override: ProviderOverride {
+            provider,
+            base_url: parsed
+                .provider
+                .base_url
+                .filter(|value| !value.trim().is_empty()),
+            api_key_env: parsed
+                .provider
+                .api_key_env
+                .filter(|value| !value.trim().is_empty()),
+            auth_token_env: parsed
+                .provider
+                .auth_token_env
+                .filter(|value| !value.trim().is_empty()),
+        },
+        context_window_tokens: parsed.model.context_window_tokens,
+        max_output_tokens: parsed.model.max_output_tokens,
+    })
 }
 
 fn format_connected_line(model: &str) -> String {
@@ -2854,6 +2973,15 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+fn auto_compaction_event_json(event: &AutoCompactionEvent) -> serde_json::Value {
+    json!({
+        "removed_messages": event.removed_message_count,
+        "estimated_context_tokens": event.estimated_context_tokens,
+        "threshold_tokens": event.threshold_tokens,
+        "notice": format_auto_compaction_notice(event.removed_message_count),
+    })
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3104,6 +3232,7 @@ fn run_resume_full_compact(
         session.clone(),
         &session.session_id,
         resolved_model,
+        None,
         system_prompt,
         true,
         false,
@@ -3436,9 +3565,10 @@ fn run_repl(
             allowed_tools,
             permission_mode,
             session_path,
+            None,
         )?
     } else {
-        LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?
+        LiveCli::new(resolved_model, true, allowed_tools, permission_mode, None)?
     };
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -3521,9 +3651,10 @@ fn run_repl_with_running_input(
             allowed_tools,
             permission_mode,
             session_path,
+            None,
         )?
     } else {
-        LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?
+        LiveCli::new(resolved_model, true, allowed_tools, permission_mode, None)?
     };
     let shared_queue = SharedPendingInputQueue::default();
     let (permission_tx, permission_rx) = mpsc::channel();
@@ -3654,7 +3785,18 @@ struct HeadlessContext {
     turn_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct HeadlessActiveTurn {
+    request_id: String,
+    turn_id: String,
+    abort_signal: runtime::HookAbortSignal,
+}
+
 static HEADLESS_CONTEXT: std::sync::OnceLock<std::sync::Mutex<HeadlessContext>> =
+    std::sync::OnceLock::new();
+static HEADLESS_ACTIVE_TURN: std::sync::OnceLock<std::sync::Mutex<Option<HeadlessActiveTurn>>> =
+    std::sync::OnceLock::new();
+static HEADLESS_PENDING_TURN_CANCELS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
     std::sync::OnceLock::new();
 
 fn get_headless_context() -> std::sync::MutexGuard<'static, HeadlessContext> {
@@ -3668,6 +3810,75 @@ fn get_headless_context() -> std::sync::MutexGuard<'static, HeadlessContext> {
         })
         .lock()
         .unwrap()
+}
+
+fn get_headless_active_turn() -> std::sync::MutexGuard<'static, Option<HeadlessActiveTurn>> {
+    HEADLESS_ACTIVE_TURN
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+}
+
+fn get_headless_pending_turn_cancels() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    HEADLESS_PENDING_TURN_CANCELS
+        .get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+        .lock()
+        .unwrap()
+}
+
+fn set_headless_active_turn(
+    request_id: &str,
+    turn_id: &str,
+    abort_signal: runtime::HookAbortSignal,
+) {
+    let mut active_turn = get_headless_active_turn();
+    *active_turn = Some(HeadlessActiveTurn {
+        request_id: request_id.to_string(),
+        turn_id: turn_id.to_string(),
+        abort_signal,
+    });
+    if take_pending_headless_turn_cancel(request_id, turn_id) {
+        if let Some(active) = active_turn.as_ref() {
+            active.abort_signal.abort();
+        }
+    }
+}
+
+fn clear_headless_active_turn(request_id: &str, turn_id: &str) {
+    let mut active_turn = get_headless_active_turn();
+    if active_turn
+        .as_ref()
+        .is_some_and(|active| active.request_id == request_id && active.turn_id == turn_id)
+    {
+        *active_turn = None;
+    }
+}
+
+fn cancel_headless_active_turn(request_id: &str) -> bool {
+    let active_turn = get_headless_active_turn();
+    let Some(active) = active_turn.as_ref() else {
+        return false;
+    };
+    if active.request_id != request_id && active.turn_id != request_id {
+        return false;
+    }
+    active.abort_signal.abort();
+    true
+}
+
+fn take_pending_headless_turn_cancel(request_id: &str, turn_id: &str) -> bool {
+    let mut pending = get_headless_pending_turn_cancels();
+    pending.remove(request_id) || pending.remove(turn_id)
+}
+
+fn request_headless_turn_cancel(request_id: &str) {
+    if request_id.trim().is_empty() {
+        return;
+    }
+    if cancel_headless_active_turn(request_id) {
+        return;
+    }
+    get_headless_pending_turn_cancels().insert(request_id.to_string());
 }
 
 #[derive(Debug, Deserialize)]
@@ -3760,6 +3971,10 @@ fn handle_headless_control_input(
             }
             true
         }
+        "cancel_turn" => {
+            request_headless_turn_cancel(&input_data.request_id);
+            true
+        }
         other => {
             let _ = prompt_tx.send(Err(format!("unsupported headless input type: {other}")));
             true
@@ -3822,18 +4037,31 @@ fn run_headless(
     base_commit: Option<&str>,
     session_path: Option<&Path>,
     appfs_idle_wake: bool,
+    model_config_path: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_stale_base_preflight(base_commit);
-    let resolved_model = resolve_repl_model(model);
+    let runtime_model_config = model_config_path
+        .map(load_runtime_model_config_override)
+        .transpose()?;
+    let resolved_model = runtime_model_config.as_ref().map_or_else(
+        || resolve_repl_model(model),
+        |config| config.model_name.clone(),
+    );
     let mut cli = if let Some(session_path) = session_path {
         LiveCli::new_from_session_headless(
             resolved_model,
             allowed_tools,
             permission_mode,
             session_path,
+            runtime_model_config.clone(),
         )?
     } else {
-        LiveCli::new_headless(resolved_model, allowed_tools, permission_mode)?
+        LiveCli::new_headless(
+            resolved_model,
+            allowed_tools,
+            permission_mode,
+            runtime_model_config.clone(),
+        )?
     };
 
     let control_listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -3981,13 +4209,15 @@ fn run_headless(
         }
 
         cli.record_prompt_history(&prompt_text);
-        cli.run_turn_headless_with_external_inputs(
+        let status = cli.run_turn_headless_with_external_inputs(
             &prompt_text,
             shared_queue.clone(),
             &request_id,
             &turn_id,
         )?;
-        let _ = cli.drain_and_run_queued_inputs_headless(shared_queue.clone())?;
+        if status == HeadlessTurnStatus::Completed {
+            let _ = cli.drain_and_run_queued_inputs_headless(shared_queue.clone())?;
+        }
 
         if appfs_idle_wake {
             if let Err(e) = cli.drive_appfs_idle_wake_headless(shared_queue.clone()) {
@@ -4021,6 +4251,7 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
+    runtime_model_config: Option<RuntimeModelConfigOverride>,
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
@@ -4055,12 +4286,19 @@ struct AppfsIdleWakeBatch {
     rendered_inputs: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessTurnStatus {
+    Completed,
+    Cancelled,
+}
+
 struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    hook_abort_signal: Option<runtime::HookAbortSignal>,
 }
 
 impl BuiltRuntime {
@@ -4075,6 +4313,7 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            hook_abort_signal: None,
         }
     }
 
@@ -4083,8 +4322,13 @@ impl BuiltRuntime {
             .runtime
             .take()
             .expect("runtime should exist before installing hook abort signal");
-        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal.clone()));
+        self.hook_abort_signal = Some(hook_abort_signal);
         self
+    }
+
+    fn hook_abort_signal(&self) -> Option<runtime::HookAbortSignal> {
+        self.hook_abort_signal.clone()
     }
 
     fn with_external_pending_inputs(mut self, queue: SharedPendingInputQueue) -> Self {
@@ -4523,6 +4767,7 @@ impl HookAbortMonitor {
 
 fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     let cwd = env::current_dir().ok()?;
+    eprintln!("AppFS attach: checking identity and private apps...");
     let outcome = ensure_appfs_attach_identity(&cwd);
     if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
         return None;
@@ -4535,8 +4780,15 @@ fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
 
 fn attach_live_cli_appfs_principal() -> Option<AppfsAttachLease> {
     let cwd = env::current_dir().ok()?;
+    eprintln!("AppFS attach: registering attach lease...");
     match attach_appfs_principal(&cwd) {
-        Ok(lease) => Some(lease),
+        Ok(lease) => {
+            eprintln!(
+                "AppFS attach: attach lease registered for principal {}",
+                lease.principal_id
+            );
+            Some(lease)
+        }
         Err(error) => {
             eprintln!("AppFS attach warning: failed to register attach lease: {error}");
             None
@@ -4548,8 +4800,10 @@ fn warmup_live_cli_appfs_private_apps() {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
+    eprintln!("AppFS attach: warming up private apps...");
     match warmup_appfs_private_apps(&cwd) {
         Ok(outcomes) => {
+            let warmed_app_count = outcomes.len();
             for outcome in outcomes {
                 match outcome.status {
                     AppfsPrivateAppWarmupStatus::Ready => {}
@@ -4567,6 +4821,10 @@ fn warmup_live_cli_appfs_private_apps() {
                     }
                 }
             }
+            eprintln!(
+                "AppFS attach: private app warmup complete ({} app(s))",
+                warmed_app_count
+            );
         }
         Err(error) => {
             eprintln!("AppFS attach warning: failed to warm up private apps: {error}");
@@ -4615,6 +4873,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
         let appfs_attach_lease = if appfs_attach_ensure.is_some() {
@@ -4635,6 +4894,7 @@ impl LiveCli {
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
             model.clone(),
+            runtime_model_config.clone(),
             system_prompt.clone(),
             enable_tools,
             true,
@@ -4648,6 +4908,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             system_prompt,
+            runtime_model_config,
             runtime,
             session,
             prompt_history: Vec::new(),
@@ -4665,6 +4926,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         session_reference: &Path,
+        runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
         let appfs_attach_lease = if appfs_attach_ensure.is_some() {
@@ -4686,6 +4948,7 @@ impl LiveCli {
             session_state,
             &session.id,
             model.clone(),
+            runtime_model_config.clone(),
             system_prompt.clone(),
             enable_tools,
             true,
@@ -4699,6 +4962,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             system_prompt,
+            runtime_model_config,
             runtime,
             session,
             prompt_history: Vec::new(),
@@ -4714,6 +4978,7 @@ impl LiveCli {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
         let appfs_attach_lease = if appfs_attach_ensure.is_some() {
@@ -4734,6 +4999,7 @@ impl LiveCli {
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
             model.clone(),
+            runtime_model_config.clone(),
             system_prompt.clone(),
             true,
             false,
@@ -4747,6 +5013,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             system_prompt,
+            runtime_model_config,
             runtime,
             session,
             prompt_history: Vec::new(),
@@ -4763,6 +5030,7 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         session_reference: &Path,
+        runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
         let appfs_attach_lease = if appfs_attach_ensure.is_some() {
@@ -4784,6 +5052,7 @@ impl LiveCli {
             session_state,
             &session.id,
             model.clone(),
+            runtime_model_config.clone(),
             system_prompt.clone(),
             true,
             false,
@@ -4797,6 +5066,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             system_prompt,
+            runtime_model_config,
             runtime,
             session,
             prompt_history: Vec::new(),
@@ -4879,6 +5149,7 @@ impl LiveCli {
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             emit_output,
@@ -4914,8 +5185,13 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                let finish_label = if summary.cancelled {
+                    "⏹ Cancelled"
+                } else {
+                    "✨ Done"
+                };
                 spinner.finish(
-                    "✨ Done",
+                    finish_label,
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -4977,7 +5253,7 @@ impl LiveCli {
         external_queue: SharedPendingInputQueue,
         request_id: &str,
         turn_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<HeadlessTurnStatus, Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -5079,16 +5355,25 @@ impl LiveCli {
             );
             let turn_id = headless_turn_id();
             self.record_prompt_history(&queued_text);
-            if let Err(error) = self.run_turn_headless_with_external_inputs(
+            let status = match self.run_turn_headless_with_external_inputs(
                 &queued_text,
                 external_queue.clone(),
                 &request_id,
                 &turn_id,
             ) {
+                Ok(status) => status,
+                Err(error) => {
+                    let mut restore = vec![pending_input];
+                    restore.extend(pending_inputs.into_iter());
+                    external_queue.restore_front(restore);
+                    return Err(error);
+                }
+            };
+            if status == HeadlessTurnStatus::Cancelled {
                 let mut restore = vec![pending_input];
                 restore.extend(pending_inputs.into_iter());
                 external_queue.restore_front(restore);
-                return Err(error);
+                break;
             }
 
             processed += 1;
@@ -5128,12 +5413,17 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                let finish_label = if summary.cancelled {
+                    "⏹ Cancelled"
+                } else {
+                    "✨ Done"
+                };
                 if let Some(redraw_handle) = &self.redraw_handle {
-                    redraw_handle.write_output("✔ ✨ Done\n".to_string());
+                    redraw_handle.write_output(format!("✔ {finish_label}\n"));
                     redraw_handle.clear_status();
                 } else {
                     spinner.finish(
-                        "✨ Done",
+                        finish_label,
                         TerminalRenderer::new().color_theme(),
                         &mut stdout,
                     )?;
@@ -5190,7 +5480,7 @@ impl LiveCli {
             &mut dyn runtime::PermissionPrompter,
         ) -> Result<runtime::TurnSummary, RuntimeError>,
         prompter: Option<&mut dyn runtime::PermissionPrompter>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<HeadlessTurnStatus, Box<dyn std::error::Error>> {
         let mut turn_start = json!({
             "type": "turn_start",
             "request_id": request_id,
@@ -5210,8 +5500,12 @@ impl LiveCli {
 
         let mut fallback_prompter = CliPermissionPrompter::new(self.permission_mode);
         let prompter = prompter.unwrap_or(&mut fallback_prompter);
+        if let Some(abort_signal) = runtime.hook_abort_signal() {
+            set_headless_active_turn(request_id, turn_id, abort_signal);
+        }
         let result = runner(&mut runtime, prompter);
         hook_abort_monitor.stop();
+        clear_headless_active_turn(request_id, turn_id);
 
         {
             let mut headless_ctx = get_headless_context();
@@ -5238,12 +5532,17 @@ impl LiveCli {
                     }
                 }
                 self.persist_session()?;
+                let status = if summary.cancelled {
+                    "cancelled"
+                } else {
+                    "completed"
+                };
                 let mut done_ev = json!({
                     "type": "turn_done",
                     "request_id": request_id,
                     "turn_id": turn_id,
                     "session_id": self.session.id,
-                    "status": "completed",
+                    "status": status,
                     "usage": {
                         "input_tokens": summary.usage.input_tokens,
                         "output_tokens": summary.usage.output_tokens,
@@ -5254,8 +5553,38 @@ impl LiveCli {
                 if let Some(source) = source {
                     done_ev["source"] = json!(source);
                 }
+                if let Some(event) = &summary.auto_compaction {
+                    done_ev["auto_compaction"] = auto_compaction_event_json(event);
+                }
                 emit_headless_json(&done_ev)?;
-                Ok(())
+                Ok(if summary.cancelled {
+                    HeadlessTurnStatus::Cancelled
+                } else {
+                    HeadlessTurnStatus::Completed
+                })
+            }
+            Err(error) if error.is_cancelled() => {
+                self.replace_runtime(runtime)?;
+                self.persist_session()?;
+                let usage = self.runtime.usage().cumulative_usage();
+                let mut done_ev = json!({
+                    "type": "turn_done",
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "session_id": self.session.id,
+                    "status": "cancelled",
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                });
+                if let Some(source) = source {
+                    done_ev["source"] = json!(source);
+                }
+                emit_headless_json(&done_ev)?;
+                Ok(HeadlessTurnStatus::Cancelled)
             }
             Err(error) => {
                 if let Err(err_shutdown) = runtime.shutdown_plugins() {
@@ -5271,7 +5600,7 @@ impl LiveCli {
                     err_ev["source"] = json!(source);
                 }
                 emit_headless_json(&err_ev)?;
-                Ok(())
+                Ok(HeadlessTurnStatus::Cancelled)
             }
         }
     }
@@ -5374,12 +5703,14 @@ impl LiveCli {
             "auto_marked_read": batch.auto_marked_read,
         }))?;
 
-        self.run_event_turn_headless_with_external_inputs(
+        let status = self.run_event_turn_headless_with_external_inputs(
             external_queue.clone(),
             &request_id,
             &turn_id,
         )?;
-        let _ = self.drain_and_run_queued_inputs_headless(external_queue)?;
+        if status == HeadlessTurnStatus::Completed {
+            let _ = self.drain_and_run_queued_inputs_headless(external_queue)?;
+        }
         Ok(true)
     }
 
@@ -5505,7 +5836,7 @@ impl LiveCli {
         external_queue: SharedPendingInputQueue,
         request_id: &str,
         turn_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<HeadlessTurnStatus, Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -5591,10 +5922,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "model": self.model,
                 "iterations": summary.iterations,
-                "auto_compaction": summary.auto_compaction.as_ref().map(|event| json!({
-                    "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
-                })),
+                "auto_compaction": summary.auto_compaction.as_ref().map(auto_compaction_event_json),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
@@ -5913,6 +6241,7 @@ impl LiveCli {
             session,
             &self.session.id,
             model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -5960,6 +6289,7 @@ impl LiveCli {
             session,
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -5994,6 +6324,7 @@ impl LiveCli {
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -6037,6 +6368,7 @@ impl LiveCli {
             session,
             &handle.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -6172,6 +6504,7 @@ impl LiveCli {
                     session,
                     &handle.id,
                     self.model.clone(),
+                    self.runtime_model_config.clone(),
                     self.system_prompt.clone(),
                     true,
                     true,
@@ -6208,6 +6541,7 @@ impl LiveCli {
                     forked,
                     &handle.id,
                     self.model.clone(),
+                    self.runtime_model_config.clone(),
                     self.system_prompt.clone(),
                     true,
                     true,
@@ -6475,6 +6809,7 @@ impl LiveCli {
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -6510,6 +6845,7 @@ impl LiveCli {
             result.compacted_session,
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             true,
             true,
@@ -6538,6 +6874,7 @@ impl LiveCli {
             session,
             &self.session.id,
             self.model.clone(),
+            self.runtime_model_config.clone(),
             self.system_prompt.clone(),
             enable_tools,
             false,
@@ -8294,6 +8631,15 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { thinking, .. } => {
+                    lines.push(format!(
+                        "[thinking hidden: {} chars]",
+                        thinking.chars().count()
+                    ));
+                }
+                ContentBlock::RedactedThinking { .. } => {
+                    lines.push("[thinking redacted by provider]".to_string());
+                }
                 ContentBlock::InputRouter { inputs } => {
                     lines.push(render_input_router_block(inputs));
                 }
@@ -8483,6 +8829,17 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Thinking { thinking, .. } => {
+                    lines.push(format!(
+                        "_thinking hidden: {} chars_",
+                        thinking.chars().count()
+                    ));
+                    lines.push(String::new());
+                }
+                ContentBlock::RedactedThinking { .. } => {
+                    lines.push("_thinking redacted by provider_".to_string());
+                    lines.push(String::new());
                 }
                 ContentBlock::InputRouter { inputs } => {
                     let rendered = render_input_router_block(inputs);
@@ -8966,6 +9323,7 @@ fn build_runtime(
     session: Session,
     session_id: &str,
     model: String,
+    runtime_model_config: Option<RuntimeModelConfigOverride>,
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
@@ -8979,6 +9337,7 @@ fn build_runtime(
         session,
         session_id,
         model,
+        runtime_model_config,
         system_prompt,
         enable_tools,
         emit_output,
@@ -8996,6 +9355,7 @@ fn build_runtime_with_plugin_state(
     session: Session,
     session_id: &str,
     model: String,
+    runtime_model_config: Option<RuntimeModelConfigOverride>,
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
@@ -9022,11 +9382,14 @@ fn build_runtime_with_plugin_state(
     let hook_redraw_handle = redraw_handle.clone();
     #[cfg(feature = "debug-dump")]
     let debug_jsonl_path = session.persistence_path().map(|p| p.to_path_buf());
+    let auto_compaction_config =
+        auto_compaction_config_for_model(&model, runtime_model_config.as_ref());
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
             session_id,
             model,
+            runtime_model_config,
             enable_tools,
             emit_output,
             allowed_tools.clone(),
@@ -9046,7 +9409,8 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_auto_compaction_config(auto_compaction_config);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter {
             redraw_handle: hook_redraw_handle,
@@ -9257,6 +9621,7 @@ struct AnthropicRuntimeClient {
     client: ProviderClient,
     session_id: String,
     model: String,
+    runtime_model_config: Option<RuntimeModelConfigOverride>,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
@@ -9273,6 +9638,7 @@ impl AnthropicRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
+        runtime_model_config: Option<RuntimeModelConfigOverride>,
         enable_tools: bool,
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
@@ -9283,9 +9649,14 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
             .map_err(Box::<dyn std::error::Error>::from)?;
-        let provider_override = runtime_config
-            .provider()
-            .map(provider_override_from_runtime_config);
+        let provider_override = runtime_model_config
+            .as_ref()
+            .map(|config| config.provider_override.clone())
+            .or_else(|| {
+                runtime_config
+                    .provider()
+                    .map(provider_override_from_runtime_config)
+            });
         let oauth = runtime_config.oauth().cloned();
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -9297,6 +9668,7 @@ impl AnthropicRuntimeClient {
             .with_prompt_cache(PromptCache::new(session_id)),
             session_id: session_id.to_string(),
             model,
+            runtime_model_config,
             enable_tools,
             emit_output,
             allowed_tools,
@@ -9317,9 +9689,15 @@ impl AnthropicRuntimeClient {
                 "failed to load runtime config for model override: {error}"
             ))
         })?;
-        let provider_override = runtime_config
-            .provider()
-            .map(provider_override_from_runtime_config);
+        let provider_override = self
+            .runtime_model_config
+            .as_ref()
+            .map(|config| config.provider_override.clone())
+            .or_else(|| {
+                runtime_config
+                    .provider()
+                    .map(provider_override_from_runtime_config)
+            });
         let oauth = runtime_config.oauth().cloned();
         ProviderClient::from_model_with_anthropic_auth_resolver(
             model,
@@ -9387,20 +9765,31 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let abort_signal = request.abort_signal.clone();
         let allow_tools = self.enable_tools && request.allow_tools;
         let effective_model = request
             .model_override
             .clone()
             .unwrap_or_else(|| self.model.clone());
+        let max_tokens = self
+            .runtime_model_config
+            .as_ref()
+            .and_then(|config| config.max_output_tokens)
+            .unwrap_or_else(|| max_tokens_for_model(&effective_model));
+        let context_window_tokens = self
+            .runtime_model_config
+            .as_ref()
+            .and_then(|config| config.context_window_tokens);
         let message_request = MessageRequest {
             model: effective_model.clone(),
-            max_tokens: max_tokens_for_model(&effective_model),
+            max_tokens,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: allow_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: allow_tools.then_some(ToolChoice::Auto),
             reasoning_effort: request.reasoning_effort.clone(),
+            context_window_tokens,
             stream: true,
             ..Default::default()
         };
@@ -9428,10 +9817,16 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(client, &message_request, is_post_tool && attempt == 1)
+                    .consume_stream(
+                        client,
+                        &message_request,
+                        abort_signal.as_ref(),
+                        is_post_tool && attempt == 1,
+                    )
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
+                    Err(error) if error.is_cancelled() => return Err(error),
                     Err(error)
                         if error.to_string().contains("post-tool stall")
                             && attempt < max_attempts =>
@@ -9456,8 +9851,12 @@ impl AnthropicRuntimeClient {
         &self,
         client: &ProviderClient,
         message_request: &MessageRequest,
+        abort_signal: Option<&runtime::HookAbortSignal>,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if abort_signal.is_some_and(runtime::HookAbortSignal::is_aborted) {
+            return Err(RuntimeError::cancelled());
+        }
         let mut stream = client
             .stream_message(message_request)
             .await
@@ -9480,21 +9879,30 @@ impl AnthropicRuntimeClient {
         let mut received_any_event = false;
 
         loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
+            let next = match next_stream_event_with_abort(
+                &self.session_id,
+                &mut stream,
+                abort_signal,
+                (apply_stall_timeout && !received_any_event).then_some(POST_TOOL_STALL_TIMEOUT),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(error) if error.is_cancelled() && stream_events_have_content(&events) => {
+                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        if let Some(redraw_handle) = &self.redraw_handle {
+                            redraw_handle.write_output(rendered);
+                        } else {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                     }
+                    saw_stop = true;
+                    events.push(AssistantEvent::MessageStop);
+                    break;
                 }
-            } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                Err(error) => return Err(error),
             };
 
             let Some(event) = next else {
@@ -9561,7 +9969,10 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                        if !thinking.is_empty() {
+                            events.push(AssistantEvent::ThinkingDelta(thinking));
+                        }
                         if !block_has_thinking_summary {
                             if let Some(redraw_handle) = &self.redraw_handle {
                                 redraw_handle.set_status(thinking_block_summary_text(None, false));
@@ -9571,7 +9982,9 @@ impl AnthropicRuntimeClient {
                             block_has_thinking_summary = true;
                         }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        events.push(AssistantEvent::ThinkingSignature(signature));
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -9642,6 +10055,9 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
+        if abort_signal.is_some_and(runtime::HookAbortSignal::is_aborted) {
+            return Err(RuntimeError::cancelled());
+        }
         let response = client
             .send_message(&MessageRequest {
                 stream: false,
@@ -9655,6 +10071,60 @@ impl AnthropicRuntimeClient {
         push_prompt_cache_record(client, &mut events);
         Ok(events)
     }
+}
+
+async fn next_stream_event_with_abort(
+    session_id: &str,
+    stream: &mut api::MessageStream,
+    abort_signal: Option<&runtime::HookAbortSignal>,
+    stall_timeout: Option<Duration>,
+) -> Result<Option<ApiStreamEvent>, RuntimeError> {
+    if abort_signal.is_some_and(runtime::HookAbortSignal::is_aborted) {
+        return Err(RuntimeError::cancelled());
+    }
+
+    match (abort_signal, stall_timeout) {
+        (Some(signal), Some(timeout)) => {
+            tokio::select! {
+                () = signal.cancelled() => Err(RuntimeError::cancelled()),
+                result = tokio::time::timeout(timeout, stream.next_event()) => {
+                    match result {
+                        Ok(inner) => map_stream_event_result(session_id, inner),
+                        Err(_elapsed) => Err(RuntimeError::new(
+                            "post-tool stall: model did not respond within timeout",
+                        )),
+                    }
+                }
+            }
+        }
+        (Some(signal), None) => {
+            tokio::select! {
+                () = signal.cancelled() => Err(RuntimeError::cancelled()),
+                result = stream.next_event() => map_stream_event_result(session_id, result),
+            }
+        }
+        (None, Some(timeout)) => match tokio::time::timeout(timeout, stream.next_event()).await {
+            Ok(inner) => map_stream_event_result(session_id, inner),
+            Err(_elapsed) => Err(RuntimeError::new(
+                "post-tool stall: model did not respond within timeout",
+            )),
+        },
+        (None, None) => map_stream_event_result(session_id, stream.next_event().await),
+    }
+}
+
+fn map_stream_event_result(
+    session_id: &str,
+    result: Result<Option<ApiStreamEvent>, api::ApiError>,
+) -> Result<Option<ApiStreamEvent>, RuntimeError> {
+    result.map_err(|error| RuntimeError::new(format_user_visible_api_error(session_id, &error)))
+}
+
+fn stream_events_have_content(events: &[AssistantEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+            || matches!(event, AssistantEvent::ToolUse { .. })
+    })
 }
 
 /// Returns `true` when the conversation ends with a tool-result message,
@@ -10466,12 +10936,20 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            events.push(AssistantEvent::ThinkingDelta(thinking));
+            if let Some(signature) = signature {
+                events.push(AssistantEvent::ThinkingSignature(signature));
+            }
             *block_has_thinking_summary = true;
         }
-        OutputContentBlock::RedactedThinking { .. } => {
+        OutputContentBlock::RedactedThinking { data } => {
             render_thinking_block_summary(out, None, true)?;
+            events.push(AssistantEvent::RedactedThinking(data));
             *block_has_thinking_summary = true;
         }
     }
@@ -10708,6 +11186,19 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::Text { text } => {
                         Some(InputContentBlock::Text { text: text.clone() })
                     }
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => Some(InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    }),
+                    ContentBlock::RedactedThinking { data } => {
+                        Some(InputContentBlock::RedactedThinking {
+                            data: serde_json::from_str(&data.render())
+                                .unwrap_or(serde_json::Value::Null),
+                        })
+                    }
                     ContentBlock::InputRouter { inputs } => {
                         let text = render_input_router_block(inputs);
                         (!text.trim().is_empty()).then_some(InputContentBlock::Text { text })
@@ -10823,6 +11314,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --model-config PATH         Headless-only runtime model/provider config"
+    )?;
+    writeln!(
+        out,
         "  --output-format FORMAT     Non-interactive output format: text or json"
     )?;
     writeln!(
@@ -10923,10 +11418,10 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle,
-        delete_merged_local_branches_in, describe_tool_progress, filter_tool_specs,
-        fork_session_for_principal, format_appfs_attach_ensure_banner_line,
+        auto_compaction_config_for_model, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, collect_session_prompt_history,
+        create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
+        filter_tool_specs, fork_session_for_principal, format_appfs_attach_ensure_banner_line,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
@@ -10946,14 +11441,17 @@ mod tests {
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, run_resume_command_with_compactor,
         short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
-        status_json_value, summarize_tool_payload_for_markdown, thinking_block_summary_text,
-        validate_no_args, write_mcp_server_fixture, ChannelPermissionPrompter, CliAction,
-        CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
-        GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        status_json_value, stream_events_have_content, summarize_tool_payload_for_markdown,
+        thinking_block_summary_text, validate_no_args, write_mcp_server_fixture,
+        ChannelPermissionPrompter, CliAction, CliOutputFormat, CliPermissionPrompter,
+        CliToolExecutor, GitBranchFreshness, GitCommitEntry, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, RuntimeModelConfigOverride, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{
+        ApiError, MessageResponse, OutputContentBlock, ProviderKind, ProviderOverride, Usage,
+    };
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -11365,6 +11863,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -11906,6 +12405,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -11937,6 +12437,7 @@ mod tests {
                 appfs_idle_wake: true,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -11958,6 +12459,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: true,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -12012,6 +12514,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -12132,6 +12635,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -12192,6 +12696,7 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: false,
+                model_config_path: None,
             }
         );
     }
@@ -12213,8 +12718,77 @@ mod tests {
                 appfs_idle_wake: false,
                 running_input: false,
                 headless: true,
+                model_config_path: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_model_config_for_headless_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--headless".to_string(),
+            "--model-config".to_string(),
+            "runtime-model.json".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                session_path: None,
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+                appfs_idle_wake: false,
+                running_input: false,
+                headless: true,
+                model_config_path: Some(PathBuf::from("runtime-model.json")),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_model_config_without_headless() {
+        let err = parse_args(&[
+            "--model-config".to_string(),
+            "runtime-model.json".to_string(),
+        ])
+        .expect_err("model config should be headless-only");
+        assert!(err.contains("--model-config"));
+        assert!(err.contains("--headless"));
+    }
+
+    #[test]
+    fn auto_compaction_config_uses_runtime_model_window() {
+        let runtime_model_config = RuntimeModelConfigOverride {
+            model_name: "glm-5.1".to_string(),
+            provider_override: ProviderOverride {
+                provider: ProviderKind::OpenAi,
+                base_url: None,
+                api_key_env: None,
+                auth_token_env: None,
+            },
+            context_window_tokens: Some(200_000),
+            max_output_tokens: Some(131_072),
+        };
+
+        let config =
+            auto_compaction_config_for_model("claude-opus-4-6", Some(&runtime_model_config));
+
+        assert_eq!(config.context_window_tokens, Some(200_000));
+        assert_eq!(config.max_output_tokens, 131_072);
+        assert_eq!(config.fixed_threshold_tokens, None);
+    }
+
+    #[test]
+    fn auto_compaction_config_falls_back_to_model_output_limit() {
+        let config = auto_compaction_config_for_model("claude-opus-4-6", None);
+
+        assert_eq!(config.context_window_tokens, None);
+        assert_eq!(config.max_output_tokens, 32_000);
+        assert_eq!(config.fixed_threshold_tokens, None);
     }
 
     #[test]
@@ -13141,6 +13715,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                None,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -14824,6 +15399,22 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn stream_events_have_content_tracks_persistable_stream_output() {
+        assert!(!stream_events_have_content(&[]));
+        assert!(!stream_events_have_content(&[AssistantEvent::Usage(
+            runtime::TokenUsage::default(),
+        )]));
+        assert!(stream_events_have_content(&[AssistantEvent::TextDelta(
+            "partial".to_string(),
+        )]));
+        assert!(stream_events_have_content(&[AssistantEvent::ToolUse {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: "{\"path\":\"README.md\"}".to_string(),
+        }]));
+    }
+
+    #[test]
     fn response_to_events_preserves_empty_object_json_input_outside_streaming() {
         let mut out = Vec::new();
         let events = response_to_events(
@@ -14927,6 +15518,14 @@ UU conflicted.rs",
 
         assert!(matches!(
             &events[0],
+            AssistantEvent::ThinkingDelta(text) if text == "step 1"
+        ));
+        assert!(matches!(
+            &events[1],
+            AssistantEvent::ThinkingSignature(signature) if signature == "sig_123"
+        ));
+        assert!(matches!(
+            &events[2],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");
@@ -15284,6 +15883,7 @@ UU conflicted.rs",
             Session::new(),
             "runtime-plugin-lifecycle",
             DEFAULT_MODEL.to_string(),
+            None,
             vec!["test system prompt".to_string()],
             true,
             false,
@@ -15417,10 +16017,20 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{dump_manifests_at_path, format_sandbox_report, CliOutputFormat, HookAbortMonitor};
+    use super::{
+        clear_headless_active_turn, dump_manifests_at_path, format_sandbox_report,
+        request_headless_turn_cancel, set_headless_active_turn, CliOutputFormat, HookAbortMonitor,
+    };
     use runtime::HookAbortSignal;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex, OnceLock};
     use std::time::Duration;
+
+    fn headless_cancel_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -15466,6 +16076,34 @@ mod sandbox_report_tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("interrupt should complete");
         monitor.stop();
+
+        assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn headless_cancel_turn_aborts_active_turn() {
+        let _guard = headless_cancel_test_lock();
+        let request_id = format!("req-active-{}", std::process::id());
+        let turn_id = format!("turn-active-{}", std::process::id());
+        let abort_signal = HookAbortSignal::new();
+
+        set_headless_active_turn(&request_id, &turn_id, abort_signal.clone());
+        request_headless_turn_cancel(&request_id);
+        clear_headless_active_turn(&request_id, &turn_id);
+
+        assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn headless_cancel_turn_replays_when_cancel_arrives_first() {
+        let _guard = headless_cancel_test_lock();
+        let request_id = format!("req-pending-{}", std::process::id());
+        let turn_id = format!("turn-pending-{}", std::process::id());
+        let abort_signal = HookAbortSignal::new();
+
+        request_headless_turn_cancel(&request_id);
+        set_headless_active_turn(&request_id, &turn_id, abort_signal.clone());
+        clear_headless_active_turn(&request_id, &turn_id);
 
         assert!(abort_signal.is_aborted());
     }

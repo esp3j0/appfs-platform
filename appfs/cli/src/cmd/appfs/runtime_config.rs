@@ -13,6 +13,7 @@ pub(crate) struct AppfsBridgeCliArgs {
     pub adapter_bridge_max_backoff_ms: u64,
     pub adapter_bridge_circuit_breaker_failures: u32,
     pub adapter_bridge_circuit_breaker_cooldown_ms: u64,
+    pub connector_config: Option<super::registry::AppfsRegistryConnectorConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ pub(crate) struct AppfsBridgeConfig {
     pub(super) adapter_grpc_endpoint: Option<String>,
     pub(super) adapter_grpc_timeout_ms: u64,
     pub(super) runtime_options: BridgeRuntimeOptions,
+    pub(super) connector_config: Option<super::registry::AppfsRegistryConnectorConfig>,
 }
 
 pub(crate) fn normalize_appfs_app_ids(
@@ -136,5 +138,6 @@ pub(crate) fn build_appfs_bridge_config(args: AppfsBridgeCliArgs) -> AppfsBridge
         adapter_grpc_endpoint: args.adapter_grpc_endpoint,
         adapter_grpc_timeout_ms: args.adapter_grpc_timeout_ms,
         runtime_options: bridge_runtime_options,
+        connector_config: args.connector_config,
     }
 }

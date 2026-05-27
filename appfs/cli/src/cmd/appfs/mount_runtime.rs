@@ -193,6 +193,8 @@ impl MountSnapshotRuntimeConfig {
     }
 
     fn from_registry(app: &registry::AppfsRegisteredAppDoc) -> Self {
+        let mut bridge = registry::bridge_args_from_transport_doc(&app.transport);
+        bridge.connector_config = app.connector_config.clone();
         Self {
             instance_id: app.instance_id.clone(),
             app_id: app.app_id.clone(),
@@ -200,7 +202,7 @@ impl MountSnapshotRuntimeConfig {
             session_id: Some(app.session_id.clone()),
             principal_id: app.principal_id.clone(),
             profile_id: app.profile_id.clone(),
-            bridge: registry::bridge_args_from_transport_doc(&app.transport),
+            bridge,
         }
     }
 }
@@ -1695,7 +1697,7 @@ mod tests {
         SnapshotOnTimeoutPolicy, SnapshotSpec, OPEN_NO_READ_HINT, OPEN_READ_ONLY, OPEN_READ_WRITE,
         OPEN_WRITE_ONLY, ROOT_INO,
     };
-    use crate::cmd::appfs::AppfsBridgeCliArgs;
+    use crate::cmd::appfs::{registry, AppfsBridgeCliArgs};
     use agentfs_sdk::{
         AppConnector, AuthStatus, ConnectorContext, ConnectorError, ConnectorInfo,
         ConnectorTransport, FetchLivePageRequest, FetchLivePageResponse, FetchSnapshotChunkRequest,
@@ -1772,6 +1774,61 @@ mod tests {
         assert!(should_suppress_snapshot_probe_read(0, 4, 4));
         assert!(!should_suppress_snapshot_probe_read(0, 5, 4));
         assert!(!should_suppress_snapshot_probe_read(1, 1, 4));
+    }
+
+    #[test]
+    fn registry_runtime_config_preserves_connector_config_for_mount_read_through() {
+        let mut app = registry::AppfsRegisteredAppDoc {
+            instance_id: "tinode--default".to_string(),
+            app_id: "tinode".to_string(),
+            visibility: registry::AppfsRegisteredAppVisibility::PrivateInstance,
+            parent_app_id: Some("tinode".to_string()),
+            principal_id: Some("default".to_string()),
+            profile_id: Some("tinode:default".to_string()),
+            path: "private/default/tinode".to_string(),
+            session_id: "sess-tinode".to_string(),
+            transport: registry::AppfsRegistryTransportDoc {
+                kind: registry::AppfsRegistryTransportKind::InProcess,
+                endpoint: None,
+                http_timeout_ms: 5_000,
+                grpc_timeout_ms: 5_000,
+                bridge_max_retries: 2,
+                bridge_initial_backoff_ms: 100,
+                bridge_max_backoff_ms: 1_000,
+                bridge_circuit_breaker_failures: 5,
+                bridge_circuit_breaker_cooldown_ms: 3_000,
+            },
+            registered_at: "2026-05-24T00:00:00Z".to_string(),
+            active_scope: None,
+            inbound_poll_ms: Some(1_000),
+            connector_config: Some(registry::AppfsRegistryConnectorConfig {
+                kind: "tinode".to_string(),
+                endpoint: "http://101.34.216.193:6060".to_string(),
+                login_prefix: "dash12345678".to_string(),
+                credential_policy: Some("auto-create".to_string()),
+            }),
+        };
+
+        let config = MountSnapshotRuntimeConfig::from_registry(&app);
+        let connector_config = config
+            .bridge
+            .connector_config
+            .as_ref()
+            .expect("connector_config must be preserved for mount-side connector init");
+        assert_eq!(connector_config.kind, "tinode");
+        assert_eq!(connector_config.endpoint, "http://101.34.216.193:6060");
+        assert_eq!(connector_config.login_prefix, "dash12345678");
+        assert_eq!(
+            connector_config.credential_policy.as_deref(),
+            Some("auto-create")
+        );
+
+        app.connector_config = None;
+        let config = MountSnapshotRuntimeConfig::from_registry(&app);
+        assert!(
+            config.bridge.connector_config.is_none(),
+            "legacy registry entries without typed config should remain supported"
+        );
     }
 
     fn build_wrapper(root: &TempDir, wake: Option<ActionWakeHandle>) -> MountSnapshotReadThroughFs {
@@ -1923,6 +1980,7 @@ mod tests {
             adapter_bridge_max_backoff_ms: 1_000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+            connector_config: None,
         }
     }
 

@@ -9,6 +9,8 @@ import { EventBus } from './event-bus.js';
 import type { AgentRegistry } from './agent-registry.js';
 import type { ProjectRegistry } from './project-registry.js';
 import type { AgentInfo } from './types.js';
+import { terminateChildProcessTree } from './child-process-utils.js';
+import type { ModelConfigStore } from './model-config-store.js';
 
 // ── Launch specification types ──
 
@@ -28,6 +30,11 @@ export interface SpawnConfig {
   sessionPath?: string;
   projectId?: string;
   projectRoot?: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  runtimeModelConfigPath?: string;
 }
 
 export function resolveProjectScopedSpawnConfig(
@@ -38,11 +45,12 @@ export function resolveProjectScopedSpawnConfig(
 
   if (resolvedConfig.projectId && projectRegistry) {
     const project = projectRegistry.getProject(resolvedConfig.projectId);
-    if (project) {
-      resolvedConfig.cwd = project.projectRoot;
-      resolvedConfig.appfsMountRoot = project.mountRoot;
-      resolvedConfig.projectRoot = project.projectRoot;
+    if (!project) {
+      throw new SpawnConfigValidationError(`Project ${resolvedConfig.projectId} not found for spawn`);
     }
+    resolvedConfig.cwd = project.projectRoot;
+    resolvedConfig.appfsMountRoot = project.mountRoot;
+    resolvedConfig.projectRoot = project.projectRoot;
   }
 
   return resolvedConfig;
@@ -51,6 +59,12 @@ export function resolveProjectScopedSpawnConfig(
 export type PromptDelivery = 'prompt' | 'queue' | 'guidance';
 
 export type PromptSubmissionStatus = 'accepted' | 'queued' | 'guidance';
+
+export interface ProjectAgentResumeResult {
+  resumed: Array<{ sessionId: string; spawnId: string }>;
+  skipped: Array<{ sessionId: string; reason: string }>;
+  errors: Array<{ sessionId: string; error: string }>;
+}
 
 // ── Headless JSONL protocol event types (from Rust stdout) ──
 
@@ -107,7 +121,7 @@ export class AgentProcessManager {
    */
   private pendingSpawnMap = new Map<string, string>();
 
-  constructor(registry: AgentRegistry) {
+  constructor(registry: AgentRegistry, private modelConfigStore?: ModelConfigStore) {
     this.eventBus = EventBus.getInstance();
     this.registry = registry;
   }
@@ -121,17 +135,26 @@ export class AgentProcessManager {
       spawnConfig,
       this.registry.projectRegistry,
     );
+    this.assertSpawnConfig(effectiveSpawnConfig);
+    this.resolveRuntimeModelConfig(effectiveSpawnConfig, spawnId);
 
     const args = this.buildArgs(effectiveSpawnConfig);
     const cmd = this.buildCommand(effectiveSpawnConfig.launchSpec);
 
     console.log(`[ProcessManager] Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`);
+    this.eventBus.broadcast('process-log', {
+      agentId: spawnId,
+      spawnId,
+      stream: 'spawn',
+      text: `Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`,
+    });
 
     const childProcess = spawn(cmd, args, {
       cwd: effectiveSpawnConfig.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: this.buildEnvironment(effectiveSpawnConfig),
       shell: false,
+      windowsHide: true,
     });
 
     const stdoutReader = createInterface({ input: childProcess.stdout! });
@@ -293,20 +316,38 @@ export class AgentProcessManager {
     return { requestId, status: 'guidance' };
   }
 
+  async cancelTurn(sessionId: string, requestId?: string): Promise<{ requestId: string; status: 'cancelling' }> {
+    const managed = this.findBySessionId(sessionId);
+    if (!managed) {
+      throw new Error(`No managed agent found for sessionId: ${sessionId}`);
+    }
+    if (managed.status === 'starting') {
+      throw new Error(`Agent ${sessionId} is still starting up`);
+    }
+
+    const activeRequestId = requestId?.trim() || managed.currentRequestId;
+    if (!activeRequestId || managed.status !== 'busy') {
+      throw new AgentNoActiveTurnError(sessionId);
+    }
+
+    await this.writeControlInput(managed, {
+      type: 'cancel_turn',
+      request_id: activeRequestId,
+    });
+
+    return { requestId: activeRequestId, status: 'cancelling' };
+  }
+
   // ── Stop agent ──
 
   stop(sessionId: string): boolean {
     const managed = this.findBySessionId(sessionId);
     if (!managed) return false;
 
-    // Close stdin to signal graceful exit, then kill after timeout
-    managed.process.stdin?.end();
-
-    setTimeout(() => {
-      if (!managed.process.killed) {
-        managed.process.kill('SIGKILL');
-      }
-    }, 5000);
+    void terminateChildProcessTree(managed.process, {
+      label: `agent ${managed.sessionId ?? sessionId}`,
+      gracefulTimeoutMs: 5000,
+    });
 
     return true;
   }
@@ -323,6 +364,67 @@ export class AgentProcessManager {
     return Array.from(this.agents.values())
       .filter(a => a.sessionId !== null)
       .map(a => a.sessionId!);
+  }
+
+  resumeProjectAgents(projectId: string): ProjectAgentResumeResult {
+    const result: ProjectAgentResumeResult = {
+      resumed: [],
+      skipped: [],
+      errors: [],
+    };
+
+    const project = this.registry.projectRegistry.getProject(projectId);
+    if (!project) {
+      result.errors.push({ sessionId: projectId, error: `Project ${projectId} not found` });
+      return result;
+    }
+
+    const agents = this.registry.getAgents()
+      .filter(agent => agent.projectId === projectId);
+
+    for (const agent of agents) {
+      if (!agent.sessionJsonlPath) {
+        result.skipped.push({ sessionId: agent.sessionId, reason: 'missing session path' });
+        continue;
+      }
+      if (this.findBySessionId(agent.sessionId)) {
+        result.skipped.push({ sessionId: agent.sessionId, reason: 'already managed' });
+        continue;
+      }
+      if (this.findBySessionPath(agent.sessionJsonlPath)) {
+        result.skipped.push({ sessionId: agent.sessionId, reason: 'already starting' });
+        continue;
+      }
+      if (agent.status === 'online') {
+        result.skipped.push({ sessionId: agent.sessionId, reason: 'already online' });
+        continue;
+      }
+
+      try {
+        const base = this.getDefaultSpawnConfig();
+        const model = agent.model && agent.model !== 'unknown'
+          ? agent.model
+          : base.model;
+        const { spawnId } = this.spawn({
+          ...base,
+          principalId: agent.principalId || agent.name,
+          model,
+          sessionPath: agent.sessionJsonlPath,
+          projectId: project.projectId,
+          projectRoot: project.projectRoot,
+          cwd: project.projectRoot,
+          appfsMountRoot: project.mountRoot,
+        });
+        result.resumed.push({ sessionId: agent.sessionId, spawnId });
+      } catch (err: unknown) {
+        result.errors.push({
+          sessionId: agent.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return result;
   }
 
   getManagedAgents(): Array<{
@@ -345,6 +447,21 @@ export class AgentProcessManager {
 
   getDefaultSpawnConfig(): SpawnConfig {
     const platformRoot = resolvePlatformRoot();
+    if (process.env.DASHBOARD_AGENT_BIN) {
+      return {
+        cwd: this.registry.dumpDirectory,
+        principalId: 'default',
+        model: process.env.DASHBOARD_AGENT_MODEL ?? 'claude-opus-4-6',
+        permissionMode: process.env.DASHBOARD_AGENT_PERMISSION_MODE ?? 'dangerous',
+        appfsMountRoot: this.registry.dumpDirectory,
+        appfsIdleWake: true,
+        env: {},
+        launchSpec: {
+          kind: 'binary',
+          binaryPath: process.env.DASHBOARD_AGENT_BIN,
+        },
+      };
+    }
     return {
       cwd: this.registry.dumpDirectory,
       principalId: 'default',
@@ -372,6 +489,36 @@ export class AgentProcessManager {
       if (agent.sessionId === sessionId) return agent;
     }
     return null;
+  }
+
+  private findBySessionPath(sessionPath: string): ManagedAgent | null {
+    const target = path.resolve(sessionPath);
+    for (const agent of this.agents.values()) {
+      if (agent.spawnConfig.sessionPath && path.resolve(agent.spawnConfig.sessionPath) === target) {
+        return agent;
+      }
+    }
+    return null;
+  }
+
+  private assertSpawnConfig(config: SpawnConfig): void {
+    const missing: string[] = [];
+    if (!config.cwd?.trim()) missing.push('cwd');
+    if (!config.principalId?.trim()) missing.push('principalId');
+    if (!config.model?.trim()) missing.push('model');
+    if (!config.appfsMountRoot?.trim()) missing.push('appfsMountRoot');
+    if (!config.launchSpec) {
+      missing.push('launchSpec');
+    } else if (config.launchSpec.kind === 'binary') {
+      if (!config.launchSpec.binaryPath?.trim()) missing.push('launchSpec.binaryPath');
+    } else if (config.launchSpec.kind === 'cargo') {
+      if (!config.launchSpec.manifestPath?.trim()) missing.push('launchSpec.manifestPath');
+      if (!config.launchSpec.package?.trim()) missing.push('launchSpec.package');
+    }
+
+    if (missing.length > 0) {
+      throw new SpawnConfigValidationError(`Missing required fields: ${missing.join(', ')}`);
+    }
   }
 
   private writeControlInput(managed: ManagedAgent, payload: Record<string, unknown>): Promise<void> {
@@ -470,6 +617,12 @@ export class AgentProcessManager {
           this.registry.registerAgent(agentInfo);
 
           console.log(`[ProcessManager] Agent ${spawnId} started with sessionId=${sessionId}`);
+          this.eventBus.broadcast('process-log', {
+            agentId: sessionId,
+            spawnId,
+            stream: 'stdout',
+            text: `session_started sessionId=${sessionId} principal=${principalId} sessionPath=${sessionJsonlPath || '<none>'}`,
+          });
 
           this.eventBus.broadcast('agent-online', {
             ...agentInfo,
@@ -592,6 +745,9 @@ export class AgentProcessManager {
       if (config.model.trim()) {
         args.push('--model', config.model.trim());
       }
+      if (config.runtimeModelConfigPath?.trim()) {
+        args.push('--model-config', config.runtimeModelConfigPath.trim());
+      }
       args.push(...this.permissionArgs(config.permissionMode));
       args.push('--headless');
       if (config.appfsIdleWake) {
@@ -607,6 +763,9 @@ export class AgentProcessManager {
     const args = ['--headless'];
     if (config.model.trim()) {
       args.push('--model', config.model.trim());
+    }
+    if (config.runtimeModelConfigPath?.trim()) {
+      args.push('--model-config', config.runtimeModelConfigPath.trim());
     }
     args.push(...this.permissionArgs(config.permissionMode));
     if (config.appfsIdleWake) {
@@ -629,6 +788,26 @@ export class AgentProcessManager {
     };
   }
 
+  private resolveRuntimeModelConfig(config: SpawnConfig, spawnId: string): void {
+    if (config.runtimeModelConfigPath || !this.modelConfigStore) {
+      return;
+    }
+
+    const resolved = this.modelConfigStore.resolveSelection({
+      providerId: config.modelProviderId,
+      modelId: config.modelId,
+      modelName: config.model,
+      contextWindowTokens: config.contextWindowTokens,
+      maxOutputTokens: config.maxOutputTokens,
+    });
+    config.model = resolved.model.name;
+    config.modelProviderId = resolved.providerId;
+    config.modelId = resolved.modelId;
+    config.contextWindowTokens = resolved.model.contextWindowTokens;
+    config.maxOutputTokens = resolved.model.maxOutputTokens;
+    config.runtimeModelConfigPath = this.modelConfigStore.writeRuntimeConfig(resolved, spawnId);
+  }
+
   private permissionArgs(permissionMode: string): string[] {
     const normalized = permissionMode.trim();
     if (!normalized || normalized === 'default') {
@@ -646,18 +825,14 @@ export class AgentProcessManager {
   // ── Shutdown all ──
 
   async shutdown(): Promise<void> {
-    for (const [spawnId, managed] of this.agents.entries()) {
+    const shutdowns = Array.from(this.agents.entries()).map(([spawnId, managed]) => {
       console.log(`[ProcessManager] Shutting down agent ${managed.sessionId ?? spawnId}`);
-      managed.process.stdin?.end();
-      managed.process.kill('SIGTERM');
-    }
-    // Give processes time to exit gracefully
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    for (const [, managed] of this.agents.entries()) {
-      if (!managed.process.killed) {
-        managed.process.kill('SIGKILL');
-      }
-    }
+      return terminateChildProcessTree(managed.process, {
+        label: `agent ${managed.sessionId ?? spawnId}`,
+        gracefulTimeoutMs: 5000,
+      });
+    });
+    await Promise.allSettled(shutdowns);
     this.agents.clear();
   }
 }
@@ -694,5 +869,19 @@ export class AgentBusyError extends Error {
   constructor(sessionId: string) {
     super(`Agent ${sessionId} is currently busy with an active turn`);
     this.name = 'AgentBusyError';
+  }
+}
+
+export class AgentNoActiveTurnError extends Error {
+  constructor(sessionId: string) {
+    super(`Agent ${sessionId} does not have an active turn to cancel`);
+    this.name = 'AgentNoActiveTurnError';
+  }
+}
+
+export class SpawnConfigValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SpawnConfigValidationError';
   }
 }

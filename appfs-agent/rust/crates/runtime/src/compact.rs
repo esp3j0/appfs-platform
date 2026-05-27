@@ -644,6 +644,8 @@ fn create_plan_mode_context_message(
                 parse_tool_result_json_prefix::<CompactPlanModeOutput>(output)
             }
             ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::InputRouter { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
@@ -742,6 +744,8 @@ fn successful_tool_outputs<'a>(
                 ..
             } if !*is_error && block_tool_name == tool_name => Some(output.as_str()),
             ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::InputRouter { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
@@ -811,7 +815,10 @@ fn collect_discovered_tools(messages: &[ConversationMessage]) -> Vec<String> {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } | ContentBlock::InputRouter { .. } => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::InputRouter { .. } => None,
         })
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -935,6 +942,10 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
+        ContentBlock::Thinking { thinking, .. } => {
+            format!("thinking block ({} chars hidden)", thinking.chars().count())
+        }
+        ContentBlock::RedactedThinking { .. } => "redacted thinking block".to_string(),
         ContentBlock::InputRouter { inputs } => render_input_router_block(inputs),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
@@ -996,6 +1007,8 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
         .map(|block| match block {
             ContentBlock::Text { text } => text.as_str(),
             ContentBlock::InputRouter { .. } => "",
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            ContentBlock::RedactedThinking { .. } => "",
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
         })
@@ -1019,6 +1032,8 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
         ContentBlock::InputRouter { .. }
+        | ContentBlock::Thinking { .. }
+        | ContentBlock::RedactedThinking { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
         | ContentBlock::Text { .. } => None,
@@ -1061,12 +1076,14 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+pub(crate) fn estimate_message_tokens(message: &ConversationMessage) -> usize {
     message
         .blocks
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
+            ContentBlock::Thinking { thinking, .. } => thinking.len() / 4 + 1,
+            ContentBlock::RedactedThinking { data } => data.render().len() / 4 + 1,
             ContentBlock::InputRouter { inputs } => render_input_router_block(inputs).len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
@@ -1703,6 +1720,8 @@ mod tests {
             .filter_map(|message| match &message.blocks[0] {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 ContentBlock::InputRouter { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::ToolResult { .. } => None,
             })
@@ -1769,6 +1788,8 @@ mod tests {
         let rendered = match &message.blocks[0] {
             ContentBlock::Text { text } => text,
             ContentBlock::InputRouter { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => {
                 panic!("expected text attachment")

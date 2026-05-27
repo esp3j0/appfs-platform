@@ -8,7 +8,10 @@
     "dev:server": "npm --prefix server run dev",
     "dev:client": "vite",
     "build": "vite build",
-    "start": "npm --prefix server start"
+    "start": "npm --prefix server start",
+    "desktop": "npm --prefix ../desktop run start",
+    "desktop:build": "npm --prefix ../desktop run build",
+    "desktop:test": "npm --prefix ../desktop run test"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",

@@ -30,6 +30,13 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: JsonValue,
+    },
     InputRouter {
         inputs: Vec<InputRouterBlockInput>,
     },
@@ -1356,6 +1363,29 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Thinking {
+                thinking,
+                signature,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
+                object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
+                if let Some(signature) = signature {
+                    object.insert(
+                        "signature".to_string(),
+                        JsonValue::String(signature.clone()),
+                    );
+                }
+            }
+            Self::RedactedThinking { data } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("redacted_thinking".to_string()),
+                );
+                object.insert("data".to_string(), data.clone());
+            }
             Self::InputRouter { inputs } => {
                 object.insert(
                     "type".to_string(),
@@ -1411,6 +1441,19 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                thinking: required_string(object, "thinking")?,
+                signature: object
+                    .get("signature")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+            }),
+            "redacted_thinking" => Ok(Self::RedactedThinking {
+                data: object
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(JsonValue::Object(BTreeMap::new())),
             }),
             "input_router" => {
                 let inputs = object

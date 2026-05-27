@@ -64,9 +64,19 @@ pub trait HookProgressReporter {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HookAbortSignal {
     aborted: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Default for HookAbortSignal {
+    fn default() -> Self {
+        Self {
+            aborted: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 impl HookAbortSignal {
@@ -76,12 +86,25 @@ impl HookAbortSignal {
     }
 
     pub fn abort(&self) {
-        self.aborted.store(true, Ordering::SeqCst);
+        if !self.aborted.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+            self.notify.notify_one();
+        }
     }
 
     #[must_use]
     pub fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_aborted() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 

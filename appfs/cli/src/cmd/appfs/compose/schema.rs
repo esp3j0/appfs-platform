@@ -51,12 +51,20 @@ pub(crate) enum AppfsComposeInitMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppfsComposeConnectorConfig {
+    pub(crate) kind: String,
+    pub(crate) endpoint: String,
+    pub(crate) login_prefix_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppfsComposeConnector {
     pub(crate) mode: AppfsComposeConnectorMode,
     pub(crate) transport: AppfsComposeTransportKind,
     pub(crate) endpoint: String,
     pub(crate) healthcheck: Option<AppfsComposeConnectorHealthcheck>,
     pub(crate) command: Option<AppfsComposeCommand>,
+    pub(crate) config: Option<AppfsComposeConnectorConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,12 +311,46 @@ fn normalize_connector(
         }
     }
 
+    let config = raw
+        .config
+        .map(|config| {
+            if config.kind != "tinode" {
+                anyhow::bail!(
+                    "compose connector {} config.kind must be 'tinode'",
+                    connector_name
+                );
+            }
+            let endpoint = config.endpoint.trim().to_string();
+            if endpoint.is_empty()
+                || !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            {
+                anyhow::bail!(
+                    "compose connector {} config.endpoint must be an http(s) URL",
+                    connector_name
+                );
+            }
+            let login_prefix_template = config.login_prefix_template.trim().to_string();
+            if login_prefix_template.is_empty() {
+                anyhow::bail!(
+                    "compose connector {} config.login_prefix_template cannot be empty",
+                    connector_name
+                );
+            }
+            Ok(AppfsComposeConnectorConfig {
+                kind: config.kind,
+                endpoint,
+                login_prefix_template,
+            })
+        })
+        .transpose()?;
+
     Ok(AppfsComposeConnector {
         mode,
         transport,
         endpoint,
         healthcheck,
         command,
+        config,
     })
 }
 
@@ -764,6 +806,14 @@ enum RawAppfsComposeInitMode {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawAppfsComposeConnectorConfig {
+    kind: String,
+    endpoint: String,
+    login_prefix_template: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAppfsComposeConnector {
     mode: RawAppfsComposeConnectorMode,
     transport: RawAppfsComposeTransportKind,
@@ -772,6 +822,8 @@ struct RawAppfsComposeConnector {
     healthcheck: Option<RawAppfsComposeHealthcheck>,
     #[serde(default)]
     command: Option<RawAppfsComposeCommand>,
+    #[serde(default)]
+    config: Option<RawAppfsComposeConnectorConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1021,6 +1073,38 @@ apps:
             AppfsComposeTransportKind::InProcess
         );
         assert_eq!(tinode_connector.endpoint, "");
+    }
+
+    #[test]
+    fn tinode_compose_config() {
+        let doc = parse_compose_doc(
+            r#"
+version: 1
+runtime:
+  db: .agentfs/demo.db
+  mountpoint: ./mnt/appfs
+  backend: fuse
+connectors:
+  tinode-in-process:
+    mode: in_process
+    transport: in_process
+    config:
+      kind: tinode
+      endpoint: http://101.34.216.193:6060
+      login_prefix_template: dash{compose_run_id}
+apps:
+  tinode:
+    connector: tinode-in-process
+"#,
+            PathBuf::from("/tmp/appfs-compose.yaml"),
+        )
+        .expect("compose should parse");
+
+        let connector = doc.connectors.get("tinode-in-process").expect("connector");
+        let config = connector.config.as_ref().expect("config");
+        assert_eq!(config.kind, "tinode");
+        assert_eq!(config.endpoint, "http://101.34.216.193:6060");
+        assert_eq!(config.login_prefix_template, "dash{compose_run_id}");
     }
 
     #[test]

@@ -245,7 +245,7 @@ Examples:
 1. 哪个 app 收到了事件。
 2. 哪个 principal 收到了事件。
 3. 这条事件是 action 结果还是外部用户发来的消息。
-4. 是否需要继续行动或只向用户汇报。
+4. 是否需要继续行动或只向用户汇报；是否需要通过 Tinode 回复应由 `requires_response` 等路由元数据控制，而不是仅靠消息正文推断。
 
 ## Skill Requirements
 

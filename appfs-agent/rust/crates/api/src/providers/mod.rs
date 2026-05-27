@@ -269,8 +269,19 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     }
 }
 
+#[must_use]
+pub fn effective_model_token_limit(request: &MessageRequest) -> Option<ModelTokenLimit> {
+    request
+        .context_window_tokens
+        .map(|context_window_tokens| ModelTokenLimit {
+            max_output_tokens: request.max_tokens,
+            context_window_tokens,
+        })
+        .or_else(|| model_token_limit(&request.model))
+}
+
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
-    let Some(limit) = model_token_limit(&request.model) else {
+    let Some(limit) = effective_model_token_limit(request) else {
         return Ok(());
     };
 
@@ -439,9 +450,9 @@ mod tests {
 
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        effective_model_token_limit, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_token_limit, parse_dotenv,
+        preflight_message_request, resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -688,6 +699,30 @@ mod tests {
         preflight_message_request(&request)
             .expect("models without context metadata should skip the guarded preflight");
         assert_eq!(model_token_limit("gpt-4.1"), None);
+    }
+
+    #[test]
+    fn preflight_uses_request_context_window_override_for_unknown_models() {
+        let request = MessageRequest {
+            model: "custom-model".to_string(),
+            max_tokens: 64_000,
+            context_window_tokens: Some(80_000),
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::Text {
+                    text: "x".repeat(600_000),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let limit = effective_model_token_limit(&request).expect("override should produce limit");
+        assert_eq!(limit.context_window_tokens, 80_000);
+
+        let error = preflight_message_request(&request)
+            .expect_err("override should make custom-model enforce context preflight");
+        assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
     }
 
     #[test]

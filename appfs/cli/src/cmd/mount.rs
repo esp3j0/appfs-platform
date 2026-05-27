@@ -138,6 +138,7 @@ fn appfs_mount_runtime_args(args: &MountArgs) -> Result<Vec<AppfsRuntimeCliArgs>
             adapter_bridge_circuit_breaker_failures: args.adapter_bridge_circuit_breaker_failures,
             adapter_bridge_circuit_breaker_cooldown_ms: args
                 .adapter_bridge_circuit_breaker_cooldown_ms,
+            connector_config: None,
         },
         None,
     )

@@ -17,7 +17,7 @@ use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit,
+    anthropic_missing_credentials, effective_model_token_limit,
     preflight_message_request as estimate_preflight_message_request, resolve_model_alias, Provider,
     ProviderFuture,
 };
@@ -499,7 +499,7 @@ impl AnthropicClient {
         // round trip.
         super::preflight_message_request(request)?;
 
-        let Some(limit) = model_token_limit(&request.model) else {
+        let Some(limit) = effective_model_token_limit(request) else {
             return Ok(());
         };
 
@@ -1625,6 +1625,50 @@ mod tests {
         assert_eq!(
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn rendered_request_body_preserves_thinking_blocks() {
+        let client = AnthropicClient::new("test-key");
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 64,
+            messages: vec![crate::types::InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    crate::types::InputContentBlock::Thinking {
+                        thinking: "hidden reasoning".to_string(),
+                        signature: Some("sig-1".to_string()),
+                    },
+                    crate::types::InputContentBlock::ToolUse {
+                        id: "tool_1".to_string(),
+                        name: "Skill".to_string(),
+                        input: serde_json::json!({"skill":"appfs-tinode"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let mut rendered = client
+            .request_profile()
+            .render_json_body(&request)
+            .expect("body should render");
+        super::strip_unsupported_beta_body_fields(&mut rendered);
+
+        assert_eq!(
+            rendered["messages"][0]["content"][0]["type"],
+            serde_json::json!("thinking")
+        );
+        assert_eq!(
+            rendered["messages"][0]["content"][0]["thinking"],
+            serde_json::json!("hidden reasoning")
+        );
+        assert_eq!(
+            rendered["messages"][0]["content"][0]["signature"],
+            serde_json::json!("sig-1")
         );
     }
 

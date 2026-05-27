@@ -44,6 +44,14 @@ pub(crate) fn build_registry_doc_from_resolved_apps(
                         .unwrap_or_else(|| now.clone()),
                     active_scope: None,
                     inbound_poll_ms: nonzero_u64(app.inbound_poll_ms),
+                    connector_config: app.connector_config.as_ref().map(|c| {
+                        registry::AppfsRegistryConnectorConfig {
+                            kind: c.kind.clone(),
+                            endpoint: c.endpoint.clone(),
+                            login_prefix: c.login_prefix_template.clone(),
+                            credential_policy: app.credential_policy.clone(),
+                        }
+                    }),
                 }
             })
             .collect(),
@@ -81,6 +89,14 @@ pub(crate) fn build_app_policy_registry_doc_from_resolved_apps(
                     profile_template: app.profile_template.clone(),
                     credential_policy: app.credential_policy.clone(),
                     inbound_poll_ms: nonzero_u64(app.inbound_poll_ms),
+                    connector_config: app.connector_config.as_ref().map(|c| {
+                        registry::AppfsRegistryConnectorConfig {
+                            kind: c.kind.clone(),
+                            endpoint: c.endpoint.clone(),
+                            login_prefix: c.login_prefix_template.clone(),
+                            credential_policy: app.credential_policy.clone(),
+                        }
+                    }),
                 }
             })
             .collect(),
@@ -177,7 +193,8 @@ mod tests {
     };
     use crate::cmd::appfs::compose::connector_supervisor::ResolvedComposeApp;
     use crate::cmd::appfs::compose::schema::{
-        AppfsComposeAppTransport, AppfsComposeAppVisibility, AppfsComposeTransportKind,
+        AppfsComposeAppTransport, AppfsComposeAppVisibility, AppfsComposeConnectorConfig,
+        AppfsComposeTransportKind,
     };
     use crate::cmd::appfs::{registry, resolve_runtime_cli_args};
     use std::collections::BTreeMap;
@@ -195,6 +212,7 @@ mod tests {
         profile_template: Option<&str>,
         credential_policy: Option<&str>,
         inbound_poll_ms: u64,
+        connector_config: Option<AppfsComposeConnectorConfig>,
     ) -> ResolvedComposeApp {
         ResolvedComposeApp {
             app_id: app_id.to_string(),
@@ -209,6 +227,7 @@ mod tests {
             profile_template: profile_template.map(str::to_string),
             credential_policy: credential_policy.map(str::to_string),
             inbound_poll_ms,
+            connector_config,
         }
     }
 
@@ -229,6 +248,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
             ),
         );
 
@@ -258,6 +278,7 @@ mod tests {
                     registered_at: "2026-04-01T00:00:00Z".to_string(),
                     active_scope: Some("chat-001".to_string()),
                     inbound_poll_ms: None,
+                    connector_config: None,
                 },
                 registry::AppfsRegisteredAppDoc {
                     instance_id: "stale".to_string(),
@@ -282,6 +303,7 @@ mod tests {
                     registered_at: "2026-04-02T00:00:00Z".to_string(),
                     active_scope: Some("stale-scope".to_string()),
                     inbound_poll_ms: None,
+                    connector_config: None,
                 },
             ],
         };
@@ -315,6 +337,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
             ),
         );
         resolved_apps.insert(
@@ -331,6 +354,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
             ),
         );
 
@@ -385,6 +409,7 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
             ),
         );
         resolved_apps.insert(
@@ -401,6 +426,7 @@ mod tests {
                 Some("tinode:{principal_id}"),
                 Some("auto-create"),
                 1_000,
+                None,
             ),
         );
 
@@ -434,5 +460,49 @@ mod tests {
         );
         assert_eq!(tinode.credential_policy.as_deref(), Some("auto-create"));
         assert_eq!(tinode.inbound_poll_ms, Some(1_000));
+    }
+
+    #[test]
+    fn tinode_connector_config_resolution() {
+        use crate::cmd::appfs::compose::connector_supervisor::ComposeConnectorSupervisor;
+        use crate::cmd::appfs::compose::schema::parse_compose_doc;
+        use std::path::PathBuf;
+
+        let yaml = r#"
+version: 1
+runtime:
+  db: demo.db
+  mountpoint: mnt
+  backend: fuse
+connectors:
+  tinode-in-process:
+    mode: in_process
+    transport: in_process
+    config:
+      kind: tinode
+      endpoint: http://127.0.0.1:6060
+      login_prefix_template: dash{compose_run_id}
+apps:
+  tinode:
+    connector: tinode-in-process
+    visibility: private
+    path_template: private/{principal_id}/tinode
+    profile_template: tinode:{principal_id}
+    credential_policy: auto-create
+    inbound_poll_ms: 1000
+"#;
+        let compose = parse_compose_doc(yaml, PathBuf::from("appfs-compose.yaml")).unwrap();
+        let (_supervisor, resolved) =
+            ComposeConnectorSupervisor::resolve_apps(&compose, None).unwrap();
+
+        let policy_registry = build_app_policy_registry_doc_from_resolved_apps(&resolved);
+        assert_eq!(policy_registry.apps.len(), 1);
+        let tinode = &policy_registry.apps[0];
+        let config = tinode.connector_config.as_ref().expect("connector_config");
+        assert_eq!(config.kind, "tinode");
+        assert_eq!(config.endpoint, "http://127.0.0.1:6060");
+        assert!(!config.login_prefix.contains("{compose_run_id}"));
+        assert!(config.login_prefix.starts_with("dash"));
+        assert_eq!(config.login_prefix.len(), 12); // "dash" + 8 chars of run_id
     }
 }

@@ -52,6 +52,7 @@ pub(super) fn persist_runtime_registry(
                     .unwrap_or_else(|| now.clone()),
                 active_scope: read_active_scope(&snapshot.app_dir),
                 inbound_poll_ms: nonzero_u64(snapshot.metadata.inbound_poll_ms),
+                connector_config: snapshot.metadata.connector_config.clone(),
             })
             .collect(),
     };
@@ -80,6 +81,7 @@ pub(super) fn register_request_to_runtime(
             registered_at: chrono::Utc::now().to_rfc3339(),
             active_scope: None,
             inbound_poll_ms: None,
+            connector_config: None,
         }],
     };
     let mut runtimes = resolve_runtime_cli_args(registry::runtime_args_from_registry(&doc)?);

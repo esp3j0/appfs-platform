@@ -1230,6 +1230,7 @@ mod tests {
             adapter_bridge_max_backoff_ms: 1_000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+            connector_config: None,
         });
 
         super::ensure_app_structure_initialized_in_db(
@@ -1311,6 +1312,7 @@ mod tests {
             adapter_bridge_max_backoff_ms: 1_000,
             adapter_bridge_circuit_breaker_failures: 5,
             adapter_bridge_circuit_breaker_cooldown_ms: 3_000,
+            connector_config: None,
         });
 
         super::ensure_app_structure_initialized_in_db(

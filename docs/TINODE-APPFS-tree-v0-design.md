@@ -359,7 +359,7 @@ Optional fields:
 Rules:
 
 1. `text` is required.
-2. `requires_response` is optional and must be a JSON boolean (`true` or `false`), not a string. Set it to `true` when the sender wants the recipient to continue the conversation or confirm receipt. Set it to `false` when the sender does not expect a Tinode reply. Omit it when the reply expectation should be inferred from content. This field does not suppress `message.received` wakeups; it only controls the receiver reminder's reply guidance.
+2. `requires_response` is optional and must be a JSON boolean (`true` or `false`), not a string. Set it to `true` when the sender wants the recipient to continue the conversation or confirm receipt. Set it to `false` when the sender does not expect a Tinode reply. Omit it only when no explicit reply request is being sent; receivers should not auto-reply solely because an external message arrived without this field. This field does not suppress `message.received` wakeups; it only controls the receiver reminder's reply guidance.
 3. Credentials are auto-created on first use if missing.
 4. The connector sends as the current app instance `profile_id`.
 5. The action result must produce `action.completed` or `action.failed`.
@@ -716,7 +716,7 @@ Practical rules:
 2. If the agent is offline or just attached, surface unread counts and recent inbox items first.
 3. Use full message history only when the current task needs prior context or a specific thread recap.
 4. `inbox.updated` is bookkeeping. It should not be treated as a standalone wake signal.
-5. `message.received` with `requires_attention=true` is the signal that should wake the agent. `requires_response=false` must still wake the agent; it only tells the receiver that no Tinode reply is expected.
+5. `message.received` with `requires_attention=true` is the signal that should wake the agent. `requires_response=false` must still wake the agent; it only tells the receiver that no Tinode reply is expected. Missing `requires_response` is treated as "no explicit Tinode reply requested" by the model-facing reminder.
 6. `delete_principal.act` may trigger `_app/forget_credentials.act` on affected private Tinode app instances so connector-private credential state is actually cleaned up, not merely requested.
 7. The model should treat `inbox/` as a summary and triage layer, not as the primary live input stream.
 8. The model should treat `messages.res.jsonl` as archive/history, not as a replacement for the event stream.

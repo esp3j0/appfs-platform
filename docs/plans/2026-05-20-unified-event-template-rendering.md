@@ -46,7 +46,7 @@ Preferred schema:
   "model_render": {
     "mode": "body_with_source_reminder",
     "body_template": "{{message.body}}",
-    "source_template": "来源：{{app.display_name}}，from={{message.sender}}，contact_key={{content.contact_key}}，seq={{seq}}"
+    "source_template": "来源：{{app.display_name}}，from={{message.sender}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
   },
   "terminal_render": {
     "mode": "card",
@@ -678,4 +678,3 @@ git commit -m "Document target-specific AppFS event rendering"
 
 - **Risk:** CLI tests are hard to isolate because rendering lives in `main.rs`.
   - **Mitigation:** Keep the first implementation minimal; if tests become awkward, extract `appfs_event_card_lines` helpers into a small module in a follow-up.
-

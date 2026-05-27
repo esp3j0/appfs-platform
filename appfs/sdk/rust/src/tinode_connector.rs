@@ -128,6 +128,38 @@ impl TinodeConnectorConfig {
         )
     }
 
+    pub fn from_registry(
+        endpoint: impl Into<String>,
+        login_prefix: impl Into<String>,
+        credential_policy: Option<impl Into<String>>,
+    ) -> std::result::Result<Self, ConnectorError> {
+        let api_key =
+            std::env::var("APPFS_TINODE_API_KEY").unwrap_or_else(|_| DEFAULT_TINODE_API_KEY.into());
+        let account_password = std::env::var("APPFS_TINODE_ACCOUNT_PASSWORD")
+            .unwrap_or_else(|_| DEFAULT_TINODE_ACCOUNT_PASSWORD.into());
+        let protocol_version = std::env::var("APPFS_TINODE_PROTOCOL_VERSION")
+            .unwrap_or_else(|_| DEFAULT_TINODE_PROTOCOL_VERSION.into());
+        let request_timeout_ms = std::env::var("APPFS_TINODE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TINODE_TIMEOUT_MS);
+
+        let resolved_credential_policy = credential_policy
+            .map(|p| p.into())
+            .or_else(|| std::env::var("APPFS_TINODE_CREDENTIAL_POLICY").ok())
+            .unwrap_or_else(|| TINODE_CREDENTIAL_POLICY_AUTO_CREATE.to_string());
+
+        Self::with_options(
+            endpoint,
+            resolved_credential_policy,
+            login_prefix,
+            api_key,
+            account_password,
+            protocol_version,
+            request_timeout_ms,
+        )
+    }
+
     fn validate(mut self) -> std::result::Result<Self, ConnectorError> {
         self.endpoint = self.endpoint.trim().trim_end_matches('/').to_string();
         self.credential_policy = self.credential_policy.trim().to_string();
@@ -470,7 +502,7 @@ impl TinodeConnector {
                     "model_render": {
                         "mode": "body_with_source_reminder",
                         "body_template": "{{content.text}}",
-                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
                     }
                 },
                 "message.sent": {
@@ -4101,6 +4133,27 @@ mod tests {
         .expect("tinode config")
     }
 
+    #[test]
+    fn config_from_registry_works() {
+        let config = TinodeConnectorConfig::from_registry(
+            "http://127.0.0.1:6060",
+            "dash123456",
+            Some("auto-create"),
+        )
+        .unwrap();
+        assert_eq!(config.endpoint, "http://127.0.0.1:6060");
+        assert_eq!(config.login_prefix, "dash123456");
+        assert_eq!(config.credential_policy, "auto-create");
+
+        let config_env = TinodeConnectorConfig::from_registry(
+            "http://127.0.0.1:6060",
+            "dash123456",
+            None::<String>,
+        )
+        .unwrap();
+        assert_eq!(config_env.credential_policy, "auto-create");
+    }
+
     fn ctx() -> ConnectorContext {
         ConnectorContext {
             app_id: "tinode".to_string(),
@@ -4514,6 +4567,10 @@ mod tests {
         assert_eq!(
             events_doc["events"]["message.received"]["model_render"]["body_template"],
             "{{content.text}}"
+        );
+        assert_eq!(
+            events_doc["events"]["message.received"]["model_render"]["source_template"],
+            "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
         );
         assert_eq!(
             events_doc["events"]["inbox.updated"]["model_render"]["mode"],

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { projectMountRoot, resolveProjectComposePath } from './compose-policy.js';
 
 export interface ProjectRecord {
   projectId: string;
@@ -52,21 +53,27 @@ export function walkProjectDirectory(dir: string): string[] {
 export class ProjectRegistry {
   private projects = new Map<string, ProjectRecord>();
 
+  private resolveComposePath(projectRoot: string): string {
+    return resolveProjectComposePath(projectRoot);
+  }
+
   registerProject(projectRoot: string): ProjectRecord {
     const normalizedRoot = path.resolve(path.normalize(projectRoot));
     const projectId = generateProjectId(normalizedRoot);
 
     const existing = this.projects.get(projectId);
     if (existing) {
+      existing.composeFilePath = this.resolveComposePath(normalizedRoot);
       return existing;
     }
 
-    const mountRoot = path.join(normalizedRoot, '.appfs');
+    const mountRoot = projectMountRoot(normalizedRoot);
+    const composeFilePath = this.resolveComposePath(normalizedRoot);
 
     const record: ProjectRecord = {
       projectId,
       projectRoot: normalizedRoot,
-      composeFilePath: path.join(normalizedRoot, '.appfs-compose.yaml'),
+      composeFilePath,
       mountRoot,
       status: 'stopped',
       agentSessionIds: [],
@@ -78,17 +85,29 @@ export class ProjectRegistry {
   }
 
   getProject(projectId: string): ProjectRecord | undefined {
-    return this.projects.get(projectId);
+    const project = this.projects.get(projectId);
+    if (project) {
+      project.composeFilePath = this.resolveComposePath(project.projectRoot);
+    }
+    return project;
   }
 
   getProjectByRoot(projectRoot: string): ProjectRecord | undefined {
     const normalizedRoot = path.resolve(path.normalize(projectRoot));
     const projectId = generateProjectId(normalizedRoot);
-    return this.projects.get(projectId);
+    const project = this.projects.get(projectId);
+    if (project) {
+      project.composeFilePath = this.resolveComposePath(project.projectRoot);
+    }
+    return project;
   }
 
   getProjects(): ProjectRecord[] {
-    return Array.from(this.projects.values());
+    const list = Array.from(this.projects.values());
+    for (const project of list) {
+      project.composeFilePath = this.resolveComposePath(project.projectRoot);
+    }
+    return list;
   }
 
   removeProject(projectId: string): boolean {

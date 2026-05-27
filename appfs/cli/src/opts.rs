@@ -708,6 +708,18 @@ pub enum AppfsComposeCommand {
         )]
         file: Option<PathBuf>,
     },
+    /// Validate compose file schema and syntax without running it
+    Validate {
+        /// Optional compose file path.
+        /// Defaults to appfs-compose.yaml / appfs-compose.yml in the current directory.
+        #[arg(
+            short = 'f',
+            long = "file",
+            value_name = "FILE",
+            add = ArgValueCompleter::new(PathCompleter::file())
+        )]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
