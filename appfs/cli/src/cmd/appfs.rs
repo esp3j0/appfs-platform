@@ -1218,6 +1218,13 @@ fn print_glob_query_text(result: &AgentFsGlobQueryResult) {
     }
 }
 
+pub async fn handle_appfs_compose_validate_command(compose_path: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    let _compose_doc = compose::loader::load_compose_doc(compose_path.as_deref(), &cwd)?;
+    println!("AppFS compose file is valid.");
+    Ok(())
+}
+
 pub async fn handle_appfs_compose_up_command(compose_path: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     let compose_doc = compose::loader::load_compose_doc(compose_path.as_deref(), &cwd)?;

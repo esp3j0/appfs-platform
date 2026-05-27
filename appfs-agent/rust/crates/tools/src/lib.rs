@@ -108,6 +108,8 @@ fn conversation_message_text(message: &ConversationMessage) -> String {
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
             ContentBlock::InputRouter { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
             | ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. } => None,
         })
@@ -4623,8 +4625,14 @@ async fn stream_with_provider(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    if !thinking.is_empty() {
+                        events.push(AssistantEvent::ThinkingDelta(thinking));
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { signature } => {
+                    events.push(AssistantEvent::ThinkingSignature(signature));
+                }
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
@@ -5446,6 +5454,19 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    },
+                    ContentBlock::RedactedThinking { data } => {
+                        InputContentBlock::RedactedThinking {
+                            data: serde_json::from_str(&data.render())
+                                .unwrap_or(serde_json::Value::Null),
+                        }
+                    }
                     ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
                         text: render_input_router_block(inputs),
                     },
@@ -5508,7 +5529,20 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta(thinking));
+            }
+            if let Some(signature) = signature {
+                events.push(AssistantEvent::ThinkingSignature(signature));
+            }
+        }
+        OutputContentBlock::RedactedThinking { data } => {
+            events.push(AssistantEvent::RedactedThinking(data));
+        }
     }
 }
 

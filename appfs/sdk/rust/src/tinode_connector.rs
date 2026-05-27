@@ -502,7 +502,7 @@ impl TinodeConnector {
                     "model_render": {
                         "mode": "body_with_source_reminder",
                         "body_template": "{{content.text}}",
-                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+                        "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
                     }
                 },
                 "message.sent": {
@@ -4567,6 +4567,10 @@ mod tests {
         assert_eq!(
             events_doc["events"]["message.received"]["model_render"]["body_template"],
             "{{content.text}}"
+        );
+        assert_eq!(
+            events_doc["events"]["message.received"]["model_render"]["source_template"],
+            "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
         );
         assert_eq!(
             events_doc["events"]["inbox.updated"]["model_render"]["mode"],

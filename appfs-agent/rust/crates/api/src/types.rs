@@ -30,6 +30,10 @@ pub struct MessageRequest {
     /// Accepted values include `"low"`, `"medium"`, and `"high"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Optional runtime override for local context-window preflight. This is
+    /// intentionally not serialized into provider payloads.
+    #[serde(skip)]
+    pub context_window_tokens: Option<u32>,
 }
 
 impl MessageRequest {
@@ -79,6 +83,15 @@ impl InputMessage {
 pub enum InputContentBlock {
     Text {
         text: String,
+    },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: Value,
     },
     ToolUse {
         id: String,

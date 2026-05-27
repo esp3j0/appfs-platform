@@ -1225,7 +1225,10 @@ pub fn scan_appfs_attention_events_for_idle_wake(
     for stream in streams {
         let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
         if let Some(max_seq) = stream_max_seq {
-            match session.appfs_wake_event_cursor(&stream.stream_id) {
+            match effective_appfs_stream_cursor(
+                session.appfs_wake_event_cursor(&stream.stream_id),
+                Some(max_seq),
+            ) {
                 Some(last_seq) if max_seq <= last_seq => continue,
                 None => {
                     // First idle scan establishes a wake baseline so an agent
@@ -1246,11 +1249,18 @@ pub fn scan_appfs_attention_events_for_idle_wake(
         let max_seq = stream_max_seq
             .or_else(|| records.iter().map(|record| record.seq).max())
             .unwrap_or(0);
-        match session.appfs_wake_event_cursor(&stream.stream_id) {
+        let model_cursor = session.appfs_event_cursor(&stream.stream_id);
+        let model_cursor_rewound = appfs_stream_cursor_rewound(model_cursor, Some(max_seq));
+        match effective_appfs_stream_cursor(
+            session.appfs_wake_event_cursor(&stream.stream_id),
+            Some(max_seq),
+        ) {
             Some(last_seq) => {
                 if max_seq > last_seq {
                     wake_cursor_updates.insert(stream.stream_id.clone(), max_seq);
-                    if session.appfs_event_cursor(&stream.stream_id).is_none() {
+                    if model_cursor_rewound {
+                        model_cursor_baselines.insert(stream.stream_id.clone(), max_seq);
+                    } else if model_cursor.is_none() {
                         model_cursor_baselines.insert(stream.stream_id.clone(), last_seq);
                     }
                 }
@@ -1325,7 +1335,10 @@ fn collect_pending_inputs_from_appfs_environment(
     for stream in streams {
         let stream_max_seq = read_appfs_stream_max_seq_hint(&stream);
         if let Some(max_seq) = stream_max_seq {
-            match session.appfs_event_cursor(&stream.stream_id) {
+            match effective_appfs_stream_cursor(
+                session.appfs_event_cursor(&stream.stream_id),
+                Some(max_seq),
+            ) {
                 Some(last_seq) if max_seq <= last_seq => continue,
                 None => {
                     // First attach establishes a baseline so old event backlog does not
@@ -1343,11 +1356,19 @@ fn collect_pending_inputs_from_appfs_environment(
         let max_seq = stream_max_seq
             .or_else(|| records.iter().map(|record| record.seq).max())
             .unwrap_or(0);
-        match session.appfs_event_cursor(&stream.stream_id) {
+        match effective_appfs_stream_cursor(
+            session.appfs_event_cursor(&stream.stream_id),
+            Some(max_seq),
+        ) {
             Some(last_seq) => {
                 if max_seq > last_seq {
                     cursor_updates.insert(stream.stream_id.clone(), max_seq);
                 }
+                let wake_last_seq = effective_appfs_stream_cursor(
+                    session.appfs_wake_event_cursor(&stream.stream_id),
+                    Some(max_seq),
+                )
+                .unwrap_or_default();
                 for record in records.into_iter().filter(|record| record.seq > last_seq) {
                     let event_metadata = event_render_metadata_for(&render_metadata, &record);
                     let classification =
@@ -1360,10 +1381,7 @@ fn collect_pending_inputs_from_appfs_environment(
                         continue;
                     };
                     if matches!(classification.idle_delivery, AppfsDeliveryMode::WakeIfIdle)
-                        && record.seq
-                            > session
-                                .appfs_wake_event_cursor(&stream.stream_id)
-                                .unwrap_or_default()
+                        && record.seq > wake_last_seq
                     {
                         wake_cursor_updates
                             .entry(stream.stream_id.clone())
@@ -1385,6 +1403,24 @@ fn collect_pending_inputs_from_appfs_environment(
         pending_inputs,
         cursor_updates,
         wake_cursor_updates,
+    }
+}
+
+fn appfs_stream_cursor_rewound(stored_cursor: Option<i64>, stream_max_seq: Option<i64>) -> bool {
+    matches!(
+        (stored_cursor, stream_max_seq),
+        (Some(stored), Some(max_seq)) if max_seq < stored
+    )
+}
+
+fn effective_appfs_stream_cursor(
+    stored_cursor: Option<i64>,
+    stream_max_seq: Option<i64>,
+) -> Option<i64> {
+    if appfs_stream_cursor_rewound(stored_cursor, stream_max_seq) {
+        Some(0)
+    } else {
+        stored_cursor
     }
 }
 
@@ -2300,6 +2336,11 @@ fn render_event_reply_hint(
     requires_response: Option<bool>,
     contact_key: Option<&str>,
 ) -> String {
+    let app_reply_name = if app_id == Some("tinode") {
+        "Tinode".to_string()
+    } else {
+        app_name.to_string()
+    };
     let reply_target = if app_id == Some("tinode") {
         match contact_key {
             Some(contact_key) => format!(
@@ -2313,10 +2354,14 @@ fn render_event_reply_hint(
     };
 
     match requires_response {
-        Some(true) => format!("发送方明确要求继续回应。{reply_target}"),
-        Some(false) => "发送方未要求继续回应；请处理并吸收上面的消息，不需要再通过 Tinode 回复发送方。".to_string(),
+        Some(true) => {
+            format!("回复策略：AppFS 路由元数据 requires_response=true；{reply_target}")
+        }
+        Some(false) => format!(
+            "回复策略：AppFS 路由元数据 requires_response=false；不需要再通过 {app_reply_name} 回复发送方。"
+        ),
         None => format!(
-            "请判断上面的消息是否需要行动或回复。若它包含任务、问题、请求、需要确认或协作推进，{reply_target}"
+            "回复策略：AppFS 路由元数据未声明需要回复；不要仅因这条外部消息到达而自动通过 {app_reply_name} 回复。"
         ),
     }
 }
@@ -5222,6 +5267,67 @@ PY"#,
     }
 
     #[test]
+    fn scan_appfs_attention_events_for_idle_wake_handles_recreated_stream_seq() {
+        let temp = TempDirGuard::new("appfs-idle-wake-recreated-stream");
+        let mount_root = temp.path().join("mnt");
+        seed_private_principal_mount(&mount_root);
+        let events_path = mount_root
+            .join("private")
+            .join("default")
+            .join("tinode")
+            .join("_stream")
+            .join("events.evt.jsonl");
+        let cursor_path = events_path
+            .parent()
+            .expect("events path parent")
+            .join("cursor.res.json");
+
+        let mut session = Session::new();
+        session
+            .update_appfs_event_cursors([("app:tinode--default".to_string(), 8)])
+            .expect("seed model cursor");
+        session
+            .update_appfs_wake_event_cursors([("app:tinode--default".to_string(), 10)])
+            .expect("seed wake cursor");
+
+        fs::write(
+            &events_path,
+            concat!(
+                r#"{"seq":1,"type":"profile.credentials.ready","app":"tinode","path":"/_app/ensure_credentials.act"}"#,
+                "\n",
+                r#"{"seq":2,"type":"message.received","app":"tinode","path":"contacts/default/messages.res.jsonl","content":{"requires_attention":true,"text_preview":"after restart"}}"#,
+                "\n",
+                r#"{"seq":3,"type":"inbox.updated","app":"tinode","path":"inbox/unread.res.jsonl","content":{"unread_count":1}}"#,
+                "\n"
+            ),
+        )
+        .expect("write recreated stream events");
+        fs::write(&cursor_path, r#"{"max_seq":3}"#).expect("write recreated cursor");
+
+        let wake = scan_appfs_attention_events_for_idle_wake(&mut session, &mount_root)
+            .expect("wake scan after stream recreation");
+        assert_eq!(wake.wake_event_count, 1);
+        assert_eq!(wake.pending_inputs.len(), 1);
+        assert_eq!(
+            wake.pending_inputs[0].envelope.input_type,
+            "message.received"
+        );
+        assert!(wake.pending_inputs[0]
+            .envelope
+            .text
+            .contains("after restart"));
+        assert_eq!(
+            session.appfs_wake_event_cursor("app:tinode--default"),
+            Some(3)
+        );
+        assert_eq!(
+            session.appfs_event_cursor("app:tinode--default"),
+            Some(3),
+            "idle wake should reset stale cursors to the recreated stream generation"
+        );
+    }
+
+    #[test]
     fn running_boundary_attention_input_does_not_wake_again_when_turn_goes_idle() {
         let temp = TempDirGuard::new("appfs-running-boundary-idle-wake");
         let mount_root = temp.path().join("mnt");
@@ -5764,8 +5870,9 @@ PY"#,
         assert!(reminder.contains("contact_key=code-implementer"));
         assert!(reminder.contains("seq=1"));
         assert!(!reminder.contains("如果需要回复"));
-        assert!(reminder.contains("请判断上面的消息是否需要行动或回复"));
-        assert!(reminder.contains("通过 Tinode 回复 contact_key=code-implementer"));
+        assert!(reminder.contains("回复策略：AppFS 路由元数据未声明需要回复"));
+        assert!(reminder.contains("不要仅因这条外部消息到达而自动通过 Tinode 回复"));
+        assert!(!reminder.contains("通过 Tinode 回复 contact_key=code-implementer"));
         assert!(!reminder.contains("不要自动回复，避免 agent 间循环"));
         assert!(reminder.contains("please implement this"));
         assert!(reminder.contains("message sent"));

@@ -1168,6 +1168,11 @@ fn render_reply_hint(
     requires_response: Option<bool>,
     contact_key: Option<&str>,
 ) -> String {
+    let app_reply_name = if app_id == Some("tinode") {
+        "Tinode".to_string()
+    } else {
+        app_name.to_string()
+    };
     let reply_target = if app_id == Some("tinode") {
         match contact_key {
             Some(contact_key) => format!(
@@ -1181,10 +1186,14 @@ fn render_reply_hint(
     };
 
     match requires_response {
-        Some(true) => format!("发送方明确要求继续回应。{reply_target}"),
-        Some(false) => "发送方未要求继续回应；请处理并吸收上面的消息，不需要再通过 Tinode 回复发送方。".to_string(),
+        Some(true) => {
+            format!("回复策略：AppFS 路由元数据 requires_response=true；{reply_target}")
+        }
+        Some(false) => format!(
+            "回复策略：AppFS 路由元数据 requires_response=false；不需要再通过 {app_reply_name} 回复发送方。"
+        ),
         None => format!(
-            "请判断上面的消息是否需要行动或回复。若它包含任务、问题、请求、需要确认或协作推进，{reply_target}"
+            "回复策略：AppFS 路由元数据未声明需要回复；不要仅因这条外部消息到达而自动通过 {app_reply_name} 回复。"
         ),
     }
 }
@@ -1369,8 +1378,9 @@ mod tests {
         assert!(reminder.contains("contact_key=default"));
         assert!(reminder.contains("seq=7"));
         assert!(!reminder.contains("如果需要回复"));
-        assert!(reminder.contains("请判断上面的消息是否需要行动或回复"));
-        assert!(reminder.contains("通过 Tinode 回复 contact_key=default"));
+        assert!(reminder.contains("回复策略：AppFS 路由元数据未声明需要回复"));
+        assert!(reminder.contains("不要仅因这条外部消息到达而自动通过 Tinode 回复"));
+        assert!(!reminder.contains("通过 Tinode 回复 contact_key=default"));
         assert!(!reminder.contains("不要自动回复，避免 agent 间循环"));
         assert!(!reminder.contains("不要重复执行已完成的发送动作"));
         assert!(!reminder.contains("do not repeat completed actions"));
@@ -1416,18 +1426,18 @@ mod tests {
         }
 
         let required = reminder_for_requires_response(Some(true));
-        assert!(required.contains("发送方明确要求继续回应"));
+        assert!(required.contains("回复策略：AppFS 路由元数据 requires_response=true"));
         assert!(required.contains("通过 Tinode 回复 contact_key=default"));
 
         let not_required = reminder_for_requires_response(Some(false));
-        assert!(not_required.contains("发送方未要求继续回应"));
-        assert!(not_required.contains("请处理并吸收上面的消息"));
+        assert!(not_required.contains("回复策略：AppFS 路由元数据 requires_response=false"));
         assert!(not_required.contains("不需要再通过 Tinode 回复发送方"));
         assert!(!not_required.contains("通过 Tinode 回复 contact_key=default"));
 
         let unspecified = reminder_for_requires_response(None);
-        assert!(unspecified.contains("请判断上面的消息是否需要行动或回复"));
-        assert!(unspecified.contains("通过 Tinode 回复 contact_key=default"));
+        assert!(unspecified.contains("回复策略：AppFS 路由元数据未声明需要回复"));
+        assert!(unspecified.contains("不要仅因这条外部消息到达而自动通过 Tinode 回复"));
+        assert!(!unspecified.contains("通过 Tinode 回复 contact_key=default"));
     }
 
     #[test]
@@ -1537,7 +1547,7 @@ mod tests {
             "model_render": {
                 "mode": "body_with_source_reminder",
                 "body_template": "{{content.text_preview}}",
-                "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，contact_key={{content.contact_key}}，seq={{seq}}"
+                "source_template": "来源：{{app.display_name}} {{content.conversation_type}} message，from={{content.from_display_name}}，to_principal={{principal_id}}，contact_key={{content.contact_key}}，seq={{seq}}"
             }
         }));
 
@@ -1548,7 +1558,7 @@ mod tests {
 
         assert!(reminder.starts_with("请实现快排。\n\n<system-reminder>"));
         assert!(reminder.contains(
-            "来源：Tinode direct message，from=AppFS Agent default，contact_key=default，seq=5。"
+            "来源：Tinode direct message，from=AppFS Agent default，to_principal=code-implementer，contact_key=default，seq=5。"
         ));
     }
 

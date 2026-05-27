@@ -3850,10 +3850,10 @@ fn format_appfs_append_example(
     example: &Value,
 ) -> Option<String> {
     let payload = json_value_to_python_literal(example, 0, None)?;
-    let target_path = appfs_action_target_path(app_root, action_path);
+    let target_path = appfs_action_target_display_path(app_root, action_path);
     Some(format!(
         "```bash\npython - <<'PY' >> {}\nimport json\n\npayload = {}\nprint(json.dumps(payload, ensure_ascii=False))\nPY\n```",
-        bash_single_quote(&path_to_bash_display(&target_path)),
+        bash_single_quote(&target_path),
         payload
     ))
 }
@@ -3917,6 +3917,39 @@ fn python_string_literal(value: &str, prefer_multiline: bool) -> String {
 fn appfs_action_target_path(app_root: &Path, action_path: &str) -> PathBuf {
     let relative_action_path = action_path.trim_start_matches(['/', '\\']);
     app_root.join(relative_action_path)
+}
+
+fn appfs_action_target_display_path(app_root: &Path, action_path: &str) -> String {
+    let relative_action_path = normalize_appfs_action_path(action_path);
+    if let Some(appfs_root) = appfs_relative_display_root(app_root) {
+        if relative_action_path.is_empty() {
+            appfs_root
+        } else {
+            format!("{appfs_root}/{relative_action_path}")
+        }
+    } else {
+        path_to_bash_display(&appfs_action_target_path(app_root, action_path))
+    }
+}
+
+fn normalize_appfs_action_path(action_path: &str) -> String {
+    action_path
+        .trim()
+        .trim_start_matches(['/', '\\'])
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn appfs_relative_display_root(app_root: &Path) -> Option<String> {
+    let raw = app_root.display().to_string().replace('\\', "/");
+    let segments = raw
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let appfs_index = segments.iter().position(|segment| *segment == ".appfs")?;
+    Some(segments[appfs_index..].join("/"))
 }
 
 fn path_to_bash_display(path: &Path) -> String {
@@ -4863,7 +4896,20 @@ fn message_response_to_assistant_events(response: MessageResponse) -> Vec<Assist
                     input: serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
                 });
             }
-            OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+            OutputContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                if !thinking.is_empty() {
+                    events.push(AssistantEvent::ThinkingDelta(thinking));
+                }
+                if let Some(signature) = signature {
+                    events.push(AssistantEvent::ThinkingSignature(signature));
+                }
+            }
+            OutputContentBlock::RedactedThinking { data } => {
+                events.push(AssistantEvent::RedactedThinking(data));
+            }
         }
     }
     let usage = response.usage.token_usage();
@@ -4888,6 +4934,19 @@ fn convert_compact_messages(messages: &[ConversationMessage]) -> Vec<InputMessag
                 .map(|block| match block {
                     runtime::ContentBlock::Text { text } => {
                         InputContentBlock::Text { text: text.clone() }
+                    }
+                    runtime::ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    },
+                    runtime::ContentBlock::RedactedThinking { data } => {
+                        InputContentBlock::RedactedThinking {
+                            data: serde_json::from_str(&data.render())
+                                .unwrap_or(serde_json::Value::Null),
+                        }
                     }
                     runtime::ContentBlock::InputRouter { inputs } => InputContentBlock::Text {
                         text: render_input_router_block(inputs),
@@ -5518,6 +5577,24 @@ mod tests {
             .contains(" >> '/c/mnt/appfs-compose-aiim/aiim/contacts/zhangsan/send_message.act'"));
         assert!(!command.contains("printf '%s\\n'"));
         assert!(!command.contains(r"C:\mnt\appfs-compose-aiim\aiim"));
+    }
+
+    #[test]
+    fn appfs_append_examples_prefer_workspace_relative_appfs_paths() {
+        let command = super::format_appfs_append_example(
+            &PathBuf::from(r"C:\Users\esp3j\rep\claude-code\.appfs\private\default\tinode"),
+            r"\contacts\send_message.act",
+            &serde_json::json!({
+                "to": "principal:code-implementer",
+                "text": "你好",
+                "requires_response": true
+            }),
+        )
+        .expect("append example");
+
+        assert!(command.contains(" >> '.appfs/private/default/tinode/contacts/send_message.act'"));
+        assert!(!command.contains(r"C:\Users\esp3j\rep\claude-code"));
+        assert!(!command.contains("/c/Users/esp3j/rep/claude-code"));
     }
 
     #[test]

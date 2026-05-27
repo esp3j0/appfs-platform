@@ -57,6 +57,12 @@ pub fn analyze_context_usage(system_prompt: &[String], session: &Session) -> Con
                         MessageRole::Tool => tool_result_tokens += tokens,
                     }
                 }
+                ContentBlock::Thinking { thinking, .. } => {
+                    assistant_message_tokens += estimate_text_tokens(thinking);
+                }
+                ContentBlock::RedactedThinking { data } => {
+                    assistant_message_tokens += estimate_text_tokens(&data.render());
+                }
                 ContentBlock::InputRouter { inputs } => {
                     let tokens = estimate_text_tokens(&render_input_router_block(inputs));
                     user_message_tokens += tokens;
