@@ -295,7 +295,8 @@ impl TinodeConnector {
         self.credential_create_attempts
     }
 
-    fn snapshot(&self, ctx: &ConnectorContext) -> AppStructureSnapshot {
+    fn snapshot(&mut self, ctx: &ConnectorContext) -> AppStructureSnapshot {
+        self.hydrate_shared_contacts_for_ctx(ctx);
         AppStructureSnapshot {
             app_id: TINODE_APP_ID.to_string(),
             revision: self.structure_revision(ctx),
@@ -397,6 +398,24 @@ impl TinodeConnector {
 
         nodes.sort_by(|a, b| a.path.cmp(&b.path));
         nodes
+    }
+
+    fn hydrate_shared_contacts_for_ctx(&mut self, ctx: &ConnectorContext) {
+        let Ok(profile_id) = effective_profile_id(ctx) else {
+            return;
+        };
+        let principal_id = ctx.principal_id.as_deref().unwrap_or("default");
+        let Some(record) = self.ready_credential_record_for_profile(&profile_id, principal_id)
+        else {
+            return;
+        };
+        if record.credential_status != ConnectorCredentialStatus::Ready {
+            return;
+        }
+        let Ok(credentials) = credentials_from_record(&record) else {
+            return;
+        };
+        let _ = self.remember_shared_principal_contacts(&credentials, Some(principal_id));
     }
 
     fn skill_resource(&self) -> JsonValue {
@@ -1530,13 +1549,26 @@ impl TinodeConnector {
             return Ok(Vec::new());
         }
         let credentials = credentials_from_record(&record)?;
+        let contacts_before = self.contacts.len();
         self.remember_shared_principal_contacts(&credentials, Some(principal_id))?;
+        let contacts_changed = self.contacts.len() != contacts_before;
         let contacts = self.contacts.values().cloned().collect::<Vec<_>>();
+        let mut events = Vec::new();
+        if contacts_changed {
+            events.push(ConnectorInboundEvent {
+                event_type: "contacts.updated".to_string(),
+                path: "contacts/index.res.jsonl".to_string(),
+                content: Some(json!({
+                    "contact_count": self.contacts.len(),
+                    "source": "shared_principal_credentials",
+                })),
+                error: None,
+            });
+        }
         if contacts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(events);
         }
 
-        let mut events = Vec::new();
         for contact in contacts {
             let since_seq = self
                 .last_direct_seq_by_contact
@@ -1836,6 +1868,7 @@ impl AppConnector for TinodeConnector {
         ctx: &ConnectorContext,
     ) -> std::result::Result<FetchSnapshotChunkResponse, ConnectorError> {
         let normalized = normalize_path(&request.resource_path);
+        self.hydrate_shared_contacts_for_ctx(ctx);
         if tinode_snapshot_read_should_refresh_inbound(&normalized) {
             self.drain_inbound_for_ctx(ctx)?;
         }
@@ -5452,11 +5485,17 @@ mod tests {
             .drain_inbound_events(&code_ctx)
             .expect("drain principal inbound");
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "message.received");
-        assert_eq!(events[0].path, "contacts/default/messages.res.jsonl");
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "contacts.updated"));
+        let message_event = events
+            .iter()
+            .find(|event| event.event_type == "message.received")
+            .expect("message.received");
+        assert_eq!(message_event.path, "contacts/default/messages.res.jsonl");
         assert_eq!(
-            events[0]
+            message_event
                 .content
                 .as_ref()
                 .and_then(|value| value.get("contact_key"))
@@ -5615,6 +5654,176 @@ mod tests {
                 .credentials
                 .contains_key("tinode:code-implementer"),
             "fresh read-through connector should hydrate its credential from shared state"
+        );
+    }
+
+    #[test]
+    fn structure_refresh_hydrates_shared_principal_contacts() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        default_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        let response = code_connector
+            .get_app_structure(
+                GetAppStructureRequest {
+                    app_id: "tinode".to_string(),
+                    known_revision: None,
+                },
+                &code_ctx,
+            )
+            .expect("structure");
+        let AppStructureSyncResult::Snapshot { snapshot } = response.result else {
+            panic!("expected snapshot");
+        };
+        assert!(snapshot
+            .nodes
+            .iter()
+            .any(|node| node.path == "contacts/default/messages.res.jsonl"));
+    }
+
+    #[test]
+    fn inbound_poll_reports_shared_principal_contact_updates() {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_connector = connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_connector = connector_with_mock_config(config, Arc::clone(&state));
+
+        default_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        let events = default_connector
+            .drain_inbound_events(&ctx())
+            .expect("contact update event");
+        let contact_event = events
+            .iter()
+            .find(|event| event.event_type == "contacts.updated")
+            .expect("contacts.updated");
+        assert_eq!(contact_event.path, "contacts/index.res.jsonl");
+        assert!(default_connector.contacts.contains_key("code-implementer"));
+    }
+
+    #[test]
+    fn principal_receiver_contact_history_read_through_uses_shared_credentials_for_fresh_connector()
+    {
+        let config = config();
+        let state = Arc::new(Mutex::new(MockGatewayState::default()));
+        let mut default_runtime_connector =
+            connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut code_runtime_connector =
+            connector_with_mock_config(config.clone(), Arc::clone(&state));
+        let mut fresh_read_through_connector =
+            connector_with_mock_config(config, Arc::clone(&state));
+
+        default_runtime_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &ctx(),
+            )
+            .expect("default credentials");
+
+        let mut code_ctx = ctx();
+        code_ctx.principal_id = Some("code-implementer".to_string());
+        code_ctx.profile_id = Some("tinode:code-implementer".to_string());
+        code_runtime_connector
+            .submit_action(
+                SubmitActionRequest {
+                    path: "/_app/ensure_credentials.act".to_string(),
+                    payload: json!({}),
+                    execution_mode: ActionExecutionMode::Inline,
+                },
+                &code_ctx,
+            )
+            .expect("code credentials");
+
+        let default_login = state
+            .lock()
+            .expect("mock state")
+            .created
+            .iter()
+            .find(|request| request.profile_id == "tinode:default")
+            .expect("default account request")
+            .login
+            .clone();
+        state
+            .lock()
+            .expect("mock state")
+            .inbound
+            .push(TinodeInboundMessage {
+                topic: format!("usr-{default_login}"),
+                seq: 1,
+                from_tinode_user_id: format!("usr-{default_login}"),
+                text: "fresh contact history hello".to_string(),
+                requires_response: None,
+            });
+
+        let messages = fresh_read_through_connector
+            .fetch_snapshot_chunk(
+                FetchSnapshotChunkRequest {
+                    resource_path: "/contacts/default/messages.res.jsonl".to_string(),
+                    resume: SnapshotResume::Start,
+                    budget_bytes: 1024,
+                },
+                &code_ctx,
+            )
+            .expect("fresh connector contact history read-through");
+
+        assert_eq!(messages.records.len(), 1);
+        assert_eq!(messages.records[0].line["contact_key"], "default");
+        assert_eq!(
+            messages.records[0].line["text"],
+            "fresh contact history hello"
         );
     }
 

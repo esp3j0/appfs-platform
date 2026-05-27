@@ -77,6 +77,7 @@ struct MountSnapshotRuntime {
     session_id: String,
     principal_id: Option<String>,
     profile_id: Option<String>,
+    manifest_fingerprint: Vec<u8>,
     snapshot_specs: Vec<SnapshotSpec>,
     snapshot_expand_journal: HashMap<String, SnapshotExpandJournalEntry>,
     connector: Box<dyn agentfs_sdk::AppConnector>,
@@ -313,17 +314,34 @@ impl SnapshotReadThroughContext {
             return Ok(false);
         };
 
+        let manifest_rel = format!("{}/_meta/manifest.res.json", runtime_config.app_mount_path);
+        let manifest_bytes = self.read_file_if_exists(&manifest_rel).await?;
+
         let mut guard = self.runtimes.lock().await;
-        if guard.contains_key(instance_id) {
+        if let Some(runtime) = guard.get_mut(instance_id) {
+            let Some(manifest_bytes) = manifest_bytes else {
+                return Ok(true);
+            };
+            if runtime.manifest_fingerprint != manifest_bytes {
+                let manifest_json = String::from_utf8(manifest_bytes.clone())
+                    .with_context(|| format!("manifest is not valid UTF-8: /{manifest_rel}"))?;
+                let manifest_contract =
+                    parse_manifest_contract_json(&manifest_json, &format!("/{}", manifest_rel))?;
+                runtime.snapshot_specs = manifest_contract.snapshot_specs;
+                runtime.manifest_fingerprint = manifest_bytes;
+                eprintln!(
+                    "[cache] mount manifest reloaded app={} path=/{}",
+                    runtime.app_id, manifest_rel
+                );
+            }
             return Ok(true);
         }
 
-        let manifest_rel = format!("{}/_meta/manifest.res.json", runtime_config.app_mount_path);
-        let manifest_bytes = match self.read_file_if_exists(&manifest_rel).await? {
+        let manifest_bytes = match manifest_bytes {
             Some(bytes) => bytes,
             None => return Ok(false),
         };
-        let manifest_json = String::from_utf8(manifest_bytes)
+        let manifest_json = String::from_utf8(manifest_bytes.clone())
             .with_context(|| format!("manifest is not valid UTF-8: /{manifest_rel}"))?;
         let manifest_contract =
             parse_manifest_contract_json(&manifest_json, &format!("/{}", manifest_rel))?;
@@ -356,6 +374,7 @@ impl SnapshotReadThroughContext {
             session_id,
             principal_id: runtime_config.principal_id,
             profile_id: runtime_config.profile_id,
+            manifest_fingerprint: manifest_bytes,
             snapshot_specs: manifest_contract.snapshot_specs,
             snapshot_expand_journal,
             connector,
@@ -1843,6 +1862,42 @@ mod tests {
         )
     }
 
+    fn write_snapshot_manifest(root: &TempDir, app_mount_path: &str, resources: &[&str]) {
+        let manifest_path = root
+            .path()
+            .join(app_mount_path)
+            .join("_meta")
+            .join("manifest.res.json");
+        fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+            .expect("create manifest parent");
+        let mut nodes = serde_json::Map::new();
+        for resource in resources {
+            nodes.insert(
+                (*resource).to_string(),
+                json!({
+                    "kind": "resource",
+                    "output_mode": "jsonl",
+                    "snapshot": {
+                        "max_materialized_bytes": 1048576,
+                        "prewarm": false,
+                        "prewarm_timeout_ms": 5000,
+                        "read_through_timeout_ms": 10000,
+                        "on_timeout": "return_stale"
+                    }
+                }),
+            );
+        }
+        fs::write(
+            manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "app_id": "tinode",
+                "nodes": nodes,
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+    }
+
     #[derive(Clone)]
     struct FakeSnapshotConnector {
         fetch_count: Arc<AtomicUsize>,
@@ -2033,6 +2088,7 @@ mod tests {
                 session_id: "sess-test".to_string(),
                 principal_id: principal_id.map(ToOwned::to_owned),
                 profile_id: profile_id.map(ToOwned::to_owned),
+                manifest_fingerprint: Vec::new(),
                 snapshot_specs: vec![SnapshotSpec {
                     template: resource_rel.to_string(),
                     max_materialized_bytes: 1024 * 1024,
@@ -2246,6 +2302,77 @@ mod tests {
             assert!(
                 placeholder.is_empty(),
                 "private app pread read-through must not mutate the placeholder file"
+            );
+        });
+    }
+
+    #[test]
+    fn mounted_runtime_reloads_manifest_for_dynamic_snapshot_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let app_mount_path = "private/default/tinode";
+        write_snapshot_manifest(&temp, app_mount_path, &["inbox/recent.res.jsonl"]);
+        let dynamic_snapshot = temp
+            .path()
+            .join(app_mount_path)
+            .join("contacts/default/messages.res.jsonl");
+        fs::create_dir_all(dynamic_snapshot.parent().expect("dynamic parent"))
+            .expect("create dynamic parent");
+        fs::write(&dynamic_snapshot, b"").expect("seed dynamic snapshot placeholder");
+
+        let wrapper = build_wrapper(&temp, None);
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+
+        crate::get_runtime().block_on(async move {
+            install_snapshot_runtime_at(
+                &wrapper,
+                "tinode--default",
+                "tinode",
+                app_mount_path,
+                Some("default"),
+                Some("tinode:default"),
+                "inbox/recent.res.jsonl",
+                Box::new(FakeSnapshotConnector::new(fetch_count, Vec::new())),
+            )
+            .await;
+
+            assert!(wrapper
+                .ctx
+                .maybe_snapshot_resource_from_fs_path(
+                    "private/default/tinode/inbox/recent.res.jsonl"
+                )
+                .await
+                .expect("initial manifest lookup")
+                .is_some());
+            assert!(wrapper
+                .ctx
+                .maybe_snapshot_resource_from_fs_path(
+                    "private/default/tinode/contacts/default/messages.res.jsonl"
+                )
+                .await
+                .expect("dynamic lookup before manifest update")
+                .is_none());
+
+            write_snapshot_manifest(
+                &temp,
+                app_mount_path,
+                &[
+                    "inbox/recent.res.jsonl",
+                    "contacts/default/messages.res.jsonl",
+                ],
+            );
+
+            assert_eq!(
+                wrapper
+                    .ctx
+                    .maybe_snapshot_resource_from_fs_path(
+                        "private/default/tinode/contacts/default/messages.res.jsonl"
+                    )
+                    .await
+                    .expect("dynamic lookup after manifest update"),
+                Some((
+                    "tinode--default".to_string(),
+                    "contacts/default/messages.res.jsonl".to_string()
+                ))
             );
         });
     }

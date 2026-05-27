@@ -1131,6 +1131,9 @@ impl AppfsAdapter {
                     None,
                     client_token,
                 )?;
+                self.refresh_structure_after_background_change(
+                    AppStructureSyncReason::ActionChanged,
+                );
                 Ok(ProcessOutcome::Consumed)
             }
             Ok(SubmitActionResponse {
