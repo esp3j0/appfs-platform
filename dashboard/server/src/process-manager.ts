@@ -56,6 +56,15 @@ export function resolveProjectScopedSpawnConfig(
   return resolvedConfig;
 }
 
+export function buildManagedAppfsAttachId(principalId: string): string {
+  const safePrincipalId = principalId
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 128);
+  return `dashboard-${safePrincipalId || 'principal'}`;
+}
+
 export type PromptDelivery = 'prompt' | 'queue' | 'guidance';
 
 export type PromptSubmissionStatus = 'accepted' | 'queued' | 'guidance';
@@ -793,6 +802,7 @@ export class AgentProcessManager {
       ...process.env,
       ...config.env,
       APPFS_PRINCIPAL_ID: config.principalId,
+      APPFS_ATTACH_ID: buildManagedAppfsAttachId(config.principalId),
       APPFS_MOUNT_ROOT: mountRoot,
       APPFS_RUNTIME_MANIFEST: path.join(mountRoot, '.well-known', 'appfs', 'runtime.json'),
     };

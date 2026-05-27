@@ -1,5 +1,6 @@
 use super::{AppfsBridgeCliArgs, AppfsRuntimeCliArgs, ResolvedAppfsRuntimeCliArgs};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -9,7 +10,10 @@ pub(crate) const APPFS_REGISTRY_VERSION: u32 = 1;
 pub(crate) const APPFS_REGISTRY_REL_PATH: &str = "_appfs/apps.registry.json";
 pub(crate) const APPFS_APP_POLICY_REGISTRY_REL_PATH: &str = "_appfs/app-policies.registry.json";
 pub(crate) const APPFS_PRINCIPAL_REGISTRY_REL_PATH: &str = "_appfs/principals.registry.json";
+pub(crate) const APPFS_PRINCIPAL_STATUS_REL_PATH: &str = "_appfs/principals/status.res.json";
 pub(crate) const APPFS_DEFAULT_PRINCIPAL_ID: &str = "default";
+pub(crate) const PRINCIPAL_ATTACH_STALE_AFTER_SECS: i64 = 90;
+pub(crate) const MAX_PRINCIPAL_TASK_PREVIEW_CHARS: usize = 240;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AppfsAppsRegistryDoc {
@@ -112,6 +116,8 @@ pub(crate) struct PrincipalRecord {
     pub(crate) active_attach_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) active_attaches: Vec<PrincipalAttachLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_status: Option<PrincipalAgentStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +130,94 @@ pub(crate) struct PrincipalAttachLease {
     pub(crate) session_id: Option<String>,
     pub(crate) attached_at: String,
     pub(crate) last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrincipalPresence {
+    Online,
+    Offline,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrincipalAgentState {
+    Idle,
+    Running,
+    Stopping,
+    Error,
+    Stopped,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrincipalAgentOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrincipalAgentStatus {
+    pub(crate) state: PrincipalAgentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) current_task_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) current_task_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attach_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    pub(crate) updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_outcome: Option<PrincipalAgentOutcome>,
+}
+
+#[derive(Serialize)]
+struct PrincipalRecordView<'a> {
+    #[serde(flatten)]
+    record: &'a PrincipalRecord,
+    presence: PrincipalPresence,
+}
+
+#[derive(Serialize)]
+struct PrincipalRegistryViewDoc<'a> {
+    version: u32,
+    default_principal_id: &'a str,
+    principals: Vec<PrincipalRecordView<'a>>,
+}
+
+#[derive(Serialize)]
+struct PrincipalStatusViewDoc<'a> {
+    version: u32,
+    updated_at: String,
+    principals: Vec<PrincipalStatusViewEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct PrincipalStatusViewEntry<'a> {
+    principal_id: &'a str,
+    display_name: &'a str,
+    kind: &'a str,
+    presence: PrincipalPresence,
+    state: PrincipalAgentState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_task_preview: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_task_source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_activity_at: Option<&'a str>,
+    updated_at: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +252,10 @@ pub(crate) fn app_policy_registry_path(root: &Path) -> PathBuf {
 
 pub(crate) fn principal_registry_path(root: &Path) -> PathBuf {
     root.join(APPFS_PRINCIPAL_REGISTRY_REL_PATH.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
+pub(crate) fn principal_status_path(root: &Path) -> PathBuf {
+    root.join(APPFS_PRINCIPAL_STATUS_REL_PATH.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
 pub(crate) fn principal_record_path(root: &Path, principal_id: &str) -> PathBuf {
@@ -216,12 +314,30 @@ pub(crate) fn read_app_policy_registry(root: &Path) -> Result<Option<AppfsAppPol
 pub(crate) fn write_principal_registry(root: &Path, doc: &PrincipalRegistryDoc) -> Result<()> {
     validate_principal_registry(doc)?;
     let path = principal_registry_path(root);
-    write_pretty_json_file(&path, doc, "AppFS principal registry")
+    let now = Utc::now();
+    let view = PrincipalRegistryViewDoc {
+        version: doc.version,
+        default_principal_id: &doc.default_principal_id,
+        principals: doc
+            .principals
+            .iter()
+            .map(|record| PrincipalRecordView {
+                record,
+                presence: principal_presence(record, now),
+            })
+            .collect(),
+    };
+    write_pretty_json_file(&path, &view, "AppFS principal registry")?;
+    write_principal_status_view(root, doc, now)
 }
 
 pub(crate) fn write_principal_record_view(root: &Path, record: &PrincipalRecord) -> Result<()> {
     let path = principal_record_path(root, &record.principal_id);
-    write_pretty_json_file(&path, record, "AppFS principal record")
+    let view = PrincipalRecordView {
+        record,
+        presence: principal_presence(record, Utc::now()),
+    };
+    write_pretty_json_file(&path, &view, "AppFS principal record")
 }
 
 pub(crate) fn delete_principal_record_view(root: &Path, principal_id: &str) -> Result<()> {
@@ -235,6 +351,46 @@ pub(crate) fn delete_principal_record_view(root: &Path, principal_id: &str) -> R
         })?;
     }
     Ok(())
+}
+
+fn write_principal_status_view(
+    root: &Path,
+    doc: &PrincipalRegistryDoc,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let path = principal_status_path(root);
+    let view = PrincipalStatusViewDoc {
+        version: doc.version,
+        updated_at: now.to_rfc3339(),
+        principals: doc
+            .principals
+            .iter()
+            .map(|record| {
+                let presence = principal_presence(record, now);
+                let status = record.agent_status.as_ref();
+                PrincipalStatusViewEntry {
+                    principal_id: &record.principal_id,
+                    display_name: &record.display_name,
+                    kind: &record.kind,
+                    presence,
+                    state: status
+                        .map(|agent_status| agent_status.state)
+                        .unwrap_or(PrincipalAgentState::Unknown),
+                    current_task_preview: status
+                        .and_then(|agent_status| agent_status.current_task_preview.as_deref()),
+                    current_task_source: status
+                        .and_then(|agent_status| agent_status.current_task_source.as_deref()),
+                    model: status.and_then(|agent_status| agent_status.model.as_deref()),
+                    last_activity_at: status
+                        .and_then(|agent_status| agent_status.last_activity_at.as_deref()),
+                    updated_at: status.map_or(record.updated_at.as_str(), |agent_status| {
+                        agent_status.updated_at.as_str()
+                    }),
+                }
+            })
+            .collect(),
+    };
+    write_pretty_json_file(&path, &view, "AppFS principal status view")
 }
 
 pub(crate) fn write_app_policy_registry(
@@ -582,11 +738,60 @@ fn validate_principal_registry(doc: &PrincipalRegistryDoc) -> Result<()> {
                 );
             }
         }
+        if let Some(status) = &principal.agent_status {
+            if status.updated_at.trim().is_empty() {
+                anyhow::bail!(
+                    "principal {} agent_status updated_at cannot be empty",
+                    principal.principal_id
+                );
+            }
+            if status
+                .current_task_preview
+                .as_ref()
+                .is_some_and(|preview| preview.chars().count() > MAX_PRINCIPAL_TASK_PREVIEW_CHARS)
+            {
+                anyhow::bail!(
+                    "principal {} current_task_preview cannot exceed {} characters",
+                    principal.principal_id,
+                    MAX_PRINCIPAL_TASK_PREVIEW_CHARS
+                );
+            }
+            if let Some(attach_id) = &status.attach_id {
+                validate_attach_id(attach_id)?;
+            }
+        }
         if seen.insert(principal.principal_id.clone(), ()).is_some() {
             anyhow::bail!("duplicate principal_id {}", principal.principal_id);
         }
     }
     Ok(())
+}
+
+pub(crate) fn principal_presence(
+    record: &PrincipalRecord,
+    now: DateTime<Utc>,
+) -> PrincipalPresence {
+    if record.active_attaches.is_empty() {
+        return PrincipalPresence::Offline;
+    }
+    if record
+        .active_attaches
+        .iter()
+        .any(|lease| !is_principal_attach_stale(lease, now))
+    {
+        PrincipalPresence::Online
+    } else {
+        PrincipalPresence::Stale
+    }
+}
+
+pub(crate) fn is_principal_attach_stale(lease: &PrincipalAttachLease, now: DateTime<Utc>) -> bool {
+    let Ok(last_seen_at) = DateTime::parse_from_rfc3339(&lease.last_seen_at) else {
+        return true;
+    };
+    now.signed_duration_since(last_seen_at.with_timezone(&Utc))
+        .num_seconds()
+        > PRINCIPAL_ATTACH_STALE_AFTER_SECS
 }
 
 pub(crate) fn validate_principal_id(principal_id: &str) -> Result<()> {
@@ -637,9 +842,12 @@ pub(crate) fn validate_attach_id(attach_id: &str) -> Result<()> {
 mod tests {
     use super::{
         app_registry_path, build_app_registry_doc, parse_app_registry_bytes, read_app_registry,
-        runtime_args_from_registry, write_app_registry, AppfsRegisteredAppVisibility,
+        runtime_args_from_registry, write_app_registry, write_principal_record_view,
+        write_principal_registry, AppfsRegisteredAppVisibility, PrincipalAttachLease,
+        PrincipalRecord, PrincipalRegistryDoc, APPFS_DEFAULT_PRINCIPAL_ID, APPFS_REGISTRY_VERSION,
     };
     use crate::cmd::appfs::{AppfsBridgeCliArgs, ResolvedAppfsRuntimeCliArgs};
+    use chrono::Utc;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -656,6 +864,97 @@ mod tests {
             adapter_bridge_circuit_breaker_cooldown_ms: 3000,
             connector_config: None,
         }
+    }
+
+    fn principal_record(principal_id: &str) -> PrincipalRecord {
+        let now = Utc::now().to_rfc3339();
+        PrincipalRecord {
+            principal_id: principal_id.to_string(),
+            display_name: principal_id.to_string(),
+            description: None,
+            kind: "agent".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            active_attach_count: 1,
+            active_attaches: vec![PrincipalAttachLease {
+                attach_id: "attach-1".to_string(),
+                role: Some("agent".to_string()),
+                session_id: Some("session-1".to_string()),
+                attached_at: now.clone(),
+                last_seen_at: now,
+            }],
+            agent_status: None,
+        }
+    }
+
+    #[test]
+    fn principal_record_view_includes_derived_presence() {
+        let temp = TempDir::new().expect("tempdir");
+        let record = principal_record("coder");
+        write_principal_record_view(temp.path(), &record).expect("write principal view");
+
+        let content = std::fs::read_to_string(
+            temp.path()
+                .join("_appfs")
+                .join("principals")
+                .join("coder.res.json"),
+        )
+        .expect("read principal view");
+        assert!(content.contains(r#""presence": "online""#));
+    }
+
+    #[test]
+    fn principal_registry_view_includes_derived_presence() {
+        let temp = TempDir::new().expect("tempdir");
+        let doc = PrincipalRegistryDoc {
+            version: APPFS_REGISTRY_VERSION,
+            default_principal_id: APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
+            principals: vec![principal_record("coder")],
+        };
+        write_principal_registry(temp.path(), &doc).expect("write principal registry");
+
+        let content =
+            std::fs::read_to_string(temp.path().join("_appfs").join("principals.registry.json"))
+                .expect("read principal registry");
+        assert!(content.contains(r#""presence": "online""#));
+    }
+
+    #[test]
+    fn principal_registry_writes_concise_status_view() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut record = principal_record("coder");
+        record.agent_status = Some(super::PrincipalAgentStatus {
+            state: super::PrincipalAgentState::Running,
+            current_task_preview: Some("Replying to default".to_string()),
+            current_task_source: Some("tinode".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            attach_id: Some("attach-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            model: Some("deepseek-v4-flash".to_string()),
+            updated_at: record.updated_at.clone(),
+            last_activity_at: Some(record.updated_at.clone()),
+            last_outcome: None,
+        });
+        let doc = PrincipalRegistryDoc {
+            version: APPFS_REGISTRY_VERSION,
+            default_principal_id: APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
+            principals: vec![record],
+        };
+        write_principal_registry(temp.path(), &doc).expect("write principal registry");
+
+        let content = std::fs::read_to_string(
+            temp.path()
+                .join("_appfs")
+                .join("principals")
+                .join("status.res.json"),
+        )
+        .expect("read principal status view");
+        assert!(content.contains(r#""principal_id": "coder""#));
+        assert!(content.contains(r#""presence": "online""#));
+        assert!(content.contains(r#""state": "running""#));
+        assert!(content.contains(r#""current_task_preview": "Replying to default""#));
+        assert!(!content.contains(r#""active_attaches""#));
+        assert!(!content.contains(r#""turn_id""#));
     }
 
     #[test]

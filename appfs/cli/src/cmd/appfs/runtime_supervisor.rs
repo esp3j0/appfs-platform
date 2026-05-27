@@ -372,6 +372,7 @@ impl AppfsRuntimeSupervisor {
             updated_at: now,
             active_attach_count: 0,
             active_attaches: Vec::new(),
+            agent_status: None,
         };
         doc.principals.push(record.clone());
         registry::write_principal_registry(&self.root, &doc)?;
@@ -422,6 +423,49 @@ impl AppfsRuntimeSupervisor {
         if let Some(kind) = request.kind {
             record.kind = kind;
         }
+        if let Some(agent_status) = request.agent_status {
+            let Some(request_attach_id) = request.attach_id.as_deref() else {
+                self.control_plane.emit_failed(
+                    "/_appfs/principals/update_principal.act",
+                    request_id,
+                    "PRINCIPAL_STATUS_ATTACH_REQUIRED",
+                    "attach_id is required when updating agent_status",
+                    client_token,
+                )?;
+                return Ok(());
+            };
+            let Some(active_attach) = current_active_attach(record) else {
+                self.control_plane.emit_failed(
+                    "/_appfs/principals/update_principal.act",
+                    request_id,
+                    "PRINCIPAL_NOT_ATTACHED",
+                    &format!("principal {} has no active attach", record.principal_id),
+                    client_token,
+                )?;
+                return Ok(());
+            };
+            if active_attach.attach_id != request_attach_id {
+                self.control_plane.emit_failed(
+                    "/_appfs/principals/update_principal.act",
+                    request_id,
+                    "PRINCIPAL_ATTACH_MISMATCH",
+                    &format!(
+                        "attach_id {} cannot update principal {}",
+                        request_attach_id, record.principal_id
+                    ),
+                    client_token,
+                )?;
+                return Ok(());
+            }
+            if let Some(active_attach) = record
+                .active_attaches
+                .iter_mut()
+                .find(|lease| lease.attach_id == request_attach_id)
+            {
+                active_attach.last_seen_at = chrono::Utc::now().to_rfc3339();
+            }
+            apply_agent_status_patch(record, request_attach_id, agent_status);
+        }
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
         registry::write_principal_registry(&self.root, &doc)?;
@@ -430,9 +474,10 @@ impl AppfsRuntimeSupervisor {
             "/_appfs/principals/update_principal.act",
             request_id,
             serde_json::json!({
-                "principal_event": "principal.updated",
+                "principal_event": if updated.agent_status.is_some() { "principal.status.updated" } else { "principal.updated" },
                 "principal_id": updated.principal_id,
                 "updated": true,
+                "agent_status": updated.agent_status,
             }),
             client_token,
         )?;
@@ -548,6 +593,7 @@ impl AppfsRuntimeSupervisor {
         };
 
         let now = chrono::Utc::now().to_rfc3339();
+        let now_dt = chrono::Utc::now();
         let mut lease_created = false;
         if let Some(existing) = record
             .active_attaches
@@ -558,6 +604,35 @@ impl AppfsRuntimeSupervisor {
             existing.session_id = request.session_id.clone();
             existing.last_seen_at = now.clone();
         } else {
+            let has_live_conflict = record
+                .active_attaches
+                .iter()
+                .any(|lease| !registry::is_principal_attach_stale(lease, now_dt));
+            if has_live_conflict && !request.takeover {
+                self.control_plane.emit_failed(
+                    "/_appfs/principals/attach_principal.act",
+                    request_id,
+                    "PRINCIPAL_ATTACH_CONFLICT",
+                    &format!(
+                        "principal {} already has an active attach",
+                        request.principal_id
+                    ),
+                    client_token,
+                )?;
+                return Ok(());
+            }
+            if request.takeover || !record.active_attaches.is_empty() {
+                record.active_attaches.clear();
+                if let Some(status) = &mut record.agent_status {
+                    status.state = registry::PrincipalAgentState::Unknown;
+                    status.attach_id = None;
+                    status.session_id = None;
+                    status.current_task_preview = None;
+                    status.current_task_source = None;
+                    status.turn_id = None;
+                    status.updated_at = now.clone();
+                }
+            }
             record.active_attaches.push(registry::PrincipalAttachLease {
                 attach_id: request.attach_id.clone(),
                 role: request.role.clone(),
@@ -582,6 +657,7 @@ impl AppfsRuntimeSupervisor {
                 "attach_id": request.attach_id,
                 "attached": true,
                 "lease_created": lease_created,
+                "takeover": request.takeover,
                 "active_attach_count": updated.active_attach_count,
                 "app_instances": materialized,
             }),
@@ -617,6 +693,23 @@ impl AppfsRuntimeSupervisor {
             .active_attaches
             .retain(|lease| lease.attach_id != request.attach_id);
         let detached = record.active_attaches.len() != before;
+        if detached
+            && (record.active_attaches.is_empty()
+                || record
+                    .agent_status
+                    .as_ref()
+                    .and_then(|status| status.attach_id.as_deref())
+                    == Some(request.attach_id.as_str()))
+        {
+            let now = chrono::Utc::now().to_rfc3339();
+            if let Some(status) = &mut record.agent_status {
+                status.state = registry::PrincipalAgentState::Stopped;
+                status.current_task_preview = None;
+                status.current_task_source = None;
+                status.turn_id = None;
+                status.updated_at = now;
+            }
+        }
         record.active_attach_count = record.active_attaches.len() as u32;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
@@ -715,4 +808,69 @@ fn runtime_metadata_key(app_id: &str, session_id: &str) -> String {
 
 fn render_principal_template(template: &str, principal_id: &str) -> String {
     template.replace("{principal_id}", principal_id)
+}
+
+fn current_active_attach(
+    record: &registry::PrincipalRecord,
+) -> Option<&registry::PrincipalAttachLease> {
+    record.active_attaches.first()
+}
+
+fn apply_agent_status_patch(
+    record: &mut registry::PrincipalRecord,
+    attach_id: &str,
+    patch: action_dispatcher::PrincipalAgentStatusPatch,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let active_session_id =
+        current_active_attach(record).and_then(|lease| lease.session_id.clone());
+    let status = record
+        .agent_status
+        .get_or_insert_with(|| registry::PrincipalAgentStatus {
+            state: registry::PrincipalAgentState::Unknown,
+            current_task_preview: None,
+            current_task_source: None,
+            turn_id: None,
+            attach_id: Some(attach_id.to_string()),
+            session_id: active_session_id.clone(),
+            model: None,
+            updated_at: now.clone(),
+            last_activity_at: None,
+            last_outcome: None,
+        });
+
+    if let Some(state) = patch.state {
+        status.state = state;
+    }
+    apply_nullable_patch(&mut status.current_task_preview, patch.current_task_preview);
+    apply_nullable_patch(&mut status.current_task_source, patch.current_task_source);
+    apply_nullable_patch(&mut status.turn_id, patch.turn_id);
+    apply_nullable_patch(&mut status.session_id, patch.session_id);
+    apply_nullable_patch(&mut status.model, patch.model);
+    apply_nullable_patch(&mut status.last_outcome, patch.last_outcome);
+    status.attach_id = Some(attach_id.to_string());
+    if status.session_id.is_none() {
+        status.session_id = active_session_id;
+    }
+    status.updated_at = now.clone();
+    if matches!(
+        status.state,
+        registry::PrincipalAgentState::Running
+            | registry::PrincipalAgentState::Stopping
+            | registry::PrincipalAgentState::Error
+    ) || status.last_outcome.is_some()
+    {
+        status.last_activity_at = Some(now);
+    }
+}
+
+fn apply_nullable_patch<T>(
+    target: &mut Option<T>,
+    patch: Option<action_dispatcher::NullablePatch<T>>,
+) {
+    match patch {
+        Some(action_dispatcher::NullablePatch::Clear) => *target = None,
+        Some(action_dispatcher::NullablePatch::Set(value)) => *target = Some(value),
+        None => {}
+    }
 }

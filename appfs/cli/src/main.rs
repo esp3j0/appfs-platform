@@ -513,7 +513,9 @@ fn main() {
                 }
                 AppfsComposeCommand::Validate { file } => {
                     let rt = get_runtime();
-                    if let Err(e) = rt.block_on(cmd::appfs::handle_appfs_compose_validate_command(file)) {
+                    if let Err(e) =
+                        rt.block_on(cmd::appfs::handle_appfs_compose_validate_command(file))
+                    {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }

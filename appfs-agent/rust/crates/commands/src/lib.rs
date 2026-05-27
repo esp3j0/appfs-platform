@@ -3671,6 +3671,9 @@ fn build_appfs_skill_markdown(
         lines.push("- Prefer the AppFS event reminder injected into the next model call to confirm `action.completed` or `action.failed`; when the reminder includes `message.received` with attention required, treat it as an active task to answer or act on in this turn. Inspect `_stream/events.evt.jsonl` manually only for debugging or if no reminder appears.".to_string());
         lines.push("- Never use `write_file` or `edit_file` on `*.act` paths because those tools overwrite the sink.".to_string());
         lines.push("- Use `bash` with Python JSON serialization, or PowerShell `ConvertTo-Json`, to append exactly one JSON object plus a trailing newline.".to_string());
+        if app_id == "tinode" {
+            lines.push("- Tinode coordination: 发出消息后无需主动等待或轮询；对方回复或执行完成后，AppFS 事件会主动唤醒你。".to_string());
+        }
     }
 
     if !uses_skill_narrative {
@@ -5660,6 +5663,8 @@ mod tests {
         );
         let prompt = render_resolved_skill_prompt(&resolved, None);
         assert!(prompt.contains("Tinode private chat app."));
+        assert!(prompt.contains("发出消息后无需主动等待或轮询"));
+        assert!(prompt.contains("AppFS 事件会主动唤醒你"));
     }
 
     #[test]
