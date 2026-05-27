@@ -12,3 +12,7 @@ dashboard/server/node_modules/
 .claw/
 .sandbox-home/
 .sandbox-tmp/
+desktop/dist/
+desktop/bin/
+desktop/dashboard/
+desktop/node_modules/
