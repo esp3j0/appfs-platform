@@ -207,6 +207,50 @@ export interface SpawnConfig {
   env: Record<string, string>;
   appfsIdleWake?: boolean;
   sessionPath?: string;
+  projectId?: string;
+  projectRoot?: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  runtimeModelConfigPath?: string;
+}
+
+export type ModelProviderType = 'anthropic' | 'openai' | 'xai';
+
+export interface ModelCredentialConfig {
+  mode: 'env';
+  apiKeyEnv?: string;
+  authTokenEnv?: string;
+}
+
+export interface ModelCatalogEntry {
+  id: string;
+  name: string;
+  displayName?: string;
+  contextWindowTokens: number;
+  maxOutputTokens: number;
+}
+
+export interface ModelProviderConfig {
+  id: string;
+  providerName: string;
+  type: ModelProviderType;
+  baseUrl?: string;
+  credential: ModelCredentialConfig;
+  models: ModelCatalogEntry[];
+}
+
+export interface DashboardModelConfig {
+  version: 1;
+  defaultProviderId: string;
+  defaultModelId: string;
+  providers: ModelProviderConfig[];
+}
+
+export interface ModelConfigResponse {
+  config: DashboardModelConfig;
+  path: string;
 }
 
 export interface AppEventRenderScopeOverride {

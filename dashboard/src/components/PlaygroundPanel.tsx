@@ -23,6 +23,7 @@ interface AgentChatState {
   messages: ChatMessage[];
   inputValue: string;
   isBusy: boolean;
+  isStopping: boolean;
   activeRequestId: string | null;
   isHydrating: boolean;
   hydrateError: string | null;
@@ -38,6 +39,7 @@ function emptyChatState(): AgentChatState {
     messages: [],
     inputValue: '',
     isBusy: false,
+    isStopping: false,
     activeRequestId: null,
     isHydrating: false,
     hydrateError: null,
@@ -187,6 +189,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       patchSession(payload.sessionId, state => ({
         ...state,
         isBusy: true,
+        isStopping: false,
         activeRequestId: payload.requestId,
       }));
     }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
@@ -282,8 +285,9 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       patchSession(payload.sessionId, state => ({
         ...state,
         isBusy: false,
+        isStopping: false,
         activeRequestId: null,
-        messages: finalizeTurnMessages(state.messages, payload.turnId, payload.usage),
+        messages: finalizeTurnMessages(state.messages, payload.turnId, payload.usage, payload.status),
       }));
     }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
 
@@ -292,6 +296,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       patchSession(payload.sessionId, state => ({
         ...state,
         isBusy: false,
+        isStopping: false,
         activeRequestId: null,
         messages: [...state.messages, {
           id: `error-${Date.now()}`,
@@ -361,6 +366,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       patchSession(agent.sessionId, current => ({
         ...current,
         isBusy: data.status === 'accepted' ? true : current.isBusy,
+        isStopping: data.status === 'accepted' ? false : current.isStopping,
         activeRequestId: data.status === 'accepted' ? data.request_id : current.activeRequestId,
         messages: [...current.messages, {
           id: `user-${data.request_id ?? Date.now()}`,
@@ -383,6 +389,40 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
           id: `error-net-${Date.now()}`,
           role: 'error',
           text: `Network error: ${err instanceof Error ? err.message : String(err)}`,
+          timestamp: Date.now(),
+        }],
+      }));
+    }
+  };
+
+  const handleCancelTurn = async (agent: AgentInfo) => {
+    const state = stateBySession[agent.sessionId] ?? emptyChatState();
+    if (!state.isBusy || !state.activeRequestId || agent.controlMode !== 'managed') return;
+
+    patchSession(agent.sessionId, current => ({
+      ...current,
+      isStopping: true,
+    }));
+
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(agent.sessionId)}/cancel-turn`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ request_id: state.activeRequestId }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(data.error || 'Failed to stop current turn');
+      }
+    } catch (err) {
+      patchSession(agent.sessionId, current => ({
+        ...current,
+        isStopping: false,
+        messages: [...current.messages, {
+          id: `error-stop-${Date.now()}`,
+          role: 'error',
+          text: `Failed to stop current turn: ${err instanceof Error ? err.message : String(err)}`,
           timestamp: Date.now(),
         }],
       }));
@@ -450,6 +490,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
           state={stateBySession[agent.sessionId] ?? emptyChatState()}
           onInputChange={value => updateInput(agent.sessionId, value)}
           onSend={() => handleSend(agent)}
+          onCancelTurn={() => void handleCancelTurn(agent)}
           onPromoteQueuedInput={message => void promoteQueuedInput(agent, message)}
           onRefresh={() => void hydrateSession(agent.sessionId).catch(() => undefined)}
           canFocus={selectedAgents.length > 1}
@@ -468,6 +509,7 @@ function AgentChatPane({
   state,
   onInputChange,
   onSend,
+  onCancelTurn,
   onPromoteQueuedInput,
   onRefresh,
   canFocus,
@@ -478,6 +520,7 @@ function AgentChatPane({
   state: AgentChatState;
   onInputChange: (value: string) => void;
   onSend: () => void;
+  onCancelTurn: () => void;
   onPromoteQueuedInput: (message: ChatMessage) => void;
   onRefresh: () => void;
   canFocus: boolean;
@@ -633,12 +676,13 @@ function AgentChatPane({
             rows={2}
           />
           <button
-            className="playground-send-btn"
-            onClick={onSend}
-            disabled={!state.inputValue.trim()}
-            title={state.isBusy ? 'Queue for after current turn (Enter)' : 'Send (Enter)'}
+            type="button"
+            className={`playground-send-btn ${state.isBusy ? 'stop' : 'send'}`}
+            onClick={state.isBusy ? onCancelTurn : onSend}
+            disabled={state.isBusy ? state.isStopping || !state.activeRequestId : !state.inputValue.trim()}
+            title={state.isBusy ? 'Stop current response' : 'Send (Enter)'}
           >
-            {state.isBusy ? '↳' : '➤'}
+            {state.isBusy ? (state.isStopping ? 'Stopping' : 'Stop') : '➤'}
           </button>
         </div>
       ) : (
@@ -761,8 +805,19 @@ function finalizeTurnMessages(
   messages: ChatMessage[],
   turnId: string | undefined,
   usage?: { input_tokens?: number; output_tokens?: number },
+  status?: string,
 ): ChatMessage[] {
   const finalized = closeAssistantSegmentsForTurn(messages, turnId);
+  if (status === 'cancelled') {
+    return [...finalized, {
+      id: `cancelled-${turnId ?? Date.now()}`,
+      role: 'error',
+      text: 'Current response stopped. You can send a new message when ready.',
+      turnId,
+      timestamp: Date.now(),
+    }];
+  }
+
   let lastAssistantIndex = -1;
   for (let i = finalized.length - 1; i >= 0; i--) {
     if (finalized[i].role === 'assistant' && finalized[i].turnId === turnId) {
