@@ -16,3 +16,4 @@ desktop/dist/
 desktop/bin/
 desktop/dashboard/
 desktop/node_modules/
+dashboard/server/dist/
