@@ -138,6 +138,11 @@ export interface AgentMeta {
   pid: number;
   started_at_ms: number;
   session_jsonl_path: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  runtimeModelConfigPath?: string;
 }
 
 // ── Dashboard API types ──
@@ -158,6 +163,11 @@ export interface AgentInfo {
   totalOutputTokens: number;
   projectId?: string;
   projectRoot?: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  runtimeModelConfigPath?: string;
 }
 
 export interface TimelineEntry {

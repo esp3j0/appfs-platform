@@ -409,6 +409,11 @@ export class AgentProcessManager {
           ...base,
           principalId: agent.principalId || agent.name,
           model,
+          modelProviderId: agent.modelProviderId,
+          modelId: agent.modelId,
+          contextWindowTokens: agent.contextWindowTokens,
+          maxOutputTokens: agent.maxOutputTokens,
+          runtimeModelConfigPath: agent.runtimeModelConfigPath,
           sessionPath: agent.sessionJsonlPath,
           projectId: project.projectId,
           projectRoot: project.projectRoot,
@@ -613,6 +618,11 @@ export class AgentProcessManager {
             totalOutputTokens: 0,
             projectId: managed.spawnConfig.projectId,
             projectRoot: managed.spawnConfig.projectRoot,
+            modelProviderId: managed.spawnConfig.modelProviderId,
+            modelId: managed.spawnConfig.modelId,
+            contextWindowTokens: managed.spawnConfig.contextWindowTokens,
+            maxOutputTokens: managed.spawnConfig.maxOutputTokens,
+            runtimeModelConfigPath: managed.spawnConfig.runtimeModelConfigPath,
           };
           this.registry.registerAgent(agentInfo);
 
@@ -791,6 +801,30 @@ export class AgentProcessManager {
   private resolveRuntimeModelConfig(config: SpawnConfig, spawnId: string): void {
     if (config.runtimeModelConfigPath || !this.modelConfigStore) {
       return;
+    }
+
+    // Fallback: If no providerId is specified, try to find a matching provider for the model name in the catalog
+    if (!config.modelProviderId && config.model && config.model !== 'unknown') {
+      try {
+        const allProviders = this.modelConfigStore.load().providers;
+        const matches: Array<{ providerId: string; modelId: string }> = [];
+        for (const p of allProviders) {
+          for (const m of p.models) {
+            if (m.name === config.model || m.id === config.model) {
+              matches.push({ providerId: p.id, modelId: m.id });
+            }
+          }
+        }
+        if (matches.length === 1) {
+          config.modelProviderId = matches[0].providerId;
+          config.modelId = matches[0].modelId;
+          console.log(`[ProcessManager] Fallback matched model "${config.model}" to provider "${config.modelProviderId}" and modelId "${config.modelId}"`);
+        } else if (matches.length > 1) {
+          console.warn(`[ProcessManager] Ambiguous model name "${config.model}" matches multiple providers: ${matches.map(m => m.providerId).join(', ')}. Skipping auto-fill.`);
+        }
+      } catch (err) {
+        console.error(`[ProcessManager] Error running model provider fallback:`, err);
+      }
     }
 
     const resolved = this.modelConfigStore.resolveSelection({

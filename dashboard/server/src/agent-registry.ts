@@ -186,6 +186,15 @@ export class AgentRegistry {
     }
 
     const name = meta.agent_name;
+    const metaPath = (meta.session_jsonl_path ?? '') + '.meta.json';
+    let sidecarMeta: any = {};
+    if (meta.session_jsonl_path && fs.existsSync(metaPath)) {
+      try {
+        sidecarMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      } catch (err) {
+        // ignore
+      }
+    }
     const agentInfo: AgentInfo = {
       name,
       principalId: meta.principal_id,
@@ -199,6 +208,11 @@ export class AgentRegistry {
       controlMode: 'external', // Managed agents will override this explicitly
       messageCount: msgs.length,
       ...this.sumUsage(msgs),
+      modelProviderId: sidecarMeta.modelProviderId,
+      modelId: sidecarMeta.modelId,
+      contextWindowTokens: sidecarMeta.contextWindowTokens,
+      maxOutputTokens: sidecarMeta.maxOutputTokens,
+      runtimeModelConfigPath: sidecarMeta.runtimeModelConfigPath,
     };
     this.fillProjectInfo(agentInfo);
     this.agents.set(sessionId, agentInfo);
@@ -228,6 +242,16 @@ export class AgentRegistry {
     const name = principalId ?? sess?.session_id ?? path.basename(fullPath, '.jsonl');
     const sessionId = sess?.session_id ?? name;
 
+    const metaPath = fullPath + '.meta.json';
+    let sidecarMeta: any = {};
+    if (fs.existsSync(metaPath)) {
+      try {
+        sidecarMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      } catch (err) {
+        // ignore
+      }
+    }
+
     const agentInfo: AgentInfo = {
       name,
       principalId: principalId ?? name,
@@ -241,6 +265,11 @@ export class AgentRegistry {
       controlMode: 'external',
       messageCount: msgs.length,
       ...this.sumUsage(msgs),
+      modelProviderId: sidecarMeta.modelProviderId,
+      modelId: sidecarMeta.modelId,
+      contextWindowTokens: sidecarMeta.contextWindowTokens,
+      maxOutputTokens: sidecarMeta.maxOutputTokens,
+      runtimeModelConfigPath: sidecarMeta.runtimeModelConfigPath,
     };
     this.fillProjectInfo(agentInfo);
     this.agents.set(sessionId, agentInfo);
@@ -259,6 +288,25 @@ export class AgentRegistry {
     const normalizedAgentInfo: AgentInfo = { ...agentInfo };
     this.fillProjectInfo(normalizedAgentInfo);
     this.agents.set(sessionId, normalizedAgentInfo);
+
+    // Save sidecar meta if managed and has a sessionJsonlPath
+    if (normalizedAgentInfo.sessionJsonlPath && normalizedAgentInfo.controlMode === 'managed') {
+      const metaPath = normalizedAgentInfo.sessionJsonlPath + '.meta.json';
+      const sidecarMeta = {
+        modelProviderId: normalizedAgentInfo.modelProviderId,
+        modelId: normalizedAgentInfo.modelId,
+        contextWindowTokens: normalizedAgentInfo.contextWindowTokens,
+        maxOutputTokens: normalizedAgentInfo.maxOutputTokens,
+        runtimeModelConfigPath: normalizedAgentInfo.runtimeModelConfigPath,
+      };
+      try {
+        fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+        fs.writeFileSync(metaPath, JSON.stringify(sidecarMeta, null, 2), 'utf-8');
+      } catch (err) {
+        console.error(`Failed to write sidecar meta file ${metaPath}:`, err);
+      }
+    }
+
     if (msgs) {
       this.messages.set(sessionId, msgs);
     } else if (!this.messages.has(sessionId) && normalizedAgentInfo.sessionJsonlPath && fs.existsSync(normalizedAgentInfo.sessionJsonlPath)) {
