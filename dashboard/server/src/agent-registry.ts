@@ -48,6 +48,13 @@ export class AgentRegistry {
     this.discover();
   }
 
+  /** Scan a project root for persisted claw sessions. Used by desktop mode,
+   * where the dashboard starts with an empty registry and projects are opened
+   * after the backend is already running. */
+  discoverProject(projectRoot: string): void {
+    this.discoverSessionRoot(projectRoot, { flatFallback: false });
+  }
+
   /** Scan for agents. Discovery order:
    *  1. agent-meta-*.json files in dump dir (Phase 3 debug-dump)
    *  2. .claw/sessions/<fingerprint>/*.jsonl (real claw session layout)
@@ -92,6 +99,38 @@ export class AgentRegistry {
     if (this.fileWatcher) {
       const newPaths = this.getSessionPaths();
       for (const p of newPaths) {
+        if (!oldPaths.has(p)) {
+          this.fileWatcher.addPath(p);
+        }
+      }
+    }
+  }
+
+  private discoverSessionRoot(root: string, options: { flatFallback: boolean }): void {
+    if (!root || !fs.existsSync(root)) return;
+
+    const oldPaths = new Set(this.getSessionPaths());
+    const oldAgentCount = this.agents.size;
+
+    const clawSessionsDir = path.join(root, '.claw', 'sessions');
+    if (fs.existsSync(clawSessionsDir)) {
+      this.discoverClawSessions(clawSessionsDir);
+    }
+
+    if (options.flatFallback && this.agents.size === oldAgentCount) {
+      let jsonlFiles: string[];
+      try {
+        jsonlFiles = fs.readdirSync(root).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
+      } catch {
+        jsonlFiles = [];
+      }
+      for (const file of jsonlFiles) {
+        this.registerFromSessionFile(path.join(root, file));
+      }
+    }
+
+    if (this.fileWatcher) {
+      for (const p of this.getSessionPaths()) {
         if (!oldPaths.has(p)) {
           this.fileWatcher.addPath(p);
         }

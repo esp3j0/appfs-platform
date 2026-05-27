@@ -1,5 +1,11 @@
 import type { FastifyInstance } from 'fastify';
-import { AgentProcessManager, type PromptDelivery, type SpawnConfig } from '../process-manager.js';
+import {
+  AgentNoActiveTurnError,
+  AgentProcessManager,
+  SpawnConfigValidationError,
+  type PromptDelivery,
+  type SpawnConfig,
+} from '../process-manager.js';
 
 export function registerProcessRoute(app: FastifyInstance, processManager: AgentProcessManager): void {
   app.get('/api/process/default-spawn-config', async (_request, reply) => {
@@ -11,12 +17,21 @@ export function registerProcessRoute(app: FastifyInstance, processManager: Agent
     Body: SpawnConfig;
   }>('/api/process/spawn', async (request, reply) => {
     try {
-      const config = request.body;
+      const config = request.body || ({} as SpawnConfig);
 
       // Validate required fields
-      if (!config.cwd || !config.principalId || !config.model || !config.appfsMountRoot || !config.launchSpec) {
+      const missing: string[] = [];
+      if (!config.principalId?.trim()) missing.push('principalId');
+      if (!config.model?.trim()) missing.push('model');
+      if (!config.launchSpec) missing.push('launchSpec');
+      if (!config.projectId) {
+        if (!config.cwd?.trim()) missing.push('cwd');
+        if (!config.appfsMountRoot?.trim()) missing.push('appfsMountRoot');
+      }
+
+      if (missing.length > 0) {
         return reply.status(400).send({
-          error: 'Missing required fields: cwd, principalId, model, appfsMountRoot, launchSpec',
+          error: `Missing required fields: ${missing.join(', ')}`,
         });
       }
 
@@ -25,6 +40,9 @@ export function registerProcessRoute(app: FastifyInstance, processManager: Agent
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error('[ProcessRoute] Spawn error:', message);
+      if (err instanceof SpawnConfigValidationError) {
+        return reply.status(400).send({ error: message });
+      }
       return reply.status(500).send({ error: message });
     }
   });
@@ -64,6 +82,23 @@ export function registerProcessRoute(app: FastifyInstance, processManager: Agent
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return reply.status(404).send({ error: message });
+    }
+  });
+
+  // ── Cancel the currently running turn without killing the managed agent ──
+  app.post<{
+    Params: { sessionId: string };
+    Body: { request_id?: string; requestId?: string };
+  }>('/api/agents/:sessionId/cancel-turn', async (request, reply) => {
+    try {
+      const { sessionId } = request.params;
+      const requestId = request.body?.request_id ?? request.body?.requestId;
+      const result = await processManager.cancelTurn(sessionId, requestId);
+      return reply.status(200).send({ request_id: result.requestId, status: result.status });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const status = err instanceof AgentNoActiveTurnError || message.includes('still starting') ? 409 : 404;
+      return reply.status(status).send({ error: message });
     }
   });
 
