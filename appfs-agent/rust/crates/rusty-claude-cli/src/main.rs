@@ -53,18 +53,19 @@ use runtime::{
     detect_appfs_environment, ensure_appfs_attach_identity, format_stale_base_warning, format_usd,
     generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt_with_appfs,
     parse_oauth_callback_request_target, pricing_for_model, render_input_router_block,
-    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
-    scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
-    ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
-    AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
-    AssistantEvent, AutoCompactionConfig, AutoCompactionEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, InputEnvelope,
-    InputSource, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PendingInput,
-    PendingInputDelivery, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
-    ToolExecutionResult, ToolExecutor, UsageTracker,
+    resolve_expected_base, resolve_sandbox_status, sanitize_appfs_task_preview,
+    save_oauth_credentials, scan_appfs_attention_events_for_idle_wake, set_shell_if_windows,
+    update_appfs_principal_agent_status, warmup_appfs_private_apps, ApiClient, ApiRequest,
+    AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachEnsureOutcome,
+    AppfsAttachEnsureStatus, AppfsAttachLease, AppfsPrincipalCreateRequest,
+    AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus, AssistantEvent, AutoCompactionConfig,
+    AutoCompactionEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, InputEnvelope, InputSource, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PendingInput, PendingInputDelivery, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, SharedPendingInputQueue,
+    TokenUsage, ToolError, ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -4868,6 +4869,66 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
 }
 
 impl LiveCli {
+    fn update_appfs_status(&self, update: AppfsAgentStatusUpdate) {
+        let Some(lease) = &self.appfs_attach_lease else {
+            return;
+        };
+        if let Err(error) = update_appfs_principal_agent_status(lease, update) {
+            eprintln!("AppFS attach warning: failed to update principal status: {error}");
+        }
+    }
+
+    fn update_appfs_status_running(
+        &self,
+        preview: Option<String>,
+        source: Option<&str>,
+        turn_id: Option<&str>,
+    ) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Running),
+            current_task_preview: Some(preview),
+            current_task_source: Some(source.map(ToOwned::to_owned)),
+            turn_id: Some(turn_id.map(ToOwned::to_owned)),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(None),
+        });
+    }
+
+    fn update_appfs_status_idle(&self, outcome: Option<AppfsAgentOutcome>) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Idle),
+            current_task_preview: Some(None),
+            current_task_source: Some(None),
+            turn_id: Some(None),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(outcome),
+        });
+    }
+
+    fn update_appfs_status_error(&self) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Error),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(Some(AppfsAgentOutcome::Failed)),
+            ..Default::default()
+        });
+    }
+
+    fn update_appfs_status_stopped(&self) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Stopped),
+            current_task_preview: Some(None),
+            current_task_source: Some(None),
+            turn_id: Some(None),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            ..Default::default()
+        });
+    }
+
     fn new(
         model: String,
         enable_tools: bool,
@@ -4916,6 +4977,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -4970,6 +5032,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -5021,6 +5084,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -5074,6 +5138,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         Ok(cli)
     }
 
@@ -5172,6 +5237,7 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        self.update_appfs_status_running(sanitize_appfs_task_preview(input), Some("user"), None);
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -5185,6 +5251,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 let finish_label = if summary.cancelled {
                     "⏹ Cancelled"
                 } else {
@@ -5219,6 +5290,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -5239,6 +5311,7 @@ impl LiveCli {
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter =
             ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.update_appfs_status_running(sanitize_appfs_task_preview(input), Some("user"), None);
         self.run_prepared_turn(
             runtime,
             hook_abort_monitor,
@@ -5257,6 +5330,11 @@ impl LiveCli {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.update_appfs_status_running(
+            sanitize_appfs_task_preview(input),
+            Some("user"),
+            Some(turn_id),
+        );
         self.run_prepared_headless_turn(
             runtime,
             hook_abort_monitor,
@@ -5413,6 +5491,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 let finish_label = if summary.cancelled {
                     "⏹ Cancelled"
                 } else {
@@ -5454,6 +5537,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 if let Some(redraw_handle) = &self.redraw_handle {
                     redraw_handle.write_output("✘ ❌ Request failed\n".to_string());
                 } else {
@@ -5517,6 +5601,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 if let Some(event) = &summary.auto_compaction {
                     #[cfg(feature = "debug-dump")]
                     if !event.removed_messages.is_empty() {
@@ -5565,6 +5654,7 @@ impl LiveCli {
             }
             Err(error) if error.is_cancelled() => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(AppfsAgentOutcome::Cancelled));
                 self.persist_session()?;
                 let usage = self.runtime.usage().cumulative_usage();
                 let mut done_ev = json!({
@@ -5590,6 +5680,7 @@ impl LiveCli {
                 if let Err(err_shutdown) = runtime.shutdown_plugins() {
                     eprintln!("Warning: failed to shutdown plugins: {err_shutdown}");
                 }
+                self.update_appfs_status_error();
                 let mut err_ev = json!({
                     "type": "error",
                     "request_id": request_id,
@@ -5707,6 +5798,7 @@ impl LiveCli {
             external_queue.clone(),
             &request_id,
             &turn_id,
+            sanitize_appfs_task_preview(&batch.rendered_inputs),
         )?;
         if status == HeadlessTurnStatus::Completed {
             let _ = self.drain_and_run_queued_inputs_headless(external_queue)?;
@@ -5759,6 +5851,7 @@ impl LiveCli {
             self.run_event_turn_with_external_inputs(
                 external_queue.clone(),
                 permission_tx.clone(),
+                sanitize_appfs_task_preview(&batch.rendered_inputs),
             )?;
             let _ = self.drain_and_run_queued_inputs_with_external_inputs(
                 terminal,
@@ -5775,6 +5868,8 @@ impl LiveCli {
         &mut self,
         pending_inputs: Vec<PendingInput>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let preview = sanitize_appfs_task_preview(&render_pending_input_echoes(&pending_inputs));
+        self.update_appfs_status_running(preview, Some("appfs_event"), None);
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         for pending_input in pending_inputs {
             runtime.enqueue_pending_input(pending_input);
@@ -5792,6 +5887,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
@@ -5821,6 +5921,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -5836,10 +5937,12 @@ impl LiveCli {
         external_queue: SharedPendingInputQueue,
         request_id: &str,
         turn_id: &str,
+        preview: Option<String>,
     ) -> Result<HeadlessTurnStatus, Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.update_appfs_status_running(preview, Some("appfs_event"), Some(turn_id));
         self.run_prepared_headless_turn(
             runtime,
             hook_abort_monitor,
@@ -5855,11 +5958,13 @@ impl LiveCli {
         &mut self,
         external_queue: SharedPendingInputQueue,
         permission_tx: Sender<PermissionPromptTicket>,
+        preview: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter =
             ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.update_appfs_status_running(preview, Some("appfs_event"), None);
         self.run_prepared_turn(
             runtime,
             hook_abort_monitor,
@@ -6956,6 +7061,9 @@ impl LiveCli {
 
 impl Drop for LiveCli {
     fn drop(&mut self) {
+        if self.appfs_attach_lease.is_some() {
+            self.update_appfs_status_stopped();
+        }
         if let Some(lease) = self.appfs_attach_lease.take() {
             if let Err(error) = detach_appfs_principal(&lease, "process_exit") {
                 eprintln!("AppFS attach warning: failed to detach principal lease: {error}");

@@ -2590,8 +2590,88 @@ mod supervisor_tests {
         append_text(
             &temp
                 .path()
+                .join("_appfs/principals/update_principal.act"),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-test.1\",\"agent_status\":{\"state\":\"running\",\"current_task_preview\":\"Tinode message from coder: hello\",\"current_task_source\":\"tinode\",\"turn_id\":\"turn-1\",\"model\":\"deepseek-v4-flash\",\"last_outcome\":null},\"client_token\":\"principal-status-001\"}\n",
+        );
+        supervisor.poll_once().expect("poll agent status update");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        let principal = registry
+            .principals
+            .iter()
+            .find(|principal| principal.principal_id == "default")
+            .expect("default principal");
+        let status = principal.agent_status.as_ref().expect("agent status");
+        assert_eq!(status.state, registry::PrincipalAgentState::Running);
+        assert_eq!(status.attach_id.as_deref(), Some("attach-test.1"));
+        assert_eq!(
+            status.current_task_preview.as_deref(),
+            Some("Tinode message from coder: hello")
+        );
+        let view: JsonValue = serde_json::from_slice(
+            &fs::read(temp.path().join("_appfs/principals/default.res.json"))
+                .expect("read principal view"),
+        )
+        .expect("parse principal view");
+        assert_eq!(view["presence"], "online");
+        assert_eq!(view["agent_status"]["state"], "running");
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/update_principal.act"),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-stale\",\"agent_status\":{\"state\":\"idle\"},\"client_token\":\"principal-status-stale\"}\n",
+        );
+        supervisor.poll_once().expect("poll stale status update");
+        let events = control_events(&temp, "principal-status-stale");
+        assert_eq!(
+            events[0]
+                .get("error")
+                .and_then(|value| value.get("code"))
+                .and_then(|value| value.as_str()),
+            Some("PRINCIPAL_ATTACH_MISMATCH")
+        );
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/attach_principal.act"),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-test.2\",\"role\":\"coordinator\",\"session_id\":\"session-3\",\"client_token\":\"principal-attach-conflict\"}\n",
+        );
+        supervisor.poll_once().expect("poll conflicting attach");
+        let events = control_events(&temp, "principal-attach-conflict");
+        assert_eq!(
+            events[0]
+                .get("error")
+                .and_then(|value| value.get("code"))
+                .and_then(|value| value.as_str()),
+            Some("PRINCIPAL_ATTACH_CONFLICT")
+        );
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/attach_principal.act"),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-test.2\",\"role\":\"coordinator\",\"session_id\":\"session-3\",\"takeover\":true,\"client_token\":\"principal-attach-takeover\"}\n",
+        );
+        supervisor.poll_once().expect("poll takeover attach");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        let principal = registry
+            .principals
+            .iter()
+            .find(|principal| principal.principal_id == "default")
+            .expect("default principal");
+        assert_eq!(principal.active_attach_count, 1);
+        assert_eq!(principal.active_attaches[0].attach_id, "attach-test.2");
+
+        append_text(
+            &temp
+                .path()
                 .join("_appfs/principals/detach_principal.act"),
-            "{\"principal_id\":\"default\",\"attach_id\":\"attach-test.1\",\"reason\":\"process_exit\",\"client_token\":\"principal-detach-001\"}\n",
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-test.2\",\"reason\":\"process_exit\",\"client_token\":\"principal-detach-001\"}\n",
         );
         supervisor.poll_once().expect("poll detach principal");
         let registry = registry::read_principal_registry(temp.path())
@@ -2604,6 +2684,10 @@ mod supervisor_tests {
             .expect("default principal");
         assert_eq!(principal.active_attach_count, 0);
         assert!(principal.active_attaches.is_empty());
+        assert_eq!(
+            principal.agent_status.as_ref().map(|status| status.state),
+            Some(registry::PrincipalAgentState::Stopped)
+        );
         let events = control_events(&temp, "principal-detach-001");
         assert_eq!(
             events[0]

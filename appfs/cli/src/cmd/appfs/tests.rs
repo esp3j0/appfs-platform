@@ -377,15 +377,61 @@ fn parse_update_and_delete_principal_requests_require_principal_id() {
 }
 
 #[test]
+fn parse_update_principal_request_accepts_agent_status_patch() {
+    let req = parse_update_principal_request(
+        r#"{"principal_id":"default","attach_id":"attach-abc.123","agent_status":{"state":"running","current_task_preview":"Tinode message from coder: hello","current_task_source":"tinode","turn_id":"turn-1","session_id":"session-1","model":"deepseek-v4-flash","last_outcome":null}}"#,
+    )
+    .expect("valid agent status update request");
+    assert_eq!(req.principal_id, "default");
+    assert_eq!(req.attach_id.as_deref(), Some("attach-abc.123"));
+    let status = req.agent_status.expect("status patch");
+    assert_eq!(
+        status.state,
+        Some(super::registry::PrincipalAgentState::Running)
+    );
+    assert!(matches!(
+        status.current_task_preview,
+        Some(super::action_dispatcher::NullablePatch::Set(_))
+    ));
+    assert!(matches!(
+        status.last_outcome,
+        Some(super::action_dispatcher::NullablePatch::Clear)
+    ));
+}
+
+#[test]
+fn parse_update_principal_request_requires_attach_id_for_agent_status() {
+    assert!(parse_update_principal_request(
+        r#"{"principal_id":"default","agent_status":{"state":"idle"}}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn parse_update_principal_request_rejects_invalid_agent_status() {
+    assert!(parse_update_principal_request(
+        r#"{"principal_id":"default","attach_id":"attach-abc","agent_status":{"state":"busy"}}"#
+    )
+    .is_err());
+
+    let long_preview = "x".repeat(super::registry::MAX_PRINCIPAL_TASK_PREVIEW_CHARS + 1);
+    let payload = format!(
+        r#"{{"principal_id":"default","attach_id":"attach-abc","agent_status":{{"current_task_preview":"{long_preview}"}}}}"#
+    );
+    assert!(parse_update_principal_request(&payload).is_err());
+}
+
+#[test]
 fn parse_attach_and_detach_principal_requests_require_safe_ids() {
     let req = parse_attach_principal_request(
-        r#"{"principal_id":"code-implementer","attach_id":"attach-abc.123","role":"worker","session_id":"session-1"}"#,
+        r#"{"principal_id":"code-implementer","attach_id":"attach-abc.123","role":"worker","session_id":"session-1","takeover":true}"#,
     )
     .expect("valid attach request");
     assert_eq!(req.principal_id, "code-implementer");
     assert_eq!(req.attach_id, "attach-abc.123");
     assert_eq!(req.role.as_deref(), Some("worker"));
     assert_eq!(req.session_id.as_deref(), Some("session-1"));
+    assert!(req.takeover);
 
     let req = parse_detach_principal_request(
         r#"{"principal_id":"code-implementer","attach_id":"attach-abc.123","reason":"process_exit"}"#,
@@ -401,6 +447,7 @@ fn parse_attach_and_detach_principal_requests_require_safe_ids() {
     .expect("null optional fields should be treated as missing");
     assert_eq!(req.role, None);
     assert_eq!(req.session_id, None);
+    assert!(!req.takeover);
 
     assert!(parse_attach_principal_request(
         r#"{"principal_id":"code-implementer","attach_id":"bad/path"}"#
