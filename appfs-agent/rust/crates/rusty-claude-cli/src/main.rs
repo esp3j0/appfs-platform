@@ -15518,6 +15518,14 @@ UU conflicted.rs",
 
         assert!(matches!(
             &events[0],
+            AssistantEvent::ThinkingDelta(text) if text == "step 1"
+        ));
+        assert!(matches!(
+            &events[1],
+            AssistantEvent::ThinkingSignature(signature) if signature == "sig_123"
+        ));
+        assert!(matches!(
+            &events[2],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         let rendered = String::from_utf8(out).expect("utf8");
