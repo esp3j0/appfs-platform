@@ -95,6 +95,7 @@ pub(super) struct PrincipalAgentStatusPatch {
 #[derive(Debug, Clone)]
 pub(super) struct DeletePrincipalRequest {
     pub(super) principal_id: String,
+    pub(super) force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -436,7 +437,10 @@ pub(super) fn parse_delete_principal_request(
 ) -> std::result::Result<DeletePrincipalRequest, &'static str> {
     let object = parse_json_object(payload)?;
     let principal_id = required_principal_id(&object, "principal_id")?;
-    Ok(DeletePrincipalRequest { principal_id })
+    Ok(DeletePrincipalRequest {
+        principal_id,
+        force: optional_bool(&object, "force")?.unwrap_or(false),
+    })
 }
 
 pub(super) fn parse_attach_principal_request(

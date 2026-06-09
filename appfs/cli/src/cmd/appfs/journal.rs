@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use super::shared::write_pretty_json_file;
 use super::AppfsAdapter;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,36 +81,13 @@ impl AppfsAdapter {
     }
 
     pub(super) fn save_snapshot_expand_journal(&self) -> Result<()> {
-        let tmp_path = self
-            .snapshot_expand_journal_path
-            .with_extension("res.json.tmp");
         let doc = SnapshotExpandJournalDoc {
             resources: self.snapshot_expand_journal.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&doc)?;
-        fs::write(&tmp_path, bytes).with_context(|| {
-            format!(
-                "Failed to write snapshot expand journal temp file {}",
-                tmp_path.display()
-            )
-        })?;
-
-        if self.snapshot_expand_journal_path.exists() {
-            fs::remove_file(&self.snapshot_expand_journal_path).with_context(|| {
-                format!(
-                    "Failed to remove old snapshot expand journal file {}",
-                    self.snapshot_expand_journal_path.display()
-                )
-            })?;
-        }
-
-        fs::rename(&tmp_path, &self.snapshot_expand_journal_path).with_context(|| {
-            format!(
-                "Failed to move snapshot expand journal temp file {} to {}",
-                tmp_path.display(),
-                self.snapshot_expand_journal_path.display()
-            )
-        })?;
-        Ok(())
+        write_pretty_json_file(
+            &self.snapshot_expand_journal_path,
+            &doc,
+            "AppFS snapshot expand journal",
+        )
     }
 }

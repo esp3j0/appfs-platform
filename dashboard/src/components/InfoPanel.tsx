@@ -1,5 +1,6 @@
 import React from 'react';
 import type { AgentInfo, CrossAgentInteraction } from '../types';
+import { contextUsagePercent, contextUsageTitle } from '../token-usage';
 
 interface MountedApp {
   instance_id: string;
@@ -96,7 +97,7 @@ export function InfoPanel({ agents, interactions }: Props) {
             )}
 
             {agents.map(agent => (
-              <div className="info-section" key={agent.name}>
+              <div className="info-section" key={agent.sessionId}>
                 <div className="info-title">{agent.name}</div>
                 <div className="info-row">
                   <span className="usage-label">Model</span>
@@ -113,6 +114,23 @@ export function InfoPanel({ agents, interactions }: Props) {
                 <div className="info-row">
                   <span className="usage-label">Output</span>
                   <span className="usage-value">{agent.totalOutputTokens.toLocaleString()} tok</span>
+                </div>
+                <div className="info-row">
+                  <span className="usage-label">Context</span>
+                  <span className="usage-value context-value">
+                    <span
+                      className="context-usage-dot"
+                      style={{
+                        ['--context-percent' as string]: `${Math.round(contextUsagePercent(
+                          agent.currentContextTokens,
+                          agent.contextWindowTokens,
+                        ))}%`,
+                      }}
+                      title={contextUsageTitle(agent.currentContextTokens, agent.contextWindowTokens)}
+                      aria-label={contextUsageTitle(agent.currentContextTokens, agent.contextWindowTokens)}
+                    />
+                    {(agent.currentContextTokens ?? 0).toLocaleString()} tok
+                  </span>
                 </div>
               </div>
             ))}

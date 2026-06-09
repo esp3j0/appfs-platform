@@ -1,3 +1,4 @@
+use super::shared::write_pretty_json_file;
 use super::{AppfsBridgeCliArgs, AppfsRuntimeCliArgs, ResolvedAppfsRuntimeCliArgs};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -408,24 +409,70 @@ pub(crate) fn write_app_registry(root: &Path, doc: &AppfsAppsRegistryDoc) -> Res
     write_pretty_json_file(&path, doc, "AppFS app registry")
 }
 
-fn write_pretty_json_file<T: Serialize>(path: &Path, doc: &T, label: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid registry path {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {label} directory {}", parent.display()))?;
-    let tmp_path = path.with_extension("json.tmp");
-    let bytes =
-        serde_json::to_vec_pretty(doc).with_context(|| format!("failed to serialize {label}"))?;
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("failed to write temporary {label} {}", tmp_path.display()))?;
-    if path.exists() {
-        fs::remove_file(&path)
-            .with_context(|| format!("failed to replace existing {label} {}", path.display()))?;
+/// Recover registry temp files left over from an interrupted write.
+///
+/// On Windows (and any platform where the process can be killed between
+/// destination removal and rename), the original file may be missing while a
+/// temp file contains the latest data. This function promotes leftover temp
+/// files to their final names when the target is missing.
+pub(crate) fn recover_tmp_registry_files(root: &Path) {
+    let candidates: &[&str] = &[
+        APPFS_REGISTRY_REL_PATH,
+        APPFS_APP_POLICY_REGISTRY_REL_PATH,
+        APPFS_PRINCIPAL_REGISTRY_REL_PATH,
+        APPFS_PRINCIPAL_STATUS_REL_PATH,
+    ];
+    for rel in candidates {
+        let local = rel.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let path = root.join(&local);
+        if !path.exists() {
+            for tmp_path in registry_tmp_candidates(&path) {
+                if !tmp_path.exists() {
+                    continue;
+                }
+                match fs::rename(&tmp_path, &path) {
+                    Ok(()) => {
+                        eprintln!(
+                            "AppFS: recovered {} from leftover .tmp file",
+                            path.display()
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "AppFS: failed to recover {} from .tmp: {err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
     }
-    fs::rename(&tmp_path, &path)
-        .with_context(|| format!("failed to publish {label} {}", path.display()))?;
-    Ok(())
+}
+
+fn registry_tmp_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.with_extension("json.tmp")];
+    let Some(parent) = path.parent() else {
+        return out;
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return out;
+    };
+    let prefix = format!(".{file_name}.");
+
+    let Ok(entries) = fs::read_dir(parent) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 #[allow(dead_code)]

@@ -55,7 +55,8 @@ use runtime::{
     parse_oauth_callback_request_target, pricing_for_model, render_input_router_block,
     resolve_expected_base, resolve_sandbox_status, sanitize_appfs_task_preview,
     save_oauth_credentials, scan_appfs_attention_events_for_idle_wake, set_shell_if_windows,
-    update_appfs_principal_agent_status, warmup_appfs_private_apps, ApiClient, ApiRequest,
+    heartbeat_appfs_principal, update_appfs_principal_agent_status, warmup_appfs_private_apps,
+    ApiClient, ApiRequest,
     AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachEnsureOutcome,
     AppfsAttachEnsureStatus, AppfsAttachLease, AppfsPrincipalCreateRequest,
     AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus, AssistantEvent, AutoCompactionConfig,
@@ -4092,6 +4093,33 @@ fn run_headless(
         cli.drive_appfs_idle_wake_headless(shared_queue.clone())?;
     }
 
+    // Spawn a background thread that writes a lightweight heartbeat to
+    // update_principal.act every 30 s.  This keeps the AppFS attach lease
+    // fresh while the agent is idle, preventing the supervisor's stale
+    // attach sweep from removing it.
+    let heartbeat_lease = cli.appfs_attach_lease.clone();
+    let (heartbeat_shutdown_tx, heartbeat_shutdown_rx) = mpsc::channel::<()>();
+    if heartbeat_lease.is_some() {
+        thread::spawn(move || {
+            const APPFS_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+            loop {
+                let shutdown = heartbeat_shutdown_rx.recv_timeout(
+                    std::time::Duration::from_secs(APPFS_HEARTBEAT_INTERVAL_SECS),
+                );
+                match shutdown {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(lease) = heartbeat_lease.as_ref() {
+                            if let Err(err) = heartbeat_appfs_principal(lease) {
+                                eprintln!("[AppFS heartbeat] {err}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let (control_tx, control_rx) = mpsc::channel::<Result<HeadlessInput, String>>();
     let control_queue = shared_queue.clone();
     let control_token_for_thread = control_token.clone();
@@ -4766,11 +4794,45 @@ impl HookAbortMonitor {
     }
 }
 
+const APPFS_MOUNT_READY_RETRY_INTERVAL_MS: u64 = 100;
+const APPFS_MOUNT_READY_RETRY_TIMEOUT_MS: u64 = 10_000;
+
 fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     let cwd = env::current_dir().ok()?;
     eprintln!("AppFS attach: checking identity and private apps...");
     let outcome = ensure_appfs_attach_identity(&cwd);
     if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
+        // When APPFS_MOUNT_ROOT is set we know the agent *should* be
+        // attached to an AppFS mount.  If the environment cannot be
+        // resolved yet (e.g. the WinFsp / FUSE mount is still starting
+        // up after an Electron restart), retry instead of giving up.
+        if env::var("APPFS_MOUNT_ROOT").ok().map_or(false, |v| !v.trim().is_empty()) {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(APPFS_MOUNT_READY_RETRY_TIMEOUT_MS);
+            eprintln!(
+                "AppFS attach: mount not ready yet, retrying for up to {} ms...",
+                APPFS_MOUNT_READY_RETRY_TIMEOUT_MS,
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    APPFS_MOUNT_READY_RETRY_INTERVAL_MS,
+                ));
+                let retry = ensure_appfs_attach_identity(&cwd);
+                if retry.status != AppfsAttachEnsureStatus::NotAppfs {
+                    for warning in &retry.warnings {
+                        eprintln!("AppFS attach warning: {warning}");
+                    }
+                    return Some(retry);
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "AppFS attach: mount did not become ready within {} ms, giving up.",
+                        APPFS_MOUNT_READY_RETRY_TIMEOUT_MS,
+                    );
+                    break;
+                }
+            }
+        }
         return None;
     }
     for warning in &outcome.warnings {
@@ -5681,11 +5743,21 @@ impl LiveCli {
                     eprintln!("Warning: failed to shutdown plugins: {err_shutdown}");
                 }
                 self.update_appfs_status_error();
+                let error_message = format!("run turn failed: {error}");
+                #[cfg(feature = "debug-dump")]
+                crate::debug_dump::write_turn_error(
+                    &self.session.path,
+                    &request_id,
+                    &turn_id,
+                    &self.session.id,
+                    &error_message,
+                    source,
+                );
                 let mut err_ev = json!({
                     "type": "error",
                     "request_id": request_id,
                     "turn_id": turn_id,
-                    "message": format!("run turn failed: {error}"),
+                    "message": error_message,
                 });
                 if let Some(source) = source {
                     err_ev["source"] = json!(source);
@@ -9882,7 +9954,10 @@ impl ApiClient for AnthropicRuntimeClient {
         let max_tokens = self
             .runtime_model_config
             .as_ref()
-            .and_then(|config| config.max_output_tokens)
+            .and_then(|config| config.max_output_tokens);
+        let max_tokens = request
+            .max_tokens_override
+            .or(max_tokens)
             .unwrap_or_else(|| max_tokens_for_model(&effective_model));
         let context_window_tokens = self
             .runtime_model_config
@@ -11280,9 +11355,10 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
+    let mut converted: Vec<InputMessage> = Vec::new();
+
+    for message in messages {
+        let Some(mut input_message) = (|| {
             let role = match message.role {
                 MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
@@ -11337,8 +11413,30 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 role: role.to_string(),
                 content,
             })
-        })
-        .collect()
+        })() else {
+            continue;
+        };
+
+        if input_message.role == "user" && content_is_only_tool_results(&input_message.content) {
+            if let Some(previous) = converted.last_mut() {
+                if previous.role == "user" && content_is_only_tool_results(&previous.content) {
+                    previous.content.append(&mut input_message.content);
+                    continue;
+                }
+            }
+        }
+
+        converted.push(input_message);
+    }
+
+    converted
+}
+
+fn content_is_only_tool_results(content: &[InputContentBlock]) -> bool {
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -11565,9 +11663,10 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput,
-        InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
-        PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, ToolExecutor,
+        AssistantEvent, AttachmentKind, ConfigLoader, ContentBlock, ConversationMessage,
+        InputRouterBlockInput, InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput,
+        PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session,
+        ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -15081,6 +15180,50 @@ UU conflicted.rs",
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_merges_adjacent_tool_results_for_parallel_tool_uses() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "glob_search".to_string(),
+                    input: "{\"pattern\":\"**/*.md\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "Skill".to_string(),
+                    input: "{\"skill\":\"appfs-tinode\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("tool-1", "glob_search", "README.md", false),
+            ConversationMessage::tool_result("tool-2", "Skill", "Launching skill", false),
+            ConversationMessage::attachment_user_text(
+                "Skill prompt",
+                AttachmentKind::InvokedSkills,
+            ),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 4);
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[2].role, "user");
+        assert_eq!(converted[2].content.len(), 2);
+        assert!(matches!(
+            &converted[2].content[0],
+            api::InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tool-1"
+        ));
+        assert!(matches!(
+            &converted[2].content[1],
+            api::InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tool-2"
+        ));
+        assert!(matches!(
+            &converted[3].content[0],
+            api::InputContentBlock::Text { text } if text == "Skill prompt"
+        ));
     }
 
     #[test]

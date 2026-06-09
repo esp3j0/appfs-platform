@@ -102,7 +102,11 @@ export function registerProcessRoute(app: FastifyInstance, processManager: Agent
     }
   });
 
-  // ── Stop a managed agent ──
+  // ── Stop a managed agent (low-level, no AppFS detach) ──
+  // Prefer POST /api/projects/:projectId/principals/:principalId/stop for
+  // project-scoped agents. This route is retained for backward compatibility
+  // and non-principal-aware consumers (e.g., playground panel, external tools).
+  // It kills the process tree but does NOT detach the AppFS principal.
   app.post<{
     Params: { sessionId: string };
   }>('/api/agents/:sessionId/stop', async (request, reply) => {

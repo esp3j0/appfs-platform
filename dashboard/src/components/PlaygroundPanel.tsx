@@ -1,6 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { AgentInfo, ChatItem, ChatThread } from '../types';
 import { useDashboardSSE } from '../hooks/useDashboardSSE';
+import {
+  cachedInputTokens,
+  contextUsagePercent,
+  contextUsageTitle,
+  effectiveInputTokens,
+  type TokenUsageLike,
+} from '../token-usage';
 
 interface ChatMessage {
   id: string;
@@ -12,7 +19,7 @@ interface ChatMessage {
   turnId?: string;
   timestamp: number;
   streaming?: boolean;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: TokenUsageLike;
   pendingInput?: {
     requestId: string;
     mode: 'queued' | 'guidance';
@@ -27,6 +34,11 @@ interface AgentChatState {
   activeRequestId: string | null;
   isHydrating: boolean;
   hydrateError: string | null;
+}
+
+interface AgentProcessStatus {
+  status: string;
+  currentRequestId: string | null;
 }
 
 interface PlaygroundPanelProps {
@@ -49,6 +61,11 @@ function emptyChatState(): AgentChatState {
 export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps) {
   const [stateBySession, setStateBySession] = useState<Record<string, AgentChatState>>({});
   const [focusedSessionId, setFocusedSessionId] = useState<string | null>(null);
+  const selectedSessionKey = selectedAgents.map(agent => agent.sessionId).join('|');
+  const managedSessionKey = selectedAgents
+    .filter(agent => agent.controlMode === 'managed')
+    .map(agent => agent.sessionId)
+    .join('|');
   const selectedSessionIds = new Set(selectedAgents.map(agent => agent.sessionId));
 
   const patchSession = useCallback((
@@ -60,6 +77,18 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       [sessionId]: updater(prev[sessionId] ?? emptyChatState()),
     }));
   }, []);
+
+  const syncAgentStatus = useCallback(async (sessionId: string) => {
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(sessionId)}/status`);
+      if (!res.ok) return;
+      const processStatus = await res.json() as AgentProcessStatus;
+      patchSession(sessionId, state => applyAgentProcessStatus(state, processStatus));
+    } catch {
+      // The chat history hydrate path remains the source of visible content;
+      // status sync is only a best-effort guard against missed transient SSE.
+    }
+  }, [patchSession]);
 
   const hydrateSession = useCallback((sessionId: string, options?: { silent?: boolean }) => {
     if (!options?.silent) {
@@ -74,7 +103,9 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       .then((thread: ChatThread) => {
         patchSession(sessionId, state => {
           const hydrated = thread.items.map(chatItemToMessage);
-          const liveMessages = state.messages.filter(item => item.streaming || item.pendingInput);
+          const liveMessages = state.messages.filter(item =>
+            item.streaming || item.pendingInput || item.role === 'error',
+          );
           return {
             ...state,
             messages: mergeHydratedWithLive(hydrated, liveMessages),
@@ -82,6 +113,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
             hydrateError: null,
           };
         });
+        void syncAgentStatus(sessionId);
       })
       .catch((err: unknown) => {
         patchSession(sessionId, state => ({
@@ -91,7 +123,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
         }));
         throw err;
       });
-  }, [patchSession]);
+  }, [patchSession, syncAgentStatus]);
 
   useEffect(() => {
     setStateBySession(prev => {
@@ -101,13 +133,30 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
       }
       return next;
     });
-  }, [selectedAgents.map(agent => agent.sessionId).join('|')]);
+  }, [selectedSessionKey]);
 
   useEffect(() => {
     if (focusedSessionId && !selectedSessionIds.has(focusedSessionId)) {
       setFocusedSessionId(null);
     }
-  }, [focusedSessionId, selectedAgents.map(agent => agent.sessionId).join('|')]);
+  }, [focusedSessionId, selectedSessionKey]);
+
+  useEffect(() => {
+    const managedSessionIds = selectedAgents
+      .filter(agent => agent.controlMode === 'managed')
+      .map(agent => agent.sessionId);
+    if (managedSessionIds.length === 0) return;
+
+    const syncAll = () => {
+      for (const sessionId of managedSessionIds) {
+        void syncAgentStatus(sessionId);
+      }
+    };
+
+    syncAll();
+    const interval = window.setInterval(syncAll, 5000);
+    return () => window.clearInterval(interval);
+  }, [managedSessionKey, syncAgentStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +185,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
     return () => {
       cancelled = true;
     };
-  }, [hydrateSession, patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]);
+  }, [hydrateSession, patchSession, selectedSessionKey]);
 
   useDashboardSSE('/api/events', {
     onMessage: useCallback((payload) => {
@@ -182,7 +231,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
 
         return state;
       });
-    }, [hydrateSession, patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [hydrateSession, patchSession, selectedSessionKey]),
 
     onTurnStart: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
@@ -192,12 +241,12 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
         isStopping: false,
         activeRequestId: payload.requestId,
       }));
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
 
     onAssistantDelta: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
       patchSession(payload.sessionId, state => appendAssistantDelta(state, payload));
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
 
     onToolStart: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
@@ -232,7 +281,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
           }],
         };
       });
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
 
     onToolResult: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
@@ -278,7 +327,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
           }],
         };
       });
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
 
     onTurnDone: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
@@ -289,7 +338,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
         activeRequestId: null,
         messages: finalizeTurnMessages(state.messages, payload.turnId, payload.usage, payload.status),
       }));
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
 
     onAgentError: useCallback((payload) => {
       if (!selectedSessionIds.has(payload.sessionId)) return;
@@ -307,7 +356,7 @@ export function PlaygroundPanel({ agents, selectedAgents }: PlaygroundPanelProps
           timestamp: Date.now(),
         }],
       }));
-    }, [patchSession, selectedAgents.map(agent => agent.sessionId).join('|')]),
+    }, [patchSession, selectedSessionKey]),
   });
 
   const updateInput = (sessionId: string, inputValue: string) => {
@@ -551,6 +600,7 @@ function AgentChatPane({
             <span className={`playground-mode-badge ${isManaged ? 'managed' : 'external'}`}>
               {isManaged ? '⚡ Managed' : '👁 External'}
             </span>
+            <AgentContextUsage agent={agent} />
             <span className="playground-session-id">{agent.sessionId}</span>
           </div>
         </div>
@@ -635,12 +685,7 @@ function AgentChatPane({
                 </div>
               </>
             )}
-            {msg.usage && (
-              <div className="playground-msg-usage">
-                {msg.usage.input_tokens && <span>↓ {msg.usage.input_tokens.toLocaleString()}</span>}
-                {msg.usage.output_tokens && <span>↑ {msg.usage.output_tokens.toLocaleString()}</span>}
-              </div>
-            )}
+            {msg.usage && <MessageUsage usage={msg.usage} contextWindowTokens={agent.contextWindowTokens} />}
             {msg.role === 'user' && msg.pendingInput && (
               <div className="playground-pending-input">
                 <span className={`playground-pending-badge ${msg.pendingInput.mode}`}>
@@ -702,6 +747,17 @@ function chatItemToMessage(item: ChatItem): ChatMessage {
       text: item.text,
       timestamp: item.timestamp,
       usage: item.usage,
+    };
+  }
+
+  if (item.kind === 'error') {
+    return {
+      id: item.id,
+      role: 'error',
+      text: item.text,
+      requestId: item.requestId,
+      turnId: item.turnId,
+      timestamp: item.timestamp,
     };
   }
 
@@ -801,10 +857,62 @@ function closeAssistantSegmentsForTurn(
   });
 }
 
+function closeAllLiveMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.flatMap(msg => {
+    if (msg.role === 'assistant' && msg.streaming) {
+      if (!msg.text.trim()) {
+        return [];
+      }
+      return [{ ...msg, streaming: false }];
+    }
+
+    if (msg.role === 'tool' && msg.tool?.status === 'pending') {
+      return [{
+        ...msg,
+        streaming: false,
+        text: `${msg.tool.toolName} completed`,
+        tool: {
+          ...msg.tool,
+          status: 'completed',
+          summary: `${msg.tool.toolName} completed`,
+        },
+      }];
+    }
+
+    return [msg];
+  });
+}
+
+function applyAgentProcessStatus(
+  state: AgentChatState,
+  processStatus: AgentProcessStatus,
+): AgentChatState {
+  if (processStatus.status === 'busy') {
+    return {
+      ...state,
+      isBusy: true,
+      isStopping: false,
+      activeRequestId: processStatus.currentRequestId,
+    };
+  }
+
+  if (!state.isBusy && !state.isStopping && state.activeRequestId === null) {
+    return state;
+  }
+
+  return {
+    ...state,
+    isBusy: false,
+    isStopping: false,
+    activeRequestId: null,
+    messages: closeAllLiveMessages(state.messages),
+  };
+}
+
 function finalizeTurnMessages(
   messages: ChatMessage[],
   turnId: string | undefined,
-  usage?: { input_tokens?: number; output_tokens?: number },
+  usage?: TokenUsageLike,
   status?: string,
 ): ChatMessage[] {
   const finalized = closeAssistantSegmentsForTurn(messages, turnId);
@@ -909,5 +1017,68 @@ function isCoveredByHydrated(live: ChatMessage, hydrated: ChatMessage[]): boolea
     );
   }
 
+  if (live.role === 'error') {
+    return hydrated.some(item =>
+      item.role === 'error'
+      && item.text.trim() === live.text.trim()
+      && (!live.turnId || item.turnId === live.turnId),
+    );
+  }
+
   return false;
+}
+
+function MessageUsage({
+  usage,
+  contextWindowTokens,
+}: {
+  usage: TokenUsageLike;
+  contextWindowTokens?: number;
+}) {
+  const input = effectiveInputTokens(usage);
+  const cached = cachedInputTokens(usage);
+  const output = usage.output_tokens ?? 0;
+  const percent = contextUsagePercent(input, contextWindowTokens);
+
+  return (
+    <div className="playground-msg-usage">
+      {input > 0 && (
+        <span>
+          <ContextUsageDot
+            percent={percent}
+            title={contextUsageTitle(input, contextWindowTokens)}
+          />
+          ↓ {input.toLocaleString()}
+          {cached > 0 && <span className="usage-cache-note">(cached {cached.toLocaleString()})</span>}
+        </span>
+      )}
+      {output > 0 && <span>↑ {output.toLocaleString()}</span>}
+    </div>
+  );
+}
+
+function AgentContextUsage({ agent }: { agent: AgentInfo }) {
+  const tokens = agent.currentContextTokens ?? 0;
+  const percent = contextUsagePercent(tokens, agent.contextWindowTokens);
+  const title = contextUsageTitle(tokens, agent.contextWindowTokens);
+
+  return (
+    <span className="playground-agent-context" title={title} aria-label={title}>
+      <ContextUsageDot percent={percent} title={title} />
+      <span>{tokens.toLocaleString()}</span>
+      <span className="playground-agent-context-unit">tok</span>
+    </span>
+  );
+}
+
+function ContextUsageDot({ percent, title }: { percent: number; title: string }) {
+  const clamped = Math.round(Math.min(100, Math.max(0, percent)));
+  return (
+    <span
+      className="context-usage-dot"
+      style={{ ['--context-percent' as string]: `${clamped}%` }}
+      title={title}
+      aria-label={title}
+    />
+  );
 }

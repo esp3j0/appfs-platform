@@ -12,6 +12,7 @@ use tokio::runtime::Builder;
 use tokio::time::timeout;
 
 use crate::appfs::{prepare_appfs_act_event_wait, wait_for_appfs_act_event_completion};
+use crate::execution_tasks::register_child_execution_task;
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
@@ -161,11 +162,17 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     if input.run_in_background.unwrap_or(false) {
         let background_output = prepare_background_shell_output(&cwd, "bash")?;
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
-        child
+        let child = child
             .stdin(Stdio::null())
             .stdout(background_output.stdout)
             .stderr(background_output.stderr)
             .spawn()?;
+        register_child_execution_task(
+            background_output.task_id.clone(),
+            "bash",
+            PathBuf::from(&background_output.output_path),
+            child,
+        );
 
         return Ok(BashCommandOutput {
             stdout: String::new(),

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react';
+import type { TokenUsageLike } from '../token-usage';
 
 export interface DashboardSSEEvent {
   type: string;
@@ -12,7 +13,7 @@ export interface DashboardSSECallbacks {
   onToolStart?: (payload: { sessionId: string; requestId?: string; turnId?: string; id?: string; toolName: string }) => void;
   onToolResult?: (payload: { sessionId: string; requestId?: string; turnId?: string; id?: string; toolName: string; isError?: boolean }) => void;
   onTurnStart?: (payload: { sessionId: string; requestId: string; turnId: string }) => void;
-  onTurnDone?: (payload: { sessionId: string; requestId: string; turnId: string; status: string; usage?: { input_tokens?: number; output_tokens?: number } }) => void;
+  onTurnDone?: (payload: { sessionId: string; requestId: string; turnId: string; status: string; usage?: TokenUsageLike }) => void;
   onAgentError?: (payload: { sessionId: string; requestId?: string; turnId?: string; message: string }) => void;
   onAgentOnline?: (payload: { sessionId: string; spawnId: string; controlMode: string }) => void;
   onAgentOffline?: (payload: { sessionId: string; spawnId: string; code: number; signal: string }) => void;

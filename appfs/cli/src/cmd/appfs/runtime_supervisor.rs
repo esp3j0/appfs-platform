@@ -19,6 +19,11 @@ pub(super) struct AppfsRuntimeSupervisor {
     runtime_session_id: String,
     control_plane: supervisor_control::SupervisorControlPlane,
     pub(super) runtimes: BTreeMap<String, AppRuntimeEntry>,
+    /// In-memory principal registry.  Loaded once from disk at startup and
+    /// kept in sync.  Every mutation goes through `write_principal_registry`
+    /// which updates both the in-memory copy and the on-disk files.
+    /// This avoids stale reads caused by WinFsp read-after-write latency.
+    principal_registry: registry::PrincipalRegistryDoc,
 }
 
 impl AppfsRuntimeSupervisor {
@@ -57,6 +62,7 @@ impl AppfsRuntimeSupervisor {
                 anyhow::bail!("duplicate runtime instance_id during supervisor bootstrap");
             }
         }
+        let principal_registry = Self::load_principal_registry_from_disk(&root)?;
         Ok(Self {
             managed,
             runtime_session_id: runtime_manifest::generate_runtime_session_id(),
@@ -68,6 +74,7 @@ impl AppfsRuntimeSupervisor {
             )?,
             root,
             runtimes,
+            principal_registry,
         })
     }
 
@@ -108,6 +115,44 @@ impl AppfsRuntimeSupervisor {
         Ok(())
     }
 
+    /// Sweep stale principal attaches.  Called on a periodic timer (every 30 s).
+    /// Removes any attach whose `last_seen_at` is older than
+    /// `PRINCIPAL_ATTACH_STALE_AFTER_SECS` (90 s) and emits a
+    /// `principal.attach_expired` event for each one.
+    pub(super) fn sweep_stale_attaches_once(&mut self) -> Result<()> {
+        let now = chrono::Utc::now();
+        let mut any_changed = false;
+
+        for record in &mut self.principal_registry.principals {
+            let before = record.active_attaches.len();
+            record
+                .active_attaches
+                .retain(|lease| !registry::is_principal_attach_stale(lease, now));
+            let removed = before - record.active_attaches.len();
+            if removed > 0 {
+                any_changed = true;
+                record.active_attach_count = record.active_attaches.len() as u32;
+                if record.active_attaches.is_empty() {
+                    record.agent_status = None;
+                }
+                record.updated_at = now.to_rfc3339();
+            }
+        }
+
+        if !any_changed {
+            return Ok(());
+        }
+
+        self.persist_principal_registry()?;
+
+        // Emit events and update individual record views for the changed principals.
+        for record in &self.principal_registry.principals {
+            registry::write_principal_record_view(&self.root, record)?;
+        }
+
+        Ok(())
+    }
+
     pub(super) fn inbound_poll_interval(&self) -> Option<Duration> {
         self.runtimes
             .values()
@@ -117,6 +162,15 @@ impl AppfsRuntimeSupervisor {
                     .then(|| Duration::from_millis(inbound_poll_ms.max(super::MIN_POLL_MS)))
             })
             .min()
+    }
+
+    /// Refresh `status.res.json` from the current principal registry state.
+    ///
+    /// Called on startup to ensure the status view file exists and is
+    /// consistent with the registry, even if it was lost during an
+    /// unclean shutdown.
+    pub(super) fn refresh_principal_status(&self) -> Result<()> {
+        self.persist_principal_registry()
     }
 
     pub(super) fn log_started(&self) {
@@ -338,8 +392,8 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::CreatePrincipalRequest,
     ) -> Result<()> {
-        let mut doc = self.load_principal_registry()?;
-        if let Some(existing) = doc
+        if let Some(existing) = self
+            .principal_registry
             .principals
             .iter()
             .find(|principal| principal.principal_id == request.principal_id)
@@ -374,8 +428,8 @@ impl AppfsRuntimeSupervisor {
             active_attaches: Vec::new(),
             agent_status: None,
         };
-        doc.principals.push(record.clone());
-        registry::write_principal_registry(&self.root, &doc)?;
+        self.principal_registry.principals.push(record.clone());
+        self.persist_principal_registry()?;
         registry::write_principal_record_view(&self.root, &record)?;
         let materialized = self.materialize_private_apps_for_principal(&record)?;
         self.control_plane.emit_completed(
@@ -398,8 +452,8 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::UpdatePrincipalRequest,
     ) -> Result<()> {
-        let mut doc = self.load_principal_registry()?;
-        let Some(record) = doc
+        let Some(record) = self
+            .principal_registry
             .principals
             .iter_mut()
             .find(|principal| principal.principal_id == request.principal_id)
@@ -414,14 +468,19 @@ impl AppfsRuntimeSupervisor {
             return Ok(());
         };
 
+        let mut meaningful_change = false;
+
         if let Some(display_name) = request.display_name {
             record.display_name = display_name;
+            meaningful_change = true;
         }
         if let Some(description) = request.description {
             record.description = Some(description);
+            meaningful_change = true;
         }
         if let Some(kind) = request.kind {
             record.kind = kind;
+            meaningful_change = true;
         }
         if let Some(agent_status) = request.agent_status {
             let Some(request_attach_id) = request.attach_id.as_deref() else {
@@ -465,22 +524,37 @@ impl AppfsRuntimeSupervisor {
                 active_attach.last_seen_at = chrono::Utc::now().to_rfc3339();
             }
             apply_agent_status_patch(record, request_attach_id, agent_status);
+            meaningful_change = true;
+        } else if let Some(request_attach_id) = request.attach_id.as_deref() {
+            // Heartbeat: no agent_status, no metadata fields — only refresh last_seen_at.
+            // Skip event emission to avoid flooding the event stream every 30s.
+            if let Some(active_attach) = record
+                .active_attaches
+                .iter_mut()
+                .find(|lease| lease.attach_id == request_attach_id)
+            {
+                active_attach.last_seen_at = chrono::Utc::now().to_rfc3339();
+            }
         }
+
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
-        registry::write_principal_registry(&self.root, &doc)?;
+        self.persist_principal_registry()?;
         registry::write_principal_record_view(&self.root, &updated)?;
-        self.control_plane.emit_completed(
-            "/_appfs/principals/update_principal.act",
-            request_id,
-            serde_json::json!({
-                "principal_event": if updated.agent_status.is_some() { "principal.status.updated" } else { "principal.updated" },
-                "principal_id": updated.principal_id,
-                "updated": true,
-                "agent_status": updated.agent_status,
-            }),
-            client_token,
-        )?;
+
+        if meaningful_change {
+            self.control_plane.emit_completed(
+                "/_appfs/principals/update_principal.act",
+                request_id,
+                serde_json::json!({
+                    "principal_event": if updated.agent_status.is_some() { "principal.status.updated" } else { "principal.updated" },
+                    "principal_id": updated.principal_id,
+                    "updated": true,
+                    "agent_status": updated.agent_status,
+                }),
+                client_token,
+            )?;
+        }
         Ok(())
     }
 
@@ -490,11 +564,12 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::DeletePrincipalRequest,
     ) -> Result<()> {
-        let mut doc = self.load_principal_registry()?;
-        let before = doc.principals.len();
-        doc.principals
-            .retain(|principal| principal.principal_id != request.principal_id);
-        if doc.principals.len() == before {
+        let Some(principal_index) = self
+            .principal_registry
+            .principals
+            .iter()
+            .position(|principal| principal.principal_id == request.principal_id)
+        else {
             self.control_plane.emit_failed(
                 "/_appfs/principals/delete_principal.act",
                 request_id,
@@ -503,7 +578,29 @@ impl AppfsRuntimeSupervisor {
                 client_token,
             )?;
             return Ok(());
+        };
+        if !request.force
+            && matches!(
+                registry::principal_presence(
+                    &self.principal_registry.principals[principal_index],
+                    chrono::Utc::now()
+                ),
+                registry::PrincipalPresence::Online
+            )
+        {
+            self.control_plane.emit_failed(
+                "/_appfs/principals/delete_principal.act",
+                request_id,
+                "PRINCIPAL_ACTIVE_ATTACH",
+                &format!(
+                    "principal {} has an active attach; retry with force=true to delete",
+                    request.principal_id
+                ),
+                client_token,
+            )?;
+            return Ok(());
         }
+        self.principal_registry.principals.remove(principal_index);
         let cleanup_keys = self
             .runtimes
             .iter()
@@ -514,8 +611,9 @@ impl AppfsRuntimeSupervisor {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let mut credential_cleanup_requests = Vec::new();
-        for runtime_key in cleanup_keys {
-            let Some(entry) = self.runtimes.get_mut(&runtime_key) else {
+        let cleanup_count = cleanup_keys.len();
+        for runtime_key in &cleanup_keys {
+            let Some(entry) = self.runtimes.get_mut(runtime_key) else {
                 continue;
             };
             let profile_id = entry.registry_metadata.profile_id.clone();
@@ -553,8 +651,14 @@ impl AppfsRuntimeSupervisor {
 
             credential_cleanup_requests.push(cleanup_request);
         }
-        registry::write_principal_registry(&self.root, &doc)?;
+        for runtime_key in cleanup_keys {
+            self.runtimes.remove(&runtime_key);
+        }
+        self.persist_principal_registry()?;
         registry::delete_principal_record_view(&self.root, &request.principal_id)?;
+        if cleanup_count > 0 {
+            self.sync_registry_to_disk(None)?;
+        }
         self.control_plane.emit_completed(
             "/_appfs/principals/delete_principal.act",
             request_id,
@@ -562,6 +666,7 @@ impl AppfsRuntimeSupervisor {
                 "principal_event": "principal.deleted",
                 "principal_id": request.principal_id,
                 "deleted": true,
+                "private_app_instances_removed": cleanup_count,
                 "credentials_cleanup": "requested",
                 "credential_cleanup_requests": credential_cleanup_requests,
             }),
@@ -576,8 +681,8 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::AttachPrincipalRequest,
     ) -> Result<()> {
-        let mut doc = self.load_principal_registry()?;
-        let Some(record) = doc
+        let Some(record) = self
+            .principal_registry
             .principals
             .iter_mut()
             .find(|principal| principal.principal_id == request.principal_id)
@@ -645,7 +750,7 @@ impl AppfsRuntimeSupervisor {
         record.active_attach_count = record.active_attaches.len() as u32;
         record.updated_at = now;
         let updated = record.clone();
-        registry::write_principal_registry(&self.root, &doc)?;
+        self.persist_principal_registry()?;
         registry::write_principal_record_view(&self.root, &updated)?;
         let materialized = self.materialize_private_apps_for_principal(&updated)?;
         self.control_plane.emit_completed(
@@ -672,8 +777,8 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::DetachPrincipalRequest,
     ) -> Result<()> {
-        let mut doc = self.load_principal_registry()?;
-        let Some(record) = doc
+        let Some(record) = self
+            .principal_registry
             .principals
             .iter_mut()
             .find(|principal| principal.principal_id == request.principal_id)
@@ -713,7 +818,7 @@ impl AppfsRuntimeSupervisor {
         record.active_attach_count = record.active_attaches.len() as u32;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
-        registry::write_principal_registry(&self.root, &doc)?;
+        self.persist_principal_registry()?;
         registry::write_principal_record_view(&self.root, &updated)?;
         self.control_plane.emit_completed(
             "/_appfs/principals/detach_principal.act",
@@ -731,14 +836,28 @@ impl AppfsRuntimeSupervisor {
         Ok(())
     }
 
-    fn load_principal_registry(&self) -> Result<registry::PrincipalRegistryDoc> {
-        Ok(registry::read_principal_registry(&self.root)?.unwrap_or(
-            registry::PrincipalRegistryDoc {
+    /// Load the principal registry from disk (called once at startup).
+    fn load_principal_registry_from_disk(
+        root: &std::path::Path,
+    ) -> Result<registry::PrincipalRegistryDoc> {
+        Ok(
+            registry::read_principal_registry(root)?.unwrap_or(registry::PrincipalRegistryDoc {
                 version: registry::APPFS_REGISTRY_VERSION,
                 default_principal_id: registry::APPFS_DEFAULT_PRINCIPAL_ID.to_string(),
                 principals: Vec::new(),
-            },
-        ))
+            }),
+        )
+    }
+
+    /// Get a shared reference to the in-memory principal registry.
+    #[allow(dead_code)]
+    fn principal_registry(&self) -> &registry::PrincipalRegistryDoc {
+        &self.principal_registry
+    }
+
+    /// Persist the in-memory principal registry to disk (registry + status files).
+    fn persist_principal_registry(&self) -> Result<()> {
+        registry::write_principal_registry(&self.root, &self.principal_registry)
     }
 
     fn materialize_private_apps_for_principal(

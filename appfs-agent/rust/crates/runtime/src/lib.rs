@@ -8,6 +8,7 @@ mod config;
 pub mod config_validate;
 mod context;
 mod conversation;
+mod execution_tasks;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -38,6 +39,7 @@ mod sse;
 pub mod stale_base;
 pub mod stale_branch;
 pub mod summary_compression;
+pub mod task_board;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
@@ -53,7 +55,8 @@ pub use appfs::{
     attach_appfs_principal, auto_mark_read_for_wake_inputs, create_appfs_principal,
     detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
     resolve_appfs_environment, sanitize_appfs_task_preview,
-    scan_appfs_attention_events_for_idle_wake, update_appfs_principal_agent_status,
+    heartbeat_appfs_principal, scan_appfs_attention_events_for_idle_wake,
+    update_appfs_principal_agent_status,
     warmup_appfs_private_apps, AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate,
     AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease, AppfsAttachSource,
     AppfsEnvironment, AppfsIdleWakeScanOutcome, AppfsPrincipalCreateOutcome,
@@ -94,6 +97,11 @@ pub use conversation::{
     AutoCompactionConfig, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
     StaticToolExecutor, ToolContextUpdate, ToolError, ToolExecutionResult, ToolExecutor,
     TurnSummary,
+};
+pub use execution_tasks::{
+    execution_task_output_file, execution_task_snapshot, mark_execution_task_status,
+    read_execution_task_output, register_abortable_execution_task, register_child_execution_task,
+    stop_execution_task, unregister_execution_task, ExecutionTaskSnapshot, ExecutionTaskStatus,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, resolve_tool_path,
@@ -188,11 +196,14 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
+pub use task_board::{
+    TaskBoardPatch, TaskBoardStatus, TaskBoardStore, TaskBoardTask, TaskBoardUpdateOutcome,
+};
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};
 pub use tool_session::{
-    current_tool_session_compaction_summary, current_tool_session_messages,
-    with_tool_session_snapshot,
+    current_tool_session_compaction_summary, current_tool_session_id,
+    current_tool_session_messages, with_tool_session_snapshot,
 };
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};

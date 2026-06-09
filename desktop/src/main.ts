@@ -55,7 +55,7 @@ function createWindow() {
   const bounds = state.windowBounds || { width: 1024, height: 768 };
 
   const currentDir = path.dirname(fileURLToPath(import.meta.url));
-  const preloadPath = path.join(currentDir, 'preload.js');
+  const preloadPath = path.join(currentDir, 'preload.cjs');
 
   mainWindow = new BrowserWindow({
     width: bounds.width,

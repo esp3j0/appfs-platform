@@ -106,6 +106,58 @@ pub fn write_message_request(
     }
 }
 
+/// Append a headless turn error to the companion `.debug.jsonl`.
+///
+/// The live headless stream already emits an `error` event, but that event is
+/// ephemeral. Persisting it here lets the dashboard reconstruct failed turns
+/// after a refresh or after the session JSONL has been rotated.
+pub fn write_turn_error(
+    session_jsonl_path: &Path,
+    request_id: &str,
+    turn_id: &str,
+    session_id: &str,
+    message: &str,
+    source: Option<&str>,
+) {
+    let debug_path = session_jsonl_path.with_extension("debug.jsonl");
+    let mut record = json!({
+        "type": "turn_error",
+        "timestamp_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        "request_id": request_id,
+        "turn_id": turn_id,
+        "session_id": session_id,
+        "message": message,
+    });
+    if let Some(source) = source {
+        record["source"] = json!(source);
+    }
+
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&debug_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&record).unwrap_or_default()
+            ) {
+                eprintln!("[debug-dump] turn error write error: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[debug-dump] turn error open error for {}: {e}",
+                debug_path.display()
+            );
+        }
+    }
+}
+
 /// Archive messages that are about to be removed by compaction.
 ///
 /// Called *before* `build_compaction_result()` replaces `session.messages`.
@@ -161,6 +213,7 @@ pub fn write_compaction_archive(
                 let record = json!({
                     "type": "compaction_archive",
                     "timestamp_ms": timestamp_ms,
+                    "compaction_count": compaction_count,
                     "message": serde_json::from_str::<serde_json::Value>(&msg_json)
                         .unwrap_or_else(|_| json!(msg_json)),
                 });

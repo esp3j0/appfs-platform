@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use super::shared::write_pretty_json_file;
+
 pub(crate) const APPFS_RUNTIME_MANIFEST_REL_PATH: &str = ".well-known/appfs/runtime.json";
 pub(crate) const APPFS_RUNTIME_SCHEMA_VERSION: u32 = 1;
 pub(crate) const APPFS_RUNTIME_KIND: &str = "appfs";
@@ -119,22 +121,7 @@ pub(crate) fn write_runtime_manifest(
         )
     })?;
     let doc = build_runtime_manifest(root, runtime_session_id, managed);
-    let bytes =
-        serde_json::to_vec_pretty(&doc).context("failed to serialize AppFS runtime manifest")?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, bytes).with_context(|| {
-        format!(
-            "failed to write temporary AppFS runtime manifest {}",
-            tmp_path.display()
-        )
-    })?;
-    fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "failed to publish AppFS runtime manifest {}",
-            path.display()
-        )
-    })?;
-    Ok(())
+    write_pretty_json_file(&path, &doc, "AppFS runtime manifest")
 }
 
 #[cfg(test)]

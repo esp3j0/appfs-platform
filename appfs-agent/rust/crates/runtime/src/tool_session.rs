@@ -101,6 +101,15 @@ pub fn current_tool_session_compaction_summary() -> Option<String> {
     })
 }
 
+#[must_use]
+pub fn current_tool_session_id() -> Option<String> {
+    CURRENT_TOOL_SESSION_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|context| context.session_id.clone())
+    })
+}
+
 fn derive_tool_session_storage_root(context: &ToolSessionContext, cwd: &Path) -> Option<PathBuf> {
     if let Some(parent) = context.persistence_path.as_deref().and_then(Path::parent) {
         return Some(parent.join(&context.session_id));

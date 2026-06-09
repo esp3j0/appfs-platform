@@ -371,9 +371,15 @@ fn parse_update_and_delete_principal_requests_require_principal_id() {
     let req = parse_delete_principal_request(r#"{"principal_id":"default"}"#)
         .expect("valid principal delete request");
     assert_eq!(req.principal_id, "default");
+    assert!(!req.force);
+    let req = parse_delete_principal_request(r#"{"principal_id":"default","force":true}"#)
+        .expect("valid force principal delete request");
+    assert_eq!(req.principal_id, "default");
+    assert!(req.force);
 
     assert!(parse_update_principal_request(r#"{}"#).is_err());
     assert!(parse_delete_principal_request(r#"{"principal_id":".."}"#).is_err());
+    assert!(parse_delete_principal_request(r#"{"principal_id":"default","force":"yes"}"#).is_err());
 }
 
 #[test]

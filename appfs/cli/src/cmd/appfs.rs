@@ -754,6 +754,10 @@ async fn handle_appfs_adapter_command_with_startup_context(
         )
     };
     wait_for_managed_runtime_paths_ready(&root, &resolved_runtime_args, startup_context.as_ref())?;
+    // Recover any registry files lost during an unclean shutdown.
+    // On Windows the remove+rename write pattern can leave the original
+    // file missing with a .tmp sidecar.  Promote before loading.
+    registry::recover_tmp_registry_files(&root);
     let startup_bootstrap = startup_context.map(|context| context.app_bootstrap);
     let mut supervisor = AppfsRuntimeSupervisor::new(
         root,
@@ -764,6 +768,9 @@ async fn handle_appfs_adapter_command_with_startup_context(
     )?;
     supervisor.prepare_action_sinks()?;
     supervisor.sync_registry_to_disk(existing_registry.as_ref())?;
+    // Always refresh status.res.json on startup so it reflects the current
+    // principal registry state, even if the file was lost during shutdown.
+    supervisor.refresh_principal_status()?;
     supervisor.log_started();
     let fallback_interval_duration = fallback_poll_interval(fallback_poll_ms);
     let mut inbound_interval_duration = supervisor.inbound_poll_interval();
@@ -805,6 +812,8 @@ async fn handle_appfs_adapter_command_with_startup_context(
     if let Some(interval) = inbound_interval.as_mut() {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     }
+    let mut stale_sweep_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    stale_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = crate::shutdown_signal::wait_for_shutdown_signal() => {
@@ -842,6 +851,11 @@ async fn handle_appfs_adapter_command_with_startup_context(
             } => {
                 if let Err(err) = supervisor.poll_inbound_events_once() {
                     eprintln!("AppFS adapter inbound poll error: {err:#}");
+                }
+            }
+            _ = stale_sweep_interval.tick() => {
+                if let Err(err) = supervisor.sweep_stale_attaches_once() {
+                    eprintln!("AppFS adapter stale attach sweep error: {err:#}");
                 }
             }
         }
@@ -2471,6 +2485,30 @@ mod supervisor_tests {
             cleanup[0].get("status").and_then(|value| value.as_str()),
             Some("completed")
         );
+        assert_eq!(
+            content
+                .get("private_app_instances_removed")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert!(
+            !supervisor.runtimes.contains_key("tinode--default"),
+            "private app runtime should be removed when its principal is deleted"
+        );
+        let stored = registry::read_app_registry(temp.path())
+            .expect("read app registry")
+            .expect("app registry exists");
+        assert!(
+            stored
+                .apps
+                .iter()
+                .all(|app| app.instance_id != "tinode--default"),
+            "private app instance should be removed from app registry"
+        );
+        assert!(
+            tinode_root.exists(),
+            "delete principal unregisters runtime/registry state but preserves private app files"
+        );
     }
 
     #[test]
@@ -2695,6 +2733,70 @@ mod supervisor_tests {
                 .and_then(|value| value.get("principal_event"))
                 .and_then(|value| value.as_str()),
             Some("principal.detached")
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_rejects_delete_principal_with_active_attach_unless_forced() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/create_principal.act"),
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"kind\":\"agent\",\"client_token\":\"principal-force-create\"}\n",
+        );
+        supervisor.poll_once().expect("poll create principal");
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/attach_principal.act"),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-active\",\"role\":\"coordinator\",\"session_id\":\"session-active\",\"client_token\":\"principal-force-attach\"}\n",
+        );
+        supervisor.poll_once().expect("poll attach principal");
+
+        append_text(
+            &temp.path().join("_appfs/principals/delete_principal.act"),
+            "{\"principal_id\":\"default\",\"client_token\":\"principal-delete-active\"}\n",
+        );
+        supervisor
+            .poll_once()
+            .expect("poll active delete principal");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert_eq!(registry.principals.len(), 1);
+        let events = control_events(&temp, "principal-delete-active");
+        assert_eq!(
+            events[0]
+                .get("error")
+                .and_then(|value| value.get("code"))
+                .and_then(|value| value.as_str()),
+            Some("PRINCIPAL_ACTIVE_ATTACH")
+        );
+
+        append_text(
+            &temp.path().join("_appfs/principals/delete_principal.act"),
+            "{\"principal_id\":\"default\",\"force\":true,\"client_token\":\"principal-delete-force\"}\n",
+        );
+        supervisor
+            .poll_once()
+            .expect("poll forced delete principal");
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert!(registry.principals.is_empty());
+        let events = control_events(&temp, "principal-delete-force");
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.deleted")
         );
     }
 

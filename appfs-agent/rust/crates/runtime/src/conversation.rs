@@ -4,17 +4,17 @@ use std::fmt::{Display, Formatter};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
-use crate::appfs::{collect_appfs_pending_inputs, detect_appfs_environment};
+use crate::appfs::{build_peer_awareness_snapshot, collect_appfs_pending_inputs, detect_appfs_environment};
 use crate::compact::{
-    build_compaction_result, compact_session, estimate_session_tokens, get_compact_prompt,
-    select_full_compact_messages, should_compact, BuildCompactionResultOptions, CompactionConfig,
-    CompactionLayout, CompactionResult, PreservedSegmentAnchor,
+    build_compaction_result, compact_session, estimate_message_tokens, estimate_session_tokens,
+    get_compact_prompt, select_full_compact_messages, should_compact, BuildCompactionResultOptions,
+    CompactionConfig, CompactionLayout, CompactionResult, PreservedSegmentAnchor,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::input_router::{
-    input_router_block_from_pending_inputs, InputEnvelope, InputSource, PendingInput,
-    PendingInputDelivery, PendingInputQueue, SharedPendingInputQueue,
+    input_router_block_from_pending_inputs, InputSource, PendingInput,
+    PendingInputQueue, SharedPendingInputQueue,
 };
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
@@ -29,6 +29,7 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_CONTEXT_WINDOW_TOKENS: u32 = 200_000;
 const MAX_OUTPUT_TOKENS_FOR_SUMMARY: u32 = 20_000;
 const AUTOCOMPACT_BUFFER_TOKENS: u32 = 13_000;
+const COMPACT_REQUEST_SAFETY_BUFFER_TOKENS: u32 = 1_024;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 const AUTO_COMPACTION_WINDOW_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 const AUTO_COMPACTION_PCT_ENV_VAR: &str = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE";
@@ -42,6 +43,8 @@ pub struct ApiRequest {
     pub allow_tools: bool,
     pub model_override: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Optional max output token override for special requests such as full compact.
+    pub max_tokens_override: Option<u32>,
     pub abort_signal: Option<HookAbortSignal>,
 }
 
@@ -54,6 +57,7 @@ impl ApiRequest {
             allow_tools: true,
             model_override: None,
             reasoning_effort: None,
+            max_tokens_override: None,
             abort_signal: None,
         }
     }
@@ -66,6 +70,7 @@ impl ApiRequest {
             allow_tools: false,
             model_override: None,
             reasoning_effort: None,
+            max_tokens_override: Some(MAX_OUTPUT_TOKENS_FOR_SUMMARY),
             abort_signal: None,
         }
     }
@@ -315,7 +320,7 @@ pub struct ConversationRuntime<C, T> {
     external_pending_inputs: Option<SharedPendingInputQueue>,
     pending_appfs_event_cursor_updates: BTreeMap<String, i64>,
     pending_appfs_wake_event_cursor_updates: BTreeMap<String, i64>,
-    last_principal_registry_revision: Option<String>,
+    peer_awareness_snapshot_injected: bool,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -351,8 +356,6 @@ where
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
-        let last_principal_registry_revision = None;
-
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
             session,
@@ -371,7 +374,7 @@ where
             external_pending_inputs: None,
             pending_appfs_event_cursor_updates: BTreeMap::new(),
             pending_appfs_wake_event_cursor_updates: BTreeMap::new(),
-            last_principal_registry_revision,
+            peer_awareness_snapshot_injected: false,
         }
     }
 
@@ -559,6 +562,7 @@ where
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
+        let mut auto_compaction = None;
         let mut iterations = 0;
         let mut tool_context = ConversationToolContext::default();
 
@@ -597,6 +601,18 @@ where
                     prompt_cache_events,
                     iterations,
                 ));
+            }
+
+            if let Some(event) = self.maybe_auto_compact() {
+                merge_auto_compaction_event(&mut auto_compaction, event);
+                if self.hook_abort_signal.is_aborted() {
+                    return Ok(self.cancelled_turn_summary(
+                        assistant_messages,
+                        tool_results,
+                        prompt_cache_events,
+                        iterations,
+                    ));
+                }
             }
 
             let mut request =
@@ -680,11 +696,13 @@ where
             }
 
             let mut pending_tool_uses = pending_tool_uses.into_iter().peekable();
+            let mut deferred_additional_messages = Vec::new();
             while let Some((tool_use_id, tool_name, input)) = pending_tool_uses.next() {
                 if self.hook_abort_signal.is_aborted() {
                     let mut remaining = vec![(tool_use_id, tool_name, input)];
                     remaining.extend(pending_tool_uses);
                     self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
+                    self.push_deferred_tool_additional_messages(deferred_additional_messages)?;
                     return Ok(self.cancelled_turn_summary(
                         assistant_messages,
                         tool_results,
@@ -698,6 +716,7 @@ where
                     let mut remaining = vec![(tool_use_id, tool_name, input)];
                     remaining.extend(pending_tool_uses);
                     self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
+                    self.push_deferred_tool_additional_messages(deferred_additional_messages)?;
                     return Ok(self.cancelled_turn_summary(
                         assistant_messages,
                         tool_results,
@@ -833,11 +852,7 @@ where
                         if let Some(context_update) = execution.context_update {
                             tool_context.apply(context_update);
                         }
-                        for message in execution.additional_messages {
-                            self.session
-                                .push_message(message)
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        }
+                        deferred_additional_messages.extend(execution.additional_messages);
                         if self.hook_abort_signal.is_aborted() {
                             let remaining = pending_tool_uses.collect::<Vec<_>>();
                             if !remaining.is_empty() {
@@ -847,6 +862,9 @@ where
                                     &mut tool_results,
                                 )?;
                             }
+                            self.push_deferred_tool_additional_messages(
+                                deferred_additional_messages,
+                            )?;
                             return Ok(self.cancelled_turn_summary(
                                 assistant_messages,
                                 tool_results,
@@ -873,6 +891,7 @@ where
                     if !remaining.is_empty() {
                         self.cancel_pending_tool_uses(iterations, remaining, &mut tool_results)?;
                     }
+                    self.push_deferred_tool_additional_messages(deferred_additional_messages)?;
                     return Ok(self.cancelled_turn_summary(
                         assistant_messages,
                         tool_results,
@@ -881,9 +900,12 @@ where
                     ));
                 }
             }
+            self.push_deferred_tool_additional_messages(deferred_additional_messages)?;
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        if let Some(event) = self.maybe_auto_compact() {
+            merge_auto_compaction_event(&mut auto_compaction, event);
+        }
 
         let summary = TurnSummary {
             assistant_messages,
@@ -941,6 +963,18 @@ where
         Ok(())
     }
 
+    fn push_deferred_tool_additional_messages(
+        &mut self,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<(), RuntimeError> {
+        for message in messages {
+            self.session
+                .push_message(message)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn enqueue_appfs_events_before_model_call(&mut self) -> Result<(), RuntimeError> {
         let root_path = self
             .session
@@ -975,60 +1009,31 @@ where
     }
 
     fn sync_pending_inputs_before_model_call(&mut self) -> Result<(), RuntimeError> {
-        let root_path = self
-            .session
-            .workspace_root()
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok());
-
-        if let Some(cwd) = root_path {
-            if let Some(env) = detect_appfs_environment(&cwd) {
-                let current = env.principal_registry_revision.clone();
-                let mut should_inject = false;
-                let roster = env
-                    .known_principals
-                    .iter()
-                    .map(|p| p.principal_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                if let Some(last) = &self.last_principal_registry_revision {
-                    if last != &current {
-                        should_inject = true;
-                    }
-                } else {
-                    // First model boundary: check if any principal is missing from the system prompt.
-                    // If any principal is missing, it means another agent was spawned between
-                    // system prompt creation and runtime initialization, so we must inject a reminder.
-                    for principal in &env.known_principals {
-                        let id_pattern = format!("`{}`", principal.principal_id);
-                        let is_present = self
-                            .system_prompt
-                            .iter()
-                            .any(|section| section.contains(&id_pattern));
-                        if !is_present {
-                            should_inject = true;
-                            break;
-                        }
+        // One-time peer awareness snapshot: on the very first model call, read
+        // status.res.json to inject initial peer state. This is needed because the
+        // event pipeline only delivers deltas (cursor-based), so pre-existing peers
+        // whose events were already consumed by idle wake scan would be invisible.
+        if !self.peer_awareness_snapshot_injected {
+            let root_path = self
+                .session
+                .workspace_root()
+                .map(|p| p.to_path_buf())
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(cwd) = root_path {
+                if let Some(env) = detect_appfs_environment(&cwd) {
+                    let snapshot = build_peer_awareness_snapshot(&env);
+                    for input in snapshot {
+                        self.pending_inputs.push(input);
                     }
                 }
-
-                if should_inject {
-                    self.pending_inputs.push(PendingInput {
-                        envelope: InputEnvelope::new(
-                            InputSource::System,
-                            "principal_registry.updated",
-                            format!(
-                                "registry updated\nnew principals available\ncurrent roster: {}\nrefresh current roster",
-                                roster
-                            ),
-                        ),
-                        delivery: PendingInputDelivery::InjectAtNextBoundary,
-                    });
-                }
-                self.last_principal_registry_revision = Some(current);
             }
+            self.peer_awareness_snapshot_injected = true;
         }
+
+        // Principal awareness is driven by the AppFS event pipeline:
+        // - principal lifecycle events (created/attached/detached/deleted) flow through events.evt.jsonl
+        // - peer status changes (principal.status.updated for other agents) pass the event classifier
+        // - self status changes are still dropped in classify_appfs_event_with_render_metadata
 
         let local_pending_inputs = self.pending_inputs.drain_boundary_pending_inputs();
         let external_pending_inputs = self
@@ -1167,6 +1172,7 @@ where
             custom_instructions,
         )));
         let mut request = ApiRequest::text_only(self.system_prompt.clone(), messages);
+        request.max_tokens_override = Some(self.compact_summary_max_output_tokens(&request));
         request.abort_signal = Some(self.hook_abort_signal.clone());
         let events = with_tool_session_context(
             &self.session.session_id,
@@ -1233,6 +1239,48 @@ where
             estimated_context_tokens,
             threshold_tokens,
         })
+    }
+
+    fn compact_summary_max_output_tokens(&self, request: &ApiRequest) -> u32 {
+        let context_window_tokens = effective_auto_compaction_context_window(
+            self.auto_compaction_config,
+            parse_positive_u32_env(AUTO_COMPACTION_WINDOW_ENV_VAR),
+        );
+        let request_input_tokens = self.estimate_compact_request_input_tokens(request);
+        let available = context_window_tokens
+            .saturating_sub(request_input_tokens)
+            .saturating_sub(COMPACT_REQUEST_SAFETY_BUFFER_TOKENS);
+        available.clamp(1, MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+    }
+
+    fn estimate_compact_request_input_tokens(&self, request: &ApiRequest) -> u32 {
+        let message_estimate = request
+            .messages
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>();
+        let system_estimate = request
+            .system_prompt
+            .iter()
+            .map(|section| section.len() / 4 + 1)
+            .sum::<usize>();
+        let local_estimate = message_estimate.saturating_add(system_estimate);
+
+        let current_session_estimate =
+            if request.messages.len() == self.session.messages.len().saturating_add(1) {
+                let extra_message_estimate = request.messages[self.session.messages.len()..]
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum::<usize>();
+                usize::try_from(UsageTracker::estimated_context_window_tokens(&self.session))
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(extra_message_estimate)
+            } else {
+                0
+            };
+
+        let estimate = local_estimate.max(current_session_estimate);
+        u32::try_from(estimate).unwrap_or(u32::MAX)
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -1506,6 +1554,22 @@ fn build_assistant_message(
     ))
 }
 
+fn merge_auto_compaction_event(
+    current: &mut Option<AutoCompactionEvent>,
+    mut next: AutoCompactionEvent,
+) {
+    if let Some(current) = current {
+        current.removed_message_count = current
+            .removed_message_count
+            .saturating_add(next.removed_message_count);
+        current.removed_messages.append(&mut next.removed_messages);
+        current.estimated_context_tokens = next.estimated_context_tokens;
+        current.threshold_tokens = next.threshold_tokens;
+    } else {
+        *current = Some(next);
+    }
+}
+
 fn assistant_text(message: &ConversationMessage) -> Option<String> {
     let text = message
         .blocks
@@ -1686,6 +1750,7 @@ mod tests {
         parse_auto_compaction_percent_override, ApiClient, ApiRequest, AssistantEvent,
         AutoCompactionConfig, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolContextUpdate, ToolExecutionResult, ToolExecutor,
+        MAX_OUTPUT_TOKENS_FOR_SUMMARY,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -2081,114 +2146,6 @@ mod tests {
     }
 
     #[test]
-    fn run_turn_injects_principal_registry_reminder_on_revision_change() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "appfs-conv-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let control_dir = temp_dir.join("_appfs");
-        std::fs::create_dir_all(&control_dir).unwrap();
-        std::fs::write(control_dir.join("register_app.act"), "").unwrap();
-        std::fs::write(control_dir.join("unregister_app.act"), "").unwrap();
-        std::fs::write(control_dir.join("list_apps.act"), "").unwrap();
-        std::fs::write(control_dir.join("apps.registry.json"), "[]").unwrap();
-        std::fs::write(
-            control_dir.join("principals.registry.json"),
-            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
-        ).unwrap();
-
-        let original_cwd = std::env::current_dir().unwrap();
-        struct RestoreCwd(std::path::PathBuf);
-        impl Drop for RestoreCwd {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
-        let _restore = RestoreCwd(original_cwd);
-        std::env::set_current_dir(&temp_dir).unwrap();
-
-        #[derive(Clone)]
-        struct RecordingApiClient {
-            seen_request: Rc<RefCell<Option<ApiRequest>>>,
-        }
-
-        impl ApiClient for RecordingApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                *self.seen_request.borrow_mut() = Some(request);
-                Ok(vec![
-                    AssistantEvent::TextDelta("ack".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-        }
-
-        let seen_request = Rc::new(RefCell::new(None));
-        let api_client = RecordingApiClient {
-            seen_request: seen_request.clone(),
-        };
-
-        let mut runtime = ConversationRuntime::new(
-            Session::new(),
-            api_client,
-            StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system - Known AppFS principals in this project: `default`.".to_string()],
-        );
-
-        // Turn 1: Initial load, should NOT alert because last_principal_registry_revision is None
-        runtime.run_turn("first turn", None).expect("turn 1");
-        {
-            let req = seen_request.borrow();
-            let req = req.as_ref().unwrap();
-            let has_reminder = req.messages.iter().any(|m| {
-                m.blocks.iter().any(|b| match b {
-                    ContentBlock::InputRouter { inputs } => {
-                        let text = render_input_router_block(inputs);
-                        text.contains("principal_registry.updated")
-                    }
-                    _ => false,
-                })
-            });
-            assert!(!has_reminder, "Should not contain reminder on initial turn");
-        }
-
-        // Wait a tiny bit and change principals.registry.json to trigger a revision change
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::write(
-            control_dir.join("principals.registry.json"),
-            r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"default","display_name":"Default agent","description":"The default project agent.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"},{"principal_id":"agent-c","display_name":"Agent C","description":"The third agent.","kind":"agent","created_at":"2026-05-22T00:00:00Z","updated_at":"2026-05-22T00:00:00Z"}]}"#,
-        ).unwrap();
-
-        // Turn 2: Roster has updated, should inject the reminder!
-        runtime.run_turn("second turn", None).expect("turn 2");
-        {
-            let req = seen_request.borrow();
-            let req = req.as_ref().unwrap();
-            let has_reminder = req.messages.iter().any(|m| {
-                m.blocks.iter().any(|b| match b {
-                    ContentBlock::InputRouter { inputs } => {
-                        let text = render_input_router_block(inputs);
-                        text.contains("principal_registry.updated")
-                            && text.contains("new principals available")
-                            && text.contains("agent-c")
-                    }
-                    _ => false,
-                })
-            });
-            assert!(
-                has_reminder,
-                "Should contain registry updated reminder on turn 2"
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
     fn run_turn_injects_external_pending_inputs_before_next_model_call() {
         #[derive(Clone)]
         struct RecordingApiClient {
@@ -2438,6 +2395,86 @@ mod tests {
         );
         assert_eq!(runtime.session().invoked_skills.len(), 1);
         assert_eq!(runtime.session().invoked_skills[0].skill, "trace");
+    }
+
+    #[test]
+    fn defers_tool_additional_messages_until_after_parallel_tool_results() {
+        struct RecordingApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for RecordingApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "skill".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "bash".to_string(),
+                            input: r#"{"command":"pwd"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert_eq!(request.messages.len(), 5);
+                        assert!(matches!(
+                            request.messages[2].blocks.first(),
+                            Some(ContentBlock::ToolResult { tool_use_id, .. })
+                                if tool_use_id == "tool-1"
+                        ));
+                        assert!(matches!(
+                            request.messages[3].blocks.first(),
+                            Some(ContentBlock::ToolResult { tool_use_id, .. })
+                                if tool_use_id == "tool-2"
+                        ));
+                        assert_eq!(
+                            request.messages[4]
+                                .attachment_metadata
+                                .as_ref()
+                                .map(|metadata| metadata.kind),
+                            Some(AttachmentKind::InvokedSkills),
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("extra API call"),
+                }
+            }
+        }
+
+        let tool_executor = StaticToolExecutor::new()
+            .register("skill", |_input| {
+                Ok(
+                    ToolExecutionResult::text("launched").with_additional_messages(vec![
+                        ConversationMessage::attachment_user_text(
+                            "Skill prompt",
+                            AttachmentKind::InvokedSkills,
+                        ),
+                    ]),
+                )
+            })
+            .register("bash", |_input| Ok("pwd output".to_string()));
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RecordingApiClient { call_count: 0 },
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("run tools", None)
+            .expect("conversation loop should succeed");
+
+        assert_eq!(summary.tool_results.len(), 2);
     }
 
     #[test]
@@ -3487,6 +3524,143 @@ mod tests {
         );
         assert!(requests[0].allow_tools);
         assert!(!requests[1].allow_tools);
+    }
+
+    #[test]
+    fn auto_compacts_before_follow_up_model_call_after_tool_result_crosses_threshold() {
+        #[derive(Clone)]
+        struct SimpleApi {
+            requests: Rc<RefCell<Vec<ApiRequest>>>,
+        }
+
+        impl ApiClient for SimpleApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let allow_tools_count = self
+                    .requests
+                    .borrow()
+                    .iter()
+                    .filter(|request| request.allow_tools)
+                    .count();
+                self.requests.borrow_mut().push(request.clone());
+
+                if !request.allow_tools {
+                    assert!(request.max_tokens_override.is_some());
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<analysis>draft</analysis><summary>Compacted before follow-up</summary>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+
+                if allow_tools_count == 0 {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("Reading the large file.".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "read".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 90_000,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    assert!(
+                        request
+                            .messages
+                            .first()
+                            .and_then(|message| message.compact_metadata.as_ref())
+                            .is_some_and(|metadata| metadata.trigger == CompactTrigger::Auto),
+                        "follow-up model request should use post-compact messages"
+                    );
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 10_000,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_workspace_root("/nonexistent/path/for/test"),
+            SimpleApi {
+                requests: requests.clone(),
+            },
+            StaticToolExecutor::new().register("read", |_input| Ok("x".repeat(60_000))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("inspect the large file", None)
+            .expect("turn should succeed");
+
+        assert!(summary.auto_compaction.is_some());
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].allow_tools);
+        assert!(!requests[1].allow_tools);
+        assert!(requests[2].allow_tools);
+    }
+
+    #[test]
+    fn compact_summary_output_budget_shrinks_when_current_context_is_near_window() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                unreachable!("this test only checks request budgeting")
+            }
+        }
+
+        let mut session = Session::new().with_workspace_root("/nonexistent/path/for/test");
+        session.messages = vec![ConversationMessage::assistant_with_usage(
+            vec![ContentBlock::Text {
+                text: "near window".to_string(),
+            }],
+            Some(TokenUsage {
+                input_tokens: 190_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+        )];
+        let runtime = ConversationRuntime::new(
+            session.clone(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_config(AutoCompactionConfig {
+            context_window_tokens: Some(200_000),
+            max_output_tokens: 32_000,
+            fixed_threshold_tokens: None,
+        });
+        let mut messages = session.messages.clone();
+        messages.push(ConversationMessage::user_text("compact prompt"));
+        let request = ApiRequest::text_only(vec!["system".to_string()], messages);
+
+        let budget = runtime.compact_summary_max_output_tokens(&request);
+
+        assert!(budget < MAX_OUTPUT_TOKENS_FOR_SUMMARY);
+        assert!(budget > 0);
     }
 
     #[test]

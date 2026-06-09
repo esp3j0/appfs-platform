@@ -588,6 +588,24 @@ pub fn detach_appfs_principal(lease: &AppfsAttachLease, reason: &str) -> Result<
     )
 }
 
+/// Write a lightweight heartbeat to `update_principal.act` that refreshes
+/// `last_seen_at` on the AppFS side without changing agent status.
+/// This keeps the principal attach from becoming stale while the agent is idle.
+pub fn heartbeat_appfs_principal(lease: &AppfsAttachLease) -> Result<(), String> {
+    let Some(action_path) = lease.update_action_path.as_ref() else {
+        return Err("AppFS update principal action path not available".to_string());
+    };
+    append_principal_lifecycle_action(
+        action_path,
+        serde_json::json!({
+            "principal_id": lease.principal_id,
+            "attach_id": lease.attach_id,
+            "client_token": format!("principal-heartbeat-{}", now_millis()),
+        }),
+        "heartbeat",
+    )
+}
+
 pub fn update_appfs_principal_agent_status(
     lease: &AppfsAttachLease,
     update: AppfsAgentStatusUpdate,
@@ -1418,6 +1436,7 @@ pub fn scan_appfs_attention_events_for_idle_wake(
                     should_wake_idle_agent_for_appfs_event_with_render_metadata(
                         record,
                         event_metadata.as_ref(),
+                        Some(&environment.principal_id),
                     )
                 }));
             }
@@ -1462,6 +1481,67 @@ pub fn scan_appfs_attention_events_for_idle_wake(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelInputCursorKind {
     Boundary,
+}
+
+pub fn build_peer_awareness_snapshot(environment: &AppfsEnvironment) -> Vec<PendingInput> {
+    let status_path = environment.mount_root.join("_appfs/principals/status.res.json");
+    let Ok(contents) = fs::read_to_string(&status_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(principals) = doc.get("principals").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut inputs = Vec::new();
+    for principal in principals {
+        let Some(principal_id) = principal.get("principal_id").and_then(Value::as_str) else {
+            continue;
+        };
+        // Skip self
+        if principal_id == environment.principal_id {
+            continue;
+        }
+        let state = principal
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let task = principal
+            .get("current_task_preview")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty());
+        let display_name = principal
+            .get("display_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
+
+        let mut text = format!("peer `{principal_id}`");
+        if let Some(name) = display_name {
+            text.push_str(&format!(" ({name})"));
+        }
+        match task {
+            Some(task) => {
+                text.push_str(&format!(
+                    " 已在线，状态: {state}（任务: {task}）"
+                ));
+            }
+            None => {
+                text.push_str(&format!(" 已在线，状态: {state}"));
+            }
+        }
+
+        inputs.push(PendingInput {
+            envelope: InputEnvelope::new(
+                InputSource::System,
+                "peer_awareness.snapshot",
+                text,
+            ),
+            delivery: PendingInputDelivery::InjectAtNextBoundary,
+        });
+    }
+    inputs
 }
 
 fn collect_pending_inputs_from_appfs_environment(
@@ -1518,7 +1598,7 @@ fn collect_pending_inputs_from_appfs_environment(
                 for record in records.into_iter().filter(|record| record.seq > last_seq) {
                     let event_metadata = event_render_metadata_for(&render_metadata, &record);
                     let classification =
-                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref());
+                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref(), Some(&environment.principal_id));
                     let Some(pending_input) = pending_input_from_appfs_event(
                         &record,
                         classification.running_delivery,
@@ -1722,8 +1802,35 @@ fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
 fn classify_appfs_event_with_render_metadata(
     event: &AppfsEventRecord,
     event_render_metadata: Option<&Value>,
+    current_principal_id: Option<&str>,
 ) -> AppfsEventClassification {
     let mut classification = classify_appfs_event(event);
+
+    // Built-in policy: agent self-status transitions are a monitoring concern
+    // and should not be injected into the LLM context. The events remain in
+    // the JSONL stream for dashboard consumption; only the agent pipeline drops them.
+    // Peer status changes (other principals) are kept — they carry valuable awareness.
+    if event.stream_id == "platform"
+        && event.event_type == "action.completed"
+        && event
+            .content
+            .as_ref()
+            .and_then(|c| c.get("principal_event"))
+            .and_then(Value::as_str)
+            == Some("principal.status.updated")
+        && event
+            .content
+            .as_ref()
+            .and_then(|c| c.get("principal_id"))
+            .and_then(Value::as_str)
+            == current_principal_id
+    {
+        classification.input_class = AppfsInputClass::Noise;
+        classification.running_delivery = AppfsDeliveryMode::Drop;
+        classification.idle_delivery = AppfsDeliveryMode::Drop;
+        return classification;
+    }
+
     let Some(metadata) = event_render_metadata else {
         return classification;
     };
@@ -1813,9 +1920,10 @@ fn appfs_event_requires_attention(event: &AppfsEventRecord) -> bool {
 fn should_wake_idle_agent_for_appfs_event_with_render_metadata(
     event: &AppfsEventRecord,
     event_render_metadata: Option<&Value>,
+    current_principal_id: Option<&str>,
 ) -> bool {
     matches!(
-        classify_appfs_event_with_render_metadata(event, event_render_metadata).idle_delivery,
+        classify_appfs_event_with_render_metadata(event, event_render_metadata, current_principal_id).idle_delivery,
         AppfsDeliveryMode::WakeIfIdle
     )
 }
@@ -3530,23 +3638,6 @@ fn summarize_registered_app_ids(environment: &AppfsEnvironment) -> Option<String
     (!app_ids.is_empty()).then(|| app_ids.join(", "))
 }
 
-fn summarize_known_principals(environment: &AppfsEnvironment) -> Option<String> {
-    let principals = environment
-        .known_principals
-        .iter()
-        .map(|principal| {
-            let mut label = format!("`{}`", principal.principal_id);
-            if let Some(display_name) = principal.display_name.as_deref() {
-                label.push_str(&format!(" ({display_name})"));
-            }
-            if let Some(description) = principal.description.as_deref() {
-                label.push_str(&format!(": {description}"));
-            }
-            label
-        })
-        .collect::<Vec<_>>();
-    (!principals.is_empty()).then(|| principals.join("; "))
-}
 
 fn render_current_app_prompt_section(
     environment: &AppfsEnvironment,
@@ -3680,14 +3771,8 @@ fn render_appfs_overview_lines(
         ),
     ];
 
-    if let Some(principals) = summarize_known_principals(environment) {
-        lines.push(format!(
-            "- Known AppFS principals in this project: {principals}."
-        ));
-    }
-
     lines.push(
-        "- When coordinating with other AppFS principals, read `_appfs/principals/status.res.json` for the concise status of all agents, including who is online, idle, running, stale, or stopped and any current task preview. For details about one principal, read `_appfs/principals/<principal-id>.res.json` or `_appfs/principals.registry.json`. These files are runtime-maintained status views; do not modify them."
+        "- Peer principal status changes are injected as runtime reminders. For a full snapshot of all agent states, read `_appfs/principals/status.res.json`; for details about one principal, read `_appfs/principals/<principal-id>.res.json`. These are runtime-maintained views; do not modify them."
             .to_string(),
     );
 
@@ -3749,7 +3834,8 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
 mod tests {
     use super::{
         appfs_act_wait_plan_has_terminal_event, appfs_event_to_input_envelope,
-        attach_appfs_principal_from_environment, build_appfs_prompt_section, classify_appfs_event,
+        attach_appfs_principal_from_environment, build_appfs_prompt_section,
+        build_peer_awareness_snapshot, classify_appfs_event,
         classify_appfs_event_with_render_metadata, collect_appfs_pending_inputs,
         create_appfs_principal, detach_appfs_principal, detect_appfs_environment,
         ensure_appfs_attach_identity, ensure_appfs_attach_identity_with_attach_env,
@@ -4740,7 +4826,7 @@ mod tests {
 
         let prompt = build_appfs_prompt_section(&cwd).expect("expected prompt");
         assert!(prompt.contains("Current AppFS principal id: `default`"));
-        assert!(prompt.contains("Known AppFS principals"));
+        assert!(prompt.contains("Peer principal status changes are injected as runtime reminders"));
         assert!(prompt.contains("private/default/..."));
         assert!(!prompt.contains("tinode--incident-reporter"));
     }
@@ -5364,7 +5450,7 @@ PY"#,
             Some("OVERRIDE {{content.text_preview}}")
         );
         assert_eq!(
-            classify_appfs_event_with_render_metadata(&event, Some(&merged)).idle_delivery,
+            classify_appfs_event_with_render_metadata(&event, Some(&merged), None).idle_delivery,
             AppfsDeliveryMode::ContextOnly
         );
     }
@@ -6158,5 +6244,123 @@ PY"#,
         fs::create_dir_all(&cwd).expect("create cwd");
 
         assert!(detect_appfs_environment(&cwd).is_none());
+    }
+
+    #[test]
+    fn peer_awareness_snapshot_excludes_self_and_formats_peers() {
+        let temp = TempDirGuard::new("peer-snapshot");
+        let mount_root = temp.path().join("mnt");
+        let control_dir = mount_root.join("_appfs");
+        let principals_dir = control_dir.join("principals");
+        fs::create_dir_all(&principals_dir).expect("create principals dir");
+        fs::write(
+            principals_dir.join("status.res.json"),
+            serde_json::json!({
+                "version": 1,
+                "updated_at": "2026-06-08T00:00:00Z",
+                "principals": [
+                    {
+                        "principal_id": "default",
+                        "display_name": "Default Agent",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "跟 coder 打招呼",
+                        "model": "claude-sonnet-4-6"
+                    },
+                    {
+                        "principal_id": "coder",
+                        "display_name": "Coder",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "idle",
+                        "current_task_preview": null,
+                        "model": null
+                    },
+                    {
+                        "principal_id": "coder2",
+                        "display_name": "Coder 2",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "初始化环境",
+                        "model": "claude-sonnet-4-6"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write status.res.json");
+
+        // Also need minimal control plane files for environment detection
+        let cwd = mount_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        seed_heuristic_mount(&mount_root);
+        // Re-write status.res.json because seed_heuristic_mount doesn't create it
+        let principals_dir2 = control_dir.join("principals");
+        fs::create_dir_all(&principals_dir2).expect("create principals dir");
+        fs::write(
+            principals_dir2.join("status.res.json"),
+            serde_json::json!({
+                "version": 1,
+                "updated_at": "2026-06-08T00:00:00Z",
+                "principals": [
+                    {
+                        "principal_id": "default",
+                        "display_name": "Default Agent",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "跟 coder 打招呼",
+                        "model": "claude-sonnet-4-6"
+                    },
+                    {
+                        "principal_id": "coder",
+                        "display_name": "Coder",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "idle",
+                        "current_task_preview": null,
+                        "model": null
+                    },
+                    {
+                        "principal_id": "coder2",
+                        "display_name": "Coder 2",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "初始化环境",
+                        "model": "claude-sonnet-4-6"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write status.res.json");
+
+        // Detect environment — principal_id will be "default" (heuristic)
+        let env = detect_appfs_environment(&cwd).expect("detect env");
+        assert_eq!(env.principal_id, "default");
+
+        let snapshot = build_peer_awareness_snapshot(&env);
+
+        // Should have 2 peers (coder, coder2), excluding self (default)
+        assert_eq!(snapshot.len(), 2, "should have exactly 2 peers");
+
+        // Find each peer by checking text content
+        let texts: Vec<&str> = snapshot.iter().map(|p| p.envelope.text.as_str()).collect();
+
+        // coder: idle, no task
+        let coder_text = texts.iter().find(|t| t.contains("`coder`")).expect("coder entry");
+        assert!(coder_text.contains("idle"));
+        assert!(!coder_text.contains("任务"));
+
+        // coder2: running, with task
+        let coder2_text = texts.iter().find(|t| t.contains("`coder2`")).expect("coder2 entry");
+        assert!(coder2_text.contains("running"));
+        assert!(coder2_text.contains("初始化环境"));
+
+        // default should not appear
+        assert!(texts.iter().all(|t| !t.contains("`default`")));
     }
 }

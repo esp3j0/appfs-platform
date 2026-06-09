@@ -19,7 +19,7 @@ export interface MessageRecord {
   message: ConversationMessage;
 }
 
-export type JsonlRecord = SessionMetaRecord | MessageRecord | { type: string };
+export type JsonlRecord = SessionMetaRecord | MessageRecord | TurnErrorRecord | { type: string };
 
 // ── Conversation message model ──
 
@@ -66,8 +66,8 @@ export interface InputRouterBlockInput {
 export interface TokenUsage {
   input_tokens: number;
   output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
 }
 
 export interface AttachmentMetadata {
@@ -112,6 +112,16 @@ export interface DebugDumpRecord {
   reasoning_effort?: string | null;
 }
 
+export interface TurnErrorRecord {
+  type: 'turn_error';
+  timestamp_ms: number;
+  request_id?: string;
+  turn_id?: string;
+  session_id?: string;
+  source?: string;
+  message: string;
+}
+
 // ── Compaction archive records (from debug-dump feature) ──
 
 export interface CompactionBoundaryRecord {
@@ -124,6 +134,7 @@ export interface CompactionBoundaryRecord {
 export interface CompactionArchiveRecord {
   type: 'compaction_archive';
   timestamp_ms: number;
+  compaction_count?: number;
   /** The archived message in the same format as session JSONL messages */
   message: ConversationMessage;
 }
@@ -161,6 +172,7 @@ export interface AgentInfo {
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  currentContextTokens?: number;
   projectId?: string;
   projectRoot?: string;
   modelProviderId?: string;
@@ -168,6 +180,9 @@ export interface AgentInfo {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   runtimeModelConfigPath?: string;
+  archived?: boolean;
+  archivedAt?: number;
+  archivedReason?: string;
 }
 
 export interface TimelineEntry {

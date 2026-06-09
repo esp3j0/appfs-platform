@@ -25,7 +25,7 @@ use super::shared::{
     collect_files_with_suffix, decode_jsonl_line, env_flag_enabled, extract_client_token,
     has_odd_unescaped_quotes, is_handle_format_valid, is_safe_action_rel_path,
     is_transient_action_sink_busy, parse_snapshot_on_timeout_policy, template_specificity,
-    MultilineRecoveryOutcome,
+    write_pretty_json_file, MultilineRecoveryOutcome,
 };
 use super::tree_sync::{
     ensure_app_structure_initialized_at, refresh_app_structure, refresh_app_structure_in_db,
@@ -1556,26 +1556,7 @@ pub(super) fn parse_manifest_contract_json(
 
 impl AppfsAdapter {
     pub(super) fn save_cursor(&self) -> Result<()> {
-        let tmp_path = self.cursor_path.with_extension("res.json.tmp");
-        let bytes = serde_json::to_vec_pretty(&self.cursor)?;
-        fs::write(&tmp_path, bytes)
-            .with_context(|| format!("Failed to write cursor temp file {}", tmp_path.display()))?;
-        if self.cursor_path.exists() {
-            fs::remove_file(&self.cursor_path).with_context(|| {
-                format!(
-                    "Failed to remove old cursor file {}",
-                    self.cursor_path.display()
-                )
-            })?;
-        }
-        fs::rename(&tmp_path, &self.cursor_path).with_context(|| {
-            format!(
-                "Failed to move cursor temp file {} to {}",
-                tmp_path.display(),
-                self.cursor_path.display()
-            )
-        })?;
-        Ok(())
+        write_pretty_json_file(&self.cursor_path, &self.cursor, "AppFS adapter cursor")
     }
 
     fn load_cursor(path: &Path) -> Result<CursorState> {
@@ -1601,26 +1582,11 @@ impl AppfsAdapter {
     }
 
     pub(super) fn save_streaming_jobs(&self) -> Result<()> {
-        let tmp_path = self.jobs_path.with_extension("res.json.tmp");
-        let bytes = serde_json::to_vec_pretty(&self.streaming_jobs)?;
-        fs::write(&tmp_path, bytes)
-            .with_context(|| format!("Failed to write jobs temp file {}", tmp_path.display()))?;
-        if self.jobs_path.exists() {
-            fs::remove_file(&self.jobs_path).with_context(|| {
-                format!(
-                    "Failed to remove old jobs file {}",
-                    self.jobs_path.display()
-                )
-            })?;
-        }
-        fs::rename(&tmp_path, &self.jobs_path).with_context(|| {
-            format!(
-                "Failed to move jobs temp file {} to {}",
-                tmp_path.display(),
-                self.jobs_path.display()
-            )
-        })?;
-        Ok(())
+        write_pretty_json_file(
+            &self.jobs_path,
+            &self.streaming_jobs,
+            "AppFS adapter streaming jobs",
+        )
     }
 
     fn load_action_cursors(path: &Path) -> Result<HashMap<String, ActionCursorState>> {
@@ -1636,35 +1602,14 @@ impl AppfsAdapter {
     }
 
     fn save_action_cursors(&self) -> Result<()> {
-        let tmp_path = self.action_cursors_path.with_extension("res.json.tmp");
         let doc = ActionCursorDoc {
             actions: self.action_cursors.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&doc)?;
-        fs::write(&tmp_path, bytes).with_context(|| {
-            format!(
-                "Failed to write action cursor temp file {}",
-                tmp_path.display()
-            )
-        })?;
-
-        if self.action_cursors_path.exists() {
-            fs::remove_file(&self.action_cursors_path).with_context(|| {
-                format!(
-                    "Failed to remove old action cursor file {}",
-                    self.action_cursors_path.display()
-                )
-            })?;
-        }
-
-        fs::rename(&tmp_path, &self.action_cursors_path).with_context(|| {
-            format!(
-                "Failed to move action cursor temp file {} to {}",
-                tmp_path.display(),
-                self.action_cursors_path.display()
-            )
-        })?;
-        Ok(())
+        write_pretty_json_file(
+            &self.action_cursors_path,
+            &doc,
+            "AppFS adapter action cursors",
+        )
     }
 
     fn collect_action_files(&self) -> Result<Vec<PathBuf>> {

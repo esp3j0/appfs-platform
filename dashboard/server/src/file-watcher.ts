@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import chokidar from 'chokidar';
 import type { AgentRegistry } from './agent-registry.js';
-import { parseNewLines } from './jsonl-parser.js';
+import { parseMessages, parseNewLines } from './jsonl-parser.js';
 import type { MessageRecord } from './types.js';
 
 export type FileChangeHandler = (sessionId: string, newRecords: MessageRecord[]) => void;
@@ -54,13 +54,20 @@ export class FileWatcher {
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
       const prevLines = this.lineCounts.get(filePath) ?? 0;
-      const newRecords = parseNewLines(content, prevLines).filter(
-        (r): r is MessageRecord => r.type === 'message',
-      );
-      this.lineCounts.set(filePath, content.split('\n').length);
+      const currentLineCount = content.split('\n').length;
+      const wasRewritten = currentLineCount < prevLines;
+      const newRecords = wasRewritten
+        ? parseMessages(content)
+        : parseNewLines(content, prevLines).filter(
+            (r): r is MessageRecord => r.type === 'message',
+          );
+      this.lineCounts.set(filePath, currentLineCount);
+
+      if (wasRewritten || newRecords.length > 0) {
+        this.registry.reloadAgent(sessionId);
+      }
 
       if (newRecords.length > 0) {
-        this.registry.reloadAgent(sessionId);
         if (this.onChangeCallback) {
           this.onChangeCallback(sessionId, newRecords);
         }
