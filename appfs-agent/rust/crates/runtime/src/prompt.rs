@@ -166,18 +166,12 @@ impl SystemPromptBuilder {
     }
 
     fn environment_section(&self) -> String {
-        let cwd = self.project_context.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.cwd.display().to_string(),
-        );
         let date = self.project_context.as_ref().map_or_else(
             || "unknown".to_string(),
             |context| context.current_date.clone(),
         );
         let mut lines = vec!["# Environment context".to_string()];
         lines.extend(prepend_bullets(vec![
-            format!("Model family: {FRONTIER_MODEL_NAME}"),
-            format!("Working directory: {cwd}"),
             format!("Date: {date}"),
             format!(
                 "Platform: {} {}",

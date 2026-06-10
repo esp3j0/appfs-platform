@@ -7,6 +7,7 @@ import http from 'node:http';
 import kill from 'tree-kill';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { PersistentLog, resolveDesktopLogDir } from './persistent-log.js';
 
 export function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -25,8 +26,10 @@ export class ServerLauncher {
   private port: number = 3100;
   private isPackaged: boolean = false;
   private shutdownToken: string = randomUUID();
+  private logDir: string;
+  private log: PersistentLog;
 
-  constructor(isPackagedOverride?: boolean) {
+  constructor(isPackagedOverride?: boolean, logDirOverride?: string) {
     try {
       const app = (electron && typeof electron === 'object' && 'app' in electron)
         ? (electron as any).app
@@ -35,6 +38,8 @@ export class ServerLauncher {
     } catch {
       this.isPackaged = isPackagedOverride || false;
     }
+    this.logDir = resolveDesktopLogDir(logDirOverride);
+    this.log = new PersistentLog(path.join(this.logDir, 'electron-main.log'));
   }
 
   getPort(): number {
@@ -57,6 +62,7 @@ export class ServerLauncher {
       APPFS_CLI_BIN: process.env.APPFS_CLI_BIN || '',
       DASHBOARD_AGENT_BIN: process.env.DASHBOARD_AGENT_BIN || '',
       DASHBOARD_SHUTDOWN_TOKEN: this.shutdownToken,
+      APPFS_LOG_DIR: this.logDir,
     };
 
     let cmd = 'npx';
@@ -96,6 +102,9 @@ export class ServerLauncher {
 
     console.log(`[ServerLauncher] Launching server on port ${this.port} (Profile: ${this.isPackaged ? 'packaged' : 'dev'})`);
     console.log(`[ServerLauncher] cmd=${cmd} args=${args.join(' ')} cwd=${cwd}`);
+    console.log(`[ServerLauncher] Logs directory: ${this.logDir}`);
+    this.log.appendLine(`[ServerLauncher] Launching server on port ${this.port} profile=${this.isPackaged ? 'packaged' : 'dev'}`);
+    this.log.appendLine(`[ServerLauncher] cmd=${cmd} args=${args.join(' ')} cwd=${cwd}`);
 
     this.serverProcess = spawn(cmd, args, {
       cwd,
@@ -107,14 +116,17 @@ export class ServerLauncher {
 
     this.serverProcess.stdout?.on('data', (data) => {
       console.log(`[Server stdout] ${data.toString().trim()}`);
+      this.log.appendChunk('[Server stdout]', data);
     });
 
     this.serverProcess.stderr?.on('data', (data) => {
       console.error(`[Server stderr] ${data.toString().trim()}`);
+      this.log.appendChunk('[Server stderr]', data);
     });
 
     this.serverProcess.on('exit', (code, signal) => {
       console.log(`[ServerLauncher] Server process exited with code=${code}, signal=${signal}`);
+      this.log.appendLine(`[ServerLauncher] Server process exited code=${code} signal=${signal}`);
       this.serverProcess = null;
     });
 
@@ -130,6 +142,7 @@ export class ServerLauncher {
     const processToStop = this.serverProcess;
     const pid = processToStop.pid!;
     console.log(`[ServerLauncher] Requesting graceful server shutdown for PID ${pid}`);
+    this.log.appendLine(`[ServerLauncher] Requesting graceful server shutdown pid=${pid}`);
 
     const exited = this.waitForServerExit(processToStop);
     const graceful = await this.requestServerShutdown().catch((err) => {
@@ -143,6 +156,7 @@ export class ServerLauncher {
     }
 
     console.warn(`[ServerLauncher] Graceful shutdown timed out; stopping server process tree under PID ${pid}`);
+    this.log.appendLine(`[ServerLauncher] Graceful shutdown timed out; killing pid=${pid}`);
     return new Promise<void>((resolve) => {
       kill(pid, 'SIGTERM', (err) => {
         if (err) {

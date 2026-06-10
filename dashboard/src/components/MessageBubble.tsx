@@ -2,6 +2,7 @@ import React from 'react';
 import type { AppfsEventRecord, TimelineEntry, ConversationMessage, DebugDumpRecord } from '../types';
 import { getAgentColor } from '../types';
 import { CollapsibleBlock } from './CollapsibleBlock';
+import { cachedInputTokens, effectiveInputTokens } from '../token-usage';
 
 interface Props { entry: TimelineEntry; agentColorIndex: number; compact?: boolean; }
 
@@ -10,6 +11,8 @@ export function MessageBubble({ entry, agentColorIndex, compact }: Props) {
   const isDebugDump = entry.source === 'debug-dump';
   const isCompactionArchive = entry.source === 'compaction-archive';
   const roleClass = isDebugDump ? 'debug-dump' : isCompactionArchive ? 'compaction-archive' : entry.role;
+  const effectiveInput = effectiveInputTokens(entry.usage);
+  const cachedInput = cachedInputTokens(entry.usage);
 
   return (
     <div className={`msg ${roleClass} ${compact ? 'msg-compact' : ''}`}>
@@ -26,8 +29,10 @@ export function MessageBubble({ entry, agentColorIndex, compact }: Props) {
       </div>
       {entry.usage && (
         <div className="msg-tokens">
-          input: {entry.usage.input_tokens.toLocaleString()} | output: {entry.usage.output_tokens.toLocaleString()}
-          {entry.usage.cache_read_input_tokens > 0 && ` | cache_read: ${entry.usage.cache_read_input_tokens.toLocaleString()}`}
+          input: {effectiveInput.toLocaleString()}
+          {cachedInput > 0 && ` (cached ${cachedInput.toLocaleString()})`}
+          {' | '}
+          output: {entry.usage.output_tokens.toLocaleString()}
         </div>
       )}
     </div>

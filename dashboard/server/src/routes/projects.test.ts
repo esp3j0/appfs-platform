@@ -241,6 +241,47 @@ describe('Projects Route Lifecycle (P1)', () => {
     }
   });
 
+  it('should resume project agents through principal lifecycle during bootstrap', async () => {
+    const app = Fastify({ logger: false });
+    const resumedProjectIds: string[] = [];
+    registerProjectsRoute(app, registry, controller, {
+      principalLifecycle: {
+        resumeProjectPrincipals: async (projectId) => {
+          resumedProjectIds.push(projectId);
+          return {
+            resumed: [{ sessionId: 'session-coder', spawnId: 'spawn-1' }],
+            skipped: [],
+            errors: [],
+          };
+        },
+      },
+    });
+
+    try {
+      const project = registry.registerProject(tempDir);
+      fs.writeFileSync(path.join(tempDir, '.appfs-compose.yaml'), 'version: "1"');
+      const mountPath = path.join(tempDir, '.appfs');
+      if (fs.existsSync(mountPath)) {
+        fs.rmSync(mountPath, { recursive: true, force: true });
+      }
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/projects/${project.projectId}/bootstrap`,
+      });
+
+      assert.strictEqual(res.statusCode, 200);
+      const data = JSON.parse(res.payload);
+      assert.strictEqual(data.runtime.status, 'started');
+      assert.deepStrictEqual(resumedProjectIds, [project.projectId]);
+      assert.deepStrictEqual(data.resume.resumed, [
+        { sessionId: 'session-coder', spawnId: 'spawn-1' },
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('should stop project and only stop managed agents', async () => {
     const app = Fastify({ logger: false });
     registerProjectsRoute(app, registry, controller);

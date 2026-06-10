@@ -9,8 +9,11 @@ interface Props {
   onToggle: () => void;
   onResume?: (agent: AgentInfo) => void;
   onStop?: (agent: AgentInfo) => void;
+  onDelete?: (agent: AgentInfo) => void;
   resumeDisabled?: boolean;
   stopDisabled?: boolean;
+  deleteDisabled?: boolean;
+  deleteTitle?: string;
 }
 
 export function AgentItem({
@@ -20,12 +23,18 @@ export function AgentItem({
   onToggle,
   onResume,
   onStop,
+  onDelete,
   resumeDisabled = false,
   stopDisabled = false,
+  deleteDisabled = false,
+  deleteTitle,
 }: Props) {
   const color = getAgentColor(colorIndex);
   const canResume = agent.status === 'offline' && Boolean(agent.sessionJsonlPath) && Boolean(onResume);
   const canStop = agent.status === 'online' && agent.controlMode === 'managed' && Boolean(agent.sessionId) && Boolean(onStop);
+  const deletePrincipalId = agent.principalId || agent.name;
+  const canDelete = Boolean(deletePrincipalId && onDelete);
+  const statusClass = agent.archived ? 'archived' : agent.status;
 
   return (
     <div className={`agent-item ${checked ? 'active' : ''}`} style={{ borderLeft: checked ? `3px solid ${color}` : '3px solid transparent' }} onClick={onToggle}>
@@ -35,7 +44,7 @@ export function AgentItem({
         <div className="agent-meta">principal: {agent.principalId}</div>
         <div className="agent-model">{agent.model}</div>
         <div className="agent-item-actions">
-          <span className={`status-badge ${agent.status}`}>{agent.status}</span>
+          <span className={`status-badge ${statusClass}`}>{agent.archived ? 'archived' : agent.status}</span>
           {canResume && (
             <button
               type="button"
@@ -62,6 +71,20 @@ export function AgentItem({
               title={stopDisabled ? 'Stopping managed agent...' : `Stop managed agent ${agent.name}`}
             >
               Stop
+            </button>
+          )}
+          {canDelete && (
+            <button
+              type="button"
+              className="agent-action-btn agent-delete-btn"
+              onClick={e => {
+                e.stopPropagation();
+                onDelete?.(agent);
+              }}
+              disabled={deleteDisabled}
+              title={deleteTitle ?? `Delete/archive agent ${deletePrincipalId}`}
+            >
+              Delete/Archive
             </button>
           )}
         </div>

@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureProjectComposeMountpoint, normalizeComposeMountpointContent } from '../compose-policy.js';
 import type { AgentRegistry } from '../agent-registry.js';
-import type { AgentProcessManager, ProjectAgentResumeResult } from '../process-manager.js';
+import type { ProjectAgentResumeResult } from '../process-manager.js';
 
 function resolvePlatformRoot(): string {
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -112,7 +112,9 @@ export interface ProjectBootstrapResult {
 
 interface ProjectRouteDependencies {
   agentRegistry?: AgentRegistry;
-  processManager?: AgentProcessManager;
+  principalLifecycle?: {
+    resumeProjectPrincipals(projectId: string): Promise<ProjectAgentResumeResult>;
+  };
 }
 
 export function registerProjectsRoute(
@@ -244,10 +246,10 @@ export function registerProjectsRoute(
 
     deps.agentRegistry?.discoverProject(project.projectRoot);
     if (
-      deps.processManager &&
+      deps.principalLifecycle &&
       (result.runtime.status === 'started' || result.runtime.status === 'already-running')
     ) {
-      result.resume = deps.processManager.resumeProjectAgents(projectId);
+      result.resume = await deps.principalLifecycle.resumeProjectPrincipals(projectId);
     }
 
     return result;

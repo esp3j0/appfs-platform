@@ -1,4 +1,4 @@
-import type { CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, JsonlRecord, MessageRecord, SessionMetaRecord } from './types.js';
+import type { CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, JsonlRecord, MessageRecord, SessionMetaRecord, TurnErrorRecord } from './types.js';
 
 /**
  * Parse a complete JSONL file into records.
@@ -45,6 +45,15 @@ export function parseMeta(content: string): SessionMetaRecord | undefined {
 export function parseDebugDumps(content: string): DebugDumpRecord[] {
   return parseJsonl(content).filter(
     (r): r is DebugDumpRecord => r.type === 'message_request',
+  );
+}
+
+/**
+ * Parse persisted headless turn errors from debug JSONL content.
+ */
+export function parseTurnErrors(content: string): TurnErrorRecord[] {
+  return parseJsonl(content).filter(
+    (r): r is TurnErrorRecord => r.type === 'turn_error',
   );
 }
 

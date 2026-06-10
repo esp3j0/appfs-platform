@@ -23,6 +23,7 @@ const UNREGISTER_APP_ACTION: &str = "unregister_app.act";
 const LIST_APPS_ACTION: &str = "list_apps.act";
 const ATTACH_PRINCIPAL_ACTION: &str = "principals/attach_principal.act";
 const DETACH_PRINCIPAL_ACTION: &str = "principals/detach_principal.act";
+const UPDATE_PRINCIPAL_ACTION: &str = "principals/update_principal.act";
 const REGISTRY_FILE: &str = "apps.registry.json";
 const PRINCIPALS_FILE: &str = "principals.registry.json";
 const APP_POLICIES_FILE: &str = "app-policies.registry.json";
@@ -36,6 +37,7 @@ const STREAM_CURSOR_FILE: &str = "cursor.res.json";
 #[cfg(test)]
 const APPFS_EVENT_REMINDER_MAX_EVENTS: usize = 20;
 const APPFS_EVENT_REMINDER_FIELD_LIMIT: usize = 360;
+const APPFS_AGENT_TASK_PREVIEW_LIMIT: usize = 240;
 #[cfg(not(test))]
 const APPFS_PRIVATE_APP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -224,6 +226,58 @@ pub struct AppfsAttachLease {
     pub principal_id: String,
     pub attach_id: String,
     pub action_path: PathBuf,
+    pub update_action_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsAgentState {
+    Idle,
+    Running,
+    Stopping,
+    Error,
+    Stopped,
+    Unknown,
+}
+
+impl AppfsAgentState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Error => "error",
+            Self::Stopped => "stopped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppfsAgentOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl AppfsAgentOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppfsAgentStatusUpdate {
+    pub state: Option<AppfsAgentState>,
+    pub current_task_preview: Option<Option<String>>,
+    pub current_task_source: Option<Option<String>>,
+    pub turn_id: Option<Option<String>>,
+    pub session_id: Option<Option<String>>,
+    pub model: Option<Option<String>>,
+    pub last_outcome: Option<Option<AppfsAgentOutcome>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,6 +588,112 @@ pub fn detach_appfs_principal(lease: &AppfsAttachLease, reason: &str) -> Result<
     )
 }
 
+/// Write a lightweight heartbeat to `update_principal.act` that refreshes
+/// `last_seen_at` on the AppFS side without changing agent status.
+/// This keeps the principal attach from becoming stale while the agent is idle.
+pub fn heartbeat_appfs_principal(lease: &AppfsAttachLease) -> Result<(), String> {
+    let Some(action_path) = lease.update_action_path.as_ref() else {
+        return Err("AppFS update principal action path not available".to_string());
+    };
+    append_principal_lifecycle_action(
+        action_path,
+        serde_json::json!({
+            "principal_id": lease.principal_id,
+            "attach_id": lease.attach_id,
+            "client_token": format!("principal-heartbeat-{}", now_millis()),
+        }),
+        "heartbeat",
+    )
+}
+
+pub fn update_appfs_principal_agent_status(
+    lease: &AppfsAttachLease,
+    update: AppfsAgentStatusUpdate,
+) -> Result<(), String> {
+    let action_path = lease
+        .update_action_path
+        .as_ref()
+        .ok_or_else(|| "AppFS update principal action was not detected".to_string())?;
+    let mut status = serde_json::Map::new();
+    if let Some(state) = update.state {
+        status.insert(
+            "state".to_string(),
+            serde_json::Value::String(state.as_str().to_string()),
+        );
+    }
+    insert_optional_string_patch(
+        &mut status,
+        "current_task_preview",
+        update.current_task_preview,
+    );
+    insert_optional_string_patch(
+        &mut status,
+        "current_task_source",
+        update.current_task_source,
+    );
+    insert_optional_string_patch(&mut status, "turn_id", update.turn_id);
+    insert_optional_string_patch(&mut status, "session_id", update.session_id);
+    insert_optional_string_patch(&mut status, "model", update.model);
+    if let Some(last_outcome) = update.last_outcome {
+        status.insert(
+            "last_outcome".to_string(),
+            last_outcome.map_or(serde_json::Value::Null, |outcome| {
+                serde_json::Value::String(outcome.as_str().to_string())
+            }),
+        );
+    }
+    append_principal_lifecycle_action(
+        action_path,
+        serde_json::json!({
+            "principal_id": lease.principal_id,
+            "attach_id": lease.attach_id,
+            "agent_status": status,
+            "client_token": format!("principal-status-{}", now_millis()),
+        }),
+        "update principal status",
+    )
+}
+
+fn insert_optional_string_patch(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    patch: Option<Option<String>>,
+) {
+    if let Some(value) = patch {
+        object.insert(
+            key.to_string(),
+            value.map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+    }
+}
+
+#[must_use]
+pub fn sanitize_appfs_task_preview(input: &str) -> Option<String> {
+    let mut collapsed = String::new();
+    let mut previous_space = false;
+    for ch in input.trim().chars() {
+        let normalized = if ch.is_control() || ch == '\n' || ch == '\r' || ch == '\t' {
+            ' '
+        } else {
+            ch
+        };
+        if normalized.is_whitespace() {
+            if !previous_space {
+                collapsed.push(' ');
+                previous_space = true;
+            }
+        } else {
+            collapsed.push(normalized);
+            previous_space = false;
+        }
+        if collapsed.chars().count() >= APPFS_AGENT_TASK_PREVIEW_LIMIT {
+            break;
+        }
+    }
+    let preview = collapsed.trim();
+    (!preview.is_empty()).then(|| preview.to_string())
+}
+
 fn attach_appfs_principal_from_environment(
     environment: &AppfsEnvironment,
 ) -> Result<AppfsAttachLease, String> {
@@ -584,6 +744,10 @@ fn attach_appfs_principal_from_environment(
                     .map(|control_dir| control_dir.join(DETACH_PRINCIPAL_ACTION))
             })
             .ok_or_else(|| "AppFS detach principal action was not detected".to_string())?,
+        update_action_path: environment
+            .control_dir
+            .as_ref()
+            .map(|control_dir| control_dir.join(UPDATE_PRINCIPAL_ACTION)),
     })
 }
 
@@ -1272,6 +1436,7 @@ pub fn scan_appfs_attention_events_for_idle_wake(
                     should_wake_idle_agent_for_appfs_event_with_render_metadata(
                         record,
                         event_metadata.as_ref(),
+                        Some(&environment.principal_id),
                     )
                 }));
             }
@@ -1316,6 +1481,67 @@ pub fn scan_appfs_attention_events_for_idle_wake(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelInputCursorKind {
     Boundary,
+}
+
+pub fn build_peer_awareness_snapshot(environment: &AppfsEnvironment) -> Vec<PendingInput> {
+    let status_path = environment.mount_root.join("_appfs/principals/status.res.json");
+    let Ok(contents) = fs::read_to_string(&status_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(principals) = doc.get("principals").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut inputs = Vec::new();
+    for principal in principals {
+        let Some(principal_id) = principal.get("principal_id").and_then(Value::as_str) else {
+            continue;
+        };
+        // Skip self
+        if principal_id == environment.principal_id {
+            continue;
+        }
+        let state = principal
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let task = principal
+            .get("current_task_preview")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty());
+        let display_name = principal
+            .get("display_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
+
+        let mut text = format!("peer `{principal_id}`");
+        if let Some(name) = display_name {
+            text.push_str(&format!(" ({name})"));
+        }
+        match task {
+            Some(task) => {
+                text.push_str(&format!(
+                    " 已在线，状态: {state}（任务: {task}）"
+                ));
+            }
+            None => {
+                text.push_str(&format!(" 已在线，状态: {state}"));
+            }
+        }
+
+        inputs.push(PendingInput {
+            envelope: InputEnvelope::new(
+                InputSource::System,
+                "peer_awareness.snapshot",
+                text,
+            ),
+            delivery: PendingInputDelivery::InjectAtNextBoundary,
+        });
+    }
+    inputs
 }
 
 fn collect_pending_inputs_from_appfs_environment(
@@ -1372,7 +1598,7 @@ fn collect_pending_inputs_from_appfs_environment(
                 for record in records.into_iter().filter(|record| record.seq > last_seq) {
                     let event_metadata = event_render_metadata_for(&render_metadata, &record);
                     let classification =
-                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref());
+                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref(), Some(&environment.principal_id));
                     let Some(pending_input) = pending_input_from_appfs_event(
                         &record,
                         classification.running_delivery,
@@ -1576,8 +1802,35 @@ fn classify_appfs_event(event: &AppfsEventRecord) -> AppfsEventClassification {
 fn classify_appfs_event_with_render_metadata(
     event: &AppfsEventRecord,
     event_render_metadata: Option<&Value>,
+    current_principal_id: Option<&str>,
 ) -> AppfsEventClassification {
     let mut classification = classify_appfs_event(event);
+
+    // Built-in policy: agent self-status transitions are a monitoring concern
+    // and should not be injected into the LLM context. The events remain in
+    // the JSONL stream for dashboard consumption; only the agent pipeline drops them.
+    // Peer status changes (other principals) are kept — they carry valuable awareness.
+    if event.stream_id == "platform"
+        && event.event_type == "action.completed"
+        && event
+            .content
+            .as_ref()
+            .and_then(|c| c.get("principal_event"))
+            .and_then(Value::as_str)
+            == Some("principal.status.updated")
+        && event
+            .content
+            .as_ref()
+            .and_then(|c| c.get("principal_id"))
+            .and_then(Value::as_str)
+            == current_principal_id
+    {
+        classification.input_class = AppfsInputClass::Noise;
+        classification.running_delivery = AppfsDeliveryMode::Drop;
+        classification.idle_delivery = AppfsDeliveryMode::Drop;
+        return classification;
+    }
+
     let Some(metadata) = event_render_metadata else {
         return classification;
     };
@@ -1667,9 +1920,10 @@ fn appfs_event_requires_attention(event: &AppfsEventRecord) -> bool {
 fn should_wake_idle_agent_for_appfs_event_with_render_metadata(
     event: &AppfsEventRecord,
     event_render_metadata: Option<&Value>,
+    current_principal_id: Option<&str>,
 ) -> bool {
     matches!(
-        classify_appfs_event_with_render_metadata(event, event_render_metadata).idle_delivery,
+        classify_appfs_event_with_render_metadata(event, event_render_metadata, current_principal_id).idle_delivery,
         AppfsDeliveryMode::WakeIfIdle
     )
 }
@@ -3384,23 +3638,6 @@ fn summarize_registered_app_ids(environment: &AppfsEnvironment) -> Option<String
     (!app_ids.is_empty()).then(|| app_ids.join(", "))
 }
 
-fn summarize_known_principals(environment: &AppfsEnvironment) -> Option<String> {
-    let principals = environment
-        .known_principals
-        .iter()
-        .map(|principal| {
-            let mut label = format!("`{}`", principal.principal_id);
-            if let Some(display_name) = principal.display_name.as_deref() {
-                label.push_str(&format!(" ({display_name})"));
-            }
-            if let Some(description) = principal.description.as_deref() {
-                label.push_str(&format!(": {description}"));
-            }
-            label
-        })
-        .collect::<Vec<_>>();
-    (!principals.is_empty()).then(|| principals.join("; "))
-}
 
 fn render_current_app_prompt_section(
     environment: &AppfsEnvironment,
@@ -3534,11 +3771,10 @@ fn render_appfs_overview_lines(
         ),
     ];
 
-    if let Some(principals) = summarize_known_principals(environment) {
-        lines.push(format!(
-            "- Known AppFS principals in this project: {principals}."
-        ));
-    }
+    lines.push(
+        "- Peer principal status changes are injected as runtime reminders. For a full snapshot of all agent states, read `_appfs/principals/status.res.json`; for details about one principal, read `_appfs/principals/<principal-id>.res.json`. These are runtime-maintained views; do not modify them."
+            .to_string(),
+    );
 
     if let (Some(app_id), Some(app_root)) = (current_app_id, current_app_root) {
         lines.push(format!(
@@ -3598,22 +3834,25 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Option<T> {
 mod tests {
     use super::{
         appfs_act_wait_plan_has_terminal_event, appfs_event_to_input_envelope,
-        attach_appfs_principal_from_environment, build_appfs_prompt_section, classify_appfs_event,
+        attach_appfs_principal_from_environment, build_appfs_prompt_section,
+        build_peer_awareness_snapshot, classify_appfs_event,
         classify_appfs_event_with_render_metadata, collect_appfs_pending_inputs,
         create_appfs_principal, detach_appfs_principal, detect_appfs_environment,
         ensure_appfs_attach_identity, ensure_appfs_attach_identity_with_attach_env,
         event_render_metadata_for, extract_appfs_act_tokens,
         prepare_appfs_act_event_wait_with_options, read_appfs_event_render_metadata,
         render_appfs_event_reminder, resolve_appfs_environment_with_attach_env,
-        scan_appfs_attention_events_for_idle_wake, sync_appfs_event_reminders,
-        sync_appfs_event_reminders_with_outcome, wait_for_appfs_act_event_completion,
-        warmup_private_apps_from_environment, AppfsAttachEnsureStatus, AppfsAttachEnv,
-        AppfsAttachSource, AppfsDeliveryMode, AppfsEnvironment, AppfsEventRecord, AppfsInputClass,
+        sanitize_appfs_task_preview, scan_appfs_attention_events_for_idle_wake,
+        sync_appfs_event_reminders, sync_appfs_event_reminders_with_outcome,
+        update_appfs_principal_agent_status, wait_for_appfs_act_event_completion,
+        warmup_private_apps_from_environment, AppfsAgentState, AppfsAgentStatusUpdate,
+        AppfsAttachEnsureStatus, AppfsAttachEnv, AppfsAttachLease, AppfsAttachSource,
+        AppfsDeliveryMode, AppfsEnvironment, AppfsEventRecord, AppfsInputClass,
         AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
         AppfsRegisteredApp, AppfsRegisteredAppVisibility, AppfsRuntimeManifest,
         AppfsRuntimeManifestCapabilities, AppfsRuntimeManifestControlPlane,
-        APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND, APPFS_RUNTIME_MANIFEST_REL_PATH,
-        APPFS_SCHEMA_VERSION,
+        APPFS_AGENT_TASK_PREVIEW_LIMIT, APPFS_MULTI_AGENT_MODE_SHARED, APPFS_RUNTIME_KIND,
+        APPFS_RUNTIME_MANIFEST_REL_PATH, APPFS_SCHEMA_VERSION,
     };
     use crate::input_router::{render_input_router_block, InputSource};
     use crate::session::{AttachmentKind, ContentBlock, ConversationMessage, Session};
@@ -4312,6 +4551,53 @@ mod tests {
     }
 
     #[test]
+    fn update_appfs_principal_agent_status_appends_patch() {
+        let temp = TempDirGuard::new("appfs-principal-status-update");
+        let action_path = temp
+            .path()
+            .join("_appfs")
+            .join("principals")
+            .join("update_principal.act");
+        let lease = AppfsAttachLease {
+            principal_id: "coder".to_string(),
+            attach_id: "attach-test".to_string(),
+            action_path: temp.path().join("detach_principal.act"),
+            update_action_path: Some(action_path.clone()),
+        };
+
+        update_appfs_principal_agent_status(
+            &lease,
+            AppfsAgentStatusUpdate {
+                state: Some(AppfsAgentState::Running),
+                current_task_preview: Some(Some("Tinode message from default: hello".to_string())),
+                current_task_source: Some(Some("tinode".to_string())),
+                session_id: Some(Some("session-1".to_string())),
+                model: Some(Some("deepseek-v4-flash".to_string())),
+                last_outcome: Some(None),
+                ..Default::default()
+            },
+        )
+        .expect("update status");
+
+        let content = fs::read_to_string(action_path).expect("read update action");
+        assert!(content.contains(r#""principal_id":"coder""#));
+        assert!(content.contains(r#""attach_id":"attach-test""#));
+        assert!(content.contains(r#""state":"running""#));
+        assert!(content.contains(r#""last_outcome":null"#));
+    }
+
+    #[test]
+    fn sanitize_appfs_task_preview_collapses_and_limits_text() {
+        let preview = sanitize_appfs_task_preview("  hello\n\tworld\u{0007}  ").expect("preview");
+        assert_eq!(preview, "hello world");
+
+        let long = "x".repeat(400);
+        let preview = sanitize_appfs_task_preview(&long).expect("preview");
+        assert_eq!(preview.chars().count(), APPFS_AGENT_TASK_PREVIEW_LIMIT);
+        assert_eq!(sanitize_appfs_task_preview(" \n\t "), None);
+    }
+
+    #[test]
     fn warmup_private_apps_submits_standard_ensure_credentials_actions() {
         let temp = TempDirGuard::new("appfs-private-app-warmup");
         let mount_root = temp.path().join("mnt");
@@ -4540,7 +4826,7 @@ mod tests {
 
         let prompt = build_appfs_prompt_section(&cwd).expect("expected prompt");
         assert!(prompt.contains("Current AppFS principal id: `default`"));
-        assert!(prompt.contains("Known AppFS principals"));
+        assert!(prompt.contains("Peer principal status changes are injected as runtime reminders"));
         assert!(prompt.contains("private/default/..."));
         assert!(!prompt.contains("tinode--incident-reporter"));
     }
@@ -5164,7 +5450,7 @@ PY"#,
             Some("OVERRIDE {{content.text_preview}}")
         );
         assert_eq!(
-            classify_appfs_event_with_render_metadata(&event, Some(&merged)).idle_delivery,
+            classify_appfs_event_with_render_metadata(&event, Some(&merged), None).idle_delivery,
             AppfsDeliveryMode::ContextOnly
         );
     }
@@ -5958,5 +6244,123 @@ PY"#,
         fs::create_dir_all(&cwd).expect("create cwd");
 
         assert!(detect_appfs_environment(&cwd).is_none());
+    }
+
+    #[test]
+    fn peer_awareness_snapshot_excludes_self_and_formats_peers() {
+        let temp = TempDirGuard::new("peer-snapshot");
+        let mount_root = temp.path().join("mnt");
+        let control_dir = mount_root.join("_appfs");
+        let principals_dir = control_dir.join("principals");
+        fs::create_dir_all(&principals_dir).expect("create principals dir");
+        fs::write(
+            principals_dir.join("status.res.json"),
+            serde_json::json!({
+                "version": 1,
+                "updated_at": "2026-06-08T00:00:00Z",
+                "principals": [
+                    {
+                        "principal_id": "default",
+                        "display_name": "Default Agent",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "跟 coder 打招呼",
+                        "model": "claude-sonnet-4-6"
+                    },
+                    {
+                        "principal_id": "coder",
+                        "display_name": "Coder",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "idle",
+                        "current_task_preview": null,
+                        "model": null
+                    },
+                    {
+                        "principal_id": "coder2",
+                        "display_name": "Coder 2",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "初始化环境",
+                        "model": "claude-sonnet-4-6"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write status.res.json");
+
+        // Also need minimal control plane files for environment detection
+        let cwd = mount_root.join("workspace");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        seed_heuristic_mount(&mount_root);
+        // Re-write status.res.json because seed_heuristic_mount doesn't create it
+        let principals_dir2 = control_dir.join("principals");
+        fs::create_dir_all(&principals_dir2).expect("create principals dir");
+        fs::write(
+            principals_dir2.join("status.res.json"),
+            serde_json::json!({
+                "version": 1,
+                "updated_at": "2026-06-08T00:00:00Z",
+                "principals": [
+                    {
+                        "principal_id": "default",
+                        "display_name": "Default Agent",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "跟 coder 打招呼",
+                        "model": "claude-sonnet-4-6"
+                    },
+                    {
+                        "principal_id": "coder",
+                        "display_name": "Coder",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "idle",
+                        "current_task_preview": null,
+                        "model": null
+                    },
+                    {
+                        "principal_id": "coder2",
+                        "display_name": "Coder 2",
+                        "kind": "agent",
+                        "presence": "online",
+                        "state": "running",
+                        "current_task_preview": "初始化环境",
+                        "model": "claude-sonnet-4-6"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write status.res.json");
+
+        // Detect environment — principal_id will be "default" (heuristic)
+        let env = detect_appfs_environment(&cwd).expect("detect env");
+        assert_eq!(env.principal_id, "default");
+
+        let snapshot = build_peer_awareness_snapshot(&env);
+
+        // Should have 2 peers (coder, coder2), excluding self (default)
+        assert_eq!(snapshot.len(), 2, "should have exactly 2 peers");
+
+        // Find each peer by checking text content
+        let texts: Vec<&str> = snapshot.iter().map(|p| p.envelope.text.as_str()).collect();
+
+        // coder: idle, no task
+        let coder_text = texts.iter().find(|t| t.contains("`coder`")).expect("coder entry");
+        assert!(coder_text.contains("idle"));
+        assert!(!coder_text.contains("任务"));
+
+        // coder2: running, with task
+        let coder2_text = texts.iter().find(|t| t.contains("`coder2`")).expect("coder2 entry");
+        assert!(coder2_text.contains("running"));
+        assert!(coder2_text.contains("初始化环境"));
+
+        // default should not appear
+        assert!(texts.iter().all(|t| !t.contains("`default`")));
     }
 }

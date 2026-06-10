@@ -4,9 +4,9 @@ declare global {
   interface Window {
     appfsShell?: {
       chooseFolder(): Promise<string | null>;
-      getRecentProjects(): Promise<Array<{ projectRoot: string; displayName: string; lastOpenedAt: number }>>;
-      removeRecentProject(projectRoot: string): Promise<Array<{ projectRoot: string; displayName: string; lastOpenedAt: number }>>;
-      persistSelectedProjectRoot(projectRoot: string): Promise<Array<{ projectRoot: string; displayName: string; lastOpenedAt: number }>>;
+      getRecentProjects(): Promise<RecentProject[]>;
+      removeRecentProject(projectRoot: string): Promise<RecentProject[]>;
+      persistSelectedProjectRoot(projectRoot: string): Promise<RecentProject[]>;
       getShellMetadata(): Promise<{ launchProfile: 'dev' | 'packaged'; serverPort: number; lastSelectedProjectRoot?: string }>;
     };
   }
@@ -65,7 +65,8 @@ export function ProjectPicker({ onProjectOpen }: ProjectPickerProps) {
       if (data && data.projectId) {
         // Track successfully opened project in ShellStore
         if (isElectron && window.appfsShell) {
-          await window.appfsShell.persistSelectedProjectRoot(projectRoot);
+          const updated = await window.appfsShell.persistSelectedProjectRoot(data.projectRoot || projectRoot);
+          setRecents(updated || []);
         }
         onProjectOpen(data.projectId, data.projectRoot || projectRoot);
       }
@@ -116,67 +117,77 @@ export function ProjectPicker({ onProjectOpen }: ProjectPickerProps) {
   return (
     <div className="project-picker-overlay">
       <div className="project-picker">
-        <h2>Select an AppFS Project</h2>
-        <p className="project-picker-desc">
-          AppFS operates inside designated workspace folders containing compose deployment scripts.
-          Open a project directory to manage runtimes and agents.
-        </p>
+        <div className="project-picker-header">
+          <h2>Select an AppFS Project</h2>
+          <p className="project-picker-desc">
+            Open a workspace folder to manage runtimes, agents, and compose scripts.
+          </p>
+        </div>
 
-        {isElectron ? (
+        <div className="project-picker-actions">
           <button
             type="button"
             className="project-picker-btn"
-            onClick={handleChooseFolder}
-            disabled={loading}
+            onClick={isElectron ? handleChooseFolder : () => undefined}
+            disabled={loading || !isElectron}
           >
-            {loading ? 'Opening Project…' : 'Open Project Folder…'}
+            {loading ? 'Opening Project...' : 'Browse Folder'}
           </button>
-        ) : (
-          <form onSubmit={handleWebOpen} style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ fontSize: '11px', color: '#8b949e', textTransform: 'uppercase', fontWeight: 700 }}>
-              Project Root Path
-              <input
-                type="text"
-                value={webPathInput}
-                onChange={e => setWebPathInput(e.target.value)}
-                placeholder="e.g. C:\mnt\appfs-compose-tinode"
-                style={{
-                  width: '100%',
-                  border: '1px solid #30363d',
-                  borderRadius: '6px',
-                  background: '#0d1117',
-                  color: '#c9d1d9',
-                  padding: '10px',
-                  marginTop: '4px',
-                  fontSize: '13px',
-                  outline: 'none',
-                }}
-                disabled={loading}
-              />
-            </label>
-            <button
-              type="submit"
-              className="project-picker-btn"
-              disabled={loading || !webPathInput.trim()}
-              style={{ marginTop: '4px' }}
-            >
-              {loading ? 'Opening Project…' : 'Open Workspace Path'}
-            </button>
-          </form>
+
+          {!isElectron && (
+            <form className="project-picker-path-form" onSubmit={handleWebOpen}>
+              <label>
+                Project Root Path
+                <input
+                  type="text"
+                  value={webPathInput}
+                  onChange={e => setWebPathInput(e.target.value)}
+                  placeholder="e.g. C:\\Users\\you\\workspace"
+                  disabled={loading}
+                />
+              </label>
+              <button
+                type="submit"
+                className="project-picker-secondary-btn"
+                disabled={loading || !webPathInput.trim()}
+              >
+                Open Path
+              </button>
+            </form>
+          )}
+        </div>
+
+        {!isElectron && (
+          <div className="project-picker-note">
+            Native folder browsing and recent projects are available in the Electron desktop shell.
+          </div>
         )}
 
         {error && <div className="project-picker-error">{error}</div>}
 
-        {isElectron && recents.length > 0 && (
-          <div className="recent-projects-section">
-            <div className="recent-projects-title">Recent Projects</div>
+        <div className="recent-projects-section">
+          <div className="recent-projects-title">Recent Projects</div>
+          {isElectron && recents.length > 0 ? (
             <div className="recent-projects-list">
               {recents.map(project => (
                 <div
                   key={project.projectRoot}
-                  className="recent-project-item"
-                  onClick={() => openProject(project.projectRoot)}
-                  style={project.isMissing ? { borderColor: '#f8514980', background: '#2a121533' } : undefined}
+                  role="button"
+                  tabIndex={0}
+                  className={`recent-project-item ${project.isMissing ? 'missing' : ''}`}
+                  onClick={() => {
+                    if (!loading) {
+                      void openProject(project.projectRoot);
+                    }
+                  }}
+                  onKeyDown={event => {
+                    if (loading) return;
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      void openProject(project.projectRoot);
+                    }
+                  }}
+                  aria-disabled={loading}
                 >
                   <div className="recent-project-info">
                     <span className="recent-project-name">
@@ -186,7 +197,7 @@ export function ProjectPicker({ onProjectOpen }: ProjectPickerProps) {
                       {project.projectRoot}
                     </span>
                     {project.isMissing && (
-                      <span style={{ fontSize: '9px', color: '#ff7b72', marginTop: '2px' }}>
+                      <span className="recent-project-warning">
                         Directory not found / unreachable
                       </span>
                     )}
@@ -202,8 +213,14 @@ export function ProjectPicker({ onProjectOpen }: ProjectPickerProps) {
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          ) : (
+            <div className="recent-projects-empty">
+              {isElectron
+                ? 'No recent projects yet. Choose a workspace folder to start.'
+                : 'This browser view can open a typed path only.'}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

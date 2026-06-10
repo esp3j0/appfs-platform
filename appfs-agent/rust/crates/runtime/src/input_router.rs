@@ -551,6 +551,11 @@ fn render_appfs_event_group_summary(envelopes: &[&InputEnvelope]) -> Vec<String>
 }
 
 fn render_single_summary_line(envelope: &InputEnvelope) -> Option<String> {
+    if envelope.input_type == "peer_awareness.snapshot" {
+        // One-time initial peer awareness snapshot rendered as a clean summary line
+        // without the generic [System] type=... prefix.
+        return Some(format!("- AppFS: {}。", envelope.text.trim()));
+    }
     if envelope.source == InputSource::AppfsEvent {
         render_concise_appfs_event_summary(envelope)
     } else {
@@ -703,6 +708,29 @@ fn render_platform_principal_event_summary(
                 .map(|value| format!("（active_attach_count={value}）"))
                 .unwrap_or_default();
             format!("- {app_name}: principal `{principal}` detach 已忽略{count}。")
+        }
+        "principal.status.updated" => {
+            let state = envelope
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("agent_status"))
+                .and_then(|s| s.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let task = envelope
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("agent_status"))
+                .and_then(|s| s.get("current_task_preview"))
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty());
+            match task {
+                Some(task) => format!(
+                    "- {app_name}: peer `{principal}` 状态: {state}（任务: {}）。",
+                    sanitize_router_text(task)
+                ),
+                None => format!("- {app_name}: peer `{principal}` 状态: {state}。"),
+            }
         }
         other => format!(
             "- {app_name}: principal `{principal}` 事件 `{}` 已完成。",

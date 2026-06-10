@@ -15,25 +15,29 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness, decode_command_output, dedupe_superseded_commit_events, edit_file,
-    execute_bash, glob_search, grep_search, load_system_prompt_with_appfs,
+    execute_bash, execution_task_output_file, execution_task_snapshot, glob_search, grep_search,
+    load_system_prompt_with_appfs,
     lsp_client::LspRegistry,
+    mark_execution_task_status,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    prepare_background_shell_output, prepare_shell_command_output, read_file,
-    render_input_router_block, shell_task_output_path,
+    prepare_background_shell_output, prepare_shell_command_output, read_execution_task_output,
+    read_file, register_abortable_execution_task, register_child_execution_task,
+    render_input_router_block, shell_task_output_path, stop_execution_task,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    tool_output_root, tool_result_path,
+    tool_output_root, tool_result_path, unregister_execution_task,
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, AttachmentKind, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
-    ConversationRuntime, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, InvokedSkill,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolContextUpdate, ToolError,
-    ToolExecutionResult, ToolExecutor,
+    ConversationRuntime, ExecutionTaskStatus, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    HookAbortSignal, InvokedSkill, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TaskBoardPatch,
+    TaskBoardStatus, TaskBoardStore, TaskPacket, ToolContextUpdate, ToolError, ToolExecutionResult,
+    ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -330,7 +334,7 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
+        let builtin = model_visible_builtin_tool_specs()
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
@@ -366,7 +370,7 @@ impl GlobalToolRegistry {
         &self,
         allowed_tools: Option<&BTreeSet<String>>,
     ) -> Result<Vec<(String, PermissionMode)>, String> {
-        let builtin = mvp_tool_specs()
+        let builtin = model_visible_builtin_tool_specs()
             .into_iter()
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| (spec.name.to_string(), spec.required_permission));
@@ -842,14 +846,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
+            description: "Create a persistent task-board card for planning multi-step work.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string" },
-                    "description": { "type": "string" }
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "metadata": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
                 },
-                "required": ["prompt"],
+                "required": ["subject", "description"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -888,20 +897,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskGet",
-            description: "Get the status and details of a background task by ID.",
+            description: "Get one persistent task-board card by ID.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "taskId": { "type": "string" }
                 },
-                "required": ["task_id"],
+                "required": ["taskId"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "TaskList",
-            description: "List all background tasks and their current status.",
+            description: "List all persistent task-board cards for this session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -911,40 +920,67 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskStop",
-            description: "Stop a running background task by ID.",
+            description: "Stop a real background execution task such as a background shell command or sub-agent.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "task_id": { "type": "string" },
+                    "taskId": { "type": "string" }
                 },
-                "required": ["task_id"],
+                "anyOf": [
+                    { "required": ["task_id"] },
+                    { "required": ["taskId"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "TaskUpdate",
-            description: "Send a message or update to a running background task.",
+            description: "Update a persistent task-board card, including status, owner, dependencies, or metadata.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" },
-                    "message": { "type": "string" }
+                    "taskId": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "deleted"]
+                    },
+                    "owner": { "type": "string" },
+                    "addBlocks": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
                 },
-                "required": ["task_id", "message"],
+                "required": ["taskId"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "TaskOutput",
-            description: "Retrieve the output produced by a background task.",
+            description: "Read output produced by a real background execution task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" }
+                    "task_id": { "type": "string" },
+                    "taskId": { "type": "string" }
                 },
-                "required": ["task_id"],
+                "anyOf": [
+                    { "required": ["task_id"] },
+                    { "required": ["taskId"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1449,15 +1485,25 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry.create(&input.prompt, input.description.as_deref());
+    let subject = input
+        .subject
+        .or(input.prompt)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| String::from("subject must not be empty"))?;
+    let description = input
+        .description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| subject.clone());
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let task = store.create(subject, description, input.active_form, input.metadata)?;
     to_pretty_json(json!({
-        "task_id": task.task_id,
-        "status": task.status,
-        "prompt": task.prompt,
-        "description": task.description,
-        "task_packet": task.task_packet,
-        "created_at": task.created_at
+        "success": true,
+        "taskId": task.id,
+        "taskListId": store.task_list_id(),
+        "task": task
     }))
 }
 
@@ -1480,42 +1526,29 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.get(&input.task_id) {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = TaskBoardStore::default_for_cwd(&cwd);
+    match store.get(&input.task_id)? {
         Some(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "prompt": task.prompt,
-            "description": task.description,
-            "task_packet": task.task_packet,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-            "messages": task.messages,
-            "team_id": task.team_id
+            "success": true,
+            "taskListId": store.task_list_id(),
+            "task": task
         })),
-        None => Err(format!("task not found: {}", input.task_id)),
+        None => to_pretty_json(json!({
+            "success": false,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
+            "error": "Task not found"
+        })),
     }
 }
 
 fn run_task_list(_input: Value) -> Result<String, String> {
-    let registry = global_task_registry();
-    let tasks: Vec<_> = registry
-        .list(None)
-        .into_iter()
-        .map(|t| {
-            json!({
-                "task_id": t.task_id,
-                "status": t.status,
-                "prompt": t.prompt,
-                "description": t.description,
-                "task_packet": t.task_packet,
-                "created_at": t.created_at,
-                "updated_at": t.updated_at,
-                "team_id": t.team_id
-            })
-        })
-        .collect();
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let tasks = store.list()?;
     to_pretty_json(json!({
+        "taskListId": store.task_list_id(),
         "tasks": tasks,
         "count": tasks.len()
     }))
@@ -1523,42 +1556,135 @@ fn run_task_list(_input: Value) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.stop(&input.task_id) {
+    match stop_execution_task(&input.task_id) {
         Ok(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "message": "Task stopped"
+            "success": true,
+            "task": task,
+            "message": "Background execution task stopped"
         })),
-        Err(e) => Err(e),
+        Err(error) => {
+            if task_board_card_exists(&input.task_id)? {
+                return Err(format!(
+                    "`{}` is a task-board card, not a background execution task. Use TaskUpdate to change its status.",
+                    input.task_id
+                ));
+            }
+            Err(error)
+        }
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.update(&input.task_id, &input.message) {
-        Ok(task) => to_pretty_json(json!({
-            "task_id": task.task_id,
-            "status": task.status,
-            "message_count": task.messages.len(),
-            "last_message": input.message
+    if input.message.is_some()
+        && input.subject.is_none()
+        && input.description.is_none()
+        && input.active_form.is_none()
+        && input.status.is_none()
+        && input.owner.is_none()
+        && input.add_blocks.is_empty()
+        && input.add_blocked_by.is_empty()
+        && input.metadata.is_none()
+    {
+        return Err(String::from(
+            "TaskUpdate updates task-board cards. Use fields such as status, owner, addBlocks, addBlockedBy, or metadata; it no longer sends messages to background tasks.",
+        ));
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = TaskBoardStore::default_for_cwd(&cwd);
+    if input.status == Some(TaskUpdateStatus::Deleted) {
+        let existing = store.get(&input.task_id)?;
+        let deleted = store.delete(&input.task_id)?;
+        return to_pretty_json(json!({
+            "success": deleted,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
+            "updatedFields": if deleted { vec!["deleted"] } else { Vec::<&str>::new() },
+            "statusChange": existing.map(|task| json!({
+                "from": task.status,
+                "to": "deleted"
+            })),
+            "error": if deleted { Value::Null } else { json!("Task not found") }
+        }));
+    }
+
+    let status = input.status.map(|status| match status {
+        TaskUpdateStatus::Pending => TaskBoardStatus::Pending,
+        TaskUpdateStatus::InProgress => TaskBoardStatus::InProgress,
+        TaskUpdateStatus::Completed => TaskBoardStatus::Completed,
+        TaskUpdateStatus::Deleted => unreachable!("deleted handled above"),
+    });
+    let outcome = store.update(
+        &input.task_id,
+        TaskBoardPatch {
+            subject: input.subject,
+            description: input.description,
+            active_form: input.active_form,
+            owner: input.owner,
+            status,
+            metadata: input.metadata,
+            add_blocks: input.add_blocks,
+            add_blocked_by: input.add_blocked_by,
+        },
+    )?;
+
+    match outcome {
+        Some(outcome) => to_pretty_json(json!({
+            "success": true,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
+            "updatedFields": outcome.updated_fields,
+            "statusChange": outcome.status_change.map(|(from, to)| json!({
+                "from": from,
+                "to": to
+            })),
+            "task": outcome.task
         })),
-        Err(e) => Err(e),
+        None => to_pretty_json(json!({
+            "success": false,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
+            "updatedFields": [],
+            "error": "Task not found"
+        })),
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
-            "output": output,
-            "has_output": !output.is_empty()
-        })),
-        Err(e) => Err(e),
+    if task_board_card_exists(&input.task_id)? {
+        return Err(format!(
+            "`{}` is a task-board card, not a background execution task. Use TaskGet to read task-board details.",
+            input.task_id
+        ));
     }
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let snapshot = execution_task_snapshot(&input.task_id);
+    let output_file = execution_task_output_file(&input.task_id)
+        .or_else(|| {
+            let path = shell_task_output_path(&cwd, &input.task_id);
+            path.exists().then_some(path)
+        })
+        .ok_or_else(|| format!("background execution task not found: {}", input.task_id))?;
+    let output = read_execution_task_output(&output_file)?;
+    to_pretty_json(json!({
+        "taskId": input.task_id,
+        "status": snapshot
+            .as_ref()
+            .map(|task| json!(task.status))
+            .unwrap_or_else(|| json!("unknown")),
+        "outputFile": output_file.to_string_lossy(),
+        "output": output,
+        "hasOutput": !output.is_empty()
+    }))
+}
+
+fn task_board_card_exists(task_id: &str) -> Result<bool, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(TaskBoardStore::default_for_cwd(&cwd)
+        .get(task_id)?
+        .is_some())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2496,20 +2622,54 @@ struct AskUserQuestionInput {
 
 #[derive(Debug, Deserialize)]
 struct TaskCreateInput {
-    prompt: String,
+    subject: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(rename = "activeForm", default)]
+    active_form: Option<String>,
+    #[serde(default)]
+    metadata: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TaskIdInput {
+    #[serde(rename = "taskId", alias = "task_id")]
     task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
+    #[serde(rename = "taskId", alias = "task_id")]
     task_id: String,
-    message: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "activeForm", default)]
+    active_form: Option<String>,
+    #[serde(default)]
+    status: Option<TaskUpdateStatus>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(rename = "addBlocks", default)]
+    add_blocks: Vec<String>,
+    #[serde(rename = "addBlockedBy", default)]
+    add_blocked_by: Vec<String>,
+    #[serde(default)]
+    metadata: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskUpdateStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Deleted,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2784,6 +2944,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    abort_signal: HookAbortSignal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3973,6 +4134,7 @@ fn prepare_agent_job(
     let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
     let allowed_tools = allowed_tools_override
         .unwrap_or_else(|| allowed_tools_for_subagent(&normalized_subagent_type));
+    let abort_signal = HookAbortSignal::new();
 
     let output_contents = format!(
         "# Agent Task
@@ -4014,12 +4176,21 @@ fn prepare_agent_job(
         prompt,
         system_prompt,
         allowed_tools,
+        abort_signal,
     })
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
-    std::thread::Builder::new()
+    register_abortable_execution_task(
+        job.manifest.agent_id.clone(),
+        "agent",
+        PathBuf::from(&job.manifest.output_file),
+        job.abort_signal.clone(),
+    );
+    let task_id = job.manifest.agent_id.clone();
+    let abort_signal = job.abort_signal.clone();
+    match std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             let result =
@@ -4027,10 +4198,12 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
+                    mark_execution_task_status(&job.manifest.agent_id, ExecutionTaskStatus::Failed);
                     let _ =
                         persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
                 }
                 Err(_) => {
+                    mark_execution_task_status(&job.manifest.agent_id, ExecutionTaskStatus::Failed);
                     let _ = persist_agent_terminal_state(
                         &job.manifest,
                         "failed",
@@ -4039,19 +4212,55 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                 }
             }
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        }) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if !abort_signal.is_aborted() {
+                unregister_execution_task(&task_id);
+            }
+            Err(error.to_string())
+        }
+    }
 }
 
 fn run_agent_job(job: &AgentJob) -> Result<String, String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
-    persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)?;
-    Ok(final_text)
+    let mut runtime = build_agent_runtime(job)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_hook_abort_signal(job.abort_signal.clone());
+    match runtime.run_turn(job.prompt.clone(), None) {
+        Ok(summary) => {
+            let final_text = final_assistant_text(&summary);
+            if job.abort_signal.is_aborted() {
+                mark_execution_task_status(&job.manifest.agent_id, ExecutionTaskStatus::Killed);
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "killed",
+                    Some("Sub-agent task stopped before completion."),
+                    None,
+                )?;
+                return Ok(final_text);
+            }
+            mark_execution_task_status(&job.manifest.agent_id, ExecutionTaskStatus::Completed);
+            persist_agent_terminal_state(
+                &job.manifest,
+                "completed",
+                Some(final_text.as_str()),
+                None,
+            )?;
+            Ok(final_text)
+        }
+        Err(_error) if job.abort_signal.is_aborted() => {
+            mark_execution_task_status(&job.manifest.agent_id, ExecutionTaskStatus::Killed);
+            persist_agent_terminal_state(
+                &job.manifest,
+                "killed",
+                Some("Sub-agent task stopped before completion."),
+                None,
+            )?;
+            Ok(String::new())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn build_agent_runtime(
@@ -4124,7 +4333,10 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "Skill",
-            "TodoWrite",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -4136,7 +4348,10 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebFetch",
             "WebSearch",
             "ToolSearch",
-            "TodoWrite",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
@@ -4170,9 +4385,12 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "grep_search",
             "WebFetch",
             "WebSearch",
-            "TodoWrite",
             "Skill",
             "ToolSearch",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
             "NotebookEdit",
             "Sleep",
             "SendUserMessage",
@@ -5608,7 +5826,7 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
 }
 
 fn deferred_tool_specs() -> Vec<ToolSpec> {
-    mvp_tool_specs()
+    model_visible_builtin_tool_specs()
         .into_iter()
         .filter(|spec| {
             !matches!(
@@ -5617,6 +5835,30 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
             )
         })
         .collect()
+}
+
+fn model_visible_builtin_tool_specs() -> Vec<ToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .filter(|spec| !is_hidden_builtin_tool(spec.name))
+        .collect()
+}
+
+fn is_hidden_builtin_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "TodoWrite"
+            | "RunTaskPacket"
+            | "WorkerCreate"
+            | "WorkerGet"
+            | "WorkerObserve"
+            | "WorkerResolveTrust"
+            | "WorkerAwaitReady"
+            | "WorkerSendPrompt"
+            | "WorkerRestart"
+            | "WorkerTerminate"
+            | "WorkerObserveCompletion"
+    )
 }
 
 fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpec]) -> Vec<String> {
@@ -6733,7 +6975,7 @@ fn execute_shell_command(
 
     if run_in_background.unwrap_or(false) {
         let background_output = prepare_background_shell_output(&cwd, "powershell")?;
-        std::process::Command::new(shell)
+        let child = std::process::Command::new(shell)
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
@@ -6743,6 +6985,12 @@ fn execute_shell_command(
             .stdout(background_output.stdout)
             .stderr(background_output.stderr)
             .spawn()?;
+        register_child_execution_task(
+            background_output.task_id.clone(),
+            "powershell",
+            PathBuf::from(&background_output.output_path),
+            child,
+        );
         return Ok(PowerShellCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -9968,13 +10216,19 @@ mod tests {
         assert!(!explore.contains("bash"));
 
         let plan = allowed_tools_for_subagent("Plan");
-        assert!(plan.contains("TodoWrite"));
+        assert!(!plan.contains("TodoWrite"));
+        assert!(plan.contains("TaskCreate"));
+        assert!(plan.contains("TaskUpdate"));
+        assert!(plan.contains("TaskList"));
+        assert!(plan.contains("TaskGet"));
         assert!(plan.contains("StructuredOutput"));
         assert!(!plan.contains("Agent"));
 
         let verification = allowed_tools_for_subagent("Verification");
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
+        assert!(!verification.contains("TodoWrite"));
+        assert!(verification.contains("TaskList"));
         assert!(!verification.contains("write_file"));
     }
 
@@ -10933,6 +11187,166 @@ mod tests {
     }
 
     #[test]
+    fn task_tools_use_persistent_task_board() {
+        let _guard = env_guard();
+        let root = temp_path("task-board-tools");
+        let cwd = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&cwd).expect("cwd");
+        fs::create_dir_all(&config_home).expect("config");
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_task_list = std::env::var("CLAW_TASK_LIST_ID").ok();
+        std::env::set_current_dir(&cwd).expect("set cwd");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("CLAW_TASK_LIST_ID", "task-tool-test");
+
+        let created = execute_tool(
+            "TaskCreate",
+            &json!({
+                "subject": "Implement task board",
+                "description": "Persist task cards",
+                "activeForm": "Implementing task board",
+                "metadata": { "priority": "high" }
+            }),
+        )
+        .expect("create task");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        assert_eq!(created_json["taskId"], "1");
+        assert!(config_home
+            .join("tasks")
+            .join("task-tool-test")
+            .join("1.json")
+            .exists());
+
+        execute_tool(
+            "TaskCreate",
+            &json!({"subject": "Verify", "description": "Run tests"}),
+        )
+        .expect("create second");
+        let updated = execute_tool(
+            "TaskUpdate",
+            &json!({
+                "taskId": "1",
+                "status": "in_progress",
+                "owner": "coder",
+                "addBlocks": ["2"],
+                "metadata": { "priority": null, "area": "runtime" }
+            }),
+        )
+        .expect("update task");
+        let updated_json: serde_json::Value = serde_json::from_str(&updated).expect("json");
+        assert_eq!(updated_json["success"], true);
+        assert_eq!(updated_json["task"]["status"], "in_progress");
+        assert_eq!(updated_json["task"]["owner"], "coder");
+        assert_eq!(updated_json["task"]["blocks"][0], "2");
+        assert!(updated_json["task"]["metadata"].get("priority").is_none());
+        assert_eq!(updated_json["task"]["metadata"]["area"], "runtime");
+
+        let list = execute_tool("TaskList", &json!({})).expect("list tasks");
+        let list_json: serde_json::Value = serde_json::from_str(&list).expect("json");
+        assert_eq!(list_json["count"], 2);
+
+        execute_tool("TaskUpdate", &json!({"taskId": "2", "status": "deleted"}))
+            .expect("delete second");
+        let get_deleted = execute_tool("TaskGet", &json!({"taskId": "2"})).expect("get deleted");
+        let get_deleted_json: serde_json::Value = serde_json::from_str(&get_deleted).expect("json");
+        assert_eq!(get_deleted_json["success"], false);
+        let first = execute_tool("TaskGet", &json!({"task_id": "1"})).expect("get first");
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("json");
+        assert!(first_json["task"]["blocks"]
+            .as_array()
+            .expect("blocks")
+            .is_empty());
+
+        restore_cwd(&original_dir);
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_task_list {
+            Some(value) => std::env::set_var("CLAW_TASK_LIST_ID", value),
+            None => std::env::remove_var("CLAW_TASK_LIST_ID"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_stop_and_output_reject_task_board_cards() {
+        let _guard = env_guard();
+        let root = temp_path("task-stop-card");
+        let cwd = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&cwd).expect("cwd");
+        fs::create_dir_all(&config_home).expect("config");
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_task_list = std::env::var("CLAW_TASK_LIST_ID").ok();
+        std::env::set_current_dir(&cwd).expect("set cwd");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("CLAW_TASK_LIST_ID", "task-stop-card");
+
+        execute_tool(
+            "TaskCreate",
+            &json!({"subject": "Plan card", "description": "Not an execution task"}),
+        )
+        .expect("create task");
+        let stop_error = execute_tool("TaskStop", &json!({"taskId": "1"}))
+            .expect_err("TaskStop should reject task-board cards");
+        assert!(stop_error.contains("task-board card"));
+        let output_error = execute_tool("TaskOutput", &json!({"task_id": "1"}))
+            .expect_err("TaskOutput should reject task-board cards");
+        assert!(output_error.contains("task-board card"));
+
+        restore_cwd(&original_dir);
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_task_list {
+            Some(value) => std::env::set_var("CLAW_TASK_LIST_ID", value),
+            None => std::env::remove_var("CLAW_TASK_LIST_ID"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_tools_are_hidden_from_default_tool_surface_and_search() {
+        let registry = super::GlobalToolRegistry::builtin();
+        let definitions = registry.definitions(None);
+        let names = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"TaskCreate"));
+        assert!(names.contains(&"TaskOutput"));
+        assert!(!names.contains(&"WorkerCreate"));
+        assert!(!names.contains(&"RunTaskPacket"));
+        assert!(!names.contains(&"TodoWrite"));
+
+        let result = execute_tool("ToolSearch", &json!({"query": "worker", "max_results": 20}))
+            .expect("ToolSearch should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        let matches = output["matches"].as_array().expect("matches");
+        assert!(
+            matches
+                .iter()
+                .all(|name| !name.as_str().unwrap_or_default().starts_with("Worker")),
+            "worker tools should not be searchable by default: {matches:?}"
+        );
+        let todo_result = execute_tool("ToolSearch", &json!({"query": "todo", "max_results": 20}))
+            .expect("ToolSearch should succeed");
+        let todo_output: serde_json::Value = serde_json::from_str(&todo_result).expect("json");
+        let todo_matches = todo_output["matches"].as_array().expect("matches");
+        assert!(
+            todo_matches
+                .iter()
+                .all(|name| name.as_str().unwrap_or_default() != "TodoWrite"),
+            "TodoWrite should not be searchable when Task Board v2 tools are enabled: {todo_matches:?}"
+        );
+    }
+
+    #[test]
     fn given_empty_payload_when_structured_output_then_rejects_with_error() {
         let result = execute_tool("StructuredOutput", &json!({}));
         let error = result.expect_err("empty payload should fail");
@@ -11058,14 +11472,6 @@ printf 'pwsh:%s' "$1"
         )
         .expect("PowerShell background should succeed");
 
-        std::env::set_var("PATH", original_path);
-        if let Some(original_override) = original_override {
-            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
-        } else {
-            std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
-        }
-        let _ = std::fs::remove_dir_all(dir);
-
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
@@ -11078,6 +11484,37 @@ printf 'pwsh:%s' "$1"
         assert!(background_output.get("noOutputExpected").is_none());
         assert!(background_output["backgroundedByUser"].is_null());
         assert!(background_output["assistantAutoBackgrounded"].is_null());
+        let task_id = background_output["backgroundTaskId"]
+            .as_str()
+            .expect("background task id");
+        let mut task_output = serde_json::Value::Null;
+        for _ in 0..20 {
+            let output = execute_tool("TaskOutput", &json!({"task_id": task_id}))
+                .expect("TaskOutput should read background output");
+            task_output = serde_json::from_str(&output).expect("json");
+            if task_output["output"]
+                .as_str()
+                .is_some_and(|value| value.contains("pwsh:Write-Output hello"))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            task_output["output"]
+                .as_str()
+                .expect("output")
+                .contains("pwsh:Write-Output hello"),
+            "unexpected task output: {task_output}"
+        );
+
+        std::env::set_var("PATH", original_path);
+        if let Some(original_override) = original_override {
+            std::env::set_var("CLAW_TEST_POWERSHELL_PATH", original_override);
+        } else {
+            std::env::remove_var("CLAW_TEST_POWERSHELL_PATH");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

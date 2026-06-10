@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AgentInfo, AgentMeta, CompactionArchiveRecord, CompactionBoundaryRecord, DebugDumpRecord, MessageRecord, SessionMetaRecord } from './types.js';
-import { parseCompactionArchives, parseCompactionBoundaries, parseDebugDumps, parseMessages, parseMeta } from './jsonl-parser.js';
+import type { AgentInfo, AgentMeta, CompactionArchiveRecord, CompactionBoundaryRecord, ConversationMessage, DebugDumpRecord, MessageRecord, SessionMetaRecord, TurnErrorRecord } from './types.js';
+import { parseCompactionArchives, parseCompactionBoundaries, parseDebugDumps, parseMessages, parseMeta, parseTurnErrors } from './jsonl-parser.js';
 import type { FileWatcher } from './file-watcher.js';
 import type { ProjectRegistry, ProjectRecord } from './project-registry.js';
 
@@ -11,6 +11,7 @@ export class AgentRegistry {
   private debugDumps = new Map<string, DebugDumpRecord[]>();
   private compactionArchives = new Map<string, CompactionArchiveRecord[]>();
   private compactionBoundaries = new Map<string, CompactionBoundaryRecord[]>();
+  private turnErrors = new Map<string, TurnErrorRecord[]>();
   private dumpDir: string;
   private fileWatcher: FileWatcher | null = null;
   public projectRegistry: ProjectRegistry;
@@ -87,7 +88,7 @@ export class AgentRegistry {
 
       // Phase 1a fallback: flat *.jsonl files in dump dir if no sessions were discovered in .claw
       if (this.agents.size === 0) {
-        const jsonlFiles = fs.readdirSync(this.dumpDir).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
+        const jsonlFiles = fs.readdirSync(this.dumpDir).filter(isPrimarySessionJsonlFile);
         for (const file of jsonlFiles) {
           const fullPath = path.join(this.dumpDir, file);
           this.registerFromSessionFile(fullPath);
@@ -120,7 +121,7 @@ export class AgentRegistry {
     if (options.flatFallback && this.agents.size === oldAgentCount) {
       let jsonlFiles: string[];
       try {
-        jsonlFiles = fs.readdirSync(root).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
+        jsonlFiles = fs.readdirSync(root).filter(isPrimarySessionJsonlFile);
       } catch {
         jsonlFiles = [];
       }
@@ -154,7 +155,7 @@ export class AgentRegistry {
 
       let sessionFiles: string[];
       try {
-        sessionFiles = fs.readdirSync(fpDir).filter(f => f.endsWith('.jsonl') && !f.endsWith('.debug.jsonl'));
+        sessionFiles = fs.readdirSync(fpDir).filter(isPrimarySessionJsonlFile);
       } catch {
         continue;
       }
@@ -166,26 +167,62 @@ export class AgentRegistry {
     }
   }
 
-  private registerFromMeta(meta: AgentMeta): void {
-    const sessionId = meta.session_id;
-    let sessionContent = '';
-    if (meta.session_jsonl_path && fs.existsSync(meta.session_jsonl_path)) {
-      sessionContent = fs.readFileSync(meta.session_jsonl_path, 'utf-8');
-    }
-    const msgs = parseMessages(sessionContent);
-    // Look for companion .debug.jsonl
-    const debugPath = (meta.session_jsonl_path ?? '').replace(/\.jsonl$/, '.debug.jsonl');
-    let dumps: DebugDumpRecord[] = [];
-    let archives: CompactionArchiveRecord[] = [];
-    let boundaries: CompactionBoundaryRecord[] = [];
-    if (debugPath && fs.existsSync(debugPath)) {
-      const debugContent = fs.readFileSync(debugPath, 'utf-8');
-      dumps = parseDebugDumps(debugContent);
-      archives = parseCompactionArchives(debugContent);
-      boundaries = parseCompactionBoundaries(debugContent);
+  private readSessionMessages(sessionPath: string): MessageRecord[] {
+    const order: string[] = [];
+    const recordsByKey = new Map<string, MessageRecord>();
+    const paths = [...findRotatedSessionPaths(sessionPath), sessionPath];
+
+    for (const filePath of paths) {
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, 'utf-8');
+      for (const record of parseMessages(content)) {
+        const key = record.message.uuid || `${filePath}:${order.length}`;
+        if (!recordsByKey.has(key)) {
+          order.push(key);
+        }
+        recordsByKey.set(key, record);
+      }
     }
 
+    return order.flatMap(key => {
+      const record = recordsByKey.get(key);
+      return record ? [record] : [];
+    });
+  }
+
+  private readDebugSidecar(sessionPath: string): {
+    dumps: DebugDumpRecord[];
+    archives: CompactionArchiveRecord[];
+    boundaries: CompactionBoundaryRecord[];
+    errors: TurnErrorRecord[];
+  } {
+    const debugPath = sessionPath.replace(/\.jsonl$/, '.debug.jsonl');
+    if (!debugPath || !fs.existsSync(debugPath)) {
+      return { dumps: [], archives: [], boundaries: [], errors: [] };
+    }
+
+    const debugContent = fs.readFileSync(debugPath, 'utf-8');
+    return {
+      dumps: parseDebugDumps(debugContent),
+      archives: parseCompactionArchives(debugContent),
+      boundaries: parseCompactionBoundaries(debugContent),
+      errors: parseTurnErrors(debugContent),
+    };
+  }
+
+  private registerFromMeta(meta: AgentMeta): void {
+    const sessionId = meta.session_id;
+    const msgs = meta.session_jsonl_path
+      ? this.readSessionMessages(meta.session_jsonl_path)
+      : [];
+    const debug = meta.session_jsonl_path
+      ? this.readDebugSidecar(meta.session_jsonl_path)
+      : { dumps: [], archives: [], boundaries: [], errors: [] };
+
     const name = meta.agent_name;
+    const sidecarMeta = meta.session_jsonl_path
+      ? this.readSessionSidecarMeta(meta.session_jsonl_path)
+      : {};
     const agentInfo: AgentInfo = {
       name,
       principalId: meta.principal_id,
@@ -198,35 +235,37 @@ export class AgentRegistry {
       status: 'online',
       controlMode: 'external', // Managed agents will override this explicitly
       messageCount: msgs.length,
-      ...this.sumUsage(msgs),
+      ...calculateSessionUsage(msgs, debug.archives),
+      modelProviderId: stringValue(sidecarMeta.modelProviderId),
+      modelId: stringValue(sidecarMeta.modelId),
+      contextWindowTokens: numberValue(sidecarMeta.contextWindowTokens),
+      maxOutputTokens: numberValue(sidecarMeta.maxOutputTokens),
+      runtimeModelConfigPath: stringValue(sidecarMeta.runtimeModelConfigPath),
+      archived: sidecarMeta.archived === true,
+      archivedAt: numberValue(sidecarMeta.archivedAt),
+      archivedReason: stringValue(sidecarMeta.archivedReason),
     };
-    this.fillProjectInfo(agentInfo);
-    this.agents.set(sessionId, agentInfo);
+    const normalizedAgentInfo = this.preserveManagedRuntimeState(agentInfo);
+    this.fillProjectInfo(normalizedAgentInfo);
+    this.agents.set(sessionId, normalizedAgentInfo);
     this.messages.set(sessionId, msgs);
-    this.debugDumps.set(sessionId, dumps);
-    this.compactionArchives.set(sessionId, archives);
-    this.compactionBoundaries.set(sessionId, boundaries);
+    this.debugDumps.set(sessionId, debug.dumps);
+    this.compactionArchives.set(sessionId, debug.archives);
+    this.compactionBoundaries.set(sessionId, debug.boundaries);
+    this.turnErrors.set(sessionId, debug.errors);
   }
 
   private registerFromSessionFile(fullPath: string): void {
     const content = fs.readFileSync(fullPath, 'utf-8');
     const sess = parseMeta(content);
-    const msgs = parseMessages(content);
-    // Look for companion .debug.jsonl file
-    const debugPath = fullPath.replace(/\.jsonl$/, '.debug.jsonl');
-    let dumps: DebugDumpRecord[] = [];
-    let archives: CompactionArchiveRecord[] = [];
-    let boundaries: CompactionBoundaryRecord[] = [];
-    if (fs.existsSync(debugPath)) {
-      const debugContent = fs.readFileSync(debugPath, 'utf-8');
-      dumps = parseDebugDumps(debugContent);
-      archives = parseCompactionArchives(debugContent);
-      boundaries = parseCompactionBoundaries(debugContent);
-    }
+    const msgs = this.readSessionMessages(fullPath);
+    const debug = this.readDebugSidecar(fullPath);
 
     const principalId = sess?.appfs_principal_id;
     const name = principalId ?? sess?.session_id ?? path.basename(fullPath, '.jsonl');
     const sessionId = sess?.session_id ?? name;
+
+    const sidecarMeta = this.readSessionSidecarMeta(fullPath);
 
     const agentInfo: AgentInfo = {
       name,
@@ -240,14 +279,24 @@ export class AgentRegistry {
       status: 'offline',
       controlMode: 'external',
       messageCount: msgs.length,
-      ...this.sumUsage(msgs),
+      ...calculateSessionUsage(msgs, debug.archives),
+      modelProviderId: stringValue(sidecarMeta.modelProviderId),
+      modelId: stringValue(sidecarMeta.modelId),
+      contextWindowTokens: numberValue(sidecarMeta.contextWindowTokens),
+      maxOutputTokens: numberValue(sidecarMeta.maxOutputTokens),
+      runtimeModelConfigPath: stringValue(sidecarMeta.runtimeModelConfigPath),
+      archived: sidecarMeta.archived === true,
+      archivedAt: numberValue(sidecarMeta.archivedAt),
+      archivedReason: stringValue(sidecarMeta.archivedReason),
     };
-    this.fillProjectInfo(agentInfo);
-    this.agents.set(sessionId, agentInfo);
+    const normalizedAgentInfo = this.preserveManagedRuntimeState(agentInfo);
+    this.fillProjectInfo(normalizedAgentInfo);
+    this.agents.set(sessionId, normalizedAgentInfo);
     this.messages.set(sessionId, msgs);
-    this.debugDumps.set(sessionId, dumps);
-    this.compactionArchives.set(sessionId, archives);
-    this.compactionBoundaries.set(sessionId, boundaries);
+    this.debugDumps.set(sessionId, debug.dumps);
+    this.compactionArchives.set(sessionId, debug.archives);
+    this.compactionBoundaries.set(sessionId, debug.boundaries);
+    this.turnErrors.set(sessionId, debug.errors);
   }
 
   /**
@@ -259,6 +308,12 @@ export class AgentRegistry {
     const normalizedAgentInfo: AgentInfo = { ...agentInfo };
     this.fillProjectInfo(normalizedAgentInfo);
     this.agents.set(sessionId, normalizedAgentInfo);
+
+    // Save sidecar meta if managed and has a sessionJsonlPath
+    if (normalizedAgentInfo.sessionJsonlPath && normalizedAgentInfo.controlMode === 'managed') {
+      this.writeSessionSidecarMeta(normalizedAgentInfo);
+    }
+
     if (msgs) {
       this.messages.set(sessionId, msgs);
     } else if (!this.messages.has(sessionId) && normalizedAgentInfo.sessionJsonlPath && fs.existsSync(normalizedAgentInfo.sessionJsonlPath)) {
@@ -269,6 +324,7 @@ export class AgentRegistry {
     if (!this.debugDumps.has(sessionId)) this.debugDumps.set(sessionId, []);
     if (!this.compactionArchives.has(sessionId)) this.compactionArchives.set(sessionId, []);
     if (!this.compactionBoundaries.has(sessionId)) this.compactionBoundaries.set(sessionId, []);
+    if (!this.turnErrors.has(sessionId)) this.turnErrors.set(sessionId, []);
 
     // Dynamically watch the file if a watcher exists
     if (this.fileWatcher && normalizedAgentInfo.sessionJsonlPath) {
@@ -276,16 +332,31 @@ export class AgentRegistry {
     }
   }
 
-  private sumUsage(msgs: MessageRecord[]): { totalInputTokens: number; totalOutputTokens: number } {
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    for (const msg of msgs) {
-      if (msg.message.usage) {
-        totalInputTokens += msg.message.usage.input_tokens;
-        totalOutputTokens += msg.message.usage.output_tokens;
-      }
+  private preserveManagedRuntimeState(discovered: AgentInfo): AgentInfo {
+    const existing = this.agents.get(discovered.sessionId);
+    if (existing?.controlMode !== 'managed') {
+      return discovered;
     }
-    return { totalInputTokens, totalOutputTokens };
+
+    return {
+      ...discovered,
+      name: existing.name || discovered.name,
+      principalId: existing.principalId || discovered.principalId,
+      pid: existing.pid,
+      startedAt: existing.startedAt || discovered.startedAt,
+      status: existing.status,
+      controlMode: existing.controlMode,
+      projectId: existing.projectId ?? discovered.projectId,
+      projectRoot: existing.projectRoot ?? discovered.projectRoot,
+      modelProviderId: discovered.modelProviderId ?? existing.modelProviderId,
+      modelId: discovered.modelId ?? existing.modelId,
+      contextWindowTokens: discovered.contextWindowTokens ?? existing.contextWindowTokens,
+      maxOutputTokens: discovered.maxOutputTokens ?? existing.maxOutputTokens,
+      runtimeModelConfigPath: discovered.runtimeModelConfigPath ?? existing.runtimeModelConfigPath,
+      archived: discovered.archived ?? existing.archived,
+      archivedAt: discovered.archivedAt ?? existing.archivedAt,
+      archivedReason: discovered.archivedReason ?? existing.archivedReason,
+    };
   }
 
   getAgents(): AgentInfo[] {
@@ -293,6 +364,41 @@ export class AgentRegistry {
       this.reloadAgent(sessionId);
     }
     return Array.from(this.agents.values());
+  }
+
+  getActiveAgents(): AgentInfo[] {
+    return this.getAgents().filter(agent => !agent.archived);
+  }
+
+  getArchivedAgents(): AgentInfo[] {
+    return this.getAgents().filter(agent => agent.archived);
+  }
+
+  archiveSessionsForPrincipal(
+    principalId: string,
+    projectId?: string,
+    reason = 'principal_deleted',
+  ): AgentInfo[] {
+    const archived: AgentInfo[] = [];
+    const archivedAt = Date.now();
+
+    for (const agent of this.getAgents()) {
+      if (!samePrincipal(agent, principalId, projectId) || agent.archived) {
+        continue;
+      }
+
+      const updated: AgentInfo = {
+        ...agent,
+        archived: true,
+        archivedAt,
+        archivedReason: reason,
+      };
+      this.agents.set(agent.sessionId, updated);
+      this.writeSessionSidecarMeta(updated);
+      archived.push(updated);
+    }
+
+    return archived;
   }
 
   getAgent(key: string): AgentInfo | undefined {
@@ -332,6 +438,14 @@ export class AgentRegistry {
     return sessionId ? (this.compactionBoundaries.get(sessionId) ?? []) : [];
   }
 
+  getTurnErrors(key: string): TurnErrorRecord[] {
+    const sessionId = this.resolveSessionId(key);
+    if (sessionId) {
+      this.reloadAgent(sessionId);
+    }
+    return sessionId ? (this.turnErrors.get(sessionId) ?? []) : [];
+  }
+
   /** Reload a single agent's messages and debug dumps from its session file. */
   reloadAgent(key: string): MessageRecord[] {
     const sessionId = this.resolveSessionId(key);
@@ -340,26 +454,17 @@ export class AgentRegistry {
     if (!info || !info.sessionJsonlPath || !fs.existsSync(info.sessionJsonlPath)) return [];
 
     try {
-      const content = fs.readFileSync(info.sessionJsonlPath, 'utf-8');
-      const msgs = parseMessages(content);
-      const debugPath = info.sessionJsonlPath.replace(/\.jsonl$/, '.debug.jsonl');
-      let dumps: DebugDumpRecord[] = [];
-      let archives: CompactionArchiveRecord[] = [];
-      let boundaries: CompactionBoundaryRecord[] = [];
-      if (fs.existsSync(debugPath)) {
-        const debugContent = fs.readFileSync(debugPath, 'utf-8');
-        dumps = parseDebugDumps(debugContent);
-        archives = parseCompactionArchives(debugContent);
-        boundaries = parseCompactionBoundaries(debugContent);
-      }
+      const msgs = this.readSessionMessages(info.sessionJsonlPath);
+      const debug = this.readDebugSidecar(info.sessionJsonlPath);
       this.messages.set(sessionId, msgs);
-      this.debugDumps.set(sessionId, dumps);
-      this.compactionArchives.set(sessionId, archives);
-      this.compactionBoundaries.set(sessionId, boundaries);
+      this.debugDumps.set(sessionId, debug.dumps);
+      this.compactionArchives.set(sessionId, debug.archives);
+      this.compactionBoundaries.set(sessionId, debug.boundaries);
+      this.turnErrors.set(sessionId, debug.errors);
       this.agents.set(sessionId, {
         ...info,
         messageCount: msgs.length,
-        ...this.sumUsage(msgs),
+        ...calculateSessionUsage(msgs, debug.archives),
       });
       return msgs;
     } catch (err) {
@@ -436,6 +541,59 @@ export class AgentRegistry {
       delete agentInfo.projectRoot;
     }
   }
+
+  private readSessionSidecarMeta(sessionPath: string): Record<string, unknown> {
+    const metaPath = sessionPath + '.meta.json';
+    if (!sessionPath || !fs.existsSync(metaPath)) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private writeSessionSidecarMeta(agentInfo: AgentInfo): void {
+    if (!agentInfo.sessionJsonlPath) {
+      return;
+    }
+
+    const metaPath = agentInfo.sessionJsonlPath + '.meta.json';
+    const existing = this.readSessionSidecarMeta(agentInfo.sessionJsonlPath);
+    const sidecarMeta = {
+      ...existing,
+      modelProviderId: agentInfo.modelProviderId,
+      modelId: agentInfo.modelId,
+      contextWindowTokens: agentInfo.contextWindowTokens,
+      maxOutputTokens: agentInfo.maxOutputTokens,
+      runtimeModelConfigPath: agentInfo.runtimeModelConfigPath,
+      archived: agentInfo.archived ?? existing.archived,
+      archivedAt: agentInfo.archivedAt ?? existing.archivedAt,
+      archivedReason: agentInfo.archivedReason ?? existing.archivedReason,
+    };
+
+    try {
+      fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+      fs.writeFileSync(metaPath, JSON.stringify(sidecarMeta, null, 2), 'utf-8');
+    } catch (err) {
+      console.error(`Failed to write sidecar meta file ${metaPath}:`, err);
+    }
+  }
+}
+
+function samePrincipal(agent: AgentInfo, principalId: string, projectId?: string): boolean {
+  return (agent.principalId || agent.name) === principalId
+    && (!projectId || agent.projectId === projectId);
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function workspaceFingerprintFromSessionPath(sessionPath: string): string | undefined {
@@ -447,4 +605,106 @@ function workspaceFingerprintFromSessionPath(sessionPath: string): string | unde
     return parts[index + 1];
   }
   return undefined;
+}
+
+function isPrimarySessionJsonlFile(file: string): boolean {
+  return file.endsWith('.jsonl')
+    && !file.endsWith('.debug.jsonl')
+    && !/\.rot-\d+\.jsonl$/.test(file);
+}
+
+function findRotatedSessionPaths(sessionPath: string): string[] {
+  const dir = path.dirname(sessionPath);
+  const base = path.basename(sessionPath, '.jsonl');
+  if (!fs.existsSync(dir)) return [];
+
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+
+  return files
+    .filter(file => file.startsWith(`${base}.rot-`) && file.endsWith('.jsonl'))
+    .sort((a, b) => rotationTimestamp(a) - rotationTimestamp(b))
+    .map(file => path.join(dir, file));
+}
+
+function rotationTimestamp(fileName: string): number {
+  const match = fileName.match(/\.rot-(\d+)\.jsonl$/);
+  return match ? Number(match[1]) : 0;
+}
+
+export function calculateSessionUsage(
+  msgs: MessageRecord[],
+  archives: CompactionArchiveRecord[] = [],
+): { totalInputTokens: number; totalOutputTokens: number; currentContextTokens: number } {
+  const liveMessages = msgs.map(record => record.message);
+  const archivedMessages = archives.map(record => record.message);
+  const usageMessages = uniqueMessages([...archivedMessages, ...liveMessages]);
+
+  return {
+    totalInputTokens: sumInputTokens(usageMessages),
+    totalOutputTokens: sumOutputTokens(usageMessages),
+    currentContextTokens: latestInputTokens(liveMessages),
+  };
+}
+
+function sumInputTokens(messages: ConversationMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if (message.usage) {
+      total += effectiveInputTokens(message.usage);
+    }
+  }
+  return total;
+}
+
+function sumOutputTokens(messages: ConversationMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if (message.usage) {
+      total += message.usage.output_tokens;
+    }
+  }
+  return total;
+}
+
+function latestInputTokens(messages: ConversationMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const usage = messages[i].usage;
+    if (usage) {
+      return effectiveInputTokens(usage);
+    }
+  }
+  return 0;
+}
+
+function effectiveInputTokens(usage: ConversationMessage['usage']): number {
+  if (!usage) return 0;
+  return positiveTokenCount(usage.input_tokens)
+    + positiveTokenCount(usage.cache_creation_input_tokens)
+    + positiveTokenCount(usage.cache_read_input_tokens);
+}
+
+function positiveTokenCount(value: number | undefined): number {
+  return typeof value === 'number' && value > 0 ? value : 0;
+}
+
+function uniqueMessages(messages: ConversationMessage[]): ConversationMessage[] {
+  const seen = new Set<string>();
+  const unique: ConversationMessage[] = [];
+  for (const message of messages) {
+    if (!message.uuid) {
+      unique.push(message);
+      continue;
+    }
+    if (seen.has(message.uuid)) {
+      continue;
+    }
+    seen.add(message.uuid);
+    unique.push(message);
+  }
+  return unique;
 }

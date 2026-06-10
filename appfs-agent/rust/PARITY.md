@@ -35,8 +35,8 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | Bash validation (9 submodules) | ✅ complete | `36dac6c` | — (`jobdori/bash-validation-submodules`) | `1005 insertions` |
 | CI fix | ✅ complete | `89104eb` | `f1969ce` | `22 insertions, 1 deletion` |
 | File-tool edge cases | ✅ complete | `284163b` | `a98f2b6` | `195 insertions, 1 deletion` |
-| TaskRegistry | ✅ complete | `5ea138e` | `21a1e1d` | `336 insertions` |
-| Task tool wiring | ✅ complete | `e8692e4` | `d994be6` | `79 insertions, 35 deletions` |
+| TaskRegistry | ⚠️ superseded | `5ea138e` | `21a1e1d` | In-memory execution-style registry was not Claude Code task-board parity |
+| Task tool wiring | 🔧 corrected | `e8692e4` | `d994be6` | TaskCreate/Update/Get/List now target persistent task-board cards; TaskStop/Output target execution tasks |
 | Team + cron runtime | ✅ complete | `c486ca6` | `49653fe` | `441 insertions, 37 deletions` |
 | MCP lifecycle | ✅ complete | `730667f` | `cc0f92e` | `491 insertions, 24 deletions` |
 | LSP client | ✅ complete | `2d66503` | `d7f0dc6` | `461 insertions, 9 deletions` |
@@ -56,15 +56,15 @@ Hashes below come from `git log --oneline`. Merge line counts come from `git sho
 | **grep_search** | `runtime::file_ops` | ripgrep-style search — **good parity** |
 | **WebFetch** | `tools` | URL fetch + content extraction — **moderate parity** (need to verify content truncation, redirect handling vs upstream) |
 | **WebSearch** | `tools` | search query execution — **moderate parity** |
-| **TodoWrite** | `tools` | todo/note persistence — **moderate parity** |
+| **TodoWrite** | `tools` | legacy Todo V1 handler retained for direct compatibility but hidden from model-visible tools while Task Board V2 is enabled |
 | **Skill** | `tools` | skill discovery/install — **moderate parity** |
 | **Agent** | `tools` | agent delegation — **moderate parity** |
-| **TaskCreate** | `runtime::task_registry` + `tools` | in-memory task creation wired into tool dispatch — **good parity** |
-| **TaskGet** | `runtime::task_registry` + `tools` | task lookup + metadata payload — **good parity** |
-| **TaskList** | `runtime::task_registry` + `tools` | registry-backed task listing — **good parity** |
-| **TaskStop** | `runtime::task_registry` + `tools` | terminal-state stop handling — **good parity** |
-| **TaskUpdate** | `runtime::task_registry` + `tools` | registry-backed message updates — **good parity** |
-| **TaskOutput** | `runtime::task_registry` + `tools` | output capture retrieval — **good parity** |
+| **TaskCreate** | `runtime::task_board` + `tools` | persistent task-board card creation under `CLAW_CONFIG_HOME/tasks/<taskListId>` — **good parity** |
+| **TaskGet** | `runtime::task_board` + `tools` | persistent task-board card lookup — **good parity** |
+| **TaskList** | `runtime::task_board` + `tools` | persistent task-board listing — **good parity** |
+| **TaskStop** | `runtime::execution_tasks` + `tools` | stops real background shell/sub-agent execution tasks, not task-board cards — **moderate parity** |
+| **TaskUpdate** | `runtime::task_board` + `tools` | card status/owner/dependency/metadata updates — **good parity** |
+| **TaskOutput** | `runtime::execution_tasks` + `tools` | reads real background task output files, not task-board cards — **moderate parity** |
 | **TeamCreate** | `runtime::team_cron_registry` + `tools` | team lifecycle + task assignment — **good parity** |
 | **TeamDelete** | `runtime::team_cron_registry` + `tools` | team delete lifecycle — **good parity** |
 | **CronCreate** | `runtime::team_cron_registry` + `tools` | cron entry creation — **good parity** |

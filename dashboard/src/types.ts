@@ -12,8 +12,17 @@ export interface AgentInfo {
   messageCount: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  currentContextTokens?: number;
   projectId?: string;
   projectRoot?: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  runtimeModelConfigPath?: string;
+  archived?: boolean;
+  archivedAt?: number;
+  archivedReason?: string;
 }
 
 export interface ProjectRecord {
@@ -66,8 +75,8 @@ export interface ConversationMessage {
   usage?: {
     input_tokens: number;
     output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
   attachment_metadata?: { kind: string };
   is_compact_summary?: boolean;
@@ -123,8 +132,8 @@ export interface TimelineEntry {
   usage?: {
     input_tokens: number;
     output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
   appfsEvents?: AppfsEventRecord[];
 }
@@ -157,7 +166,7 @@ export interface ChatThread {
   items: ChatItem[];
 }
 
-export type ChatItem = ChatMessageItem | ChatToolItem;
+export type ChatItem = ChatMessageItem | ChatToolItem | ChatErrorItem;
 
 export interface ChatMessageItem {
   kind: 'message';
@@ -168,8 +177,8 @@ export interface ChatMessageItem {
   usage?: {
     input_tokens: number;
     output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
 }
 
@@ -182,6 +191,15 @@ export interface ChatToolItem {
   summary?: string;
   isError?: boolean;
   timestamp: number;
+}
+
+export interface ChatErrorItem {
+  kind: 'error';
+  id: string;
+  text: string;
+  timestamp: number;
+  requestId?: string;
+  turnId?: string;
 }
 
 export type AgentLaunchSpec =
@@ -214,6 +232,60 @@ export interface SpawnConfig {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   runtimeModelConfigPath?: string;
+}
+
+export interface PrincipalLifecycleInfo {
+  principal_id: string;
+  display_name?: string;
+  description?: string | null;
+  kind?: string;
+  created_at?: string;
+  updated_at?: string;
+  presence?: string;
+  active_attach_count?: number;
+  active_attaches?: Array<{
+    attach_id?: string;
+    last_seen_at?: string;
+    [key: string]: unknown;
+  }>;
+  online: boolean;
+  status: string;
+  agent_status?: {
+    state?: string;
+    current_task_preview?: string | null;
+    session_id?: string | null;
+    [key: string]: unknown;
+  } | null;
+  pid?: number;
+  sessionId?: string | null;
+  model?: string;
+  permissionMode?: string;
+}
+
+export interface PrincipalListResponse {
+  version: number;
+  default_principal_id?: string;
+  principals: PrincipalLifecycleInfo[];
+}
+
+export interface CreatePrincipalRequest {
+  principalId: string;
+  displayName?: string;
+  description?: string | null;
+  kind?: string;
+}
+
+export interface PrincipalStartRequest {
+  model?: string;
+  modelProviderId?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
+  permissionMode?: string;
+}
+
+export interface PrincipalResumeRequest extends PrincipalStartRequest {
+  sessionId?: string;
 }
 
 export type ModelProviderType = 'anthropic' | 'openai' | 'xai';

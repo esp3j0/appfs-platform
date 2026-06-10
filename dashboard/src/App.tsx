@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import type { AgentInfo, TimelineResponse } from './types';
 import { useSSE } from './hooks/useSSE';
+import { useDashboardSSE } from './hooks/useDashboardSSE';
 import { TopBar } from './components/TopBar';
 import { AgentSidebar } from './components/AgentSidebar';
 import { TimelinePanel } from './components/TimelinePanel';
@@ -21,7 +22,8 @@ const EMPTY_TIMELINE: TimelineResponse = {
 
 export function App() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
-  const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
+  const [archivedAgents, setArchivedAgents] = useState<AgentInfo[]>([]);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
   const [timeline, setTimeline] = useState<TimelineResponse>(EMPTY_TIMELINE);
   const [filter, setFilter] = useState<string>('all');
   const [mainView, setMainView] = useState<MainView>('timeline');
@@ -63,12 +65,26 @@ export function App() {
   }, [loadProjects]);
 
   const loadAgents = useCallback(() => {
-    fetch('/api/agents')
-      .then(r => r.json())
-      .then((data: AgentInfo[]) => {
-        setAgents(data);
-        if (data.length > 0) {
-          setSelectedAgents(prev => prev.size > 0 ? prev : new Set([data[0].name]));
+    Promise.all([
+      fetch('/api/agents').then(r => r.json() as Promise<AgentInfo[]>),
+      fetch('/api/agents?archived=only').then(r => r.json() as Promise<AgentInfo[]>),
+    ])
+      .then(([active, archived]) => {
+        setAgents(active);
+        setArchivedAgents(archived);
+        if (active.length > 0) {
+          setSelectedSessionIds(prev => {
+            const visibleSessionIds = preferredSessionIds(active);
+            const knownSessionIds = new Set([
+              ...active.map(agent => agent.sessionId),
+              ...archived.map(agent => agent.sessionId),
+            ]);
+            const kept = Array.from(prev).filter(sessionId => knownSessionIds.has(sessionId));
+            if (kept.length > 0) {
+              return new Set(kept);
+            }
+            return new Set([Array.from(visibleSessionIds)[0] ?? active[0].sessionId]);
+          });
         }
       })
       .catch(() => {});
@@ -143,12 +159,12 @@ export function App() {
     }
   }, [bootstrapProject, loadAgents]);
 
-  const loadTimeline = useCallback((names: string[]) => {
-    if (names.length === 0) {
+  const loadTimeline = useCallback((sessionIds: string[]) => {
+    if (sessionIds.length === 0) {
       setTimeline(EMPTY_TIMELINE);
       return;
     }
-    fetch(`/api/timeline?agents=${names.map(encodeURIComponent).join(',')}`)
+    fetch(`/api/timeline?agents=${sessionIds.map(encodeURIComponent).join(',')}`)
       .then(r => r.json())
       .then((data: TimelineResponse) => setTimeline({
         ...data,
@@ -158,22 +174,18 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    loadTimeline(Array.from(selectedAgents));
-  }, [selectedAgents, loadTimeline]);
+    loadTimeline(Array.from(selectedSessionIds));
+  }, [selectedSessionIds, loadTimeline]);
 
   useSSE('/api/events', {
     onMessage: (entry) => {
-      if (selectedAgents.has(entry.agentName)) {
-        loadTimeline(Array.from(selectedAgents));
-      } else {
-        setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      if (entry.sessionId && selectedSessionIds.has(entry.sessionId)) {
+        loadTimeline(Array.from(selectedSessionIds));
       }
     },
     onDebugDump: (entry) => {
-      if (selectedAgents.has(entry.agentName)) {
-        loadTimeline(Array.from(selectedAgents));
-      } else {
-        setTimeline(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+      if (entry.sessionId && selectedSessionIds.has(entry.sessionId)) {
+        loadTimeline(Array.from(selectedSessionIds));
       }
     },
     onAgentOnline: (agent: Partial<AgentInfo>) => {
@@ -190,8 +202,18 @@ export function App() {
         }
         return [...prev, agent as AgentInfo];
       });
-      if (agent.controlMode === 'managed' && agent.name) {
-        setSelectedAgents(prev => new Set(prev).add(agent.name!));
+      if (agent.controlMode === 'managed' && agent.sessionId) {
+        setSelectedSessionIds(prev => {
+          const next = new Set(prev);
+          const principalId = agent.principalId || agent.name;
+          for (const existing of agents) {
+            if ((existing.principalId || existing.name) === principalId) {
+              next.delete(existing.sessionId);
+            }
+          }
+          next.add(agent.sessionId!);
+          return next;
+        });
       }
     },
     onAgentOffline: (agent: any) => {
@@ -206,13 +228,19 @@ export function App() {
     },
   });
 
-  const toggleAgent = (name: string) => {
-    setSelectedAgents(prev => {
+  useDashboardSSE('/api/events', {
+    onTurnDone: () => {
+      loadAgents();
+    },
+  });
+
+  const toggleAgent = (sessionId: string) => {
+    setSelectedSessionIds(prev => {
       const next = new Set(prev);
-      if (next.has(name)) {
-        if (next.size > 1) next.delete(name);
+      if (next.has(sessionId)) {
+        if (next.size > 1) next.delete(sessionId);
       } else {
-        next.add(name);
+        next.add(sessionId);
       }
       return next;
     });
@@ -265,6 +293,10 @@ export function App() {
   const projectName = selectedProjectRoot ? getProjectFolderName(selectedProjectRoot) : undefined;
 
   const crossEntryIds = new Set(timeline.interactions.map(i => i.entryId));
+  const allKnownAgents = [...agents, ...archivedAgents];
+  const selectedAgents = allKnownAgents.filter(a => selectedSessionIds.has(a.sessionId));
+  const selectedActiveAgents = agents.filter(a => selectedSessionIds.has(a.sessionId));
+  const selectedAgentLabels = displayLabelsForAgents(selectedAgents);
   const filtered = filter === 'all'
     ? timeline.entries
     : timeline.entries.filter(e => {
@@ -306,7 +338,8 @@ export function App() {
       <div className="main-layout">
         <AgentSidebar
           agents={agents}
-          selected={selectedAgents}
+          archivedAgents={archivedAgents}
+          selected={selectedSessionIds}
           onToggle={toggleAgent}
           onRefreshAgents={loadAgents}
           onAgentStopped={markAgentStopped}
@@ -322,22 +355,69 @@ export function App() {
             <button className={`view-tab ${mainView === 'model' ? 'active' : ''}`} onClick={() => setMainView('model')}>Model</button>
           </div>
           {mainView === 'timeline' ? (
-            <TimelinePanel selectedAgents={Array.from(selectedAgents)} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
+            <TimelinePanel selectedAgents={selectedAgentLabels} entries={filtered} interactions={timeline.interactions} filter={filter} onFilterChange={setFilter} />
           ) : mainView === 'chat' ? (
             <PlaygroundPanel
               agents={agents}
-              selectedAgents={agents.filter(a => selectedAgents.has(a.name))}
+              selectedAgents={selectedActiveAgents}
             />
           ) : mainView === 'apps' ? (
-            <AppControlPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} />
+            <AppControlPanel selectedAgents={selectedAgentLabels} entries={timeline.entries} />
           ) : mainView === 'compose' ? (
             <ProjectComposeEditor projectId={selectedProjectId!} />
           ) : (
-            <ModelViewPanel selectedAgents={Array.from(selectedAgents)} entries={timeline.entries} compactionBoundaries={timeline.compactionBoundaries ?? []} />
+            <ModelViewPanel selectedAgents={selectedAgentLabels} entries={timeline.entries} compactionBoundaries={timeline.compactionBoundaries ?? []} />
           )}
         </div>
-        <InfoPanel agents={agents.filter(a => selectedAgents.has(a.name))} interactions={timeline.interactions} />
+        <InfoPanel agents={selectedAgents} interactions={timeline.interactions} />
       </div>
     </>
   );
+}
+
+function displayLabelsForAgents(agents: AgentInfo[]): string[] {
+  const labelCounts = new Map<string, number>();
+  for (const agent of agents) {
+    const label = agent.name || agent.principalId || agent.sessionId;
+    labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  }
+  return agents.map(agent => {
+    const label = agent.name || agent.principalId || agent.sessionId;
+    if ((labelCounts.get(label) ?? 0) <= 1) {
+      return label;
+    }
+    return `${label} · ${agent.sessionId}`;
+  });
+}
+
+function preferredSessionIds(agents: AgentInfo[]): Set<string> {
+  const byPrincipal = new Map<string, AgentInfo>();
+  for (const agent of agents) {
+    const principalId = agent.principalId || agent.name || agent.sessionId;
+    const current = byPrincipal.get(principalId);
+    if (!current || isPreferredAgent(agent, current)) {
+      byPrincipal.set(principalId, agent);
+    }
+  }
+  return new Set(Array.from(byPrincipal.values()).map(agent => agent.sessionId));
+}
+
+function isPreferredAgent(candidate: AgentInfo, current: AgentInfo): boolean {
+  const candidateScore = agentScore(candidate);
+  const currentScore = agentScore(current);
+  for (let i = 0; i < candidateScore.length; i += 1) {
+    if (candidateScore[i] !== currentScore[i]) {
+      return candidateScore[i] > currentScore[i];
+    }
+  }
+  return false;
+}
+
+function agentScore(agent: AgentInfo): number[] {
+  return [
+    agent.status === 'online' ? 1 : 0,
+    agent.controlMode === 'managed' ? 1 : 0,
+    agent.startedAt || 0,
+    agent.messageCount || 0,
+  ];
 }

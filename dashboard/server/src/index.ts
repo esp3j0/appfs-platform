@@ -22,10 +22,15 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { terminateChildProcessTree } from './child-process-utils.js';
 import { ModelConfigStore } from './model-config-store.js';
+import { PrincipalLifecycleService } from './principal-lifecycle.js';
+import { waitForAppfsRuntimeReady } from './appfs-runtime-ready.js';
+import { PersistentLog, resolveDashboardLogDir, safeLogFileSegment } from './persistent-log.js';
 
 const PORT = parseInt(process.env.PORT ?? '3100', 10);
 const HOST = process.env.HOST ?? '127.0.0.1';
 const DUMP_DIR = process.argv[2] ?? process.env.APPFS_DEBUG_DUMP_DIR ?? '';
+const LOG_DIR = resolveDashboardLogDir();
+const serverLog = new PersistentLog(path.join(LOG_DIR, 'dashboard-server.log'));
 
 // In desktop mode, DUMP_DIR is optional and starts with an empty registry
 const dumpDir = DUMP_DIR ? path.resolve(DUMP_DIR) : '';
@@ -45,8 +50,7 @@ class AppfsProjectRuntimeController implements ProjectRuntimeController {
     }
 
     if (this.activeProcesses.has(projectId)) {
-      project.status = 'running';
-      return Promise.resolve(project);
+      return this.waitForActiveRuntime(projectId, project);
     }
 
     const platformRoot = resolvePlatformRoot();
@@ -71,6 +75,10 @@ class AppfsProjectRuntimeController implements ProjectRuntimeController {
     }
 
     console.log(`[ProjectRuntime] Starting AppFS for project ${projectId}: ${cmd} ${args.join(' ')}`);
+    const runtimeLog = new PersistentLog(path.join(LOG_DIR, `appfs-runtime-${safeLogFileSegment(projectId)}.log`));
+    runtimeLog.appendLine(`[ProjectRuntime] projectRoot=${project.projectRoot}`);
+    runtimeLog.appendLine(`[ProjectRuntime] mountRoot=${project.mountRoot}`);
+    runtimeLog.appendLine(`[ProjectRuntime] cmd=${cmd} args=${args.join(' ')} cwd=${project.projectRoot}`);
 
     return new Promise<ProjectRecord>((resolve, reject) => {
       let resolved = false;
@@ -84,23 +92,48 @@ class AppfsProjectRuntimeController implements ProjectRuntimeController {
 
       child.stdout?.on('data', chunk => {
         console.log(`[ProjectRuntime stdout] ${chunk.toString().trim()}`);
+        runtimeLog.appendChunk('[stdout]', chunk);
       });
       child.stderr?.on('data', chunk => {
         console.error(`[ProjectRuntime stderr] ${chunk.toString().trim()}`);
+        runtimeLog.appendChunk('[stderr]', chunk);
       });
 
       this.activeProcesses.set(projectId, child);
 
       child.on('spawn', () => {
         if (!resolved) {
-          resolved = true;
-          project.status = 'running';
-          resolve(project);
+          void waitForAppfsRuntimeReady(project.mountRoot)
+            .then(() => {
+              if (resolved) {
+                return;
+              }
+              resolved = true;
+              project.status = 'running';
+              runtimeLog.appendLine('[ProjectRuntime] AppFS runtime ready');
+              resolve(project);
+            })
+            .catch((err) => {
+              console.error(`[ProjectRuntime] AppFS readiness error for project ${projectId}:`, err);
+              runtimeLog.appendLine(`[ProjectRuntime] AppFS readiness error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+              if (resolved) {
+                return;
+              }
+              this.activeProcesses.delete(projectId);
+              void terminateChildProcessTree(child, {
+                label: `project runtime ${projectId}`,
+                gracefulTimeoutMs: 3000,
+              });
+              resolved = true;
+              project.status = 'error';
+              reject(err);
+            });
         }
       });
 
       child.on('error', (err) => {
         console.error(`[ProjectRuntime] AppFS spawn error for project ${projectId}:`, err);
+        runtimeLog.appendLine(`[ProjectRuntime] spawn error: ${err.stack ?? err.message}`);
         this.activeProcesses.delete(projectId);
         project.status = 'error';
         if (!resolved) {
@@ -111,6 +144,7 @@ class AppfsProjectRuntimeController implements ProjectRuntimeController {
 
       child.on('exit', (code, signal) => {
         console.log(`[ProjectRuntime] AppFS compose process for project ${projectId} exited with code=${code}, signal=${signal}`);
+        runtimeLog.appendLine(`[ProjectRuntime] exited code=${code} signal=${signal}`);
         this.activeProcesses.delete(projectId);
         
         if (project.status === 'starting') {
@@ -125,6 +159,25 @@ class AppfsProjectRuntimeController implements ProjectRuntimeController {
         }
       });
     });
+  }
+
+  private async waitForActiveRuntime(projectId: string, project: ProjectRecord): Promise<ProjectRecord> {
+    try {
+      await waitForAppfsRuntimeReady(project.mountRoot);
+      project.status = 'running';
+      return project;
+    } catch (err) {
+      const child = this.activeProcesses.get(projectId);
+      this.activeProcesses.delete(projectId);
+      project.status = 'error';
+      if (child) {
+        await terminateChildProcessTree(child, {
+          label: `project runtime ${projectId}`,
+          gracefulTimeoutMs: 3000,
+        });
+      }
+      throw err;
+    }
   }
 
   async stop(projectId: string): Promise<ProjectRecord> {
@@ -186,6 +239,10 @@ function resolvePlatformRoot(): string {
 }
 
 async function main() {
+  serverLog.appendLine(`[Server] Dashboard server starting host=${HOST} port=${PORT}`);
+  serverLog.appendLine(`[Server] Log directory ${LOG_DIR}`);
+  console.log(`[Server] Logs directory: ${LOG_DIR}`);
+
   const projectRegistry = new ProjectRegistry();
   if (dumpDir) {
     try {
@@ -212,6 +269,11 @@ async function main() {
   const modelConfigStore = new ModelConfigStore();
   const processManager = new AgentProcessManager(registry, modelConfigStore);
   const runtimeController = new AppfsProjectRuntimeController(projectRegistry, processManager);
+  const principalLifecycle = new PrincipalLifecycleService({
+    projectRegistry,
+    agentRegistry: registry,
+    processManager,
+  });
 
   const app = Fastify({ logger: false });
   if (process.env.ELECTRON_RUN_AS_NODE === '1') {
@@ -222,7 +284,7 @@ async function main() {
     });
   }
 
-  registerAgentsRoute(app, registry);
+  registerAgentsRoute(app, registry, processManager);
   registerMessagesRoute(app, registry);
   registerTimelineRoute(app, registry);
   registerEventsRoute(app, registry);
@@ -230,10 +292,10 @@ async function main() {
   registerMountedAppsRoute(app, registry, projectRegistry);
   registerModelConfigsRoute(app, modelConfigStore);
   registerProcessRoute(app, processManager);
-  registerPrincipalsRoute(app, registry, processManager);
+  registerPrincipalsRoute(app, principalLifecycle);
   registerProjectsRoute(app, projectRegistry, runtimeController, {
     agentRegistry: registry,
-    processManager,
+    principalLifecycle,
   });
 
   let shuttingDown = false;
@@ -296,7 +358,7 @@ async function main() {
 
   await app.listen({ port: PORT, host: HOST });
   console.log(`Dashboard API listening on http://${HOST}:${PORT}`);
-  console.log(`Process Manager ready — POST /api/process/spawn to launch headless agents`);
+  console.log(`Principal lifecycle ready — POST /api/projects/:projectId/principals/:principalId/start to launch headless agents`);
 }
 
 main().catch(err => {

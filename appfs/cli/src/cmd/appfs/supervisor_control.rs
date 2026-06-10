@@ -15,7 +15,7 @@ use super::action_dispatcher::{
     RegisterAppRequest, UnregisterAppRequest, UpdatePrincipalRequest,
 };
 use super::errors::{ERR_INVALID_ARGUMENT, ERR_INVALID_PAYLOAD};
-use super::shared::{decode_jsonl_line, extract_client_token};
+use super::shared::{decode_jsonl_line, extract_client_token, write_pretty_json_file};
 use super::{ActionCursorDoc, ActionCursorState, CursorState, DEFAULT_RETENTION_HINT_SEC};
 
 const CONTROL_APP_ID: &str = "_appfs";
@@ -28,7 +28,6 @@ const CONTROL_UPDATE_PRINCIPAL_ACTION: &str = "principals/update_principal.act";
 const CONTROL_DELETE_PRINCIPAL_ACTION: &str = "principals/delete_principal.act";
 const CONTROL_ATTACH_PRINCIPAL_ACTION: &str = "principals/attach_principal.act";
 const CONTROL_DETACH_PRINCIPAL_ACTION: &str = "principals/detach_principal.act";
-
 type NormalizedPayload = (String, Option<String>);
 type NormalizePayloadError = (&'static str, &'static str, Option<String>);
 
@@ -126,19 +125,21 @@ impl SupervisorControlPlane {
             })?;
         }
         if !self.cursor_path.exists() {
-            write_json_file(
+            write_pretty_json_file(
                 &self.cursor_path,
-                &json!(CursorState {
+                &CursorState {
                     min_seq: 0,
                     max_seq: 0,
                     retention_hint_sec: DEFAULT_RETENTION_HINT_SEC,
-                }),
+                },
+                "AppFS control cursor",
             )?;
         }
         if !self.action_cursors_path.exists() {
-            write_json_file(
+            write_pretty_json_file(
                 &self.action_cursors_path,
-                &serde_json::to_value(ActionCursorDoc::default())?,
+                &ActionCursorDoc::default(),
+                "AppFS control action cursors",
             )?;
         }
         for action_name in [
@@ -270,8 +271,14 @@ impl SupervisorControlPlane {
         cursor.offset = end as u64;
         cursor.boundary_probe = None;
         cursor.pending_multiline_eof_len = None;
-        self.action_cursors.insert(cursor_key, cursor);
-        self.save_action_cursors()?;
+
+        // Persist the prospective cursor map before committing it in memory.
+        // If publishing action-cursors.res.json fails, the caller retries from
+        // the previous offset instead of silently dropping parsed invocations.
+        let mut next_action_cursors = self.action_cursors.clone();
+        next_action_cursors.insert(cursor_key, cursor);
+        self.save_action_cursors_map(&next_action_cursors)?;
+        self.action_cursors = next_action_cursors;
 
         Ok(invocations)
     }
@@ -397,15 +404,23 @@ impl SupervisorControlPlane {
     }
 
     fn save_cursor(&self) -> Result<()> {
-        write_json_file(&self.cursor_path, &serde_json::to_value(&self.cursor)?)
+        write_pretty_json_file(
+            &self.cursor_path,
+            &serde_json::to_value(&self.cursor)?,
+            "AppFS control cursor",
+        )
     }
 
-    fn save_action_cursors(&self) -> Result<()> {
-        write_json_file(
+    fn save_action_cursors_map(
+        &self,
+        action_cursors: &HashMap<String, ActionCursorState>,
+    ) -> Result<()> {
+        write_pretty_json_file(
             &self.action_cursors_path,
             &serde_json::to_value(ActionCursorDoc {
-                actions: self.action_cursors.clone(),
+                actions: action_cursors.clone(),
             })?,
+            "AppFS control action cursors",
         )
     }
 }
@@ -511,32 +526,12 @@ fn load_action_cursors_or_default(path: &Path) -> Result<HashMap<String, ActionC
     Ok(doc.actions)
 }
 
-fn write_json_file(path: &Path, value: &JsonValue) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Failed to create parent directory {}", parent.display()))?;
-    let tmp_path = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "Failed to move {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::SupervisorControlPlane;
+    use super::{
+        SupervisorControlInvocation, SupervisorControlPlane, CONTROL_CREATE_PRINCIPAL_ACTION,
+    };
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -558,6 +553,62 @@ mod tests {
                 "{rel_path} should exist"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_control_keeps_cursor_unadvanced_when_cursor_save_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut control =
+            SupervisorControlPlane::new(temp.path().to_path_buf(), false).expect("control plane");
+        control.prepare_action_sinks().expect("prepare sinks");
+
+        fs::write(
+            temp.path()
+                .join("_appfs")
+                .join(CONTROL_CREATE_PRINCIPAL_ACTION),
+            "{\"principal_id\":\"default\",\"display_name\":\"default\",\"kind\":\"agent\",\"client_token\":\"create-default\"}\n",
+        )
+        .expect("write create action");
+
+        let original_action_cursors_path = control.action_cursors_path.clone();
+        let blocked_parent = temp.path().join("not-a-dir");
+        fs::write(&blocked_parent, "file").expect("write blocking file");
+        control.action_cursors_path = blocked_parent.join("action-cursors.res.json");
+
+        control
+            .drain_invocations()
+            .expect_err("cursor save should fail");
+        assert!(
+            control
+                .action_cursors
+                .get(CONTROL_CREATE_PRINCIPAL_ACTION)
+                .is_none(),
+            "failed cursor publish must not advance the in-memory cursor"
+        );
+
+        control.action_cursors_path = original_action_cursors_path;
+        let invocations = control
+            .drain_invocations()
+            .expect("retry should re-read uncommitted action");
+        assert_eq!(invocations.len(), 1);
+        match &invocations[0] {
+            SupervisorControlInvocation::CreatePrincipal {
+                client_token,
+                request,
+                ..
+            } => {
+                assert_eq!(client_token.as_deref(), Some("create-default"));
+                assert_eq!(request.principal_id, "default");
+            }
+            other => panic!("expected create principal invocation, got {other:?}"),
+        }
+        assert!(
+            control
+                .action_cursors
+                .get(CONTROL_CREATE_PRINCIPAL_ACTION)
+                .is_some(),
+            "successful retry should advance the cursor"
+        );
     }
 }
 

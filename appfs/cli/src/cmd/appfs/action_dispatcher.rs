@@ -1,7 +1,10 @@
 use serde_json::Value as JsonValue;
 
 use super::errors::{ERR_INVALID_ARGUMENT, ERR_INVALID_PAYLOAD};
-use super::registry::AppfsRegistryTransportDoc;
+use super::registry::{
+    AppfsRegistryTransportDoc, PrincipalAgentOutcome, PrincipalAgentState,
+    MAX_PRINCIPAL_TASK_PREVIEW_CHARS,
+};
 use super::{ActionSpec, InputMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,11 +71,31 @@ pub(super) struct UpdatePrincipalRequest {
     pub(super) display_name: Option<String>,
     pub(super) description: Option<String>,
     pub(super) kind: Option<String>,
+    pub(super) attach_id: Option<String>,
+    pub(super) agent_status: Option<PrincipalAgentStatusPatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NullablePatch<T> {
+    Clear,
+    Set(T),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PrincipalAgentStatusPatch {
+    pub(super) state: Option<PrincipalAgentState>,
+    pub(super) current_task_preview: Option<NullablePatch<String>>,
+    pub(super) current_task_source: Option<NullablePatch<String>>,
+    pub(super) turn_id: Option<NullablePatch<String>>,
+    pub(super) session_id: Option<NullablePatch<String>>,
+    pub(super) model: Option<NullablePatch<String>>,
+    pub(super) last_outcome: Option<NullablePatch<PrincipalAgentOutcome>>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct DeletePrincipalRequest {
     pub(super) principal_id: String,
+    pub(super) force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +104,7 @@ pub(super) struct AttachPrincipalRequest {
     pub(super) attach_id: String,
     pub(super) role: Option<String>,
     pub(super) session_id: Option<String>,
+    pub(super) takeover: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -393,11 +417,18 @@ pub(super) fn parse_update_principal_request(
 ) -> std::result::Result<UpdatePrincipalRequest, &'static str> {
     let object = parse_json_object(payload)?;
     let principal_id = required_principal_id(&object, "principal_id")?;
+    let attach_id = optional_attach_id(&object, "attach_id")?;
+    let agent_status = optional_agent_status_patch(&object)?;
+    if agent_status.is_some() && attach_id.is_none() {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
     Ok(UpdatePrincipalRequest {
         principal_id,
         display_name: optional_string(&object, "display_name")?,
         description: optional_string(&object, "description")?,
         kind: optional_string(&object, "kind")?,
+        attach_id,
+        agent_status,
     })
 }
 
@@ -406,7 +437,10 @@ pub(super) fn parse_delete_principal_request(
 ) -> std::result::Result<DeletePrincipalRequest, &'static str> {
     let object = parse_json_object(payload)?;
     let principal_id = required_principal_id(&object, "principal_id")?;
-    Ok(DeletePrincipalRequest { principal_id })
+    Ok(DeletePrincipalRequest {
+        principal_id,
+        force: optional_bool(&object, "force")?.unwrap_or(false),
+    })
 }
 
 pub(super) fn parse_attach_principal_request(
@@ -418,6 +452,7 @@ pub(super) fn parse_attach_principal_request(
         attach_id: required_attach_id(&object, "attach_id")?,
         role: optional_string(&object, "role")?,
         session_id: optional_string(&object, "session_id")?,
+        takeover: optional_bool(&object, "takeover")?.unwrap_or(false),
     })
 }
 
@@ -469,6 +504,128 @@ fn optional_string(
         .map(ToOwned::to_owned)
         .ok_or(ERR_INVALID_ARGUMENT)
         .map(Some)
+}
+
+fn optional_nullable_string(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<NullablePatch<String>>, &'static str> {
+    let Some(value) = object.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(NullablePatch::Clear));
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| NullablePatch::Set(value.to_string()))
+        .ok_or(ERR_INVALID_ARGUMENT)
+        .map(Some)
+}
+
+fn optional_bool(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<bool>, &'static str> {
+    let Some(value) = object.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_bool().ok_or(ERR_INVALID_ARGUMENT).map(Some)
+}
+
+fn optional_attach_id(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<String>, &'static str> {
+    let Some(value) = object.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let attach_id = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ERR_INVALID_ARGUMENT)?;
+    if is_safe_attach_id(attach_id) {
+        Ok(Some(attach_id.to_string()))
+    } else {
+        Err(ERR_INVALID_ARGUMENT)
+    }
+}
+
+fn optional_agent_status_patch(
+    object: &serde_json::Map<String, JsonValue>,
+) -> std::result::Result<Option<PrincipalAgentStatusPatch>, &'static str> {
+    let Some(value) = object.get("agent_status") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    let status = value.as_object().ok_or(ERR_INVALID_ARGUMENT)?;
+    let current_task_preview = optional_nullable_string(status, "current_task_preview")?;
+    if let Some(NullablePatch::Set(preview)) = &current_task_preview {
+        if preview.chars().count() > MAX_PRINCIPAL_TASK_PREVIEW_CHARS {
+            return Err(ERR_INVALID_ARGUMENT);
+        }
+    }
+    Ok(Some(PrincipalAgentStatusPatch {
+        state: optional_agent_state(status, "state")?,
+        current_task_preview,
+        current_task_source: optional_nullable_string(status, "current_task_source")?,
+        turn_id: optional_nullable_string(status, "turn_id")?,
+        session_id: optional_nullable_string(status, "session_id")?,
+        model: optional_nullable_string(status, "model")?,
+        last_outcome: optional_agent_outcome_patch(status, "last_outcome")?,
+    }))
+}
+
+fn optional_agent_state(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<PrincipalAgentState>, &'static str> {
+    let Some(value) = object.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Err(ERR_INVALID_ARGUMENT);
+    }
+    let value = value.as_str().ok_or(ERR_INVALID_ARGUMENT)?;
+    match value {
+        "idle" => Ok(Some(PrincipalAgentState::Idle)),
+        "running" => Ok(Some(PrincipalAgentState::Running)),
+        "stopping" => Ok(Some(PrincipalAgentState::Stopping)),
+        "error" => Ok(Some(PrincipalAgentState::Error)),
+        "stopped" => Ok(Some(PrincipalAgentState::Stopped)),
+        "unknown" => Ok(Some(PrincipalAgentState::Unknown)),
+        _ => Err(ERR_INVALID_ARGUMENT),
+    }
+}
+
+fn optional_agent_outcome_patch(
+    object: &serde_json::Map<String, JsonValue>,
+    field_name: &str,
+) -> std::result::Result<Option<NullablePatch<PrincipalAgentOutcome>>, &'static str> {
+    let Some(value) = object.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(NullablePatch::Clear));
+    }
+    let value = value.as_str().ok_or(ERR_INVALID_ARGUMENT)?;
+    match value {
+        "completed" => Ok(Some(NullablePatch::Set(PrincipalAgentOutcome::Completed))),
+        "cancelled" => Ok(Some(NullablePatch::Set(PrincipalAgentOutcome::Cancelled))),
+        "failed" => Ok(Some(NullablePatch::Set(PrincipalAgentOutcome::Failed))),
+        _ => Err(ERR_INVALID_ARGUMENT),
+    }
 }
 
 fn required_principal_id(

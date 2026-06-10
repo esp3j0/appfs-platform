@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-appfs-platform is an **integration monorepo** that brings together two separate layers:
+appfs-platform is an **integration monorepo** that brings together two separate layers plus tooling:
 
 - **appfs** (source repo: `agentfs`) — a filesystem protocol, runtime supervisor, connectors (Tinode, gRPC, HTTP bridges), and SDKs for AI agent app state
 - **appfs-agent** (source repo: `claw-code`) — an interactive agent runtime (Claude-style) that attaches to an AppFS mount, reads app state, writes actions, and reacts to event streams
+- **dashboard/** — debug dashboard: Fastify server + React frontend for inspecting agent sessions, timelines, and debug dumps
+- **desktop/** — Electron shell that packages the dashboard with AppFS and agent binaries
 - **integration/** — cross-project scripts, fixtures, end-to-end smoke tests, and contracts
 
 The standalone repositories are the source of truth for component internals. This monorepo owns integration assets, end-to-end scenarios, and cross-project documentation.
@@ -24,7 +26,11 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Run a single test: `cargo test --package <crate> -- <test_name>`
+
 Workspace lints: `unsafe_code = "forbid"`, clippy `all` + `pedantic` at warn.
+
+9 crates under `appfs-agent/rust/crates/`: `runtime`, `api`, `tools`, `commands`, `rusty-claude-cli`, `plugins`, `telemetry`, `mock-anthropic-service`, `compat-harness`.
 
 ### appfs (Rust CLI + SDK)
 
@@ -34,6 +40,8 @@ cargo build
 cargo test
 cargo test --package agentfs
 ```
+
+Run a single test: `cargo test -- <test_name>`
 
 ### appfs TypeScript SDK
 
@@ -51,12 +59,42 @@ uv sync && uv run pytest
 
 ### appfs-agent Python layer
 
-Tests run from repo root via CI (`appfs-agent/python`):
-
 ```bash
 cd appfs-agent
-uv run pytest
+python -m unittest discover -s tests -v
 ```
+
+### Dashboard
+
+```bash
+cd dashboard
+npm install
+(cd server && npm install)
+
+# Type-check server
+cd dashboard/server && npx tsc --noEmit
+
+# Build frontend
+cd dashboard && npx vite build
+
+# Dev mode (server + client concurrently)
+cd dashboard && npm run dev
+```
+
+Server runs on `http://localhost:3100` by default. SSE events at `/api/events`. REST endpoints: `/api/agents`, `/api/timeline`, `/api/messages`, `/api/principals`.
+
+### Desktop
+
+```bash
+cd desktop
+npm install
+npm run build       # TypeScript compile
+npm run start       # Build + launch Electron
+npm test            # Run tests via tsx
+npm run dist        # Production package via electron-builder
+```
+
+The desktop shell embeds the dashboard server and ships `agentfs` and `claw` binaries from `desktop/bin/`.
 
 ## Integration Smoke Tests
 
@@ -108,6 +146,12 @@ Rust workspace at `appfs-agent/rust/crates/`:
 
 Python layer at `appfs-agent/src/` — bootstrap, hooks, skills, tools, bridge — coexists with Rust.
 
+### Dashboard Architecture
+
+- **Server** (`dashboard/server/src/`): Fastify app with JSONL parser, file watcher, agent registry (discovers sessions from 3 paths), and SSE event bus
+- **Client** (`dashboard/src/`): React + Vite SPA with agent sidebar, timeline panel (single-agent list + multi-agent swimlane), message bubbles, debug dump viewer, compaction archive viewer
+- Agent sessions are stored as JSONL files under `.claw/sessions/`. The server watches these files and normalizes them into a unified timeline with k-way chronological merge.
+
 ### AppFS Mount Contract
 
 The agent discovers AppFS via `APPFS_ATTACH_SCHEMA` env or `runtime.json` manifest at `.well-known/appfs/runtime.json`. Key paths on the mount:
@@ -125,6 +169,17 @@ The agent discovers AppFS via `APPFS_ATTACH_SCHEMA` env or `runtime.json` manife
 ### Input Router
 
 `input_router.rs` classifies input into four sources: `UserTerminal`, `AppfsEvent`, `AgentMessage`, `System`. Each input is an `InputEnvelope` with optional `principal_id`, `app_id`, `stream_id`, `seq`. Delivery is either `InjectAtNextBoundary` (interrupt current turn) or `QueueAfterTurn`.
+
+## Common Environment Variables
+
+- `ANTHROPIC_API_KEY` — required for real model calls in smoke tests and agent sessions
+- `ANTHROPIC_BASE_URL` — override Anthropic API endpoint (e.g., `https://open.bigmodel.cn/api/anthropic`)
+- `APPFS_TINODE_ENDPOINT` — Tinode server URL for compose configs
+- `APPFS_TINODE_API_KEY` — Tinode API key
+- `APPFS_TINODE_LOGIN_PREFIX` — unique prefix per smoke test run to avoid credential collisions
+- `APPFS_TINODE_CREDENTIAL_POLICY` — set to `auto-create` for automated credential warmup
+- `APPFS_PRINCIPAL_ID` — override principal identity for agent sessions
+- `APPFS_ATTACH_SCHEMA` — tells the agent how to discover the AppFS mount
 
 ## Sync Workflow
 

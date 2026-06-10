@@ -53,18 +53,20 @@ use runtime::{
     detect_appfs_environment, ensure_appfs_attach_identity, format_stale_base_warning, format_usd,
     generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt_with_appfs,
     parse_oauth_callback_request_target, pricing_for_model, render_input_router_block,
-    resolve_expected_base, resolve_sandbox_status, save_oauth_credentials,
-    scan_appfs_attention_events_for_idle_wake, set_shell_if_windows, warmup_appfs_private_apps,
-    ApiClient, ApiRequest, AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
-    AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
-    AssistantEvent, AutoCompactionConfig, AutoCompactionEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, InputEnvelope,
-    InputSource, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PendingInput,
-    PendingInputDelivery, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
-    ToolExecutionResult, ToolExecutor, UsageTracker,
+    resolve_expected_base, resolve_sandbox_status, sanitize_appfs_task_preview,
+    save_oauth_credentials, scan_appfs_attention_events_for_idle_wake, set_shell_if_windows,
+    heartbeat_appfs_principal, update_appfs_principal_agent_status, warmup_appfs_private_apps,
+    ApiClient, ApiRequest,
+    AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachEnsureOutcome,
+    AppfsAttachEnsureStatus, AppfsAttachLease, AppfsPrincipalCreateRequest,
+    AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus, AssistantEvent, AutoCompactionConfig,
+    AutoCompactionEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, InputEnvelope, InputSource, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenExchangeRequest, PendingInput, PendingInputDelivery, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, SharedPendingInputQueue,
+    TokenUsage, ToolError, ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -4091,6 +4093,33 @@ fn run_headless(
         cli.drive_appfs_idle_wake_headless(shared_queue.clone())?;
     }
 
+    // Spawn a background thread that writes a lightweight heartbeat to
+    // update_principal.act every 30 s.  This keeps the AppFS attach lease
+    // fresh while the agent is idle, preventing the supervisor's stale
+    // attach sweep from removing it.
+    let heartbeat_lease = cli.appfs_attach_lease.clone();
+    let (heartbeat_shutdown_tx, heartbeat_shutdown_rx) = mpsc::channel::<()>();
+    if heartbeat_lease.is_some() {
+        thread::spawn(move || {
+            const APPFS_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+            loop {
+                let shutdown = heartbeat_shutdown_rx.recv_timeout(
+                    std::time::Duration::from_secs(APPFS_HEARTBEAT_INTERVAL_SECS),
+                );
+                match shutdown {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(lease) = heartbeat_lease.as_ref() {
+                            if let Err(err) = heartbeat_appfs_principal(lease) {
+                                eprintln!("[AppFS heartbeat] {err}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let (control_tx, control_rx) = mpsc::channel::<Result<HeadlessInput, String>>();
     let control_queue = shared_queue.clone();
     let control_token_for_thread = control_token.clone();
@@ -4765,11 +4794,45 @@ impl HookAbortMonitor {
     }
 }
 
+const APPFS_MOUNT_READY_RETRY_INTERVAL_MS: u64 = 100;
+const APPFS_MOUNT_READY_RETRY_TIMEOUT_MS: u64 = 10_000;
+
 fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     let cwd = env::current_dir().ok()?;
     eprintln!("AppFS attach: checking identity and private apps...");
     let outcome = ensure_appfs_attach_identity(&cwd);
     if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
+        // When APPFS_MOUNT_ROOT is set we know the agent *should* be
+        // attached to an AppFS mount.  If the environment cannot be
+        // resolved yet (e.g. the WinFsp / FUSE mount is still starting
+        // up after an Electron restart), retry instead of giving up.
+        if env::var("APPFS_MOUNT_ROOT").ok().map_or(false, |v| !v.trim().is_empty()) {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(APPFS_MOUNT_READY_RETRY_TIMEOUT_MS);
+            eprintln!(
+                "AppFS attach: mount not ready yet, retrying for up to {} ms...",
+                APPFS_MOUNT_READY_RETRY_TIMEOUT_MS,
+            );
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    APPFS_MOUNT_READY_RETRY_INTERVAL_MS,
+                ));
+                let retry = ensure_appfs_attach_identity(&cwd);
+                if retry.status != AppfsAttachEnsureStatus::NotAppfs {
+                    for warning in &retry.warnings {
+                        eprintln!("AppFS attach warning: {warning}");
+                    }
+                    return Some(retry);
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "AppFS attach: mount did not become ready within {} ms, giving up.",
+                        APPFS_MOUNT_READY_RETRY_TIMEOUT_MS,
+                    );
+                    break;
+                }
+            }
+        }
         return None;
     }
     for warning in &outcome.warnings {
@@ -4868,6 +4931,66 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
 }
 
 impl LiveCli {
+    fn update_appfs_status(&self, update: AppfsAgentStatusUpdate) {
+        let Some(lease) = &self.appfs_attach_lease else {
+            return;
+        };
+        if let Err(error) = update_appfs_principal_agent_status(lease, update) {
+            eprintln!("AppFS attach warning: failed to update principal status: {error}");
+        }
+    }
+
+    fn update_appfs_status_running(
+        &self,
+        preview: Option<String>,
+        source: Option<&str>,
+        turn_id: Option<&str>,
+    ) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Running),
+            current_task_preview: Some(preview),
+            current_task_source: Some(source.map(ToOwned::to_owned)),
+            turn_id: Some(turn_id.map(ToOwned::to_owned)),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(None),
+        });
+    }
+
+    fn update_appfs_status_idle(&self, outcome: Option<AppfsAgentOutcome>) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Idle),
+            current_task_preview: Some(None),
+            current_task_source: Some(None),
+            turn_id: Some(None),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(outcome),
+        });
+    }
+
+    fn update_appfs_status_error(&self) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Error),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            last_outcome: Some(Some(AppfsAgentOutcome::Failed)),
+            ..Default::default()
+        });
+    }
+
+    fn update_appfs_status_stopped(&self) {
+        self.update_appfs_status(AppfsAgentStatusUpdate {
+            state: Some(AppfsAgentState::Stopped),
+            current_task_preview: Some(None),
+            current_task_source: Some(None),
+            turn_id: Some(None),
+            session_id: Some(Some(self.session.id.clone())),
+            model: Some(Some(self.model.clone())),
+            ..Default::default()
+        });
+    }
+
     fn new(
         model: String,
         enable_tools: bool,
@@ -4916,6 +5039,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -4970,6 +5094,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -5021,6 +5146,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         cli.persist_session()?;
         Ok(cli)
     }
@@ -5074,6 +5200,7 @@ impl LiveCli {
             appfs_attach_lease,
             redraw_handle: None,
         };
+        cli.update_appfs_status_idle(None);
         Ok(cli)
     }
 
@@ -5172,6 +5299,7 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        self.update_appfs_status_running(sanitize_appfs_task_preview(input), Some("user"), None);
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -5185,6 +5313,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 let finish_label = if summary.cancelled {
                     "⏹ Cancelled"
                 } else {
@@ -5219,6 +5352,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -5239,6 +5373,7 @@ impl LiveCli {
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter =
             ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.update_appfs_status_running(sanitize_appfs_task_preview(input), Some("user"), None);
         self.run_prepared_turn(
             runtime,
             hook_abort_monitor,
@@ -5257,6 +5392,11 @@ impl LiveCli {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.update_appfs_status_running(
+            sanitize_appfs_task_preview(input),
+            Some("user"),
+            Some(turn_id),
+        );
         self.run_prepared_headless_turn(
             runtime,
             hook_abort_monitor,
@@ -5413,6 +5553,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 let finish_label = if summary.cancelled {
                     "⏹ Cancelled"
                 } else {
@@ -5454,6 +5599,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 if let Some(redraw_handle) = &self.redraw_handle {
                     redraw_handle.write_output("✘ ❌ Request failed\n".to_string());
                 } else {
@@ -5517,6 +5663,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 if let Some(event) = &summary.auto_compaction {
                     #[cfg(feature = "debug-dump")]
                     if !event.removed_messages.is_empty() {
@@ -5565,6 +5716,7 @@ impl LiveCli {
             }
             Err(error) if error.is_cancelled() => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(AppfsAgentOutcome::Cancelled));
                 self.persist_session()?;
                 let usage = self.runtime.usage().cumulative_usage();
                 let mut done_ev = json!({
@@ -5590,11 +5742,22 @@ impl LiveCli {
                 if let Err(err_shutdown) = runtime.shutdown_plugins() {
                     eprintln!("Warning: failed to shutdown plugins: {err_shutdown}");
                 }
+                self.update_appfs_status_error();
+                let error_message = format!("run turn failed: {error}");
+                #[cfg(feature = "debug-dump")]
+                crate::debug_dump::write_turn_error(
+                    &self.session.path,
+                    &request_id,
+                    &turn_id,
+                    &self.session.id,
+                    &error_message,
+                    source,
+                );
                 let mut err_ev = json!({
                     "type": "error",
                     "request_id": request_id,
                     "turn_id": turn_id,
-                    "message": format!("run turn failed: {error}"),
+                    "message": error_message,
                 });
                 if let Some(source) = source {
                     err_ev["source"] = json!(source);
@@ -5707,6 +5870,7 @@ impl LiveCli {
             external_queue.clone(),
             &request_id,
             &turn_id,
+            sanitize_appfs_task_preview(&batch.rendered_inputs),
         )?;
         if status == HeadlessTurnStatus::Completed {
             let _ = self.drain_and_run_queued_inputs_headless(external_queue)?;
@@ -5759,6 +5923,7 @@ impl LiveCli {
             self.run_event_turn_with_external_inputs(
                 external_queue.clone(),
                 permission_tx.clone(),
+                sanitize_appfs_task_preview(&batch.rendered_inputs),
             )?;
             let _ = self.drain_and_run_queued_inputs_with_external_inputs(
                 terminal,
@@ -5775,6 +5940,8 @@ impl LiveCli {
         &mut self,
         pending_inputs: Vec<PendingInput>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let preview = sanitize_appfs_task_preview(&render_pending_input_echoes(&pending_inputs));
+        self.update_appfs_status_running(preview, Some("appfs_event"), None);
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         for pending_input in pending_inputs {
             runtime.enqueue_pending_input(pending_input);
@@ -5792,6 +5959,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                self.update_appfs_status_idle(Some(if summary.cancelled {
+                    AppfsAgentOutcome::Cancelled
+                } else {
+                    AppfsAgentOutcome::Completed
+                }));
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
@@ -5821,6 +5993,7 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.update_appfs_status_error();
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -5836,10 +6009,12 @@ impl LiveCli {
         external_queue: SharedPendingInputQueue,
         request_id: &str,
         turn_id: &str,
+        preview: Option<String>,
     ) -> Result<HeadlessTurnStatus, Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        self.update_appfs_status_running(preview, Some("appfs_event"), Some(turn_id));
         self.run_prepared_headless_turn(
             runtime,
             hook_abort_monitor,
@@ -5855,11 +6030,13 @@ impl LiveCli {
         &mut self,
         external_queue: SharedPendingInputQueue,
         permission_tx: Sender<PermissionPromptTicket>,
+        preview: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let runtime = runtime.with_external_pending_inputs(external_queue);
         let mut permission_prompter =
             ChannelPermissionPrompter::new(self.permission_mode, permission_tx);
+        self.update_appfs_status_running(preview, Some("appfs_event"), None);
         self.run_prepared_turn(
             runtime,
             hook_abort_monitor,
@@ -6956,6 +7133,9 @@ impl LiveCli {
 
 impl Drop for LiveCli {
     fn drop(&mut self) {
+        if self.appfs_attach_lease.is_some() {
+            self.update_appfs_status_stopped();
+        }
         if let Some(lease) = self.appfs_attach_lease.take() {
             if let Err(error) = detach_appfs_principal(&lease, "process_exit") {
                 eprintln!("AppFS attach warning: failed to detach principal lease: {error}");
@@ -9774,7 +9954,10 @@ impl ApiClient for AnthropicRuntimeClient {
         let max_tokens = self
             .runtime_model_config
             .as_ref()
-            .and_then(|config| config.max_output_tokens)
+            .and_then(|config| config.max_output_tokens);
+        let max_tokens = request
+            .max_tokens_override
+            .or(max_tokens)
             .unwrap_or_else(|| max_tokens_for_model(&effective_model));
         let context_window_tokens = self
             .runtime_model_config
@@ -11172,9 +11355,10 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
+    let mut converted: Vec<InputMessage> = Vec::new();
+
+    for message in messages {
+        let Some(mut input_message) = (|| {
             let role = match message.role {
                 MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
@@ -11229,8 +11413,30 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 role: role.to_string(),
                 content,
             })
-        })
-        .collect()
+        })() else {
+            continue;
+        };
+
+        if input_message.role == "user" && content_is_only_tool_results(&input_message.content) {
+            if let Some(previous) = converted.last_mut() {
+                if previous.role == "user" && content_is_only_tool_results(&previous.content) {
+                    previous.content.append(&mut input_message.content);
+                    continue;
+                }
+            }
+        }
+
+        converted.push(input_message);
+    }
+
+    converted
+}
+
+fn content_is_only_tool_results(content: &[InputContentBlock]) -> bool {
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -11457,9 +11663,10 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput,
-        InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
-        PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, ToolExecutor,
+        AssistantEvent, AttachmentKind, ConfigLoader, ContentBlock, ConversationMessage,
+        InputRouterBlockInput, InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput,
+        PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session,
+        ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -14973,6 +15180,50 @@ UU conflicted.rs",
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_merges_adjacent_tool_results_for_parallel_tool_uses() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "glob_search".to_string(),
+                    input: "{\"pattern\":\"**/*.md\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "Skill".to_string(),
+                    input: "{\"skill\":\"appfs-tinode\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("tool-1", "glob_search", "README.md", false),
+            ConversationMessage::tool_result("tool-2", "Skill", "Launching skill", false),
+            ConversationMessage::attachment_user_text(
+                "Skill prompt",
+                AttachmentKind::InvokedSkills,
+            ),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 4);
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[2].role, "user");
+        assert_eq!(converted[2].content.len(), 2);
+        assert!(matches!(
+            &converted[2].content[0],
+            api::InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tool-1"
+        ));
+        assert!(matches!(
+            &converted[2].content[1],
+            api::InputContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tool-2"
+        ));
+        assert!(matches!(
+            &converted[3].content[0],
+            api::InputContentBlock::Text { text } if text == "Skill prompt"
+        ));
     }
 
     #[test]

@@ -14,9 +14,9 @@ import { isModelContextAttachmentMessage } from '../session-message-filters.js';
 export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegistry): void {
   app.get('/api/timeline', async (request) => {
     const query = request.query as { agents?: string };
-    const agentNames = (query.agents ?? '').split(',').filter(Boolean).map(decodeURIComponent);
+    const agentKeys = (query.agents ?? '').split(',').filter(Boolean).map(decodeURIComponent);
 
-    if (agentNames.length === 0) {
+    if (agentKeys.length === 0) {
       return { entries: [], interactions: [], compactionBoundaries: [] } satisfies TimelineResponse;
     }
 
@@ -24,23 +24,27 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
     const compactionBoundaries: TimelineCompactionBoundary[] = [];
     const perAgent: Map<string, TimelineEntry[]> = new Map();
 
-    for (const name of agentNames) {
+    for (const key of agentKeys) {
+      const agent = registry.getAgent(key);
+      const name = agent?.name || agent?.principalId || key;
+      const sessionId = agent?.sessionId ?? key;
       const entries: TimelineEntry[] = [];
 
-      for (const rec of registry.getMessages(name)) {
+      for (const rec of registry.getMessages(key)) {
         const msg = rec.message;
         if (isModelContextAttachmentMessage(msg)) {
           continue;
         }
         const content = extractTextContent(msg.blocks);
         const timestamp = msg.timestamp_ms ?? 0;
-        const entryId = `${name}:${msg.uuid}`;
+        const entryId = `${sessionId}:${msg.uuid}`;
         const appfsEvents = msg.role === 'user'
           ? extractAppfsEvents(name, msg, content, 'session')
           : [];
 
         entries.push({
           id: entryId,
+          sessionId,
           agentName: name,
           timestamp,
           source: 'session',
@@ -54,14 +58,15 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
         addAppfsInteractions(name, timestamp, entryId, appfsEvents, interactions);
       }
 
-      for (const dump of registry.getDebugDumps(name)) {
+      for (const dump of registry.getDebugDumps(key)) {
         const systemPrompt = dump.system ?? dump.system_prompt ?? '';
         const toolCount = dump.tools?.length ?? dump.tools_count ?? 0;
         const msgCount = dump.messages?.length ?? dump.message_count ?? 0;
         const sysLen = systemPrompt.length;
 
         entries.push({
-          id: `${name}:debug:${dump.request_index ?? entries.length}:${dump.timestamp_ms ?? 0}`,
+          id: `${sessionId}:debug:${dump.request_index ?? entries.length}:${dump.timestamp_ms ?? 0}`,
+          sessionId,
           agentName: name,
           timestamp: dump.timestamp_ms ?? 0,
           source: 'debug-dump',
@@ -71,20 +76,21 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
         });
       }
 
-      for (const archive of registry.getCompactionArchives(name)) {
+      for (const archive of registry.getCompactionArchives(key)) {
         const msg = archive.message;
         if (isModelContextAttachmentMessage(msg)) {
           continue;
         }
         const content = extractTextContent(msg.blocks);
         const timestamp = msg.timestamp_ms ?? archive.timestamp_ms;
-        const entryId = `${name}:archive:${msg.uuid}:${archive.timestamp_ms}`;
+        const entryId = `${sessionId}:archive:${msg.uuid}:${archive.timestamp_ms}`;
         const appfsEvents = msg.role === 'user'
           ? extractAppfsEvents(name, msg, content, 'archive')
           : [];
 
         entries.push({
           id: entryId,
+          sessionId,
           agentName: name,
           timestamp,
           source: 'compaction-archive',
@@ -98,7 +104,7 @@ export function registerTimelineRoute(app: FastifyInstance, registry: AgentRegis
         addAppfsInteractions(name, timestamp, entryId, appfsEvents, interactions);
       }
 
-      for (const boundary of registry.getCompactionBoundaries(name)) {
+      for (const boundary of registry.getCompactionBoundaries(key)) {
         compactionBoundaries.push({
           agentName: name,
           timestamp: boundary.timestamp_ms,

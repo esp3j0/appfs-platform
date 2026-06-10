@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::{
     ActionSpec, SnapshotOnTimeoutPolicy, ACTION_CURSOR_PROBE_WINDOW, ALLOWED_SEGMENT_CHARS,
@@ -10,6 +13,10 @@ use super::{
     SNAPSHOT_COALESCE_WINDOW_ENV, SNAPSHOT_EXPAND_DELAY_ENV, SNAPSHOT_FORCE_EXPAND_ON_REFRESH_ENV,
     SNAPSHOT_PUBLISH_DELAY_ENV,
 };
+
+const JSON_PUBLISH_RETRY_DELAYS_MS: &[u64] = &[5, 10, 25, 50, 100, 200, 400, 800];
+
+static JSON_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn collect_files_with_suffix(
     dir: &Path,
@@ -35,6 +42,124 @@ pub(super) fn collect_files_with_suffix(
         }
     }
     Ok(())
+}
+
+pub(super) fn write_pretty_json_file<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    label: &str,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create {label} parent directory {}",
+            parent.display()
+        )
+    })?;
+
+    let tmp_path = unique_tmp_path(path);
+    let bytes =
+        serde_json::to_vec_pretty(value).with_context(|| format!("Failed to serialize {label}"))?;
+    {
+        let mut file = fs::File::create(&tmp_path).with_context(|| {
+            format!("Failed to create {label} temp file {}", tmp_path.display())
+        })?;
+        file.write_all(&bytes)
+            .with_context(|| format!("Failed to write {label} temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync {label} temp file {}", tmp_path.display()))?;
+    }
+
+    publish_temp_file(&tmp_path, path, label)
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("appfs-json");
+    let counter = JSON_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ))
+}
+
+fn publish_temp_file(tmp_path: &Path, path: &Path, label: &str) -> Result<()> {
+    wait_for_temp_visibility(tmp_path);
+
+    let mut last_error = None;
+    for attempt in 0..=JSON_PUBLISH_RETRY_DELAYS_MS.len() {
+        refresh_parent_directory(tmp_path);
+        match fs::rename(tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let destination_conflict = err.kind() != ErrorKind::NotFound
+                    && (matches!(
+                        err.kind(),
+                        ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
+                    ) || path.exists());
+                if destination_conflict {
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                        Err(remove_err) => {
+                            last_error = Some(remove_err);
+                            sleep_before_retry(attempt);
+                            continue;
+                        }
+                    }
+                    match fs::rename(tmp_path, path) {
+                        Ok(()) => return Ok(()),
+                        Err(rename_err) => last_error = Some(rename_err),
+                    }
+                } else {
+                    last_error = Some(err);
+                }
+            }
+        }
+        sleep_before_retry(attempt);
+    }
+
+    let message = last_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "unknown rename failure".to_string());
+    let _ = fs::remove_file(tmp_path);
+    anyhow::bail!(
+        "Failed to move {label} temp file {} to {}: {message}",
+        tmp_path.display(),
+        path.display()
+    )
+}
+
+fn wait_for_temp_visibility(tmp_path: &Path) {
+    for attempt in 0..JSON_PUBLISH_RETRY_DELAYS_MS.len() {
+        refresh_parent_directory(tmp_path);
+        if tmp_path.exists() {
+            return;
+        }
+        sleep_before_retry(attempt);
+    }
+}
+
+fn sleep_before_retry(attempt: usize) {
+    if let Some(delay_ms) = JSON_PUBLISH_RETRY_DELAYS_MS.get(attempt) {
+        std::thread::sleep(Duration::from_millis(*delay_ms));
+    }
+}
+
+fn refresh_parent_directory(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries {
+            let _ = entry;
+        }
+    }
 }
 
 pub(super) fn boundary_probe_from_bytes(bytes: &[u8], offset: u64) -> Option<String> {

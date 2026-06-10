@@ -12,6 +12,10 @@ export function registerMessagesRoute(app: FastifyInstance, registry: AgentRegis
   app.get('/api/agents/:sessionId/chat', async (request) => {
     const { sessionId } = request.params as { sessionId: string };
     const decodedSessionId = decodeURIComponent(sessionId);
-    return normalizeChatThread(decodedSessionId, registry.getMessages(decodedSessionId));
+    return normalizeChatThread(
+      decodedSessionId,
+      registry.getMessages(decodedSessionId),
+      registry.getTurnErrors(decodedSessionId),
+    );
   });
 }

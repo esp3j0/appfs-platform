@@ -5,11 +5,21 @@ import type {
   ModelCatalogEntry,
   ModelConfigResponse,
   ModelProviderConfig,
+  PrincipalLifecycleInfo,
+  PrincipalStartRequest,
   ProjectRecord,
   SpawnConfig,
 } from '../types';
 import { AgentItem } from './AgentItem';
 import { useDashboardSSE } from '../hooks/useDashboardSSE';
+import {
+  createProjectPrincipal,
+  deleteProjectPrincipal,
+  listProjectPrincipals,
+  resumeProjectPrincipal,
+  startProjectPrincipal,
+  stopProjectPrincipal,
+} from '../principal-api';
 
 function defaultProvider(config: DashboardModelConfig): ModelProviderConfig | null {
   return config.providers.find(provider => provider.id === config.defaultProviderId)
@@ -58,10 +68,82 @@ function applyModelConfigDefaults(spawnConfig: SpawnConfig, modelConfig: Dashboa
   };
 }
 
+function dedupeAgentEntries(
+  entries: { agent: AgentInfo; index: number }[],
+): { agent: AgentInfo; index: number }[] {
+  const byPrincipal = new Map<string, { agent: AgentInfo; index: number }>();
+
+  for (const entry of entries) {
+    const key = entry.agent.principalId || entry.agent.name || entry.agent.sessionId;
+    const current = byPrincipal.get(key);
+    if (!current || isPreferredAgentEntry(entry.agent, current.agent)) {
+      byPrincipal.set(key, entry);
+    }
+  }
+
+  return Array.from(byPrincipal.values());
+}
+
+function isPreferredAgentEntry(candidate: AgentInfo, current: AgentInfo): boolean {
+  const candidateScore = agentEntryScore(candidate);
+  const currentScore = agentEntryScore(current);
+  for (let i = 0; i < candidateScore.length; i += 1) {
+    if (candidateScore[i] !== currentScore[i]) {
+      return candidateScore[i] > currentScore[i];
+    }
+  }
+  return false;
+}
+
+function agentEntryScore(agent: AgentInfo): number[] {
+  return [
+    agent.status === 'online' ? 1 : 0,
+    agent.controlMode === 'managed' ? 1 : 0,
+    agent.startedAt || 0,
+    agent.messageCount || 0,
+  ];
+}
+
+const ACTIVE_PRINCIPAL_STATUSES = new Set(['starting', 'idle', 'busy', 'running', 'online']);
+
+function isPrincipalActive(principal?: PrincipalLifecycleInfo): boolean {
+  if (!principal) {
+    return false;
+  }
+  // If there are any attaches at all, the agent is considered active.
+  // The AppFS sweep + agent heartbeat ensure stale attaches are cleaned up
+  // promptly, so we no longer need to distinguish fresh vs stale here.
+  const attaches = principal.active_attaches ?? [];
+  if (attaches.length > 0) {
+    return true;
+  }
+  return ACTIVE_PRINCIPAL_STATUSES.has(principal.status) && principal.status !== 'online';
+}
+
+function principalStartRequestFromSpawnConfig(spawnConfig: SpawnConfig): PrincipalStartRequest {
+  return {
+    model: spawnConfig.model.trim() || undefined,
+    modelProviderId: spawnConfig.modelProviderId,
+    modelId: spawnConfig.modelId,
+    contextWindowTokens: spawnConfig.contextWindowTokens,
+    maxOutputTokens: spawnConfig.maxOutputTokens,
+    permissionMode: spawnConfig.permissionMode.trim() || undefined,
+  };
+}
+
+function readSpawnId(value: unknown): string | undefined {
+  if (value && typeof value === 'object' && 'spawnId' in value) {
+    const spawnId = (value as { spawnId?: unknown }).spawnId;
+    return typeof spawnId === 'string' ? spawnId : undefined;
+  }
+  return undefined;
+}
+
 interface Props {
   agents: AgentInfo[];
+  archivedAgents?: AgentInfo[];
   selected: Set<string>;
-  onToggle: (name: string) => void;
+  onToggle: (sessionId: string) => void;
   onRefreshAgents?: () => void;
   onAgentStopped?: (sessionId: string) => void;
   selectedProjectId?: string | null;
@@ -70,6 +152,7 @@ interface Props {
 
 export function AgentSidebar({
   agents,
+  archivedAgents = [],
   selected,
   onToggle,
   onRefreshAgents,
@@ -79,6 +162,7 @@ export function AgentSidebar({
 }: Props) {
   const [projects, setProjects] = React.useState<ProjectRecord[]>([]);
   const [expandedProjects, setExpandedProjects] = React.useState<Record<string, boolean>>({});
+  const [archivedExpanded, setArchivedExpanded] = React.useState(false);
   const [spawnConfig, setSpawnConfig] = React.useState<SpawnConfig | null>(null);
   const [spawnStatus, setSpawnStatus] = React.useState<{ kind: 'idle' | 'loading' | 'success' | 'error'; text?: string }>({ kind: 'loading' });
   const [spawnDefaultsLoaded, setSpawnDefaultsLoaded] = React.useState(false);
@@ -86,6 +170,8 @@ export function AgentSidebar({
   const [modelConfigPath, setModelConfigPath] = React.useState('');
   const [modelConfigStatus, setModelConfigStatus] = React.useState<{ kind: 'idle' | 'loading' | 'error'; text?: string }>({ kind: 'loading' });
   const [stoppingAgents, setStoppingAgents] = React.useState<Set<string>>(new Set());
+  const [principalsByProject, setPrincipalsByProject] = React.useState<Record<string, PrincipalLifecycleInfo[]>>({});
+  const [deletingPrincipals, setDeletingPrincipals] = React.useState<Set<string>>(new Set());
 
   const totalInput = agents.reduce((s, a) => s + a.totalInputTokens, 0);
   const totalOutput = agents.reduce((s, a) => s + a.totalOutputTokens, 0);
@@ -107,11 +193,43 @@ export function AgentSidebar({
       });
   }, []);
 
+  const loadPrincipals = React.useCallback((projectIds?: string[]) => {
+    const ids = projectIds ?? projects.map(project => project.projectId);
+    if (ids.length === 0) {
+      setPrincipalsByProject({});
+      return;
+    }
+
+    void Promise.all(ids.map(async projectId => {
+      try {
+        const data = await listProjectPrincipals(projectId);
+        return { projectId, principals: data.principals ?? [] };
+      } catch (err) {
+        console.error(`[AgentSidebar] Failed to load principals for ${projectId}:`, err);
+        return { projectId, principals: [] };
+      }
+    })).then(results => {
+      setPrincipalsByProject(current => {
+        const next = { ...current };
+        for (const result of results) {
+          next[result.projectId] = result.principals;
+        }
+        return next;
+      });
+    });
+  }, [projects]);
+
   React.useEffect(() => {
     loadProjects();
     const interval = setInterval(loadProjects, 5000);
     return () => clearInterval(interval);
   }, [loadProjects]);
+
+  React.useEffect(() => {
+    loadPrincipals();
+    const interval = setInterval(loadPrincipals, 5000);
+    return () => clearInterval(interval);
+  }, [loadPrincipals]);
 
   React.useEffect(() => {
     fetch('/api/process/default-spawn-config')
@@ -188,7 +306,7 @@ export function AgentSidebar({
     // 1. Process known projects from fetched projects list
     projects.forEach(p => {
       processedIds.add(p.projectId);
-      const projectAgents = groupedAgents.groups[p.projectId] || [];
+      const projectAgents = dedupeAgentEntries(groupedAgents.groups[p.projectId] || []);
       list.push({
         projectId: p.projectId,
         projectRoot: p.projectRoot,
@@ -202,7 +320,7 @@ export function AgentSidebar({
     Object.keys(groupedAgents.groups).forEach(pId => {
       if (!processedIds.has(pId)) {
         processedIds.add(pId);
-        const projectAgents = groupedAgents.groups[pId] || [];
+        const projectAgents = dedupeAgentEntries(groupedAgents.groups[pId] || []);
         const projectRoot = projectAgents[0]?.agent.projectRoot || pId;
         list.push({
           projectId: pId,
@@ -226,8 +344,11 @@ export function AgentSidebar({
 
   const handleRefresh = () => {
     loadProjects();
+    loadPrincipals();
     onRefreshAgents?.();
   };
+
+  const principalActionKey = (projectId: string, principalId: string) => `${projectId}:${principalId}`;
 
   const postSpawn = async (spawnConfig: SpawnConfig, successLabel: string) => {
     const principalId = spawnConfig.principalId.trim();
@@ -235,33 +356,23 @@ export function AgentSidebar({
       setSpawnStatus({ kind: 'error', text: 'principalId is required.' });
       return;
     }
+    if (!selectedProjectId) {
+      setSpawnStatus({ kind: 'error', text: 'Select a project before starting an agent.' });
+      return;
+    }
 
-    const projectRoot = selectedProjectRoot?.trim();
-    const body: SpawnConfig = {
-      ...spawnConfig,
-      projectId: selectedProjectId || undefined,
-      projectRoot: projectRoot || undefined,
-      principalId,
-      model: spawnConfig.model.trim(),
-      cwd: projectRoot || spawnConfig.cwd.trim(),
-      appfsMountRoot: projectRoot || spawnConfig.appfsMountRoot.trim(),
-      permissionMode: spawnConfig.permissionMode.trim() || 'dangerous',
-      env: spawnConfig.env ?? {},
-      sessionPath: spawnConfig.sessionPath?.trim() || undefined,
-    };
+    const startBody = principalStartRequestFromSpawnConfig(spawnConfig);
 
-    setSpawnStatus({ kind: 'loading', text: 'Spawning...' });
+    setSpawnStatus({ kind: 'loading', text: 'Starting principal agent...' });
     try {
-      const res = await fetch('/api/process/spawn', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      await createProjectPrincipal(selectedProjectId, {
+        principalId,
+        displayName: principalId,
+        kind: 'agent',
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error ?? `HTTP ${res.status}`);
-      }
-      setSpawnStatus({ kind: 'success', text: `${successLabel}: ${data.spawnId ?? 'pending'}` });
+      const data = await startProjectPrincipal(selectedProjectId, principalId, startBody);
+      const spawnId = readSpawnId(data);
+      setSpawnStatus({ kind: 'success', text: `${successLabel}: ${spawnId ?? 'pending'}` });
       handleRefresh();
     } catch (err: unknown) {
       setSpawnStatus({
@@ -273,44 +384,76 @@ export function AgentSidebar({
 
   const resumeAgent = async (agent: AgentInfo) => {
     if (!spawnConfig) return;
+    const projectId = agent.projectId || selectedProjectId;
+    if (!projectId) {
+      setSpawnStatus({ kind: 'error', text: `Cannot resume ${agent.name} without a project id.` });
+      return;
+    }
     const baseConfig: SpawnConfig = {
       ...spawnConfig,
       principalId: agent.principalId || agent.name,
       model: agent.model || spawnConfig.model,
+      modelProviderId: agent.modelProviderId ?? spawnConfig.modelProviderId,
+      modelId: agent.modelId ?? spawnConfig.modelId,
+      contextWindowTokens: agent.contextWindowTokens ?? spawnConfig.contextWindowTokens,
+      maxOutputTokens: agent.maxOutputTokens ?? spawnConfig.maxOutputTokens,
+      runtimeModelConfigPath: agent.runtimeModelConfigPath ?? spawnConfig.runtimeModelConfigPath,
       sessionPath: agent.sessionJsonlPath,
     };
     const resolvedConfig = modelConfig
-      ? applyModelConfigDefaults(
-          agent.model
-            ? {
-                ...baseConfig,
-                modelProviderId: undefined,
-                modelId: undefined,
-                contextWindowTokens: undefined,
-                maxOutputTokens: undefined,
-              }
-            : baseConfig,
-          modelConfig,
-        )
+      ? applyModelConfigDefaults(baseConfig, modelConfig)
       : baseConfig;
-    await postSpawn(resolvedConfig, `Resume accepted for ${agent.name}`);
+    const principalId = resolvedConfig.principalId.trim();
+    if (!principalId) {
+      setSpawnStatus({ kind: 'error', text: 'Cannot resume an agent without a principal id.' });
+      return;
+    }
+
+    setSpawnStatus({ kind: 'loading', text: `Resuming ${agent.name}...` });
+    try {
+      const data = await resumeProjectPrincipal(projectId, principalId, {
+        ...principalStartRequestFromSpawnConfig(resolvedConfig),
+        sessionId: agent.sessionId,
+      });
+      const spawnId = readSpawnId(data);
+      setSpawnStatus({
+        kind: 'success',
+        text: `Resume accepted for ${agent.name}: ${spawnId ?? 'pending'}`,
+      });
+      handleRefresh();
+    } catch (err: unknown) {
+      setSpawnStatus({
+        kind: 'error',
+        text: err instanceof Error ? err.message : String(err),
+      });
+    }
   };
 
   const stopAgent = async (agent: AgentInfo) => {
     if (!agent.sessionId) return;
 
+    const principalId = agent.principalId || agent.name;
+    const projectId = agent.projectId;
+
     setStoppingAgents(prev => new Set(prev).add(agent.sessionId));
     setSpawnStatus({ kind: 'loading', text: `Stopping ${agent.name}...` });
     try {
-      const res = await fetch(`/api/agents/${encodeURIComponent(agent.sessionId)}/stop`, {
-        method: 'POST',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error ?? `HTTP ${res.status}`);
+      if (projectId && principalId) {
+        // Lifecycle-aware stop: await process termination + detach AppFS principal
+        await stopProjectPrincipal(projectId, principalId);
+      } else {
+        // Fallback: legacy low-level kill (no detach, no await)
+        const res = await fetch(`/api/agents/${encodeURIComponent(agent.sessionId)}/stop`, {
+          method: 'POST',
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error ?? `HTTP ${res.status}`);
+        }
       }
       setSpawnStatus({ kind: 'success', text: `Stop requested for ${agent.name}` });
       onAgentStopped?.(agent.sessionId);
+      loadPrincipals();
     } catch (err: unknown) {
       setSpawnStatus({
         kind: 'error',
@@ -325,6 +468,46 @@ export function AgentSidebar({
     }
   };
 
+  const deletePrincipal = async (
+    projectId: string,
+    agent: AgentInfo,
+    principal?: PrincipalLifecycleInfo,
+  ) => {
+    const principalId = agent.principalId || agent.name;
+    if (!principalId) {
+      setSpawnStatus({ kind: 'error', text: 'Cannot delete an agent without a principal id.' });
+      return;
+    }
+    if (agent.status === 'online' || isPrincipalActive(principal)) {
+      setSpawnStatus({ kind: 'error', text: `Stop ${principalId} before deleting it.` });
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete/archive agent "${principalId}"?\n\nThis removes the AppFS principal and private app state, then archives its sessions so they leave the active list. Session logs are not deleted.`,
+    );
+    if (!confirmed) return;
+
+    const key = principalActionKey(projectId, principalId);
+    setDeletingPrincipals(prev => new Set(prev).add(key));
+    setSpawnStatus({ kind: 'loading', text: `Deleting/archiving ${principalId}...` });
+    try {
+      await deleteProjectPrincipal(projectId, principalId);
+      setSpawnStatus({ kind: 'success', text: `Delete/archive requested for ${principalId}` });
+      loadPrincipals([projectId]);
+      onRefreshAgents?.();
+    } catch (err: unknown) {
+      setSpawnStatus({ kind: 'error', text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setDeletingPrincipals(prev => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
+
   return (
     <div className="sidebar">
       <div className="sidebar-header">Agents (multi-select)</div>
@@ -333,6 +516,10 @@ export function AgentSidebar({
       <div className="agent-list">
         {renderedProjects.map(project => {
           const isExpanded = expandedProjects[project.projectId] ?? true;
+          const projectPrincipals = principalsByProject[project.projectId] ?? [];
+          const projectPrincipalsById = new Map(
+            projectPrincipals.map(principal => [principal.principal_id, principal]),
+          );
 
           return (
             <div key={project.projectId} className="project-group">
@@ -370,19 +557,34 @@ export function AgentSidebar({
                 {project.agents.length === 0 ? (
                   <div className="project-empty-agents">No active agents in project</div>
                 ) : (
-                  project.agents.map(({ agent, index }) => (
-                    <AgentItem
-                      key={agent.sessionId || agent.name}
-                      agent={agent}
-                      checked={selected.has(agent.name)}
-                      colorIndex={index}
-                      onToggle={() => onToggle(agent.name)}
-                      onResume={resumeAgent}
-                      onStop={stopAgent}
-                      resumeDisabled={!spawnConfig || spawnStatus.kind === 'loading'}
-                      stopDisabled={stoppingAgents.has(agent.sessionId)}
-                    />
-                  ))
+                  project.agents.map(({ agent, index }) => {
+                    const principalId = agent.principalId || agent.name;
+                    const principal = projectPrincipalsById.get(principalId);
+                    const deleteBusy = deletingPrincipals.has(principalActionKey(project.projectId, principalId));
+                    const deleteBlocked = agent.status === 'online' || isPrincipalActive(principal);
+                    return (
+                      <AgentItem
+                        key={agent.sessionId || agent.name}
+                        agent={agent}
+                        checked={selected.has(agent.sessionId)}
+                        colorIndex={index}
+                        onToggle={() => onToggle(agent.sessionId)}
+                        onResume={resumeAgent}
+                        onStop={stopAgent}
+                        onDelete={target => deletePrincipal(project.projectId, target, principal)}
+                        resumeDisabled={!spawnConfig || spawnStatus.kind === 'loading'}
+                        stopDisabled={stoppingAgents.has(agent.sessionId)}
+                        deleteDisabled={deleteBusy || deleteBlocked}
+                        deleteTitle={
+                          deleteBusy
+                            ? `Deleting principal ${principalId}...`
+                            : deleteBlocked
+                              ? `Stop ${principalId} before deleting/archiving it.`
+                              : `Delete/archive agent ${principalId}`
+                        }
+                      />
+                    );
+                  })
                 )}
               </div>
             </div>
@@ -392,22 +594,67 @@ export function AgentSidebar({
         {groupedAgents.ungrouped.length > 0 && (
           <div className="project-group">
             <div className="legacy-header">
-              Legacy / Flat Sessions ({groupedAgents.ungrouped.length})
+              Legacy / Flat Sessions ({dedupeAgentEntries(groupedAgents.ungrouped).length})
             </div>
             <div className="project-content">
-              {groupedAgents.ungrouped.map(({ agent, index }) => (
+              {dedupeAgentEntries(groupedAgents.ungrouped).map(({ agent, index }) => (
                 <AgentItem
                   key={agent.sessionId || agent.name}
                   agent={agent}
-                  checked={selected.has(agent.name)}
+                  checked={selected.has(agent.sessionId)}
                   colorIndex={index}
-                  onToggle={() => onToggle(agent.name)}
+                  onToggle={() => onToggle(agent.sessionId)}
                   onResume={resumeAgent}
                   onStop={stopAgent}
                   resumeDisabled={!spawnConfig || spawnStatus.kind === 'loading'}
                   stopDisabled={stoppingAgents.has(agent.sessionId)}
                 />
               ))}
+            </div>
+          </div>
+        )}
+
+        {archivedAgents.length > 0 && (
+          <div className="project-group archived-agent-group">
+            <button
+              type="button"
+              className="project-header archived-project-header"
+              onClick={() => setArchivedExpanded(value => !value)}
+              aria-expanded={archivedExpanded}
+              aria-controls="archived-agent-content"
+            >
+              <div className="project-header-left">
+                <span className={`project-arrow ${archivedExpanded ? 'expanded' : ''}`}>▸</span>
+                <div className="project-header-titles">
+                  <div className="project-header-row">
+                    <span className="project-name">Archived agents/sessions</span>
+                    <span className="project-badge archived">archived</span>
+                  </div>
+                  <div className="project-root-subtitle">
+                    Historical sessions kept for review
+                  </div>
+                </div>
+              </div>
+              <div className="project-header-right">
+                <span className="project-agent-count">{archivedAgents.length}</span>
+              </div>
+            </button>
+            <div
+              id="archived-agent-content"
+              className="project-content archived-agent-content"
+              hidden={!archivedExpanded}
+            >
+              {[...archivedAgents]
+                .sort((left, right) => (right.startedAt || 0) - (left.startedAt || 0))
+                .map((agent, index) => (
+                  <AgentItem
+                    key={agent.sessionId || agent.name}
+                    agent={agent}
+                    checked={selected.has(agent.sessionId)}
+                    colorIndex={agents.length + index}
+                    onToggle={() => onToggle(agent.sessionId)}
+                  />
+                ))}
             </div>
           </div>
         )}
@@ -606,6 +853,12 @@ function SpawnAgentPanel({
         <span>{expanded ? 'Hide' : 'New Agent'}</span>
         <span className="spawn-agent-toggle-icon">{expanded ? '−' : '+'}</span>
       </button>
+
+      {!expanded && status.text && (
+        <div className={`spawn-agent-status spawn-agent-status-compact ${status.kind}`}>
+          {status.text}
+        </div>
+      )}
 
       {expanded && (
         <div className="spawn-agent-form">

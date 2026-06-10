@@ -915,17 +915,7 @@ fn bootstrap_runtime_scaffolding(root: &Path, app_id: &str) -> Result<()> {
 }
 
 fn write_json_file(path: &Path, value: &JsonValue) -> Result<()> {
-    ensure_parent_dir(path)?;
-    let tmp = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp, bytes)
-        .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("Failed to move {} to {}", tmp.display(), path.display()))?;
-    Ok(())
+    super::shared::write_pretty_json_file(path, value, "AppFS structure JSON")
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

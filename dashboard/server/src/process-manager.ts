@@ -8,9 +8,9 @@ import { createInterface, Interface as ReadlineInterface } from 'node:readline';
 import { EventBus } from './event-bus.js';
 import type { AgentRegistry } from './agent-registry.js';
 import type { ProjectRegistry } from './project-registry.js';
-import type { AgentInfo } from './types.js';
+import type { AgentInfo, TokenUsage } from './types.js';
 import { terminateChildProcessTree } from './child-process-utils.js';
-import type { ModelConfigStore } from './model-config-store.js';
+import type { ModelConfigStore, ResolvedRuntimeModelConfig } from './model-config-store.js';
 
 // ── Launch specification types ──
 
@@ -56,6 +56,24 @@ export function resolveProjectScopedSpawnConfig(
   return resolvedConfig;
 }
 
+export function buildManagedAppfsAttachId(principalId: string): string {
+  const safePrincipalId = principalId
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 128);
+  return `dashboard-${safePrincipalId || 'principal'}`;
+}
+
+export function samePrincipalScope(
+  candidate: { principalId: string; projectId?: string },
+  principalId: string,
+  projectId?: string,
+): boolean {
+  return candidate.principalId === principalId
+    && (!projectId || candidate.projectId === projectId);
+}
+
 export type PromptDelivery = 'prompt' | 'queue' | 'guidance';
 
 export type PromptSubmissionStatus = 'accepted' | 'queued' | 'guidance';
@@ -82,7 +100,7 @@ export interface HeadlessEvent {
   is_error?: boolean;
   status?: string;
   message?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: Partial<TokenUsage>;
 }
 
 interface HeadlessControlEndpoint {
@@ -107,6 +125,14 @@ interface ManagedAgent {
 
 type ManagedAgentMap = Map<string, ManagedAgent>;
 
+interface PendingStartWaiter {
+  resolve(result: { spawnId: string; sessionId: string }): void;
+  reject(error: Error): void;
+  timeout: NodeJS.Timeout;
+}
+
+const DEFAULT_AGENT_START_TIMEOUT_MS = 30_000;
+
 // ── AgentProcessManager ──
 
 export class AgentProcessManager {
@@ -120,6 +146,7 @@ export class AgentProcessManager {
    * before we know their real sessionId.
    */
   private pendingSpawnMap = new Map<string, string>();
+  private pendingStartWaiters = new Map<string, PendingStartWaiter>();
 
   constructor(registry: AgentRegistry, private modelConfigStore?: ModelConfigStore) {
     this.eventBus = EventBus.getInstance();
@@ -136,6 +163,17 @@ export class AgentProcessManager {
       this.registry.projectRegistry,
     );
     this.assertSpawnConfig(effectiveSpawnConfig);
+    const existing = this.findByPrincipalScope(
+      effectiveSpawnConfig.principalId,
+      effectiveSpawnConfig.projectId,
+    );
+    if (existing) {
+      throw new SpawnConfigValidationError(
+        `Managed agent already running for principal ${effectiveSpawnConfig.principalId}`
+        + (effectiveSpawnConfig.projectId ? ` in project ${effectiveSpawnConfig.projectId}` : '')
+        + '; stop it before starting or resuming another session.',
+      );
+    }
     this.resolveRuntimeModelConfig(effectiveSpawnConfig, spawnId);
 
     const args = this.buildArgs(effectiveSpawnConfig);
@@ -191,35 +229,7 @@ export class AgentProcessManager {
 
     // ── Process exit ──
     childProcess.on('exit', (code, signal) => {
-      const agentId = managedAgent.sessionId ?? spawnId;
-      console.log(`[ProcessManager] Agent ${agentId} exited with code=${code}, signal=${signal}`);
-
-      this.eventBus.broadcast('agent-offline', {
-        sessionId: agentId,
-        spawnId,
-        code,
-        signal,
-      });
-
-      // Update registry status if we have a real sessionId
-      if (managedAgent.sessionId) {
-        const existingAgent = this.registry.getAgent(managedAgent.sessionId);
-        if (existingAgent) {
-          this.registry.registerAgent({ ...existingAgent, status: 'offline' });
-        }
-      }
-
-      // Clean up
-      stdoutReader.close();
-      stderrReader.close();
-      childProcess.stdout?.destroy();
-      childProcess.stderr?.destroy();
-      childProcess.stdin?.end();
-      childProcess.stdin?.destroy();
-      this.agents.delete(spawnId);
-      if (managedAgent.sessionId) {
-        this.pendingSpawnMap.delete(managedAgent.sessionId);
-      }
+      this.handleManagedExit(spawnId, managedAgent, code, signal);
     });
 
     childProcess.on('error', (err) => {
@@ -237,9 +247,34 @@ export class AgentProcessManager {
       childProcess.stdin?.end();
       childProcess.stdin?.destroy();
       this.agents.delete(spawnId);
+      this.rejectStartWaiter(spawnId, err);
     });
 
     return { spawnId };
+  }
+
+  async spawnAndWaitStarted(
+    spawnConfig: SpawnConfig,
+    timeoutMs = agentStartTimeoutMs(),
+  ): Promise<{ spawnId: string; sessionId: string }> {
+    const { spawnId } = this.spawn(spawnConfig);
+    const managed = this.agents.get(spawnId);
+    if (managed?.sessionId) {
+      return { spawnId, sessionId: managed.sessionId };
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingStartWaiters.delete(spawnId);
+        reject(new Error(`Agent ${spawnId} did not publish session_started within ${timeoutMs} ms`));
+      }, timeoutMs);
+
+      this.pendingStartWaiters.set(spawnId, {
+        resolve,
+        reject,
+        timeout,
+      });
+    });
   }
 
   // ── Prompt submission ──
@@ -352,6 +387,44 @@ export class AgentProcessManager {
     return true;
   }
 
+  findManagedAgentByPrincipal(
+    principalId: string,
+    projectId?: string,
+  ): {
+    pid?: number;
+    sessionId: string | null;
+    status: 'starting' | 'idle' | 'busy';
+    principalId: string;
+    model: string;
+    permissionMode: string;
+  } | null {
+    const agent = this.findByPrincipalScope(principalId, projectId);
+    if (agent) {
+      return {
+        pid: agent.process.pid,
+        sessionId: agent.sessionId,
+        status: agent.status,
+        principalId: agent.spawnConfig.principalId,
+        model: agent.spawnConfig.model,
+        permissionMode: agent.spawnConfig.permissionMode,
+      };
+    }
+    return null;
+  }
+
+  async stopPrincipal(principalId: string, projectId?: string): Promise<{ sessionId: string | null } | null> {
+    const agent = this.findByPrincipalScope(principalId, projectId);
+    if (agent) {
+      const sessionId = agent.sessionId;
+      await terminateChildProcessTree(agent.process, {
+        label: `agent ${agent.sessionId ?? principalId}`,
+        gracefulTimeoutMs: 5000,
+      });
+      return { sessionId };
+    }
+    return null;
+  }
+
   // ── Status ──
 
   getStatus(sessionId: string): { status: string; currentRequestId: string | null } | null {
@@ -379,8 +452,9 @@ export class AgentProcessManager {
       return result;
     }
 
-    const agents = this.registry.getAgents()
-      .filter(agent => agent.projectId === projectId);
+    const agents = latestResumableAgentPerPrincipal(
+      this.registry.getAgents().filter(agent => agent.projectId === projectId),
+    );
 
     for (const agent of agents) {
       if (!agent.sessionJsonlPath) {
@@ -409,6 +483,11 @@ export class AgentProcessManager {
           ...base,
           principalId: agent.principalId || agent.name,
           model,
+          modelProviderId: agent.modelProviderId,
+          modelId: agent.modelId,
+          contextWindowTokens: agent.contextWindowTokens,
+          maxOutputTokens: agent.maxOutputTokens,
+          runtimeModelConfigPath: agent.runtimeModelConfigPath,
           sessionPath: agent.sessionJsonlPath,
           projectId: project.projectId,
           projectRoot: project.projectRoot,
@@ -432,6 +511,7 @@ export class AgentProcessManager {
     sessionId: string | null;
     status: 'starting' | 'idle' | 'busy';
     principalId: string;
+    projectId?: string;
     model: string;
     permissionMode: string;
   }> {
@@ -440,6 +520,7 @@ export class AgentProcessManager {
       sessionId: a.sessionId,
       status: a.status,
       principalId: a.spawnConfig.principalId,
+      projectId: a.spawnConfig.projectId,
       model: a.spawnConfig.model,
       permissionMode: a.spawnConfig.permissionMode,
     }));
@@ -495,6 +576,15 @@ export class AgentProcessManager {
     const target = path.resolve(sessionPath);
     for (const agent of this.agents.values()) {
       if (agent.spawnConfig.sessionPath && path.resolve(agent.spawnConfig.sessionPath) === target) {
+        return agent;
+      }
+    }
+    return null;
+  }
+
+  private findByPrincipalScope(principalId: string, projectId?: string): ManagedAgent | null {
+    for (const agent of this.agents.values()) {
+      if (samePrincipalScope(agent.spawnConfig, principalId, projectId)) {
         return agent;
       }
     }
@@ -611,8 +701,14 @@ export class AgentProcessManager {
             messageCount: 0,
             totalInputTokens: 0,
             totalOutputTokens: 0,
+            currentContextTokens: 0,
             projectId: managed.spawnConfig.projectId,
             projectRoot: managed.spawnConfig.projectRoot,
+            modelProviderId: managed.spawnConfig.modelProviderId,
+            modelId: managed.spawnConfig.modelId,
+            contextWindowTokens: managed.spawnConfig.contextWindowTokens,
+            maxOutputTokens: managed.spawnConfig.maxOutputTokens,
+            runtimeModelConfigPath: managed.spawnConfig.runtimeModelConfigPath,
           };
           this.registry.registerAgent(agentInfo);
 
@@ -628,12 +724,17 @@ export class AgentProcessManager {
             ...agentInfo,
             spawnId,
           });
+          this.resolveStartWaiter(spawnId, sessionId);
         } else {
           this.eventBus.broadcast('agent-online', {
             sessionId: spawnId,
             spawnId,
             controlMode: 'managed',
           });
+          this.rejectStartWaiter(
+            spawnId,
+            new Error(`Agent ${spawnId} emitted session_started without session_id`),
+          );
         }
         break;
       }
@@ -721,6 +822,73 @@ export class AgentProcessManager {
     }
   }
 
+  private handleManagedExit(
+    spawnId: string,
+    managedAgent: ManagedAgent,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    const agentId = managedAgent.sessionId ?? spawnId;
+    console.log(`[ProcessManager] Agent ${agentId} exited with code=${code}, signal=${signal}`);
+
+    this.eventBus.broadcast('agent-offline', {
+      sessionId: agentId,
+      spawnId,
+      code,
+      signal,
+    });
+
+    if (managedAgent.sessionId) {
+      const existingAgent = this.registry.getAgent(managedAgent.sessionId);
+      if (existingAgent) {
+        this.registry.registerAgent({ ...existingAgent, status: 'offline' });
+      }
+      if (managedAgent.spawnConfig.projectId) {
+        this.registry.projectRegistry.detachAgent(
+          managedAgent.spawnConfig.projectId,
+          managedAgent.sessionId,
+        );
+      }
+    }
+
+    managedAgent.stdoutReader.close();
+    managedAgent.stderrReader.close();
+    managedAgent.process.stdout?.destroy();
+    managedAgent.process.stderr?.destroy();
+    managedAgent.process.stdin?.end();
+    managedAgent.process.stdin?.destroy();
+    this.agents.delete(spawnId);
+    if (!managedAgent.sessionId) {
+      this.rejectStartWaiter(
+        spawnId,
+        new Error(`Agent ${spawnId} exited before session_started (code=${code}, signal=${signal})`),
+      );
+    }
+    if (managedAgent.sessionId) {
+      this.pendingSpawnMap.delete(managedAgent.sessionId);
+    }
+  }
+
+  private resolveStartWaiter(spawnId: string, sessionId: string): void {
+    const waiter = this.pendingStartWaiters.get(spawnId);
+    if (!waiter) {
+      return;
+    }
+    clearTimeout(waiter.timeout);
+    this.pendingStartWaiters.delete(spawnId);
+    waiter.resolve({ spawnId, sessionId });
+  }
+
+  private rejectStartWaiter(spawnId: string, error: Error): void {
+    const waiter = this.pendingStartWaiters.get(spawnId);
+    if (!waiter) {
+      return;
+    }
+    clearTimeout(waiter.timeout);
+    this.pendingStartWaiters.delete(spawnId);
+    waiter.reject(error);
+  }
+
   private buildCommand(launchSpec: AgentLaunchSpec): string {
     if (launchSpec.kind === 'binary') {
       return launchSpec.binaryPath;
@@ -783,14 +951,43 @@ export class AgentProcessManager {
       ...process.env,
       ...config.env,
       APPFS_PRINCIPAL_ID: config.principalId,
+      APPFS_ATTACH_ID: buildManagedAppfsAttachId(config.principalId),
       APPFS_MOUNT_ROOT: mountRoot,
       APPFS_RUNTIME_MANIFEST: path.join(mountRoot, '.well-known', 'appfs', 'runtime.json'),
     };
   }
 
   private resolveRuntimeModelConfig(config: SpawnConfig, spawnId: string): void {
-    if (config.runtimeModelConfigPath || !this.modelConfigStore) {
+    if (config.runtimeModelConfigPath && this.hydrateExistingRuntimeModelConfig(config)) {
       return;
+    }
+
+    if (!this.modelConfigStore) {
+      return;
+    }
+
+    // Fallback: If no providerId is specified, try to find a matching provider for the model name in the catalog
+    if (!config.modelProviderId && config.model && config.model !== 'unknown') {
+      try {
+        const allProviders = this.modelConfigStore.load().providers;
+        const matches: Array<{ providerId: string; modelId: string }> = [];
+        for (const p of allProviders) {
+          for (const m of p.models) {
+            if (m.name === config.model || m.id === config.model) {
+              matches.push({ providerId: p.id, modelId: m.id });
+            }
+          }
+        }
+        if (matches.length === 1) {
+          config.modelProviderId = matches[0].providerId;
+          config.modelId = matches[0].modelId;
+          console.log(`[ProcessManager] Fallback matched model "${config.model}" to provider "${config.modelProviderId}" and modelId "${config.modelId}"`);
+        } else if (matches.length > 1) {
+          console.warn(`[ProcessManager] Ambiguous model name "${config.model}" matches multiple providers: ${matches.map(m => m.providerId).join(', ')}. Skipping auto-fill.`);
+        }
+      } catch (err) {
+        console.error(`[ProcessManager] Error running model provider fallback:`, err);
+      }
     }
 
     const resolved = this.modelConfigStore.resolveSelection({
@@ -806,6 +1003,43 @@ export class AgentProcessManager {
     config.contextWindowTokens = resolved.model.contextWindowTokens;
     config.maxOutputTokens = resolved.model.maxOutputTokens;
     config.runtimeModelConfigPath = this.modelConfigStore.writeRuntimeConfig(resolved, spawnId);
+  }
+
+  private hydrateExistingRuntimeModelConfig(config: SpawnConfig): boolean {
+    const configPath = config.runtimeModelConfigPath?.trim();
+    if (!configPath) {
+      return false;
+    }
+
+    if (!fs.existsSync(configPath)) {
+      console.warn(`[ProcessManager] Runtime model config not found at ${configPath}; resolving from model catalog instead.`);
+      config.runtimeModelConfigPath = undefined;
+      return false;
+    }
+
+    try {
+      const resolved = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Partial<ResolvedRuntimeModelConfig>;
+      if (!resolved.providerId || !resolved.modelId || !resolved.model?.name) {
+        console.warn(`[ProcessManager] Runtime model config at ${configPath} is incomplete; resolving from model catalog instead.`);
+        config.runtimeModelConfigPath = undefined;
+        return false;
+      }
+      config.modelProviderId ??= resolved.providerId;
+      config.modelId ??= resolved.modelId;
+      config.contextWindowTokens ??= resolved.model?.contextWindowTokens;
+      config.maxOutputTokens ??= resolved.model?.maxOutputTokens;
+      if (!config.model?.trim() && resolved.model?.name) {
+        config.model = resolved.model.name;
+      }
+      return true;
+    } catch (err) {
+      console.warn(
+        `[ProcessManager] Failed to read runtime model config at ${configPath}; resolving from model catalog instead:`,
+        err,
+      );
+      config.runtimeModelConfigPath = undefined;
+      return false;
+    }
   }
 
   private permissionArgs(permissionMode: string): string[] {
@@ -825,6 +1059,9 @@ export class AgentProcessManager {
   // ── Shutdown all ──
 
   async shutdown(): Promise<void> {
+    for (const spawnId of Array.from(this.pendingStartWaiters.keys())) {
+      this.rejectStartWaiter(spawnId, new Error(`Agent ${spawnId} was shut down before session_started`));
+    }
     const shutdowns = Array.from(this.agents.entries()).map(([spawnId, managed]) => {
       console.log(`[ProcessManager] Shutting down agent ${managed.sessionId ?? spawnId}`);
       return terminateChildProcessTree(managed.process, {
@@ -835,6 +1072,30 @@ export class AgentProcessManager {
     await Promise.allSettled(shutdowns);
     this.agents.clear();
   }
+}
+
+function agentStartTimeoutMs(): number {
+  const parsed = Number.parseInt(process.env.DASHBOARD_AGENT_START_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_START_TIMEOUT_MS;
+}
+
+export function latestResumableAgentPerPrincipal(agents: AgentInfo[]): AgentInfo[] {
+  const latestByPrincipal = new Map<string, AgentInfo>();
+  for (const agent of agents) {
+    if (agent.archived) {
+      continue;
+    }
+    const principalId = agent.principalId || agent.name;
+    if (!principalId) {
+      continue;
+    }
+    const current = latestByPrincipal.get(principalId);
+    if (!current || agent.startedAt > current.startedAt) {
+      latestByPrincipal.set(principalId, agent);
+    }
+  }
+  return Array.from(latestByPrincipal.values())
+    .sort((a, b) => b.startedAt - a.startedAt);
 }
 
 function workspaceFingerprintFromSessionPath(sessionPath: string): string | undefined {

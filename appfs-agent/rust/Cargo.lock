@@ -1125,6 +1125,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "fd-lock",
  "getrandom 0.2.17",
  "glob",
  "plugins",
