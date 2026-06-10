@@ -216,10 +216,12 @@ impl AppfsRuntimeSupervisor {
     }
 
     fn drain_control_plane_and_materialize_private_apps(&mut self) -> Result<()> {
-        let invocations = self.control_plane.drain_invocations()?;
+        let mut pending = self.control_plane.drain_invocations_uncommitted()?;
+        let invocations = std::mem::take(&mut pending.invocations);
         for invocation in invocations {
             self.handle_control_invocation(invocation)?;
         }
+        self.control_plane.commit_pending_invocations(pending)?;
         Ok(())
     }
 
@@ -428,8 +430,9 @@ impl AppfsRuntimeSupervisor {
             active_attaches: Vec::new(),
             agent_status: None,
         };
-        self.principal_registry.principals.push(record.clone());
-        self.persist_principal_registry()?;
+        let mut next_registry = self.principal_registry.clone();
+        next_registry.principals.push(record.clone());
+        self.replace_principal_registry(next_registry)?;
         registry::write_principal_record_view(&self.root, &record)?;
         let materialized = self.materialize_private_apps_for_principal(&record)?;
         self.control_plane.emit_completed(
@@ -452,11 +455,11 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::UpdatePrincipalRequest,
     ) -> Result<()> {
-        let Some(record) = self
+        let Some(record_index) = self
             .principal_registry
             .principals
-            .iter_mut()
-            .find(|principal| principal.principal_id == request.principal_id)
+            .iter()
+            .position(|principal| principal.principal_id == request.principal_id)
         else {
             self.control_plane.emit_failed(
                 "/_appfs/principals/update_principal.act",
@@ -468,6 +471,8 @@ impl AppfsRuntimeSupervisor {
             return Ok(());
         };
 
+        let mut next_registry = self.principal_registry.clone();
+        let record = &mut next_registry.principals[record_index];
         let mut meaningful_change = false;
 
         if let Some(display_name) = request.display_name {
@@ -539,7 +544,7 @@ impl AppfsRuntimeSupervisor {
 
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
-        self.persist_principal_registry()?;
+        self.replace_principal_registry(next_registry)?;
         registry::write_principal_record_view(&self.root, &updated)?;
 
         if meaningful_change {
@@ -600,7 +605,6 @@ impl AppfsRuntimeSupervisor {
             )?;
             return Ok(());
         }
-        self.principal_registry.principals.remove(principal_index);
         let cleanup_keys = self
             .runtimes
             .iter()
@@ -651,10 +655,12 @@ impl AppfsRuntimeSupervisor {
 
             credential_cleanup_requests.push(cleanup_request);
         }
+        let mut next_registry = self.principal_registry.clone();
+        next_registry.principals.remove(principal_index);
+        self.replace_principal_registry(next_registry)?;
         for runtime_key in cleanup_keys {
             self.runtimes.remove(&runtime_key);
         }
-        self.persist_principal_registry()?;
         registry::delete_principal_record_view(&self.root, &request.principal_id)?;
         if cleanup_count > 0 {
             self.sync_registry_to_disk(None)?;
@@ -681,11 +687,11 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::AttachPrincipalRequest,
     ) -> Result<()> {
-        let Some(record) = self
+        let Some(record_index) = self
             .principal_registry
             .principals
-            .iter_mut()
-            .find(|principal| principal.principal_id == request.principal_id)
+            .iter()
+            .position(|principal| principal.principal_id == request.principal_id)
         else {
             self.control_plane.emit_failed(
                 "/_appfs/principals/attach_principal.act",
@@ -697,6 +703,8 @@ impl AppfsRuntimeSupervisor {
             return Ok(());
         };
 
+        let mut next_registry = self.principal_registry.clone();
+        let record = &mut next_registry.principals[record_index];
         let now = chrono::Utc::now().to_rfc3339();
         let now_dt = chrono::Utc::now();
         let mut lease_created = false;
@@ -750,7 +758,7 @@ impl AppfsRuntimeSupervisor {
         record.active_attach_count = record.active_attaches.len() as u32;
         record.updated_at = now;
         let updated = record.clone();
-        self.persist_principal_registry()?;
+        self.replace_principal_registry(next_registry)?;
         registry::write_principal_record_view(&self.root, &updated)?;
         let materialized = self.materialize_private_apps_for_principal(&updated)?;
         self.control_plane.emit_completed(
@@ -777,11 +785,11 @@ impl AppfsRuntimeSupervisor {
         client_token: Option<String>,
         request: action_dispatcher::DetachPrincipalRequest,
     ) -> Result<()> {
-        let Some(record) = self
+        let Some(record_index) = self
             .principal_registry
             .principals
-            .iter_mut()
-            .find(|principal| principal.principal_id == request.principal_id)
+            .iter()
+            .position(|principal| principal.principal_id == request.principal_id)
         else {
             self.control_plane.emit_failed(
                 "/_appfs/principals/detach_principal.act",
@@ -793,6 +801,8 @@ impl AppfsRuntimeSupervisor {
             return Ok(());
         };
 
+        let mut next_registry = self.principal_registry.clone();
+        let record = &mut next_registry.principals[record_index];
         let before = record.active_attaches.len();
         record
             .active_attaches
@@ -818,7 +828,7 @@ impl AppfsRuntimeSupervisor {
         record.active_attach_count = record.active_attaches.len() as u32;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
-        self.persist_principal_registry()?;
+        self.replace_principal_registry(next_registry)?;
         registry::write_principal_record_view(&self.root, &updated)?;
         self.control_plane.emit_completed(
             "/_appfs/principals/detach_principal.act",
@@ -851,13 +861,24 @@ impl AppfsRuntimeSupervisor {
 
     /// Get a shared reference to the in-memory principal registry.
     #[allow(dead_code)]
-    fn principal_registry(&self) -> &registry::PrincipalRegistryDoc {
+    pub(super) fn principal_registry(&self) -> &registry::PrincipalRegistryDoc {
         &self.principal_registry
     }
 
     /// Persist the in-memory principal registry to disk (registry + status files).
     fn persist_principal_registry(&self) -> Result<()> {
         registry::write_principal_registry(&self.root, &self.principal_registry)
+    }
+
+    /// Persist a candidate principal registry and only commit it in memory once
+    /// the external registry/status files are published successfully.
+    fn replace_principal_registry(
+        &mut self,
+        next_registry: registry::PrincipalRegistryDoc,
+    ) -> Result<()> {
+        registry::write_principal_registry(&self.root, &next_registry)?;
+        self.principal_registry = next_registry;
+        Ok(())
     }
 
     fn materialize_private_apps_for_principal(

@@ -11,6 +11,7 @@ import type { ProjectRegistry } from './project-registry.js';
 import type { AgentInfo, TokenUsage } from './types.js';
 import { terminateChildProcessTree } from './child-process-utils.js';
 import type { ModelConfigStore, ResolvedRuntimeModelConfig } from './model-config-store.js';
+import { PersistentLog, resolveDashboardLogDir, safeLogFileSegment } from './persistent-log.js';
 
 // ── Launch specification types ──
 
@@ -121,6 +122,7 @@ interface ManagedAgent {
   controlEndpoint: HeadlessControlEndpoint | null;
   stdoutReader: ReadlineInterface;
   stderrReader: ReadlineInterface;
+  log?: PersistentLog;
 }
 
 type ManagedAgentMap = Map<string, ManagedAgent>;
@@ -132,6 +134,7 @@ interface PendingStartWaiter {
 }
 
 const DEFAULT_AGENT_START_TIMEOUT_MS = 30_000;
+const DASHBOARD_AGENT_LOG_RAW_STDOUT = 'DASHBOARD_AGENT_LOG_RAW_STDOUT';
 
 // ── AgentProcessManager ──
 
@@ -178,8 +181,18 @@ export class AgentProcessManager {
 
     const args = this.buildArgs(effectiveSpawnConfig);
     const cmd = this.buildCommand(effectiveSpawnConfig.launchSpec);
+    const agentLog = this.createAgentLog(spawnId, effectiveSpawnConfig);
 
     console.log(`[ProcessManager] Spawning agent ${spawnId}: ${cmd} ${args.join(' ')}`);
+    agentLog?.appendLine(`[ProcessManager] spawnId=${spawnId}`);
+    agentLog?.appendLine(`[ProcessManager] projectId=${effectiveSpawnConfig.projectId ?? '<none>'}`);
+    agentLog?.appendLine(`[ProcessManager] principalId=${effectiveSpawnConfig.principalId}`);
+    agentLog?.appendLine(`[ProcessManager] cwd=${effectiveSpawnConfig.cwd}`);
+    agentLog?.appendLine(`[ProcessManager] appfsMountRoot=${effectiveSpawnConfig.appfsMountRoot}`);
+    agentLog?.appendLine(`[ProcessManager] model=${effectiveSpawnConfig.model}`);
+    agentLog?.appendLine(`[ProcessManager] sessionPath=${effectiveSpawnConfig.sessionPath ?? '<new>'}`);
+    agentLog?.appendLine(`[ProcessManager] runtimeModelConfigPath=${effectiveSpawnConfig.runtimeModelConfigPath ?? '<none>'}`);
+    agentLog?.appendLine(`[ProcessManager] cmd=${cmd} args=${args.join(' ')}`);
     this.eventBus.broadcast('process-log', {
       agentId: spawnId,
       spawnId,
@@ -207,6 +220,7 @@ export class AgentProcessManager {
       controlEndpoint: null,
       stdoutReader,
       stderrReader,
+      log: agentLog,
     };
 
     this.agents.set(spawnId, managedAgent);
@@ -218,22 +232,18 @@ export class AgentProcessManager {
 
     // ── stderr log forwarder ──
     stderrReader.on('line', (line: string) => {
-      const agentId = managedAgent.sessionId ?? spawnId;
-      this.eventBus.broadcast('process-log', {
-        agentId,
-        spawnId,
-        stream: 'stderr',
-        text: line,
-      });
+      this.forwardStderrLine(spawnId, managedAgent, line);
     });
 
     // ── Process exit ──
     childProcess.on('exit', (code, signal) => {
+      managedAgent.log?.appendLine(`[ProcessManager] exited code=${code} signal=${signal}`);
       this.handleManagedExit(spawnId, managedAgent, code, signal);
     });
 
     childProcess.on('error', (err) => {
       console.error(`[ProcessManager] Spawn error for ${spawnId}:`, err);
+      managedAgent.log?.appendLine(`[ProcessManager] spawn error: ${err.stack ?? err.message}`);
       this.eventBus.broadcast('process-log', {
         agentId: spawnId,
         spawnId,
@@ -664,6 +674,7 @@ export class AgentProcessManager {
       event = JSON.parse(line);
     } catch {
       // Non-JSON line from stdout; log as process output
+      this.appendStdoutLog(managed, line);
       this.eventBus.broadcast('process-log', {
         agentId: managed.sessionId ?? spawnId,
         spawnId,
@@ -674,6 +685,7 @@ export class AgentProcessManager {
     }
 
     const agentId = managed.sessionId ?? spawnId;
+    this.appendHeadlessEventLog(managed, event);
 
     switch (event.type) {
       case 'session_started': {
@@ -822,6 +834,47 @@ export class AgentProcessManager {
     }
   }
 
+  private forwardStderrLine(spawnId: string, managedAgent: ManagedAgent, line: string): void {
+    const agentId = managedAgent.sessionId ?? spawnId;
+    managedAgent.log?.appendLine(`[stderr] ${line}`);
+    this.eventBus.broadcast('process-log', {
+      agentId,
+      spawnId,
+      stream: 'stderr',
+      text: line,
+    });
+  }
+
+  private appendStdoutLog(managedAgent: ManagedAgent, line: string): void {
+    if (shouldLogRawAgentStdout()) {
+      managedAgent.log?.appendLine(`[stdout] ${line}`);
+    } else {
+      managedAgent.log?.appendLine(`[stdout] <non-json ${line.length} chars; set ${DASHBOARD_AGENT_LOG_RAW_STDOUT}=1 to persist raw stdout>`);
+    }
+  }
+
+  private appendHeadlessEventLog(managedAgent: ManagedAgent, event: HeadlessEvent): void {
+    if (shouldLogRawAgentStdout()) {
+      managedAgent.log?.appendLine(`[stdout] ${JSON.stringify(event)}`);
+      return;
+    }
+
+    const parts = [`type=${event.type}`];
+    appendLogPart(parts, 'session', event.session_id);
+    appendLogPart(parts, 'principal', event.principal_id);
+    appendLogPart(parts, 'request', event.request_id);
+    appendLogPart(parts, 'turn', event.turn_id);
+    appendLogPart(parts, 'tool', event.tool_name);
+    appendLogPart(parts, 'status', event.status);
+    if (event.message) {
+      appendLogPart(parts, 'message', truncateForLog(event.message, 240));
+    }
+    if (event.type === 'assistant_delta') {
+      appendLogPart(parts, 'text_len', String(event.text?.length ?? 0));
+    }
+    managedAgent.log?.appendLine(`[stdout-event] ${parts.join(' ')}`);
+  }
+
   private handleManagedExit(
     spawnId: string,
     managedAgent: ManagedAgent,
@@ -887,6 +940,25 @@ export class AgentProcessManager {
     clearTimeout(waiter.timeout);
     this.pendingStartWaiters.delete(spawnId);
     waiter.reject(error);
+  }
+
+  private createAgentLog(spawnId: string, config: SpawnConfig): PersistentLog | undefined {
+    try {
+      const projectSegment = safeLogFileSegment(config.projectId ?? config.projectRoot ?? 'project');
+      const principalSegment = safeLogFileSegment(config.principalId);
+      const spawnSegment = safeLogFileSegment(spawnId);
+      return new PersistentLog(path.join(
+        resolveDashboardLogDir(),
+        'agents',
+        `agent-${projectSegment}-${principalSegment}-${spawnSegment}.log`,
+      ));
+    } catch (err) {
+      console.warn(
+        `[ProcessManager] Failed to create persistent agent log for ${spawnId}:`,
+        err,
+      );
+      return undefined;
+    }
   }
 
   private buildCommand(launchSpec: AgentLaunchSpec): string {
@@ -1077,6 +1149,25 @@ export class AgentProcessManager {
 function agentStartTimeoutMs(): number {
   const parsed = Number.parseInt(process.env.DASHBOARD_AGENT_START_TIMEOUT_MS ?? '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_START_TIMEOUT_MS;
+}
+
+function shouldLogRawAgentStdout(): boolean {
+  const value = process.env[DASHBOARD_AGENT_LOG_RAW_STDOUT];
+  return value === '1' || value?.toLowerCase() === 'true';
+}
+
+function appendLogPart(parts: string[], key: string, value: string | undefined): void {
+  if (value === undefined || value === '') {
+    return;
+  }
+  parts.push(`${key}=${value}`);
+}
+
+function truncateForLog(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength)}...`;
 }
 
 export function latestResumableAgentPerPrincipal(agents: AgentInfo[]): AgentInfo[] {

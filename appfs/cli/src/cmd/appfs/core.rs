@@ -14,29 +14,28 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use uuid::Uuid;
 
+use super::action_consumer::{
+    self, ActionConsumerConfig, ActionInvocation, ActionInvocationHandler, InvalidActionPayload,
+};
 use super::action_dispatcher;
-use super::errors::{is_transient_connector_failure, ERR_INVALID_PAYLOAD};
+use super::errors::is_transient_connector_failure;
 use super::grpc_bridge_adapter::GrpcBridgeConnector;
 use super::http_bridge_adapter::HttpBridgeConnector;
 use super::shared::{
-    action_template_matches, boundary_probe_from_bytes, classify_multiline_json_payload,
-    collect_files_with_suffix, decode_jsonl_line, env_flag_enabled, extract_client_token,
-    has_odd_unescaped_quotes, is_handle_format_valid, is_safe_action_rel_path,
-    is_transient_action_sink_busy, parse_snapshot_on_timeout_policy, template_specificity,
-    write_pretty_json_file, MultilineRecoveryOutcome,
+    action_template_matches, env_flag_enabled, extract_client_token, is_handle_format_valid,
+    is_safe_action_rel_path, parse_snapshot_on_timeout_policy, template_specificity,
+    write_pretty_json_file,
 };
 use super::tree_sync::{
     ensure_app_structure_initialized_at, refresh_app_structure, refresh_app_structure_in_db,
 };
 use super::{
-    ActionCursorDoc, ActionCursorState, ActionSpec, AppRuntimeStartupBootstrap, AppfsAdapter,
-    AppfsBridgeConfig, CursorState, ExecutionMode, InputMode, ManifestContract, ManifestDoc,
-    ProcessOutcome, SnapshotSpec, StreamingJob, ACTION_CURSORS_FILENAME,
-    DEFAULT_RETENTION_HINT_SEC, DEFAULT_SNAPSHOT_MAX_MATERIALIZED_BYTES,
-    DEFAULT_SNAPSHOT_PREWARM_TIMEOUT_MS, DEFAULT_SNAPSHOT_READ_THROUGH_TIMEOUT_MS,
-    SNAPSHOT_EXPAND_JOURNAL_FILENAME,
+    ActionSpec, AppRuntimeStartupBootstrap, AppfsAdapter, AppfsBridgeConfig, CursorState,
+    ExecutionMode, InputMode, ManifestContract, ManifestDoc, ProcessOutcome, SnapshotSpec,
+    StreamingJob, ACTION_CURSORS_FILENAME, DEFAULT_RETENTION_HINT_SEC,
+    DEFAULT_SNAPSHOT_MAX_MATERIALIZED_BYTES, DEFAULT_SNAPSHOT_PREWARM_TIMEOUT_MS,
+    DEFAULT_SNAPSHOT_READ_THROUGH_TIMEOUT_MS, SNAPSHOT_EXPAND_JOURNAL_FILENAME,
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -422,7 +421,7 @@ impl AppfsAdapter {
             next_seq,
             action_cursors: match startup_bootstrap.as_ref() {
                 Some(bootstrap) => bootstrap.action_cursors.clone(),
-                None => Self::load_action_cursors(&action_cursors_path)?,
+                None => action_consumer::load_action_cursors(&action_cursors_path)?,
             },
             handles: HashMap::new(),
             handle_aliases: HashMap::new(),
@@ -472,7 +471,7 @@ impl AppfsAdapter {
     }
 
     pub(super) fn prepare_action_sinks(&mut self) -> Result<()> {
-        let actions = self.collect_action_files()?;
+        let actions = action_consumer::collect_action_files(&self.app_dir)?;
         for action in actions {
             #[cfg(not(unix))]
             let _ = &action;
@@ -561,19 +560,21 @@ impl AppfsAdapter {
     }
 
     fn drain_action_sinks(&mut self) -> Result<()> {
-        let mut actions = self.collect_action_files()?;
-        actions.sort();
-        let mut cursor_dirty = false;
-
-        for action_path in actions {
-            cursor_dirty |= self.process_action_sink(&action_path)?;
-        }
-
-        if cursor_dirty {
-            self.save_action_cursors()?;
-        }
-
-        Ok(())
+        let config = ActionConsumerConfig {
+            app_id: self.app_id.clone(),
+            session_id: self.session_id.clone(),
+            app_dir: self.app_dir.clone(),
+            action_cursors_path: self.action_cursors_path.clone(),
+            action_specs: self.action_specs.clone(),
+            actionline_strict: self.actionline_strict,
+            cursor_label: "AppFS adapter action cursors",
+            log_label: "AppFS adapter",
+            fixed_action_order: None,
+        };
+        let mut action_cursors = std::mem::take(&mut self.action_cursors);
+        let result = action_consumer::drain_action_sinks(config, &mut action_cursors, self);
+        self.action_cursors = action_cursors;
+        result
     }
 
     fn refresh_structure_after_background_change(&mut self, reason: AppStructureSyncReason) {
@@ -604,236 +605,12 @@ impl AppfsAdapter {
         }
     }
 
-    fn process_action_sink(&mut self, action_path: &Path) -> Result<bool> {
-        let rel = self.rel_path_for_log(action_path);
-        if !is_safe_action_rel_path(&rel) {
-            eprintln!("AppFS adapter rejected unsafe action path: {rel}");
-            return Ok(false);
-        }
-
-        let Some(spec) = self.find_action_spec(&rel).cloned() else {
-            eprintln!("AppFS adapter ignored undeclared action path: {rel}");
-            return Ok(false);
-        };
-
-        let mut cursor = self.action_cursors.get(&rel).cloned().unwrap_or_default();
-        let original_cursor = cursor.clone();
-        let file_len = match fs::metadata(action_path) {
-            Ok(meta) => meta.len(),
-            Err(err) => {
-                if is_transient_action_sink_busy(&err) {
-                    // Writer currently owns an exclusive handle (common on Windows).
-                    // Defer and retry next poll without consuming data.
-                    return Ok(false);
-                }
-                eprintln!(
-                    "AppFS adapter rejected action payload for {rel}: validation={ERR_INVALID_PAYLOAD} reason={}",
-                    err
-                );
-                return Ok(false);
-            }
-        };
-
-        if cursor.offset > file_len {
-            eprintln!(
-                "AppFS adapter HIGH: illegal action sink truncation detected for {rel}: offset={} file_len={file_len}; skipping rewritten content and waiting for future append",
-                cursor.offset
-            );
-            cursor.offset = file_len;
-            cursor.boundary_probe = None;
-            cursor.pending_multiline_eof_len = None;
-        } else if cursor.offset == file_len {
-            return Ok(false);
-        }
-
-        let bytes = match fs::read(action_path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if is_transient_action_sink_busy(&err) {
-                    return Ok(false);
-                }
-                eprintln!(
-                    "AppFS adapter rejected action payload for {rel}: validation={ERR_INVALID_PAYLOAD} reason={}",
-                    err
-                );
-                return Ok(false);
-            }
-        };
-        let file_len = bytes.len() as u64;
-
-        if cursor.offset > file_len {
-            eprintln!(
-                "AppFS adapter HIGH: illegal action sink truncation detected for {rel}: offset={} file_len={file_len}; skipping rewritten content and waiting for future append",
-                cursor.offset
-            );
-            cursor.offset = file_len;
-            cursor.boundary_probe = None;
-            cursor.pending_multiline_eof_len = None;
-        } else if cursor.offset > 0 && cursor.boundary_probe.is_some() {
-            let expected = cursor.boundary_probe.as_deref().unwrap_or_default();
-            let current = boundary_probe_from_bytes(&bytes, cursor.offset);
-            if current.as_deref() != Some(expected) {
-                eprintln!(
-                    "AppFS adapter HIGH: illegal action sink overwrite detected for {rel}: offset={} (probe mismatch); skipping rewritten content and waiting for future append",
-                    cursor.offset
-                );
-                cursor.offset = file_len;
-                cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                cursor.pending_multiline_eof_len = None;
-            }
-        }
-
-        let mut position = cursor.offset as usize;
-        while position < bytes.len() {
-            while position < bytes.len() && bytes[position] == 0 {
-                // PowerShell 5 `>>` (Out-File) may leave a trailing UTF-16 newline NUL byte
-                // after our `\n` delimiter split. Consume it so the cursor can progress.
-                position += 1;
-                cursor.offset = position as u64;
-                cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                cursor.pending_multiline_eof_len = None;
-            }
-            if position >= bytes.len() {
-                break;
-            }
-
-            let Some(rel_idx) = bytes[position..].iter().position(|b| *b == b'\n') else {
-                break;
-            };
-            let line_end = position + rel_idx + 1;
-            let line_bytes = &bytes[position..line_end];
-            let mut payload = match decode_jsonl_line(line_bytes, position == 0) {
-                Ok(Some(line)) => line,
-                Ok(None) => {
-                    cursor.offset = line_end as u64;
-                    cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                    cursor.pending_multiline_eof_len = None;
-                    position = line_end;
-                    continue;
-                }
-                Err(reason) => {
-                    let len = line_bytes.len();
-                    eprintln!(
-                        "AppFS adapter rejected action payload for {rel}: validation={ERR_INVALID_PAYLOAD} len={len} reason={reason}"
-                    );
-                    cursor.offset = line_end as u64;
-                    cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                    cursor.pending_multiline_eof_len = None;
-                    position = line_end;
-                    continue;
-                }
-            };
-            let mut payload_line_end = line_end;
-            let mut client_token_override = None;
-
-            if matches!(spec.input_mode, InputMode::Json)
-                && serde_json::from_str::<JsonValue>(&payload).is_err()
-                && has_odd_unescaped_quotes(&payload)
-            {
-                match classify_multiline_json_payload(&bytes, &payload, line_end, &spec) {
-                    Some(MultilineRecoveryOutcome::Recovered {
-                        merged_payload,
-                        merged_line_end,
-                        consumed_lines,
-                    }) => {
-                        eprintln!(
-                            "AppFS adapter normalized shell-expanded newline for {rel}: consumed_lines={consumed_lines}"
-                        );
-                        payload = merged_payload;
-                        payload_line_end = merged_line_end;
-                        cursor.pending_multiline_eof_len = None;
-                    }
-                    Some(MultilineRecoveryOutcome::PendingAtEof) => {
-                        let pending_len = bytes.len() as u64;
-                        if cursor.pending_multiline_eof_len == Some(pending_len) {
-                            cursor.pending_multiline_eof_len = None;
-                        } else {
-                            eprintln!(
-                                "AppFS adapter deferred incomplete multiline payload for {rel} at offset={}",
-                                cursor.offset
-                            );
-                            cursor.pending_multiline_eof_len = Some(pending_len);
-                            break;
-                        }
-                    }
-                    None => {
-                        cursor.pending_multiline_eof_len = None;
-                    }
-                }
-            } else {
-                cursor.pending_multiline_eof_len = None;
-            }
-
-            match action_dispatcher::normalize_actionline_payload(&payload, self.actionline_strict)
-            {
-                Ok(Some(parsed)) => {
-                    client_token_override = Some(parsed.client_token);
-                    payload = parsed.payload_json;
-                }
-                Ok(None) => {}
-                Err(validation) => {
-                    let len = payload.len();
-                    eprintln!(
-                        "AppFS adapter rejected action payload for {rel}: validation={} len={len} reason={}",
-                        validation.code, validation.reason
-                    );
-                    cursor.offset = payload_line_end as u64;
-                    cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                    cursor.pending_multiline_eof_len = None;
-                    position = payload_line_end;
-                    continue;
-                }
-            }
-
-            let client_token = client_token_override
-                .or_else(|| extract_client_token(&payload))
-                .or_else(|| {
-                    Some(stable_action_line_client_token(
-                        &self.app_id,
-                        &self.session_id,
-                        &rel,
-                        cursor.offset,
-                        &payload,
-                    ))
-                });
-
-            match self.process_action(&rel, &spec, &payload, client_token)? {
-                ProcessOutcome::Consumed => {
-                    cursor.offset = payload_line_end as u64;
-                    cursor.boundary_probe = boundary_probe_from_bytes(&bytes, cursor.offset);
-                    cursor.pending_multiline_eof_len = None;
-                    position = payload_line_end;
-                }
-                ProcessOutcome::RetryPending => {
-                    eprintln!(
-                        "AppFS adapter deferred action retry for {rel} at offset={}",
-                        cursor.offset
-                    );
-                    break;
-                }
-            }
-        }
-
-        let changed = cursor != original_cursor;
-        if changed {
-            self.action_cursors.insert(rel, cursor);
-        }
-        Ok(changed)
-    }
-
-    fn rel_path_for_log(&self, action_path: &Path) -> String {
-        action_path
-            .strip_prefix(&self.app_dir)
-            .unwrap_or(action_path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    }
-
     fn process_action(
         &mut self,
         rel: &str,
         spec: &ActionSpec,
         payload: &str,
+        request_id: &str,
         client_token_override: Option<String>,
     ) -> Result<ProcessOutcome> {
         if let Err(code) = action_dispatcher::validate_submit_payload(spec, payload) {
@@ -845,7 +622,6 @@ impl AppfsAdapter {
         }
 
         let normalized_path = format!("/{}", rel);
-        let request_id = Self::new_request_id();
         let client_token = client_token_override.or_else(|| extract_client_token(payload));
 
         match action_dispatcher::route_action(&normalized_path, payload) {
@@ -963,7 +739,7 @@ impl AppfsAdapter {
         let request_ctx = ConnectorContext {
             app_id: self.app_id.clone(),
             session_id: self.session_id.clone(),
-            request_id: request_id.clone(),
+            request_id: request_id.to_string(),
             client_token: client_token.clone(),
             trace_id: None,
             principal_id: self.principal_id.clone(),
@@ -1195,7 +971,14 @@ impl AppfsAdapter {
             );
         };
         let payload_json = serde_json::to_string(&payload)?;
-        self.process_action(&normalized_path, &spec, &payload_json, client_token)
+        let request_id = action_consumer::new_request_id();
+        self.process_action(
+            &normalized_path,
+            &spec,
+            &payload_json,
+            &request_id,
+            client_token,
+        )
     }
 
     fn find_action_spec(&self, rel_path: &str) -> Option<&ActionSpec> {
@@ -1305,34 +1088,6 @@ struct ConnectorSideEvent {
     path: Option<String>,
     content: Option<JsonValue>,
     error: Option<JsonValue>,
-}
-
-fn stable_action_line_client_token(
-    app_id: &str,
-    session_id: &str,
-    rel: &str,
-    offset: u64,
-    payload: &str,
-) -> String {
-    // Action retries must keep a stable idempotency key even when the caller
-    // intentionally keeps the JSONL action payload terse.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let offset = offset.to_string();
-    for part in [
-        app_id.as_bytes(),
-        session_id.as_bytes(),
-        rel.as_bytes(),
-        offset.as_bytes(),
-        payload.as_bytes(),
-    ] {
-        for byte in part {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash ^= u64::from(b'|');
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("appfs-act-{hash:016x}")
 }
 
 fn split_connector_side_events(mut content: JsonValue) -> (JsonValue, Vec<ConnectorSideEvent>) {
@@ -1589,35 +1344,6 @@ impl AppfsAdapter {
         )
     }
 
-    fn load_action_cursors(path: &Path) -> Result<HashMap<String, ActionCursorState>> {
-        if !path.exists() {
-            return Ok(HashMap::new());
-        }
-
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let doc: ActionCursorDoc = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        Ok(doc.actions)
-    }
-
-    fn save_action_cursors(&self) -> Result<()> {
-        let doc = ActionCursorDoc {
-            actions: self.action_cursors.clone(),
-        };
-        write_pretty_json_file(
-            &self.action_cursors_path,
-            &doc,
-            "AppFS adapter action cursors",
-        )
-    }
-
-    fn collect_action_files(&self) -> Result<Vec<PathBuf>> {
-        let mut out = Vec::new();
-        collect_files_with_suffix(&self.app_dir, ".act", &mut out)?;
-        Ok(out)
-    }
-
     pub(super) fn reload_manifest_contract(&mut self) -> Result<()> {
         let manifest_path = self.app_dir.join("_meta").join("manifest.res.json");
         let manifest_contract = Self::load_manifest_contract(&manifest_path)?;
@@ -1785,8 +1511,34 @@ impl AppfsAdapter {
     }
 
     fn new_request_id() -> String {
-        let uuid = Uuid::new_v4().simple().to_string();
-        format!("req-{}", &uuid[..8])
+        action_consumer::new_request_id()
+    }
+}
+
+impl ActionInvocationHandler for AppfsAdapter {
+    fn handle_action_invocation(
+        &mut self,
+        invocation: ActionInvocation,
+        spec: &ActionSpec,
+    ) -> Result<ProcessOutcome> {
+        self.process_action(
+            &invocation.rel_path,
+            spec,
+            &invocation.payload_json,
+            &invocation.request_id,
+            invocation.client_token,
+        )
+    }
+
+    fn handle_invalid_action_payload(
+        &mut self,
+        invalid: InvalidActionPayload,
+    ) -> Result<ProcessOutcome> {
+        eprintln!(
+            "AppFS adapter rejected action payload for {}: validation={} reason={}",
+            invalid.rel_path, invalid.code, invalid.message
+        );
+        Ok(ProcessOutcome::Consumed)
     }
 }
 
@@ -3032,7 +2784,13 @@ mod tests {
             .map(|line| serde_json::from_str::<JsonValue>(line).expect("event json"))
             .find(|event| event["type"] == "action.completed")
             .expect("completed event");
-        let expected = super::stable_action_line_client_token("aiim", "sess-test", rel, 0, payload);
+        let expected = crate::cmd::appfs::action_consumer::stable_action_line_client_token(
+            "aiim",
+            "sess-test",
+            rel,
+            0,
+            payload,
+        );
         assert_eq!(
             completed.get("client_token").and_then(JsonValue::as_str),
             Some(expected.as_str())

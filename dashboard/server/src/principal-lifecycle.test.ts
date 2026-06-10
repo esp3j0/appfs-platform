@@ -571,10 +571,17 @@ describe('PrincipalLifecycleService', () => {
     }
   });
 
-  it('resumeProjectPrincipals waits for each agent to publish session_started before starting the next', async () => {
+  it('resumeProjectPrincipals resumes agents with bounded parallelism and default priority', async () => {
     const fixture = createFixture();
+    const previousConcurrency = process.env.DASHBOARD_BOOTSTRAP_RESUME_CONCURRENCY;
+    process.env.DASHBOARD_BOOTSTRAP_RESUME_CONCURRENCY = '2';
 
     try {
+      writePrincipalRegistry(fixture.project.mountRoot, [
+        { principal_id: 'default', display_name: 'default' },
+        { principal_id: 'coder-new', display_name: 'coder-new' },
+        { principal_id: 'coder-old', display_name: 'coder-old' },
+      ]);
       fixture.agentRegistry.agents = [
         agentInfo({
           principalId: 'coder-new',
@@ -582,6 +589,13 @@ describe('PrincipalLifecycleService', () => {
           projectId: fixture.project.projectId,
           startedAt: 300,
           sessionJsonlPath: path.join(fixture.tempDir, 'session-new.jsonl'),
+        }),
+        agentInfo({
+          principalId: 'default',
+          sessionId: 'session-default',
+          projectId: fixture.project.projectId,
+          startedAt: 200,
+          sessionJsonlPath: path.join(fixture.tempDir, 'session-default.jsonl'),
         }),
         agentInfo({
           principalId: 'coder-old',
@@ -596,9 +610,15 @@ describe('PrincipalLifecycleService', () => {
       const firstStarted = new Promise<void>((resolve) => {
         releaseFirst = resolve;
       });
+      let releaseSecond!: () => void;
+      const secondStarted = new Promise<void>((resolve) => {
+        releaseSecond = resolve;
+      });
       fixture.processManager.spawnAndWaitStartedHandler = async (_config, spawnId) => {
         if (spawnId === 'spawn-1') {
           await firstStarted;
+        } else if (spawnId === 'spawn-2') {
+          await secondStarted;
         }
         return { spawnId, sessionId: `started-${spawnId}` };
       };
@@ -606,23 +626,39 @@ describe('PrincipalLifecycleService', () => {
       const resume = fixture.service.resumeProjectPrincipals(fixture.project.projectId);
       await Promise.resolve();
 
-      assert.strictEqual(fixture.processManager.spawned.length, 1);
-      assert.strictEqual(fixture.processManager.spawned[0]?.principalId, 'coder-new');
-
-      releaseFirst();
-      const result = await resume;
-
       assert.strictEqual(fixture.processManager.spawned.length, 2);
       assert.deepStrictEqual(
         fixture.processManager.spawned.map((config) => config.principalId),
-        ['coder-new', 'coder-old'],
+        ['default', 'coder-new'],
+      );
+
+      releaseFirst();
+      await waitForSpawnCount(fixture.processManager, 3);
+      assert.deepStrictEqual(
+        fixture.processManager.spawned.map((config) => config.principalId),
+        ['default', 'coder-new', 'coder-old'],
+      );
+
+      releaseSecond();
+      const result = await resume;
+
+      assert.strictEqual(fixture.processManager.spawned.length, 3);
+      assert.deepStrictEqual(
+        fixture.processManager.spawned.map((config) => config.principalId),
+        ['default', 'coder-new', 'coder-old'],
       );
       assert.deepStrictEqual(result.resumed, [
-        { sessionId: 'session-new', spawnId: 'spawn-1' },
-        { sessionId: 'session-old', spawnId: 'spawn-2' },
+        { sessionId: 'session-default', spawnId: 'spawn-1' },
+        { sessionId: 'session-new', spawnId: 'spawn-2' },
+        { sessionId: 'session-old', spawnId: 'spawn-3' },
       ]);
       assert.deepStrictEqual(result.errors, []);
     } finally {
+      if (previousConcurrency === undefined) {
+        delete process.env.DASHBOARD_BOOTSTRAP_RESUME_CONCURRENCY;
+      } else {
+        process.env.DASHBOARD_BOOTSTRAP_RESUME_CONCURRENCY = previousConcurrency;
+      }
       fixture.cleanup();
     }
   });
@@ -670,6 +706,17 @@ function writePrincipalRegistry(
       principals,
     }),
   );
+}
+
+async function waitForSpawnCount(processManager: FakeProcessManager, count: number): Promise<void> {
+  const deadline = Date.now() + 1000;
+  while (Date.now() <= deadline) {
+    if (processManager.spawned.length >= count) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(`Timed out waiting for ${count} spawned agents; saw ${processManager.spawned.length}`);
 }
 
 function completeNextDeleteAction(

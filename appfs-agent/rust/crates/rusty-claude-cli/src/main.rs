@@ -48,15 +48,15 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    attach_appfs_principal, auto_mark_read_for_wake_inputs, check_base_commit,
+    attach_appfs_principal_with_environment, auto_mark_read_for_wake_inputs, check_base_commit,
     clear_oauth_credentials, create_appfs_principal, detach_appfs_principal,
     detect_appfs_environment, ensure_appfs_attach_identity, format_stale_base_warning, format_usd,
-    generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt_with_appfs,
-    parse_oauth_callback_request_target, pricing_for_model, render_input_router_block,
-    resolve_expected_base, resolve_sandbox_status, sanitize_appfs_task_preview,
-    save_oauth_credentials, scan_appfs_attention_events_for_idle_wake, set_shell_if_windows,
-    heartbeat_appfs_principal, update_appfs_principal_agent_status, warmup_appfs_private_apps,
-    ApiClient, ApiRequest,
+    generate_pkce_pair, generate_state, heartbeat_appfs_principal, load_oauth_credentials,
+    load_system_prompt_with_appfs, parse_oauth_callback_request_target, pricing_for_model,
+    render_input_router_block, resolve_expected_base, resolve_sandbox_status,
+    sanitize_appfs_task_preview, save_oauth_credentials, scan_appfs_attention_events_for_idle_wake,
+    set_shell_if_windows, update_appfs_principal_agent_status, warmup_appfs_private_apps, ApiClient,
+    ApiRequest,
     AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachEnsureOutcome,
     AppfsAttachEnsureStatus, AppfsAttachLease, AppfsPrincipalCreateRequest,
     AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus, AssistantEvent, AutoCompactionConfig,
@@ -4086,6 +4086,7 @@ fn run_headless(
     });
     println!("{}", serde_json::to_string(&start_ev)?);
     io::stdout().flush()?;
+    spawn_live_cli_appfs_ensure_and_attach(cli.appfs_attach_state.clone());
 
     let shared_queue = SharedPendingInputQueue::default();
 
@@ -4097,28 +4098,22 @@ fn run_headless(
     // update_principal.act every 30 s.  This keeps the AppFS attach lease
     // fresh while the agent is idle, preventing the supervisor's stale
     // attach sweep from removing it.
-    let heartbeat_lease = cli.appfs_attach_lease.clone();
+    let heartbeat_state = cli.appfs_attach_state.clone();
     let (heartbeat_shutdown_tx, heartbeat_shutdown_rx) = mpsc::channel::<()>();
-    if heartbeat_lease.is_some() {
-        thread::spawn(move || {
-            const APPFS_HEARTBEAT_INTERVAL_SECS: u64 = 30;
-            loop {
-                let shutdown = heartbeat_shutdown_rx.recv_timeout(
-                    std::time::Duration::from_secs(APPFS_HEARTBEAT_INTERVAL_SECS),
-                );
-                match shutdown {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some(lease) = heartbeat_lease.as_ref() {
-                            if let Err(err) = heartbeat_appfs_principal(lease) {
-                                eprintln!("[AppFS heartbeat] {err}");
-                            }
-                        }
-                    }
+    thread::spawn(move || {
+        const APPFS_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+        loop {
+            let shutdown = heartbeat_shutdown_rx.recv_timeout(std::time::Duration::from_secs(
+                APPFS_HEARTBEAT_INTERVAL_SECS,
+            ));
+            match shutdown {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    LiveCli::heartbeat_appfs_attach_state(&heartbeat_state);
                 }
             }
-        });
-    }
+        }
+    });
 
     let (control_tx, control_rx) = mpsc::channel::<Result<HeadlessInput, String>>();
     let control_queue = shared_queue.clone();
@@ -4255,6 +4250,7 @@ fn run_headless(
         }
     }
 
+    drop(heartbeat_shutdown_tx);
     Ok(())
 }
 
@@ -4285,8 +4281,25 @@ struct LiveCli {
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
     appfs_attach_ensure: Option<AppfsAttachEnsureOutcome>,
-    appfs_attach_lease: Option<AppfsAttachLease>,
+    appfs_attach_state: SharedAppfsAttachState,
     redraw_handle: Option<OutputRedrawHandle>,
+}
+
+type SharedAppfsAttachState = Arc<Mutex<AppfsAttachState>>;
+
+#[derive(Debug, Default)]
+struct AppfsAttachState {
+    lease: Option<AppfsAttachLease>,
+    pending_status: Option<AppfsAgentStatusUpdate>,
+    shutting_down: bool,
+}
+
+fn new_appfs_attach_state(lease: Option<AppfsAttachLease>) -> SharedAppfsAttachState {
+    Arc::new(Mutex::new(AppfsAttachState {
+        lease,
+        pending_status: None,
+        shutting_down: false,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -4799,14 +4812,17 @@ const APPFS_MOUNT_READY_RETRY_TIMEOUT_MS: u64 = 10_000;
 
 fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     let cwd = env::current_dir().ok()?;
-    eprintln!("AppFS attach: checking identity and private apps...");
+    eprintln!("AppFS attach: checking identity...");
     let outcome = ensure_appfs_attach_identity(&cwd);
     if outcome.status == AppfsAttachEnsureStatus::NotAppfs {
         // When APPFS_MOUNT_ROOT is set we know the agent *should* be
         // attached to an AppFS mount.  If the environment cannot be
         // resolved yet (e.g. the WinFsp / FUSE mount is still starting
         // up after an Electron restart), retry instead of giving up.
-        if env::var("APPFS_MOUNT_ROOT").ok().map_or(false, |v| !v.trim().is_empty()) {
+        if env::var("APPFS_MOUNT_ROOT")
+            .ok()
+            .map_or(false, |v| !v.trim().is_empty())
+        {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(APPFS_MOUNT_READY_RETRY_TIMEOUT_MS);
             eprintln!(
@@ -4841,10 +4857,12 @@ fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     Some(outcome)
 }
 
-fn attach_live_cli_appfs_principal() -> Option<AppfsAttachLease> {
-    let cwd = env::current_dir().ok()?;
+fn attach_live_cli_appfs_principal(
+    outcome: &AppfsAttachEnsureOutcome,
+) -> Option<AppfsAttachLease> {
+    let environment = outcome.environment.as_ref()?;
     eprintln!("AppFS attach: registering attach lease...");
-    match attach_appfs_principal(&cwd) {
+    match attach_appfs_principal_with_environment(environment) {
         Ok(lease) => {
             eprintln!(
                 "AppFS attach: attach lease registered for principal {}",
@@ -4857,6 +4875,75 @@ fn attach_live_cli_appfs_principal() -> Option<AppfsAttachLease> {
             None
         }
     }
+}
+
+fn appfs_principal_id_from_ensure(outcome: Option<&AppfsAttachEnsureOutcome>) -> Option<&str> {
+    outcome?
+        .environment
+        .as_ref()
+        .map(|environment| environment.principal_id.as_str())
+}
+
+fn appfs_principal_id_from_env() -> Option<String> {
+    env::var(runtime::APPFS_PRINCIPAL_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn complete_appfs_attach(
+    state: &SharedAppfsAttachState,
+    lease: AppfsAttachLease,
+) -> bool {
+    let (pending_status, shutting_down) = {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.shutting_down {
+            guard.lease = None;
+        } else {
+            guard.lease = Some(lease.clone());
+        }
+        (guard.pending_status.take(), guard.shutting_down)
+    };
+    if let Some(update) = pending_status {
+        if let Err(error) = update_appfs_principal_agent_status(&lease, update) {
+            eprintln!("AppFS attach warning: failed to replay principal status: {error}");
+        }
+    }
+    if shutting_down {
+        if let Err(error) = detach_appfs_principal(&lease, "process_exit") {
+            eprintln!("AppFS attach warning: failed to detach late principal lease: {error}");
+        }
+        return false;
+    }
+    true
+}
+
+fn spawn_live_cli_appfs_ensure_and_attach(state: SharedAppfsAttachState) {
+    thread::spawn(move || {
+        let Some(outcome) = ensure_live_cli_appfs_attach_identity() else {
+            return;
+        };
+        if let Some(lease) = attach_live_cli_appfs_principal(&outcome) {
+            if complete_appfs_attach(&state, lease) {
+                warmup_live_cli_appfs_private_apps();
+            }
+        }
+    });
+}
+
+fn spawn_live_cli_appfs_attach(
+    outcome: AppfsAttachEnsureOutcome,
+    state: SharedAppfsAttachState,
+) {
+    thread::spawn(move || {
+        if let Some(lease) = attach_live_cli_appfs_principal(&outcome) {
+            if complete_appfs_attach(&state, lease) {
+                warmup_live_cli_appfs_private_apps();
+            }
+        }
+    });
 }
 
 fn warmup_live_cli_appfs_private_apps() {
@@ -4909,7 +4996,6 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
     let status = match outcome.status {
         AppfsAttachEnsureStatus::NotAppfs => "not detected",
         AppfsAttachEnsureStatus::Ready => "ready",
-        AppfsAttachEnsureStatus::WaitingForPrivateApps => "waiting for private apps",
         AppfsAttachEnsureStatus::Created => "created principal",
         AppfsAttachEnsureStatus::Submitted => "submitted principal create",
     };
@@ -4931,12 +5017,52 @@ fn format_appfs_attach_ensure_banner_line(outcome: &AppfsAttachEnsureOutcome) ->
 }
 
 impl LiveCli {
+    fn appfs_attach_lease(&self) -> Option<AppfsAttachLease> {
+        self.appfs_attach_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease
+            .clone()
+    }
+
     fn update_appfs_status(&self, update: AppfsAgentStatusUpdate) {
-        let Some(lease) = &self.appfs_attach_lease else {
+        let lease = {
+            let mut guard = self
+                .appfs_attach_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(lease) = guard.lease.clone() {
+                lease
+            } else {
+                guard.pending_status = Some(update);
+                return;
+            }
+        };
+        if let Err(error) = update_appfs_principal_agent_status(&lease, update) {
+            eprintln!("AppFS attach warning: failed to update principal status: {error}");
+        }
+    }
+
+    fn mark_appfs_attach_shutting_down(&self) -> Option<AppfsAttachLease> {
+        let mut guard = self
+            .appfs_attach_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.shutting_down = true;
+        guard.lease.take()
+    }
+
+    fn heartbeat_appfs_attach_state(state: &SharedAppfsAttachState) {
+        let lease = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease
+            .clone();
+        let Some(lease) = lease else {
             return;
         };
-        if let Err(error) = update_appfs_principal_agent_status(lease, update) {
-            eprintln!("AppFS attach warning: failed to update principal status: {error}");
+        if let Err(err) = heartbeat_appfs_principal(&lease) {
+            eprintln!("[AppFS heartbeat] {err}");
         }
     }
 
@@ -4999,14 +5125,13 @@ impl LiveCli {
         runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
-        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
-            attach_live_cli_appfs_principal()
-        } else {
-            None
-        };
+        let appfs_attach_lease = appfs_attach_ensure
+            .as_ref()
+            .and_then(attach_live_cli_appfs_principal);
         if appfs_attach_lease.is_some() {
             warmup_live_cli_appfs_private_apps();
         }
+        let appfs_attach_state = new_appfs_attach_state(appfs_attach_lease.clone());
         let system_prompt = build_system_prompt()?;
         let mut session_state = Session::new().with_model(&model);
         if let Some(lease) = &appfs_attach_lease {
@@ -5036,7 +5161,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             appfs_attach_ensure,
-            appfs_attach_lease,
+            appfs_attach_state,
             redraw_handle: None,
         };
         cli.update_appfs_status_idle(None);
@@ -5053,14 +5178,13 @@ impl LiveCli {
         runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
-        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
-            attach_live_cli_appfs_principal()
-        } else {
-            None
-        };
+        let appfs_attach_lease = appfs_attach_ensure
+            .as_ref()
+            .and_then(attach_live_cli_appfs_principal);
         if appfs_attach_lease.is_some() {
             warmup_live_cli_appfs_private_apps();
         }
+        let appfs_attach_state = new_appfs_attach_state(appfs_attach_lease);
         let system_prompt = build_system_prompt()?;
         let handle = resolve_session_path_or_reference(session_reference)?;
         let session_state = Session::load_from_path(&handle.path)?;
@@ -5091,7 +5215,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             appfs_attach_ensure,
-            appfs_attach_lease,
+            appfs_attach_state,
             redraw_handle: None,
         };
         cli.update_appfs_status_idle(None);
@@ -5105,19 +5229,12 @@ impl LiveCli {
         permission_mode: PermissionMode,
         runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
-        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
-            attach_live_cli_appfs_principal()
-        } else {
-            None
-        };
-        if appfs_attach_lease.is_some() {
-            warmup_live_cli_appfs_private_apps();
-        }
+        let appfs_attach_ensure = None;
+        let appfs_attach_state = new_appfs_attach_state(None);
         let system_prompt = build_system_prompt()?;
         let mut session_state = Session::new().with_model(&model);
-        if let Some(lease) = &appfs_attach_lease {
-            session_state = session_state.with_appfs_principal_id(lease.principal_id.as_str());
+        if let Some(principal_id) = appfs_principal_id_from_env() {
+            session_state = session_state.with_appfs_principal_id(principal_id);
         }
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -5143,7 +5260,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             appfs_attach_ensure,
-            appfs_attach_lease,
+            appfs_attach_state,
             redraw_handle: None,
         };
         cli.update_appfs_status_idle(None);
@@ -5158,18 +5275,16 @@ impl LiveCli {
         session_reference: &Path,
         runtime_model_config: Option<RuntimeModelConfigOverride>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let appfs_attach_ensure = ensure_live_cli_appfs_attach_identity();
-        let appfs_attach_lease = if appfs_attach_ensure.is_some() {
-            attach_live_cli_appfs_principal()
-        } else {
-            None
-        };
-        if appfs_attach_lease.is_some() {
-            warmup_live_cli_appfs_private_apps();
-        }
+        let appfs_attach_ensure = None;
+        let appfs_attach_state = new_appfs_attach_state(None);
         let system_prompt = build_system_prompt()?;
         let handle = resolve_session_path_or_reference(session_reference)?;
-        let session_state = Session::load_from_path(&handle.path)?;
+        let mut session_state = Session::load_from_path(&handle.path)?;
+        if session_state.appfs_principal_id.is_none() {
+            if let Some(principal_id) = appfs_principal_id_from_env() {
+                session_state = session_state.with_appfs_principal_id(principal_id);
+            }
+        }
         let session = SessionHandle {
             id: session_state.session_id.clone(),
             path: handle.path,
@@ -5197,7 +5312,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             appfs_attach_ensure,
-            appfs_attach_lease,
+            appfs_attach_state,
             redraw_handle: None,
         };
         cli.update_appfs_status_idle(None);
@@ -6493,8 +6608,12 @@ impl LiveCli {
 
         let previous_session = self.session.clone();
         let mut session_state = Session::new().with_model(&self.model);
-        if let Some(lease) = &self.appfs_attach_lease {
+        if let Some(lease) = self.appfs_attach_lease() {
             session_state = session_state.with_appfs_principal_id(lease.principal_id.as_str());
+        } else if let Some(principal_id) =
+            appfs_principal_id_from_ensure(self.appfs_attach_ensure.as_ref())
+        {
+            session_state = session_state.with_appfs_principal_id(principal_id);
         }
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -7133,10 +7252,8 @@ impl LiveCli {
 
 impl Drop for LiveCli {
     fn drop(&mut self) {
-        if self.appfs_attach_lease.is_some() {
-            self.update_appfs_status_stopped();
-        }
-        if let Some(lease) = self.appfs_attach_lease.take() {
+        self.update_appfs_status_stopped();
+        if let Some(lease) = self.mark_appfs_attach_shutting_down() {
             if let Err(error) = detach_appfs_principal(&lease, "process_exit") {
                 eprintln!("AppFS attach warning: failed to detach principal lease: {error}");
             }
@@ -11625,7 +11742,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         auto_compaction_config_for_model, build_runtime_plugin_state_with_loader,
-        build_runtime_with_plugin_state, collect_session_prompt_history,
+        build_runtime_with_plugin_state, collect_session_prompt_history, complete_appfs_attach,
         create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
         filter_tool_specs, fork_session_for_principal, format_appfs_attach_ensure_banner_line,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
@@ -11636,12 +11753,12 @@ mod tests {
         format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, git_ref_exists_in, merge_prompt_with_stdin,
-        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_git_worktrees,
-        parse_history_count, parse_hook_args, parse_recent_commits, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_hook_list_report_for, render_memory_report,
-        render_merged_runtime_config_json, render_pending_input_echoes,
+        new_appfs_attach_state, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_git_worktrees, parse_history_count, parse_hook_args, parse_recent_commits,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_hook_list_report_for,
+        render_memory_report, render_merged_runtime_config_json, render_pending_input_echoes,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
@@ -11663,10 +11780,10 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AssistantEvent, AttachmentKind, ConfigLoader, ContentBlock, ConversationMessage,
-        InputRouterBlockInput, InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput,
-        PermissionMode, PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session,
-        ToolExecutor,
+        AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachLease, AssistantEvent,
+        AttachmentKind, ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput,
+        InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
+        PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -13980,6 +14097,96 @@ mod tests {
 
         assert!(line.contains("private apps tinode"));
         assert!(!line.contains("private/code-implementer/tinode"));
+    }
+
+    #[test]
+    fn appfs_attach_state_replays_pending_status_after_async_attach() {
+        let root = temp_dir();
+        let update_path = root
+            .join("_appfs")
+            .join("principals")
+            .join("update_principal.act");
+        let detach_path = root
+            .join("_appfs")
+            .join("principals")
+            .join("detach_principal.act");
+        let state = new_appfs_attach_state(None);
+        {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.pending_status = Some(AppfsAgentStatusUpdate {
+                state: Some(AppfsAgentState::Idle),
+                session_id: Some(Some("session-async".to_string())),
+                model: Some(Some("deepseek-v4-flash".to_string())),
+                ..Default::default()
+            });
+        }
+
+        let lease = AppfsAttachLease {
+            principal_id: "coder".to_string(),
+            attach_id: "dashboard-coder".to_string(),
+            action_path: detach_path,
+            update_action_path: Some(update_path.clone()),
+        };
+
+        assert!(complete_appfs_attach(&state, lease));
+        let update = fs::read_to_string(&update_path).expect("pending status should replay");
+        assert!(update.contains(r#""principal_id":"coder""#));
+        assert!(update.contains(r#""state":"idle""#));
+        assert!(state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease
+            .is_some());
+
+        remove_dir_all_with_retry(&root);
+    }
+
+    #[test]
+    fn late_appfs_attach_detaches_when_cli_is_shutting_down() {
+        let root = temp_dir();
+        let update_path = root
+            .join("_appfs")
+            .join("principals")
+            .join("update_principal.act");
+        let detach_path = root
+            .join("_appfs")
+            .join("principals")
+            .join("detach_principal.act");
+        let state = new_appfs_attach_state(None);
+        {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.shutting_down = true;
+            guard.pending_status = Some(AppfsAgentStatusUpdate {
+                state: Some(AppfsAgentState::Stopped),
+                session_id: Some(Some("session-late".to_string())),
+                model: Some(Some("deepseek-v4-flash".to_string())),
+                ..Default::default()
+            });
+        }
+
+        let lease = AppfsAttachLease {
+            principal_id: "coder".to_string(),
+            attach_id: "dashboard-coder".to_string(),
+            action_path: detach_path.clone(),
+            update_action_path: Some(update_path.clone()),
+        };
+
+        assert!(!complete_appfs_attach(&state, lease));
+        assert!(state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lease
+            .is_none());
+        let update = fs::read_to_string(&update_path).expect("stopped status should replay");
+        assert!(update.contains(r#""state":"stopped""#));
+        let detach = fs::read_to_string(&detach_path).expect("late attach should detach");
+        assert!(detach.contains(r#""reason":"process_exit""#));
+
+        remove_dir_all_with_retry(&root);
     }
 
     #[test]

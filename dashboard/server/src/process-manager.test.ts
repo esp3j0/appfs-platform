@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   AgentProcessManager,
   buildManagedAppfsAttachId,
@@ -198,6 +201,79 @@ describe('AgentProcessManager project tracking', () => {
       });
       assert.strictEqual(agentRegistry.getAgent('session-wait')?.status, 'online');
     } finally {
+      EventBus.getInstance().shutdown();
+    }
+  });
+
+  it('persists per-spawn agent stderr and stdout event summaries', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-process-log-'));
+    const previousLogDir = process.env.APPFS_LOG_DIR;
+    process.env.APPFS_LOG_DIR = tempDir;
+
+    const projectRegistry = new ProjectRegistry();
+    const project = projectRegistry.registerProject(process.cwd());
+    const agentRegistry = new AgentRegistry(process.cwd(), projectRegistry);
+    const manager = new AgentProcessManager(agentRegistry);
+    const spawnId = 'spawn-log-test';
+    const baseConfig = {
+      cwd: project.projectRoot,
+      principalId: 'coder',
+      model: 'test-model',
+      permissionMode: 'dangerous',
+      appfsMountRoot: project.mountRoot,
+      launchSpec: { kind: 'binary' as const, binaryPath: 'agent-bin' },
+      env: {},
+      projectId: project.projectId,
+    };
+
+    try {
+      const managed = {
+        process: fakeChildProcess(),
+        sessionId: null,
+        spawnConfig: baseConfig,
+        status: 'starting',
+        currentRequestId: null,
+        controlEndpoint: null,
+        stdoutReader: fakeReader(),
+        stderrReader: fakeReader(),
+        log: (manager as any).createAgentLog(spawnId, baseConfig),
+      };
+      (manager as any).agents.set(spawnId, managed);
+
+      (manager as any).forwardStderrLine(
+        spawnId,
+        managed,
+        'AppFS attach: checking identity...',
+      );
+      (manager as any).forwardStderrLine(
+        spawnId,
+        managed,
+        'AppFS attach: warming up private apps...',
+      );
+      (manager as any).handleStdoutLine(spawnId, JSON.stringify({
+        type: 'session_started',
+        session_id: 'session-log-test',
+        principal_id: 'coder',
+        session_path: 'session-log-test.jsonl',
+      }));
+
+      const agentLogDir = path.join(tempDir, 'agents');
+      const logFiles = fs.readdirSync(agentLogDir);
+      assert.strictEqual(logFiles.length, 1);
+      const logFile = logFiles[0];
+      assert.ok(logFile);
+      assert.match(logFile, /agent-.*-coder-spawn-log-test\.log/);
+      const logContent = fs.readFileSync(path.join(agentLogDir, logFile), 'utf8');
+      assert.match(logContent, /\[stderr\] AppFS attach: checking identity/);
+      assert.match(logContent, /\[stderr\] AppFS attach: warming up private apps/);
+      assert.match(logContent, /\[stdout-event\] type=session_started session=session-log-test principal=coder/);
+    } finally {
+      if (previousLogDir === undefined) {
+        delete process.env.APPFS_LOG_DIR;
+      } else {
+        process.env.APPFS_LOG_DIR = previousLogDir;
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
       EventBus.getInstance().shutdown();
     }
   });
