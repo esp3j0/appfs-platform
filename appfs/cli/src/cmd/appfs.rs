@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::opts::AppfsQueryFormat;
 
+mod action_consumer;
 mod action_dispatcher;
 mod bridge_resilience;
 pub(crate) mod compose;
@@ -1611,7 +1612,8 @@ struct AppfsAdapter {
 mod supervisor_tests {
     use super::{
         build_runtime_cli_args, compose, registry, resolve_runtime_cli_args, runtime_config,
-        ActionWakeHandle, AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
+        ActionCursorDoc, ActionWakeHandle, AppfsBridgeCliArgs, AppfsRuntimeSupervisor,
+        ACTION_CURSORS_FILENAME,
     };
     use serde_json::{json, Value as JsonValue};
     use std::fs::{self, OpenOptions};
@@ -2337,6 +2339,65 @@ mod supervisor_tests {
     }
 
     #[test]
+    fn runtime_supervisor_replays_control_action_when_handler_fails_before_cursor_commit() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+
+        let registry_path = registry::principal_registry_path(temp.path());
+        fs::create_dir(&registry_path).expect("block principal registry path");
+        let create_action = temp.path().join("_appfs/principals/create_principal.act");
+        append_text(
+            &create_action,
+            "{\"principal_id\":\"default\",\"display_name\":\"Default agent\",\"kind\":\"agent\",\"client_token\":\"principal-replay-001\"}\n",
+        );
+
+        supervisor
+            .poll_once()
+            .expect_err("registry write failure should abort control cursor commit");
+        let cursor_path = temp
+            .path()
+            .join("_appfs/_stream")
+            .join(ACTION_CURSORS_FILENAME);
+        let cursor_doc: ActionCursorDoc =
+            serde_json::from_slice(&fs::read(&cursor_path).expect("read control cursors"))
+                .expect("parse control cursors");
+        assert!(
+            cursor_doc
+                .actions
+                .get("principals/create_principal.act")
+                .is_none(),
+            "failed handler must not advance the control action cursor"
+        );
+        assert!(
+            supervisor.principal_registry().principals.is_empty(),
+            "failed handler must not leave an in-memory principal behind"
+        );
+
+        fs::remove_dir(&registry_path).expect("unblock principal registry path");
+        supervisor
+            .poll_once()
+            .expect("retry should re-read uncommitted control action");
+
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        assert_eq!(registry.principals.len(), 1);
+        assert_eq!(registry.principals[0].principal_id, "default");
+        let events = control_events(&temp, "principal-replay-001");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .get("content")
+                .and_then(|value| value.get("principal_event"))
+                .and_then(|value| value.as_str()),
+            Some("principal.created")
+        );
+    }
+
+    #[test]
     fn runtime_supervisor_materializes_private_tinode_skeleton_for_created_principal() {
         let temp = TempDir::new().expect("tempdir");
         configure_tinode_env_for_tests();
@@ -2734,6 +2795,75 @@ mod supervisor_tests {
                 .and_then(|value| value.as_str()),
             Some("principal.detached")
         );
+    }
+
+    #[test]
+    fn runtime_supervisor_applies_restore_attach_before_idle_status_update() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut supervisor =
+            AppfsRuntimeSupervisor::new(temp.path().to_path_buf(), Vec::new(), false, None, None)
+                .expect("supervisor");
+        supervisor.prepare_action_sinks().expect("prepare sinks");
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/create_principal.act"),
+            "{\"principal_id\":\"coder\",\"display_name\":\"coder\",\"kind\":\"agent\",\"client_token\":\"restore-create\"}\n",
+        );
+        supervisor.poll_once().expect("poll create principal");
+
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/update_principal.act"),
+            "{\"principal_id\":\"coder\",\"attach_id\":\"dashboard-coder\",\"agent_status\":{\"state\":\"idle\",\"session_id\":\"session-coder\",\"model\":\"deepseek-v4-flash\",\"current_task_preview\":null,\"current_task_source\":null,\"turn_id\":null},\"client_token\":\"restore-status\"}\n",
+        );
+        append_text(
+            &temp
+                .path()
+                .join("_appfs/principals/attach_principal.act"),
+            "{\"principal_id\":\"coder\",\"attach_id\":\"dashboard-coder\",\"role\":\"worker\",\"session_id\":\"session-coder\",\"takeover\":true,\"client_token\":\"restore-attach\"}\n",
+        );
+
+        supervisor
+            .poll_once()
+            .expect("poll attach and status restore");
+
+        let registry = registry::read_principal_registry(temp.path())
+            .expect("read principal registry")
+            .expect("principal registry exists");
+        let principal = registry
+            .principals
+            .iter()
+            .find(|principal| principal.principal_id == "coder")
+            .expect("coder principal");
+        let status = principal.agent_status.as_ref().expect("agent status");
+        assert_eq!(principal.active_attach_count, 1);
+        assert_eq!(status.state, registry::PrincipalAgentState::Idle);
+        assert_eq!(status.attach_id.as_deref(), Some("dashboard-coder"));
+        assert_eq!(status.session_id.as_deref(), Some("session-coder"));
+        assert_eq!(status.model.as_deref(), Some("deepseek-v4-flash"));
+
+        let concise_status: JsonValue = serde_json::from_slice(
+            &fs::read(
+                temp.path()
+                    .join("_appfs")
+                    .join("principals")
+                    .join("status.res.json"),
+            )
+            .expect("read status view"),
+        )
+        .expect("parse status view");
+        let entry = concise_status["principals"]
+            .as_array()
+            .expect("status principals")
+            .iter()
+            .find(|entry| entry["principal_id"] == "coder")
+            .expect("coder status entry");
+        assert_eq!(entry["presence"], "online");
+        assert_eq!(entry["state"], "idle");
+        assert_eq!(entry["model"], "deepseek-v4-flash");
     }
 
     #[test]

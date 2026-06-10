@@ -52,11 +52,11 @@ mod windows_shell;
 pub mod worker_boot;
 
 pub use appfs::{
-    attach_appfs_principal, auto_mark_read_for_wake_inputs, create_appfs_principal,
-    detach_appfs_principal, detect_appfs_environment, ensure_appfs_attach_identity,
+    attach_appfs_principal, attach_appfs_principal_with_environment,
+    auto_mark_read_for_wake_inputs, create_appfs_principal, detach_appfs_principal,
+    detect_appfs_environment, ensure_appfs_attach_identity, heartbeat_appfs_principal,
     resolve_appfs_environment, sanitize_appfs_task_preview,
-    heartbeat_appfs_principal, scan_appfs_attention_events_for_idle_wake,
-    update_appfs_principal_agent_status,
+    scan_appfs_attention_events_for_idle_wake, update_appfs_principal_agent_status,
     warmup_appfs_private_apps, AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate,
     AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease, AppfsAttachSource,
     AppfsEnvironment, AppfsIdleWakeScanOutcome, AppfsPrincipalCreateOutcome,

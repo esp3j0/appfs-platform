@@ -43,6 +43,11 @@ const APPFS_PRIVATE_APP_WARMUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const APPFS_PRIVATE_APP_WARMUP_TIMEOUT: Duration = Duration::from_millis(300);
 const APPFS_PRIVATE_APP_WARMUP_POLL: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const APPFS_PRIVATE_APP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const APPFS_PRIVATE_APP_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(300);
+const APPFS_PRIVATE_APP_DISCOVERY_POLL: Duration = Duration::from_millis(50);
 const APPFS_ACT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const APPFS_ACT_EVENT_WAIT_POLL: Duration = Duration::from_millis(50);
 pub const APPFS_RUNTIME_MANIFEST_REL_PATH: &str = ".well-known/appfs/runtime.json";
@@ -208,7 +213,6 @@ pub struct AppfsPrincipalCreateOutcome {
 pub enum AppfsAttachEnsureStatus {
     NotAppfs,
     Ready,
-    WaitingForPrivateApps,
     Created,
     Submitted,
 }
@@ -442,19 +446,8 @@ fn ensure_appfs_attach_identity_with_attach_env(
         }
         let resolved = resolve_appfs_environment_with_attach_env(cwd, attach_env.clone())
             .or_else(|| Some(environment.clone()));
-        let status = principal_outcome.as_ref().map_or_else(
-            || {
-                resolved.as_ref().map_or(
-                    AppfsAttachEnsureStatus::WaitingForPrivateApps,
-                    |environment| {
-                        if should_wait_for_selected_private_apps(environment) {
-                            AppfsAttachEnsureStatus::WaitingForPrivateApps
-                        } else {
-                            AppfsAttachEnsureStatus::Ready
-                        }
-                    },
-                )
-            },
+        let status = principal_outcome.as_ref().map_or(
+            AppfsAttachEnsureStatus::Ready,
             attach_ensure_status_from_principal_outcome,
         );
         return AppfsAttachEnsureOutcome {
@@ -495,42 +488,6 @@ fn ensure_appfs_attach_identity_with_attach_env(
         };
     }
 
-    if should_wait_for_selected_private_apps(&environment) {
-        let mut warnings = Vec::new();
-        if let Some(control_dir) = environment.control_dir.as_deref() {
-            let principal = wait_for_principal_ready(
-                control_dir,
-                &control_dir.join(PRINCIPALS_FILE),
-                environment.registry_path.as_deref(),
-                &environment.principal_id,
-            );
-            if principal.is_none() {
-                warnings.push(format!(
-                    "principal '{}' exists but private apps were not ready before timeout",
-                    environment.principal_id
-                ));
-            }
-        }
-        let resolved = resolve_appfs_environment_with_attach_env(cwd, attach_env)
-            .or_else(|| Some(environment.clone()));
-        let status = resolved.as_ref().map_or(
-            AppfsAttachEnsureStatus::WaitingForPrivateApps,
-            |environment| {
-                if should_wait_for_selected_private_apps(environment) {
-                    AppfsAttachEnsureStatus::WaitingForPrivateApps
-                } else {
-                    AppfsAttachEnsureStatus::Ready
-                }
-            },
-        );
-        return AppfsAttachEnsureOutcome {
-            status,
-            environment: resolved,
-            principal_outcome: None,
-            warnings,
-        };
-    }
-
     AppfsAttachEnsureOutcome {
         status: AppfsAttachEnsureStatus::Ready,
         environment: Some(environment),
@@ -567,6 +524,12 @@ pub fn attach_appfs_principal(cwd: &Path) -> Result<AppfsAttachLease, String> {
     let environment = resolve_appfs_environment_with_attach_env(cwd, load_attach_env())
         .ok_or_else(|| "AppFS mount was not detected from the current directory".to_string())?;
     attach_appfs_principal_from_environment(&environment)
+}
+
+pub fn attach_appfs_principal_with_environment(
+    environment: &AppfsEnvironment,
+) -> Result<AppfsAttachLease, String> {
+    attach_appfs_principal_from_environment(environment)
 }
 
 pub fn warmup_appfs_private_apps(cwd: &Path) -> Result<Vec<AppfsPrivateAppWarmupOutcome>, String> {
@@ -755,12 +718,7 @@ fn warmup_private_apps_from_environment(
     environment: &AppfsEnvironment,
 ) -> Result<Vec<AppfsPrivateAppWarmupOutcome>, String> {
     let mut outcomes = Vec::new();
-    for app in &environment.registered_apps {
-        if app.visibility != AppfsRegisteredAppVisibility::PrivateInstance
-            || app.principal_id.as_deref() != Some(environment.principal_id.as_str())
-        {
-            continue;
-        }
+    for app in private_app_warmup_candidates(environment) {
         let Some(profile_id) = app.profile_id.as_deref() else {
             continue;
         };
@@ -787,6 +745,100 @@ fn warmup_private_apps_from_environment(
         });
     }
     Ok(outcomes)
+}
+
+fn private_app_warmup_candidates(environment: &AppfsEnvironment) -> Vec<AppfsRegisteredApp> {
+    let expected_count = environment
+        .control_dir
+        .as_ref()
+        .map(|control_dir| private_app_policy_count(&control_dir.join(APP_POLICIES_FILE)))
+        .unwrap_or(0);
+    let deadline = Instant::now() + APPFS_PRIVATE_APP_DISCOVERY_TIMEOUT;
+
+    loop {
+        let candidates = private_app_warmup_candidates_once(environment);
+        if expected_count == 0 || candidates.len() >= expected_count || Instant::now() >= deadline {
+            return candidates;
+        }
+        thread::sleep(APPFS_PRIVATE_APP_DISCOVERY_POLL);
+    }
+}
+
+fn private_app_warmup_candidates_once(environment: &AppfsEnvironment) -> Vec<AppfsRegisteredApp> {
+    let mut apps = Vec::new();
+    apps.extend(load_registered_apps_from_paths(
+        environment.registry_path.as_deref(),
+        &environment.principal_id,
+    ));
+    apps.extend(environment.registered_apps.clone());
+    apps.extend(load_private_policy_warmup_candidates(environment));
+
+    let mut seen = BTreeSet::new();
+    apps.into_iter()
+        .filter(|app| {
+            if app.visibility != AppfsRegisteredAppVisibility::PrivateInstance
+                || app.principal_id.as_deref() != Some(environment.principal_id.as_str())
+                || app.profile_id.is_none()
+            {
+                return false;
+            }
+            if !app
+                .app_root(&environment.mount_root)
+                .join(APP_CONTROL_DIR_NAME)
+                .join(ENSURE_CREDENTIALS_ACTION)
+                .exists()
+            {
+                return false;
+            }
+            seen.insert(app.instance_id.clone())
+        })
+        .collect()
+}
+
+fn load_private_policy_warmup_candidates(
+    environment: &AppfsEnvironment,
+) -> Vec<AppfsRegisteredApp> {
+    let Some(control_dir) = environment.control_dir.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(control_dir.join(APP_POLICIES_FILE)) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(apps) = doc.get("apps").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    apps.iter()
+        .filter_map(|entry| {
+            if !entry
+                .get("visibility")
+                .and_then(Value::as_str)
+                .is_some_and(|visibility| visibility == "private")
+            {
+                return None;
+            }
+            let app_id = entry.get("app_id")?.as_str()?.to_string();
+            let path_template = entry.get("path_template")?.as_str()?;
+            let profile_id = entry
+                .get("profile_template")
+                .and_then(Value::as_str)
+                .map(|template| render_principal_template(template, &environment.principal_id))
+                .unwrap_or_else(|| format!("{}:{}", app_id, environment.principal_id));
+            Some(AppfsRegisteredApp {
+                instance_id: format!("{}--{}", app_id, environment.principal_id),
+                app_id: app_id.clone(),
+                visibility: AppfsRegisteredAppVisibility::PrivateInstance,
+                parent_app_id: Some(app_id),
+                principal_id: Some(environment.principal_id.clone()),
+                profile_id: Some(profile_id),
+                path: render_principal_template(path_template, &environment.principal_id),
+                active_scope: None,
+            })
+        })
+        .collect()
 }
 
 fn create_appfs_principal_from_environment(
@@ -1484,7 +1536,9 @@ enum ModelInputCursorKind {
 }
 
 pub fn build_peer_awareness_snapshot(environment: &AppfsEnvironment) -> Vec<PendingInput> {
-    let status_path = environment.mount_root.join("_appfs/principals/status.res.json");
+    let status_path = environment
+        .mount_root
+        .join("_appfs/principals/status.res.json");
     let Ok(contents) = fs::read_to_string(&status_path) else {
         return Vec::new();
     };
@@ -1523,9 +1577,7 @@ pub fn build_peer_awareness_snapshot(environment: &AppfsEnvironment) -> Vec<Pend
         }
         match task {
             Some(task) => {
-                text.push_str(&format!(
-                    " 已在线，状态: {state}（任务: {task}）"
-                ));
+                text.push_str(&format!(" 已在线，状态: {state}（任务: {task}）"));
             }
             None => {
                 text.push_str(&format!(" 已在线，状态: {state}"));
@@ -1533,11 +1585,7 @@ pub fn build_peer_awareness_snapshot(environment: &AppfsEnvironment) -> Vec<Pend
         }
 
         inputs.push(PendingInput {
-            envelope: InputEnvelope::new(
-                InputSource::System,
-                "peer_awareness.snapshot",
-                text,
-            ),
+            envelope: InputEnvelope::new(InputSource::System, "peer_awareness.snapshot", text),
             delivery: PendingInputDelivery::InjectAtNextBoundary,
         });
     }
@@ -1597,8 +1645,11 @@ fn collect_pending_inputs_from_appfs_environment(
                 .unwrap_or_default();
                 for record in records.into_iter().filter(|record| record.seq > last_seq) {
                     let event_metadata = event_render_metadata_for(&render_metadata, &record);
-                    let classification =
-                        classify_appfs_event_with_render_metadata(&record, event_metadata.as_ref(), Some(&environment.principal_id));
+                    let classification = classify_appfs_event_with_render_metadata(
+                        &record,
+                        event_metadata.as_ref(),
+                        Some(&environment.principal_id),
+                    );
                     let Some(pending_input) = pending_input_from_appfs_event(
                         &record,
                         classification.running_delivery,
@@ -1923,7 +1974,12 @@ fn should_wake_idle_agent_for_appfs_event_with_render_metadata(
     current_principal_id: Option<&str>,
 ) -> bool {
     matches!(
-        classify_appfs_event_with_render_metadata(event, event_render_metadata, current_principal_id).idle_delivery,
+        classify_appfs_event_with_render_metadata(
+            event,
+            event_render_metadata,
+            current_principal_id
+        )
+        .idle_delivery,
         AppfsDeliveryMode::WakeIfIdle
     )
 }
@@ -3033,6 +3089,10 @@ fn absolute_mount_path(mount_root: &Path, virtual_path: &str) -> PathBuf {
     path
 }
 
+fn render_principal_template(template: &str, principal_id: &str) -> String {
+    template.replace("{principal_id}", principal_id)
+}
+
 fn load_attach_env() -> AppfsAttachEnv {
     AppfsAttachEnv {
         schema: env::var(APPFS_ATTACH_SCHEMA_ENV).ok(),
@@ -3479,27 +3539,6 @@ fn should_auto_create_selected_principal(
             .any(|principal| principal.principal_id == environment.principal_id)
 }
 
-fn should_wait_for_selected_private_apps(environment: &AppfsEnvironment) -> bool {
-    let Some(control_dir) = environment.control_dir.as_deref() else {
-        return false;
-    };
-    if !environment
-        .known_principals
-        .iter()
-        .any(|principal| principal.principal_id == environment.principal_id)
-    {
-        return false;
-    }
-    let expected_private_apps = private_app_policy_count(&control_dir.join(APP_POLICIES_FILE));
-    expected_private_apps > 0
-        && environment
-            .registry_path
-            .as_deref()
-            .map(|path| private_app_count_for_principal(path, &environment.principal_id))
-            .unwrap_or(0)
-            < expected_private_apps
-}
-
 fn has_pending_default_principal_create_action(control_dir: &Path) -> bool {
     fs::read_to_string(control_dir.join("principals").join("create_principal.act"))
         .ok()
@@ -3637,7 +3676,6 @@ fn summarize_registered_app_ids(environment: &AppfsEnvironment) -> Option<String
         .collect::<Vec<_>>();
     (!app_ids.is_empty()).then(|| app_ids.join(", "))
 }
-
 
 fn render_current_app_prompt_section(
     environment: &AppfsEnvironment,
@@ -4032,26 +4070,6 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-        })
-    }
-
-    fn spawn_private_app_materializer_stub(
-        mount_root: &Path,
-        principal_id: &'static str,
-    ) -> thread::JoinHandle<()> {
-        let apps_registry = mount_root.join("_appfs").join("apps.registry.json");
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
-            let instance_id = format!("tinode--{principal_id}");
-            let private_path = format!("private/{principal_id}/tinode");
-            let profile_id = format!("tinode:{principal_id}");
-            fs::write(
-                &apps_registry,
-                format!(
-                    r#"{{"version":1,"apps":[{{"instance_id":"{instance_id}","app_id":"tinode","visibility":"private_instance","parent_app_id":"tinode","principal_id":"{principal_id}","profile_id":"{profile_id}","path":"{private_path}","session_id":"sess-tinode-{principal_id}","registered_at":"2026-04-07T00:00:00Z","transport":{{"kind":"in_process","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":3,"bridge_initial_backoff_ms":50,"bridge_max_backoff_ms":500,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":1000}}}}]}}"#
-                ),
-            )
-            .expect("write apps registry");
         })
     }
 
@@ -4642,6 +4660,45 @@ mod tests {
     }
 
     #[test]
+    fn warmup_private_apps_uses_policy_when_registry_view_is_stale() {
+        let temp = TempDirGuard::new("appfs-private-app-warmup-policy-fallback");
+        let mount_root = temp.path().join("mnt");
+        seed_mount_without_principals(&mount_root);
+        let coder2_root = mount_root.join("private").join("coder2").join("tinode");
+        fs::create_dir_all(coder2_root.join("_app")).expect("create coder2 app control");
+        fs::create_dir_all(coder2_root.join("_stream")).expect("create coder2 app stream");
+        fs::write(coder2_root.join("_app").join("ensure_credentials.act"), "")
+            .expect("write coder2 ensure action");
+        fs::write(coder2_root.join("_stream").join("events.evt.jsonl"), "")
+            .expect("write coder2 events");
+
+        let environment = resolve_appfs_environment_with_attach_env(
+            &mount_root,
+            AppfsAttachEnv {
+                principal_id: Some("coder2".to_string()),
+                ..AppfsAttachEnv::default()
+            },
+        )
+        .expect("detect appfs environment");
+        assert!(
+            environment.registered_apps.is_empty(),
+            "fixture should simulate a stale apps.registry.json view"
+        );
+
+        let outcomes =
+            warmup_private_apps_from_environment(&environment).expect("warm private apps");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].instance_id, "tinode--coder2");
+        assert_eq!(outcomes[0].app_id, "tinode");
+        assert_eq!(outcomes[0].status, AppfsPrivateAppWarmupStatus::TimedOut);
+        let action = fs::read_to_string(coder2_root.join("_app").join("ensure_credentials.act"))
+            .expect("read coder2 ensure action");
+        assert!(action.contains(r#""expected_profile_id":"tinode:coder2""#));
+        assert!(action.contains(r#""client_token":"appfs-agent-warmup-tinode--coder2-"#));
+    }
+
+    #[test]
     fn warmup_private_apps_reports_ready_when_standard_event_arrives() {
         let temp = TempDirGuard::new("appfs-private-app-warmup-ready");
         let mount_root = temp.path().join("mnt");
@@ -4734,8 +4791,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_appfs_attach_identity_waits_for_existing_principal_private_apps() {
-        let temp = TempDirGuard::new("appfs-existing-principal-private-app-waits");
+    fn ensure_appfs_attach_identity_does_not_wait_for_existing_principal_private_apps() {
+        let temp = TempDirGuard::new("appfs-existing-principal-private-app-no-wait");
         let mount_root = temp.path().join("mnt");
         seed_mount_without_principals(&mount_root);
         fs::write(
@@ -4743,7 +4800,6 @@ mod tests {
             r#"{"version":1,"default_principal_id":"default","principals":[{"principal_id":"code-implementer","display_name":"code-implementer","description":"Existing principal.","kind":"agent","created_at":"2026-04-07T00:00:00Z","updated_at":"2026-04-07T00:00:00Z"}]}"#,
         )
         .expect("write existing principal registry");
-        let materializer = spawn_private_app_materializer_stub(&mount_root, "code-implementer");
 
         let outcome = ensure_appfs_attach_identity_with_attach_env(
             &mount_root,
@@ -4752,16 +4808,12 @@ mod tests {
                 ..AppfsAttachEnv::default()
             },
         );
-        materializer
-            .join()
-            .expect("materializer stub should finish");
 
         assert_eq!(outcome.status, AppfsAttachEnsureStatus::Ready);
         let environment = outcome.environment.expect("environment should be present");
         assert_eq!(environment.principal_id, "code-implementer");
-        assert!(environment.registered_apps.iter().any(|app| {
-            app.instance_id == "tinode--code-implementer"
-                && app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
+        assert!(!environment.registered_apps.iter().any(|app| {
+            app.visibility == AppfsRegisteredAppVisibility::PrivateInstance
                 && app.principal_id.as_deref() == Some("code-implementer")
         }));
     }
@@ -6351,12 +6403,18 @@ PY"#,
         let texts: Vec<&str> = snapshot.iter().map(|p| p.envelope.text.as_str()).collect();
 
         // coder: idle, no task
-        let coder_text = texts.iter().find(|t| t.contains("`coder`")).expect("coder entry");
+        let coder_text = texts
+            .iter()
+            .find(|t| t.contains("`coder`"))
+            .expect("coder entry");
         assert!(coder_text.contains("idle"));
         assert!(!coder_text.contains("任务"));
 
         // coder2: running, with task
-        let coder2_text = texts.iter().find(|t| t.contains("`coder2`")).expect("coder2 entry");
+        let coder2_text = texts
+            .iter()
+            .find(|t| t.contains("`coder2`"))
+            .expect("coder2 entry");
         assert!(coder2_text.contains("running"));
         assert!(coder2_text.contains("初始化环境"));
 

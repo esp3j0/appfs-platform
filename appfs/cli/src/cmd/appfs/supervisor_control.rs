@@ -5,18 +5,23 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
-use super::action_dispatcher::{
-    normalize_actionline_payload, parse_attach_principal_request, parse_create_principal_request,
-    parse_delete_principal_request, parse_detach_principal_request, parse_list_apps_request,
-    parse_register_app_request, parse_unregister_app_request, parse_update_principal_request,
-    AttachPrincipalRequest, CreatePrincipalRequest, DeletePrincipalRequest, DetachPrincipalRequest,
-    RegisterAppRequest, UnregisterAppRequest, UpdatePrincipalRequest,
+use super::action_consumer::{
+    self, ActionConsumerConfig, ActionInvocation, ActionInvocationHandler, InvalidActionPayload,
 };
-use super::errors::{ERR_INVALID_ARGUMENT, ERR_INVALID_PAYLOAD};
-use super::shared::{decode_jsonl_line, extract_client_token, write_pretty_json_file};
-use super::{ActionCursorDoc, ActionCursorState, CursorState, DEFAULT_RETENTION_HINT_SEC};
+use super::action_dispatcher::{
+    parse_attach_principal_request, parse_create_principal_request, parse_delete_principal_request,
+    parse_detach_principal_request, parse_list_apps_request, parse_register_app_request,
+    parse_unregister_app_request, parse_update_principal_request, AttachPrincipalRequest,
+    CreatePrincipalRequest, DeletePrincipalRequest, DetachPrincipalRequest, RegisterAppRequest,
+    UnregisterAppRequest, UpdatePrincipalRequest,
+};
+use super::errors::ERR_INVALID_ARGUMENT;
+use super::shared::{extract_client_token, write_pretty_json_file};
+use super::{
+    ActionCursorDoc, ActionCursorState, ActionSpec, CursorState, ExecutionMode, InputMode,
+    ProcessOutcome, DEFAULT_RETENTION_HINT_SEC,
+};
 
 const CONTROL_APP_ID: &str = "_appfs";
 const CONTROL_SESSION_ID: &str = "runtime-control";
@@ -28,8 +33,6 @@ const CONTROL_UPDATE_PRINCIPAL_ACTION: &str = "principals/update_principal.act";
 const CONTROL_DELETE_PRINCIPAL_ACTION: &str = "principals/delete_principal.act";
 const CONTROL_ATTACH_PRINCIPAL_ACTION: &str = "principals/attach_principal.act";
 const CONTROL_DETACH_PRINCIPAL_ACTION: &str = "principals/detach_principal.act";
-type NormalizedPayload = (String, Option<String>);
-type NormalizePayloadError = (&'static str, &'static str, Option<String>);
 
 #[derive(Debug, Clone)]
 pub(super) enum SupervisorControlInvocation {
@@ -86,6 +89,12 @@ pub(super) struct SupervisorControlPlane {
     actionline_strict: bool,
 }
 
+pub(super) struct PendingSupervisorControlInvocations {
+    pub(super) invocations: Vec<SupervisorControlInvocation>,
+    action_cursors: HashMap<String, ActionCursorState>,
+    cursor_dirty: bool,
+}
+
 impl SupervisorControlPlane {
     pub(super) fn new(root: PathBuf, actionline_strict: bool) -> Result<Self> {
         let control_dir = root.join(CONTROL_APP_ID);
@@ -102,7 +111,7 @@ impl SupervisorControlPlane {
             replay_dir,
             action_cursors_path: action_cursors_path.clone(),
             cursor,
-            action_cursors: load_action_cursors_or_default(&action_cursors_path)?,
+            action_cursors: action_consumer::load_action_cursors(&action_cursors_path)?,
             next_seq,
             actionline_strict,
         })
@@ -165,132 +174,63 @@ impl SupervisorControlPlane {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn drain_invocations(&mut self) -> Result<Vec<SupervisorControlInvocation>> {
-        let mut out = Vec::new();
-        for action_name in [
-            CONTROL_LIST_ACTION,
-            CONTROL_REGISTER_ACTION,
-            CONTROL_UNREGISTER_ACTION,
-            CONTROL_CREATE_PRINCIPAL_ACTION,
-            CONTROL_UPDATE_PRINCIPAL_ACTION,
-            CONTROL_DELETE_PRINCIPAL_ACTION,
-            CONTROL_ATTACH_PRINCIPAL_ACTION,
-            CONTROL_DETACH_PRINCIPAL_ACTION,
-        ] {
-            out.extend(self.drain_action_file(action_name)?);
-        }
-        Ok(out)
-    }
-
-    fn drain_action_file(&mut self, action_name: &str) -> Result<Vec<SupervisorControlInvocation>> {
-        let action_path = self.root.join(CONTROL_APP_ID).join(action_name);
-        if !action_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let bytes = fs::read(&action_path)
-            .with_context(|| format!("Failed to read control action {}", action_path.display()))?;
-        let cursor_key = action_name.to_string();
-        let mut cursor = self
-            .action_cursors
-            .get(&cursor_key)
-            .cloned()
-            .unwrap_or_default();
-        let file_len = bytes.len() as u64;
-        if cursor.offset > file_len {
-            cursor.offset = file_len;
-        }
-        if cursor.offset == file_len {
-            return Ok(Vec::new());
-        }
-
-        let start = cursor.offset as usize;
-        let Some(last_newline_rel) = bytes[start..].iter().rposition(|byte| *byte == b'\n') else {
-            return Ok(Vec::new());
-        };
-        let end = start + last_newline_rel + 1;
-        let mut invocations = Vec::new();
-        let mut line_start = start;
-
-        while line_start < end {
-            let line_end = bytes[line_start..end]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|idx| line_start + idx + 1)
-                .expect("newline must exist");
-            let line_bytes = &bytes[line_start..line_end];
-            let request_id = new_request_id();
-
-            match decode_jsonl_line(line_bytes, line_start == 0) {
-                Ok(Some(line)) => match self.normalize_payload(&line) {
-                    Ok((payload_json, client_token)) => {
-                        let failure_token = client_token.clone();
-                        match parse_invocation(
-                            action_name,
-                            &request_id,
-                            client_token,
-                            &payload_json,
-                        ) {
-                            Ok(invocation) => invocations.push(invocation),
-                            Err(code) => {
-                                self.emit_failed(
-                                    control_action_path(action_name),
-                                    &request_id,
-                                    code,
-                                    "invalid AppFS lifecycle control payload",
-                                    failure_token.or_else(|| extract_client_token(&payload_json)),
-                                )?;
-                            }
-                        }
-                    }
-                    Err((code, message, client_token)) => {
-                        self.emit_failed(
-                            control_action_path(action_name),
-                            &request_id,
-                            code,
-                            message,
-                            client_token,
-                        )?;
-                    }
-                },
-                Ok(None) => {}
-                Err(message) => {
-                    self.emit_failed(
-                        control_action_path(action_name),
-                        &request_id,
-                        ERR_INVALID_PAYLOAD,
-                        &message,
-                        None,
-                    )?;
-                }
-            }
-
-            line_start = line_end;
-        }
-
-        cursor.offset = end as u64;
-        cursor.boundary_probe = None;
-        cursor.pending_multiline_eof_len = None;
-
-        // Persist the prospective cursor map before committing it in memory.
-        // If publishing action-cursors.res.json fails, the caller retries from
-        // the previous offset instead of silently dropping parsed invocations.
-        let mut next_action_cursors = self.action_cursors.clone();
-        next_action_cursors.insert(cursor_key, cursor);
-        self.save_action_cursors_map(&next_action_cursors)?;
-        self.action_cursors = next_action_cursors;
-
+        let pending = self.drain_invocations_uncommitted()?;
+        let invocations = pending.invocations.clone();
+        self.commit_pending_invocations(pending)?;
         Ok(invocations)
     }
 
-    fn normalize_payload(
-        &self,
-        line: &str,
-    ) -> std::result::Result<NormalizedPayload, NormalizePayloadError> {
-        match normalize_actionline_payload(line, self.actionline_strict) {
-            Ok(Some(parsed)) => Ok((parsed.payload_json, Some(parsed.client_token))),
-            Ok(None) => Ok((line.to_string(), extract_client_token(line))),
-            Err(err) => Err((err.code, err.reason, None)),
+    pub(super) fn drain_invocations_uncommitted(
+        &mut self,
+    ) -> Result<PendingSupervisorControlInvocations> {
+        let config = self.action_consumer_config();
+        let action_cursors = self.action_cursors.clone();
+        let mut collector = ControlInvocationCollector {
+            control: self,
+            invocations: Vec::new(),
+        };
+        let result = action_consumer::drain_action_sinks_uncommitted(
+            &config,
+            &action_cursors,
+            &mut collector,
+        );
+        let invocations = collector.invocations;
+        let result = result?;
+        Ok(PendingSupervisorControlInvocations {
+            invocations,
+            action_cursors: result.action_cursors,
+            cursor_dirty: result.cursor_dirty,
+        })
+    }
+
+    pub(super) fn commit_pending_invocations(
+        &mut self,
+        pending: PendingSupervisorControlInvocations,
+    ) -> Result<()> {
+        if !pending.cursor_dirty {
+            return Ok(());
+        }
+        let config = self.action_consumer_config();
+        action_consumer::commit_action_cursors(
+            &config,
+            &mut self.action_cursors,
+            pending.action_cursors,
+        )
+    }
+
+    fn action_consumer_config(&self) -> ActionConsumerConfig {
+        ActionConsumerConfig {
+            app_id: CONTROL_APP_ID.to_string(),
+            session_id: CONTROL_SESSION_ID.to_string(),
+            app_dir: self.root.join(CONTROL_APP_ID),
+            action_cursors_path: self.action_cursors_path.clone(),
+            action_specs: control_action_specs(),
+            actionline_strict: self.actionline_strict,
+            cursor_label: "AppFS control action cursors",
+            log_label: "AppFS control",
+            fixed_action_order: Some(control_action_order()),
         }
     }
 
@@ -410,18 +350,55 @@ impl SupervisorControlPlane {
             "AppFS control cursor",
         )
     }
+}
 
-    fn save_action_cursors_map(
-        &self,
-        action_cursors: &HashMap<String, ActionCursorState>,
-    ) -> Result<()> {
-        write_pretty_json_file(
-            &self.action_cursors_path,
-            &serde_json::to_value(ActionCursorDoc {
-                actions: action_cursors.clone(),
-            })?,
-            "AppFS control action cursors",
-        )
+struct ControlInvocationCollector<'a> {
+    control: &'a mut SupervisorControlPlane,
+    invocations: Vec<SupervisorControlInvocation>,
+}
+
+impl ActionInvocationHandler for ControlInvocationCollector<'_> {
+    fn handle_action_invocation(
+        &mut self,
+        invocation: ActionInvocation,
+        _spec: &ActionSpec,
+    ) -> Result<ProcessOutcome> {
+        let failure_token = invocation.client_token.clone();
+        match parse_invocation(
+            &invocation.rel_path,
+            &invocation.request_id,
+            invocation.client_token,
+            &invocation.payload_json,
+        ) {
+            Ok(control_invocation) => {
+                self.invocations.push(control_invocation);
+                Ok(ProcessOutcome::Consumed)
+            }
+            Err(code) => {
+                self.control.emit_failed(
+                    &invocation.normalized_path,
+                    &invocation.request_id,
+                    code,
+                    "invalid AppFS lifecycle control payload",
+                    failure_token.or_else(|| extract_client_token(&invocation.payload_json)),
+                )?;
+                Ok(ProcessOutcome::Consumed)
+            }
+        }
+    }
+
+    fn handle_invalid_action_payload(
+        &mut self,
+        invalid: InvalidActionPayload,
+    ) -> Result<ProcessOutcome> {
+        self.control.emit_failed(
+            &invalid.normalized_path,
+            &invalid.request_id,
+            invalid.code,
+            &invalid.message,
+            invalid.client_token,
+        )?;
+        Ok(ProcessOutcome::Consumed)
     }
 }
 
@@ -478,23 +455,32 @@ fn parse_invocation(
     }
 }
 
-fn control_action_path(action_name: &str) -> &'static str {
-    match action_name {
-        CONTROL_REGISTER_ACTION => "/_appfs/register_app.act",
-        CONTROL_UNREGISTER_ACTION => "/_appfs/unregister_app.act",
-        CONTROL_LIST_ACTION => "/_appfs/list_apps.act",
-        CONTROL_CREATE_PRINCIPAL_ACTION => "/_appfs/principals/create_principal.act",
-        CONTROL_UPDATE_PRINCIPAL_ACTION => "/_appfs/principals/update_principal.act",
-        CONTROL_DELETE_PRINCIPAL_ACTION => "/_appfs/principals/delete_principal.act",
-        CONTROL_ATTACH_PRINCIPAL_ACTION => "/_appfs/principals/attach_principal.act",
-        CONTROL_DETACH_PRINCIPAL_ACTION => "/_appfs/principals/detach_principal.act",
-        _ => "/_appfs/unknown.act",
-    }
+fn control_action_specs() -> Vec<ActionSpec> {
+    control_action_order()
+        .into_iter()
+        .map(|template| ActionSpec {
+            template,
+            input_mode: InputMode::Json,
+            execution_mode: ExecutionMode::Inline,
+            max_payload_bytes: None,
+        })
+        .collect()
 }
 
-fn new_request_id() -> String {
-    let uuid = Uuid::new_v4().simple().to_string();
-    format!("req-{}", &uuid[..8])
+fn control_action_order() -> Vec<String> {
+    [
+        CONTROL_LIST_ACTION,
+        CONTROL_REGISTER_ACTION,
+        CONTROL_UNREGISTER_ACTION,
+        CONTROL_CREATE_PRINCIPAL_ACTION,
+        CONTROL_ATTACH_PRINCIPAL_ACTION,
+        CONTROL_UPDATE_PRINCIPAL_ACTION,
+        CONTROL_DETACH_PRINCIPAL_ACTION,
+        CONTROL_DELETE_PRINCIPAL_ACTION,
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 fn load_cursor_or_default(path: &Path) -> Result<CursorState> {
@@ -515,21 +501,11 @@ fn load_cursor_or_default(path: &Path) -> Result<CursorState> {
     Ok(cursor)
 }
 
-fn load_action_cursors_or_default(path: &Path) -> Result<HashMap<String, ActionCursorState>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let doc: ActionCursorDoc = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
-    Ok(doc.actions)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        SupervisorControlInvocation, SupervisorControlPlane, CONTROL_CREATE_PRINCIPAL_ACTION,
+        SupervisorControlInvocation, SupervisorControlPlane, CONTROL_ATTACH_PRINCIPAL_ACTION,
+        CONTROL_CREATE_PRINCIPAL_ACTION, CONTROL_UPDATE_PRINCIPAL_ACTION,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -609,6 +585,71 @@ mod tests {
                 .is_some(),
             "successful retry should advance the cursor"
         );
+    }
+
+    #[test]
+    fn supervisor_control_accepts_actionline_create_principal() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut control =
+            SupervisorControlPlane::new(temp.path().to_path_buf(), true).expect("control plane");
+        control.prepare_action_sinks().expect("prepare sinks");
+
+        fs::write(
+            temp.path()
+                .join("_appfs")
+                .join(CONTROL_CREATE_PRINCIPAL_ACTION),
+            format!(
+                "{}\n",
+                r#"{"version":"2.0","client_token":"create-actionline-default","payload":{"principal_id":"default","display_name":"default","kind":"agent"}}"#
+            ),
+        )
+        .expect("write create actionline");
+
+        let invocations = control.drain_invocations().expect("drain invocations");
+        assert_eq!(invocations.len(), 1);
+        match &invocations[0] {
+            SupervisorControlInvocation::CreatePrincipal {
+                client_token,
+                request,
+                ..
+            } => {
+                assert_eq!(client_token.as_deref(), Some("create-actionline-default"));
+                assert_eq!(request.principal_id, "default");
+            }
+            other => panic!("expected create principal invocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn supervisor_control_drains_attach_before_update() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut control =
+            SupervisorControlPlane::new(temp.path().to_path_buf(), false).expect("control plane");
+        control.prepare_action_sinks().expect("prepare sinks");
+
+        fs::write(
+            temp.path()
+                .join("_appfs")
+                .join(CONTROL_UPDATE_PRINCIPAL_ACTION),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-1\",\"agent_status\":{\"state\":\"idle\"},\"client_token\":\"status-1\"}\n",
+        )
+        .expect("write update action");
+        fs::write(
+            temp.path()
+                .join("_appfs")
+                .join(CONTROL_ATTACH_PRINCIPAL_ACTION),
+            "{\"principal_id\":\"default\",\"attach_id\":\"attach-1\",\"client_token\":\"attach-1\"}\n",
+        )
+        .expect("write attach action");
+
+        let invocations = control.drain_invocations().expect("drain invocations");
+        assert!(matches!(
+            invocations.as_slice(),
+            [
+                SupervisorControlInvocation::AttachPrincipal { .. },
+                SupervisorControlInvocation::UpdatePrincipal { .. }
+            ]
+        ));
     }
 }
 

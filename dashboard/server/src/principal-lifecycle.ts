@@ -14,6 +14,8 @@ const APPFS_ACTION_WAIT_TIMEOUT_MS = Number.parseInt(
   10,
 ) || 10_000;
 const APPFS_ACTION_POLL_MS = 100;
+const DEFAULT_BOOTSTRAP_RESUME_CONCURRENCY = 2;
+const MAX_BOOTSTRAP_RESUME_CONCURRENCY = 8;
 
 export interface PrincipalRegistryPrincipal {
   principal_id: string;
@@ -116,6 +118,11 @@ interface AppfsControlEvent {
     [key: string]: unknown;
   };
 }
+
+type BootstrapResumeOutcome =
+  | { kind: 'resumed'; sessionId: string; spawnId: string }
+  | { kind: 'skipped'; sessionId: string; reason: string }
+  | { kind: 'error'; sessionId: string; error: string };
 
 export class PrincipalLifecycleError extends Error {
   constructor(
@@ -292,42 +299,85 @@ export class PrincipalLifecycleService {
     };
 
     this.deps.agentRegistry.discoverProject(project.projectRoot);
-    const agents = latestResumableAgentPerPrincipal(
-      this.deps.agentRegistry.getAgents().filter((agent) => agent.projectId === project.projectId),
+    const defaultPrincipalId = readDefaultPrincipalId(project.mountRoot, project.projectId);
+    const agents = orderBootstrapResumeAgents(
+      latestResumableAgentPerPrincipal(
+        this.deps.agentRegistry.getAgents().filter((agent) => agent.projectId === project.projectId),
+      ),
+      defaultPrincipalId,
+    );
+    const concurrency = bootstrapResumeConcurrency();
+
+    console.log(
+      `[PrincipalLifecycle] Bootstrap resume project=${project.projectId} candidates=${agents.length} `
+      + `concurrency=${concurrency}${defaultPrincipalId ? ` default=${defaultPrincipalId}` : ''}`,
     );
 
-    for (const agent of agents) {
+    const skippedOutcome = (agent: AgentInfo, reason: string): BootstrapResumeOutcome => {
+      console.log(
+        `[PrincipalLifecycle] Bootstrap resume skipped project=${project.projectId} `
+        + `principal=${agent.principalId || agent.name || '<missing>'} session=${agent.sessionId} reason=${reason}`,
+      );
+      return { kind: 'skipped', sessionId: agent.sessionId, reason };
+    };
+
+    const outcomes = await mapWithConcurrency(agents, concurrency, async (agent): Promise<BootstrapResumeOutcome> => {
       if (!agent.sessionJsonlPath) {
-        result.skipped.push({ sessionId: agent.sessionId, reason: 'missing session path' });
-        continue;
+        return skippedOutcome(agent, 'missing session path');
       }
       if (agent.status === 'online') {
-        result.skipped.push({ sessionId: agent.sessionId, reason: 'already online' });
-        continue;
+        return skippedOutcome(agent, 'already online');
       }
 
       const principalId = agent.principalId || agent.name;
       if (!principalId) {
-        result.skipped.push({ sessionId: agent.sessionId, reason: 'missing principal id' });
-        continue;
+        return skippedOutcome(agent, 'missing principal id');
       }
 
       try {
+        console.log(
+          `[PrincipalLifecycle] Bootstrap resume starting project=${project.projectId} `
+          + `principal=${principalId} session=${agent.sessionId}`,
+        );
         const resume = await this.resumePrincipalForBootstrap(project, principalId, {
           sessionId: agent.sessionId,
         });
         if ('spawnId' in resume && typeof resume.spawnId === 'string') {
-          result.resumed.push({ sessionId: agent.sessionId, spawnId: resume.spawnId });
-        } else {
-          result.skipped.push({ sessionId: agent.sessionId, reason: resume.status });
+          console.log(
+            `[PrincipalLifecycle] Bootstrap resume started project=${project.projectId} `
+            + `principal=${principalId} session=${agent.sessionId} spawn=${resume.spawnId}`,
+          );
+          return { kind: 'resumed', sessionId: agent.sessionId, spawnId: resume.spawnId };
         }
+        return skippedOutcome(agent, resume.status);
       } catch (err: unknown) {
-        result.errors.push({
+        const error = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[PrincipalLifecycle] Bootstrap resume failed project=${project.projectId} `
+          + `principal=${principalId} session=${agent.sessionId}: ${error}`,
+        );
+        return {
+          kind: 'error',
           sessionId: agent.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
+          error,
+        };
+      }
+    });
+
+    for (const outcome of outcomes) {
+      if (outcome.kind === 'resumed') {
+        result.resumed.push({ sessionId: outcome.sessionId, spawnId: outcome.spawnId });
+      } else if (outcome.kind === 'skipped') {
+        result.skipped.push({ sessionId: outcome.sessionId, reason: outcome.reason });
+      } else {
+        result.errors.push({ sessionId: outcome.sessionId, error: outcome.error });
       }
     }
+
+    console.log(
+      `[PrincipalLifecycle] Bootstrap resume complete project=${project.projectId} `
+      + `resumed=${result.resumed.length} skipped=${result.skipped.length} errors=${result.errors.length}`,
+    );
 
     return result;
   }
@@ -531,6 +581,68 @@ function latestAgentForPrincipal(agents: AgentInfo[], principalId: string): Agen
       if (a.status !== 'online' && b.status === 'online') return 1;
       return b.startedAt - a.startedAt;
     })[0];
+}
+
+function bootstrapResumeConcurrency(): number {
+  const parsed = Number.parseInt(process.env.DASHBOARD_BOOTSTRAP_RESUME_CONCURRENCY ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_BOOTSTRAP_RESUME_CONCURRENCY;
+  }
+  return Math.min(parsed, MAX_BOOTSTRAP_RESUME_CONCURRENCY);
+}
+
+function orderBootstrapResumeAgents(agents: AgentInfo[], defaultPrincipalId?: string): AgentInfo[] {
+  if (!defaultPrincipalId) {
+    return agents;
+  }
+  return [...agents].sort((left, right) => {
+    const leftPrincipal = left.principalId || left.name;
+    const rightPrincipal = right.principalId || right.name;
+    const leftDefault = leftPrincipal === defaultPrincipalId;
+    const rightDefault = rightPrincipal === defaultPrincipalId;
+    if (leftDefault === rightDefault) {
+      return 0;
+    }
+    return leftDefault ? -1 : 1;
+  });
+}
+
+function readDefaultPrincipalId(mountRoot: string, projectId: string): string | undefined {
+  try {
+    const defaultPrincipalId = readPrincipalViews(mountRoot).default_principal_id;
+    return typeof defaultPrincipalId === 'string' && defaultPrincipalId.trim()
+      ? defaultPrincipalId
+      : undefined;
+  } catch (err: unknown) {
+    console.warn(
+      `[PrincipalLifecycle] Could not read default principal for bootstrap resume project=${projectId}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await worker(items[index], index);
+    }
+  }));
+
+  return results;
 }
 
 async function waitForPrincipalDeleteAction(
