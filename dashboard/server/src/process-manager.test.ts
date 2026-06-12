@@ -205,6 +205,46 @@ describe('AgentProcessManager project tracking', () => {
     }
   });
 
+  it('injects AppFS and dashboard control environment for project managed agents', () => {
+    const projectRegistry = new ProjectRegistry();
+    const project = projectRegistry.registerProject(process.cwd());
+    const agentRegistry = new AgentRegistry(process.cwd(), projectRegistry);
+    const manager = new AgentProcessManager(agentRegistry, undefined, {
+      apiOrigin: 'http://127.0.0.1:3100',
+      controlToken: 'secret-token',
+    });
+
+    const env = (manager as any).buildEnvironment({
+      cwd: project.projectRoot,
+      principalId: 'coder',
+      model: 'test-model',
+      permissionMode: 'dangerous',
+      appfsMountRoot: project.mountRoot,
+      launchSpec: { kind: 'binary' as const, binaryPath: 'agent-bin' },
+      env: { CUSTOM_ENV: '1' },
+      projectId: project.projectId,
+      teamName: 'alpha team',
+      taskListId: 'alpha',
+    });
+
+    assert.strictEqual(env.APPFS_PRINCIPAL_ID, 'coder');
+    assert.strictEqual(env.APPFS_ATTACH_ID, 'dashboard-coder');
+    assert.strictEqual(env.APPFS_MOUNT_ROOT, path.resolve(project.mountRoot));
+    assert.strictEqual(
+      env.APPFS_RUNTIME_MANIFEST,
+      path.join(path.resolve(project.mountRoot), '.well-known', 'appfs', 'runtime.json'),
+    );
+    assert.strictEqual(env.APPFS_DASHBOARD_API_ORIGIN, 'http://127.0.0.1:3100');
+    assert.strictEqual(env.APPFS_DASHBOARD_PROJECT_ID, project.projectId);
+    assert.strictEqual(env.APPFS_DASHBOARD_CONTROL_TOKEN, 'secret-token');
+    assert.strictEqual(env.APPFS_TASK_LIST_ID, 'alpha');
+    assert.strictEqual(env.CLAW_TASK_LIST_ID, 'alpha');
+    assert.strictEqual(env.CLAUDE_CODE_TASK_LIST_ID, 'alpha');
+    assert.strictEqual(env.APPFS_TEAM_NAME, 'alpha team');
+    assert.strictEqual(env.CLAUDE_CODE_TEAM_NAME, 'alpha team');
+    assert.strictEqual(env.CUSTOM_ENV, '1');
+  });
+
   it('persists per-spawn agent stderr and stdout event summaries', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-process-log-'));
     const previousLogDir = process.env.APPFS_LOG_DIR;

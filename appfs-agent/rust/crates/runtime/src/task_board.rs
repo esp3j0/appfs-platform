@@ -58,6 +58,25 @@ pub struct TaskBoardUpdateOutcome {
     pub status_change: Option<(TaskBoardStatus, TaskBoardStatus)>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskBoardClaimOutcome {
+    pub task: TaskBoardTask,
+    pub claimed: bool,
+    pub current_owner: Option<String>,
+    pub reason: Option<TaskBoardClaimRejectionReason>,
+    pub blocking_tasks: Vec<TaskBoardTask>,
+    pub active_task: Option<TaskBoardTask>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskBoardClaimRejectionReason {
+    AlreadyClaimed,
+    AlreadyCompleted,
+    Blocked,
+    OwnerBusy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskBoardStore {
     root: PathBuf,
@@ -204,6 +223,92 @@ impl TaskBoardStore {
         })
     }
 
+    pub fn claim(
+        &self,
+        task_id: &str,
+        owner: String,
+        active_form: Option<String>,
+        metadata: Option<BTreeMap<String, Value>>,
+    ) -> Result<Option<TaskBoardClaimOutcome>, String> {
+        self.with_write_lock(|store| {
+            let Some(mut task) = store.read_task_unlocked(task_id)? else {
+                return Ok(None);
+            };
+            if task.status == TaskBoardStatus::Completed {
+                return Ok(Some(TaskBoardClaimOutcome {
+                    task,
+                    claimed: false,
+                    current_owner: None,
+                    reason: Some(TaskBoardClaimRejectionReason::AlreadyCompleted),
+                    blocking_tasks: Vec::new(),
+                    active_task: None,
+                }));
+            }
+            if let Some(current_owner) = task.owner.as_deref() {
+                if current_owner != owner {
+                    let current_owner = current_owner.to_string();
+                    return Ok(Some(TaskBoardClaimOutcome {
+                        task,
+                        claimed: false,
+                        current_owner: Some(current_owner),
+                        reason: Some(TaskBoardClaimRejectionReason::AlreadyClaimed),
+                        blocking_tasks: Vec::new(),
+                        active_task: None,
+                    }));
+                }
+            }
+
+            let blocking_tasks = store.unfinished_blocking_tasks_unlocked(&task)?;
+            if !blocking_tasks.is_empty() {
+                return Ok(Some(TaskBoardClaimOutcome {
+                    task,
+                    claimed: false,
+                    current_owner: None,
+                    reason: Some(TaskBoardClaimRejectionReason::Blocked),
+                    blocking_tasks,
+                    active_task: None,
+                }));
+            }
+
+            if let Some(active_task) = store.active_task_for_owner_unlocked(&owner, task_id)? {
+                return Ok(Some(TaskBoardClaimOutcome {
+                    task,
+                    claimed: false,
+                    current_owner: None,
+                    reason: Some(TaskBoardClaimRejectionReason::OwnerBusy),
+                    blocking_tasks: Vec::new(),
+                    active_task: Some(active_task),
+                }));
+            }
+
+            task.owner = Some(owner);
+            task.status = TaskBoardStatus::InProgress;
+            if let Some(active_form) = active_form {
+                task.active_form = Some(active_form);
+            }
+            if let Some(metadata_patch) = metadata {
+                let mut existing = task.metadata.unwrap_or_default();
+                for (key, value) in metadata_patch {
+                    if value.is_null() {
+                        existing.remove(&key);
+                    } else {
+                        existing.insert(key, value);
+                    }
+                }
+                task.metadata = Some(existing);
+            }
+            store.write_task_unlocked(&task)?;
+            Ok(Some(TaskBoardClaimOutcome {
+                task,
+                claimed: true,
+                current_owner: None,
+                reason: None,
+                blocking_tasks: Vec::new(),
+                active_task: None,
+            }))
+        })
+    }
+
     pub fn delete(&self, task_id: &str) -> Result<bool, String> {
         self.with_write_lock(|store| {
             if store.read_task_unlocked(task_id)?.is_none() {
@@ -251,6 +356,34 @@ impl TaskBoardStore {
             }
         }
         Ok(changed)
+    }
+
+    fn unfinished_blocking_tasks_unlocked(
+        &self,
+        task: &TaskBoardTask,
+    ) -> Result<Vec<TaskBoardTask>, String> {
+        let mut blockers = Vec::new();
+        for blocker_id in &task.blocked_by {
+            if let Some(blocker) = self.read_task_unlocked(blocker_id)? {
+                if blocker.status != TaskBoardStatus::Completed {
+                    blockers.push(blocker);
+                }
+            }
+        }
+        blockers.sort_by(|a, b| compare_task_ids(&a.id, &b.id));
+        Ok(blockers)
+    }
+
+    fn active_task_for_owner_unlocked(
+        &self,
+        owner: &str,
+        excluded_task_id: &str,
+    ) -> Result<Option<TaskBoardTask>, String> {
+        Ok(self.list_unlocked()?.into_iter().find(|task| {
+            task.id != excluded_task_id
+                && task.owner.as_deref() == Some(owner)
+                && task.status != TaskBoardStatus::Completed
+        }))
     }
 
     fn add_blocked_by_unlocked(
@@ -415,16 +548,24 @@ impl TaskBoardStore {
 }
 
 fn resolve_task_list_id() -> String {
-    std::env::var("CLAW_TASK_LIST_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CLAUDE_CODE_TASK_LIST_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(current_tool_session_id)
-        .unwrap_or_else(|| String::from("default"))
+    first_non_empty_env(&[
+        "APPFS_TASK_LIST_ID",
+        "CLAW_TASK_LIST_ID",
+        "CLAUDE_CODE_TASK_LIST_ID",
+        "APPFS_TEAM_NAME",
+        "CLAUDE_CODE_TEAM_NAME",
+    ])
+    .or_else(current_tool_session_id)
+    .unwrap_or_else(|| String::from("default"))
+}
+
+fn first_non_empty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn compare_task_ids(a: &str, b: &str) -> std::cmp::Ordering {
@@ -455,10 +596,11 @@ fn sanitize_path_component(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskBoardPatch, TaskBoardStatus, TaskBoardStore};
+    use super::{TaskBoardClaimRejectionReason, TaskBoardPatch, TaskBoardStatus, TaskBoardStore};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -467,6 +609,61 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("runtime-task-board-{unique}-{name}"))
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env(name: &str, value: Option<String>) {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    #[test]
+    fn resolves_appfs_task_scope_environment_before_legacy_names() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = [
+            "APPFS_TASK_LIST_ID",
+            "CLAW_TASK_LIST_ID",
+            "CLAUDE_CODE_TASK_LIST_ID",
+            "APPFS_TEAM_NAME",
+            "CLAUDE_CODE_TEAM_NAME",
+        ];
+        let original: Vec<(&str, Option<String>)> = names
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+        let root = temp_dir("env-scope");
+
+        std::env::set_var("APPFS_TEAM_NAME", "Alpha Team");
+        assert_eq!(
+            TaskBoardStore::default_for_cwd(&root).task_list_id(),
+            "Alpha_Team"
+        );
+        std::env::set_var("CLAW_TASK_LIST_ID", "legacy-list");
+        assert_eq!(
+            TaskBoardStore::default_for_cwd(&root).task_list_id(),
+            "legacy-list"
+        );
+        std::env::set_var("APPFS_TASK_LIST_ID", "appfs-list");
+        assert_eq!(
+            TaskBoardStore::default_for_cwd(&root).task_list_id(),
+            "appfs-list"
+        );
+
+        for (name, value) in original {
+            restore_env(name, value);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -537,6 +734,145 @@ mod tests {
                 .get("priority")
                 .expect("priority"),
             "high"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claim_sets_owner_and_rejects_competing_owner() {
+        let root = temp_dir("claim");
+        let store = TaskBoardStore::new(root.join("tasks"), String::from("session-1"));
+        store
+            .create(String::from("A"), String::from("first"), None, None)
+            .expect("create task");
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert(String::from("claimedBy"), json!("coder"));
+        let claimed = store
+            .claim(
+                "1",
+                String::from("coder"),
+                Some(String::from("Coder is working")),
+                Some(metadata),
+            )
+            .expect("claim")
+            .expect("task exists");
+
+        assert!(claimed.claimed);
+        assert_eq!(claimed.current_owner, None);
+        assert_eq!(claimed.task.owner.as_deref(), Some("coder"));
+        assert_eq!(claimed.task.status, TaskBoardStatus::InProgress);
+        assert_eq!(
+            claimed.task.active_form.as_deref(),
+            Some("Coder is working")
+        );
+        assert_eq!(
+            claimed
+                .task
+                .metadata
+                .as_ref()
+                .expect("metadata")
+                .get("claimedBy")
+                .expect("claimedBy"),
+            "coder"
+        );
+
+        let same_owner = store
+            .claim("1", String::from("coder"), None, None)
+            .expect("same owner claim")
+            .expect("task exists");
+        assert!(same_owner.claimed);
+        assert_eq!(same_owner.task.owner.as_deref(), Some("coder"));
+
+        let rejected = store
+            .claim("1", String::from("reviewer"), None, None)
+            .expect("competing claim")
+            .expect("task exists");
+        assert!(!rejected.claimed);
+        assert_eq!(rejected.current_owner.as_deref(), Some("coder"));
+        assert_eq!(rejected.task.owner.as_deref(), Some("coder"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claim_rejects_completed_blocked_and_busy_tasks() {
+        let root = temp_dir("claim-guards");
+        let store = TaskBoardStore::new(root.join("tasks"), String::from("session-1"));
+        store
+            .create(String::from("Blocker"), String::from("first"), None, None)
+            .expect("create blocker");
+        store
+            .create(String::from("Blocked"), String::from("second"), None, None)
+            .expect("create blocked");
+        store
+            .update(
+                "1",
+                TaskBoardPatch {
+                    add_blocks: vec![String::from("2")],
+                    ..TaskBoardPatch::default()
+                },
+            )
+            .expect("link blocker");
+
+        let blocked = store
+            .claim("2", String::from("coder"), None, None)
+            .expect("blocked claim")
+            .expect("task exists");
+        assert!(!blocked.claimed);
+        assert_eq!(blocked.reason, Some(TaskBoardClaimRejectionReason::Blocked));
+        assert_eq!(blocked.blocking_tasks[0].id, "1");
+
+        store
+            .update(
+                "1",
+                TaskBoardPatch {
+                    status: Some(TaskBoardStatus::Completed),
+                    ..TaskBoardPatch::default()
+                },
+            )
+            .expect("complete blocker");
+        let claimed = store
+            .claim("2", String::from("coder"), None, None)
+            .expect("claim after unblock")
+            .expect("task exists");
+        assert!(claimed.claimed);
+
+        store
+            .create(String::from("Next"), String::from("third"), None, None)
+            .expect("create next");
+        let busy = store
+            .claim("3", String::from("coder"), None, None)
+            .expect("busy claim")
+            .expect("task exists");
+        assert!(!busy.claimed);
+        assert_eq!(busy.reason, Some(TaskBoardClaimRejectionReason::OwnerBusy));
+        assert_eq!(
+            busy.active_task
+                .as_ref()
+                .expect("active task should be reported")
+                .id,
+            "2"
+        );
+
+        store
+            .update(
+                "3",
+                TaskBoardPatch {
+                    status: Some(TaskBoardStatus::Completed),
+                    ..TaskBoardPatch::default()
+                },
+            )
+            .expect("complete next");
+        let completed = store
+            .claim("3", String::from("reviewer"), None, None)
+            .expect("completed claim")
+            .expect("task exists");
+        assert!(!completed.claimed);
+        assert_eq!(
+            completed.reason,
+            Some(TaskBoardClaimRejectionReason::AlreadyCompleted)
         );
 
         let _ = std::fs::remove_dir_all(root);

@@ -4,7 +4,9 @@ use std::fmt::{Display, Formatter};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
-use crate::appfs::{build_peer_awareness_snapshot, collect_appfs_pending_inputs, detect_appfs_environment};
+use crate::appfs::{
+    build_peer_awareness_snapshot, collect_appfs_pending_inputs, detect_appfs_environment,
+};
 use crate::compact::{
     build_compaction_result, compact_session, estimate_message_tokens, estimate_session_tokens,
     get_compact_prompt, select_full_compact_messages, should_compact, BuildCompactionResultOptions,
@@ -13,8 +15,8 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::input_router::{
-    input_router_block_from_pending_inputs, InputSource, PendingInput,
-    PendingInputQueue, SharedPendingInputQueue,
+    input_router_block_from_pending_inputs, InputSource, PendingInput, PendingInputQueue,
+    SharedPendingInputQueue,
 };
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,

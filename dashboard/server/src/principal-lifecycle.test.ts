@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   appendPrincipalAction,
   normalizePrincipalId,
+  PrincipalLifecycleError,
   PrincipalLifecycleService,
   principalControlDir,
   readPrincipalViews,
@@ -386,6 +387,8 @@ describe('PrincipalLifecycleService', () => {
         contextWindowTokens: 200000,
         maxOutputTokens: 8192,
         permissionMode: 'workspace-write',
+        teamName: 'alpha team',
+        taskListId: 'alpha',
       });
 
       assert.deepStrictEqual(result, {
@@ -407,6 +410,106 @@ describe('PrincipalLifecycleService', () => {
       assert.strictEqual(config?.maxOutputTokens, 8192);
       assert.strictEqual(config?.permissionMode, 'workspace-write');
       assert.deepStrictEqual(config?.launchSpec, fixture.processManager.defaultConfig.launchSpec);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('ensurePrincipalReady appends create action and accepts created control event', async () => {
+    const fixture = createFixture();
+
+    try {
+      const completed = completeNextCreateAction(fixture.project.mountRoot, 'coder', 'principal.created');
+      const result = await fixture.service.ensurePrincipalReady(fixture.project.projectId, {
+        principalId: 'coder',
+        displayName: 'Coder',
+        description: 'External teammate',
+      });
+      await completed;
+
+      assert.deepStrictEqual(result, {
+        status: 'created',
+        principal: { principal_id: 'coder' },
+        appInstances: undefined,
+      });
+      const action = fs.readFileSync(
+        path.join(fixture.project.mountRoot, '_appfs', 'principals', 'create_principal.act'),
+        'utf8',
+      );
+      assert.match(action, /"principal_id":"coder"/);
+      assert.match(action, /"display_name":"Coder"/);
+      assert.match(action, /"description":"External teammate"/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('startPrincipalAndWait waits for session_started with project-scoped config', async () => {
+    const fixture = createFixture();
+
+    try {
+      const result = await fixture.service.startPrincipalAndWait(fixture.project.projectId, 'coder', {
+        model: 'claude-opus-test',
+        modelProviderId: 'anthropic-default',
+        modelId: 'opus-test',
+        contextWindowTokens: 200000,
+        maxOutputTokens: 8192,
+        permissionMode: 'workspace-write',
+        teamName: 'alpha team',
+        taskListId: 'alpha',
+      });
+
+      assert.deepStrictEqual(result, {
+        status: 'started',
+        spawnId: 'spawn-1',
+        principalId: 'coder',
+        sessionId: 'spawn-1',
+        model: 'claude-opus-test',
+      });
+      assert.strictEqual(fixture.processManager.spawned.length, 1);
+      const config = fixture.processManager.spawned[0];
+      assert.strictEqual(config?.principalId, 'coder');
+      assert.strictEqual(config?.projectId, fixture.project.projectId);
+      assert.strictEqual(config?.projectRoot, fixture.project.projectRoot);
+      assert.strictEqual(config?.cwd, fixture.project.projectRoot);
+      assert.strictEqual(config?.appfsMountRoot, fixture.project.mountRoot);
+      assert.strictEqual(config?.model, 'claude-opus-test');
+      assert.strictEqual(config?.modelProviderId, 'anthropic-default');
+      assert.strictEqual(config?.modelId, 'opus-test');
+      assert.strictEqual(config?.contextWindowTokens, 200000);
+      assert.strictEqual(config?.maxOutputTokens, 8192);
+      assert.strictEqual(config?.permissionMode, 'workspace-write');
+      assert.strictEqual(config?.teamName, 'alpha team');
+      assert.strictEqual(config?.taskListId, 'alpha');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('startPrincipalAndWait reports starting managed agents as conflicts', async () => {
+    const fixture = createFixture();
+
+    try {
+      fixture.processManager.managedAgents = [
+        {
+          pid: 123,
+          sessionId: null,
+          status: 'starting',
+          principalId: 'coder',
+          projectId: fixture.project.projectId,
+          model: 'managed-model',
+          permissionMode: 'dangerous',
+        },
+      ];
+
+      await assert.rejects(
+        () => fixture.service.startPrincipalAndWait(fixture.project.projectId, 'coder'),
+        (err: unknown) => (
+          err instanceof PrincipalLifecycleError
+          && err.statusCode === 409
+          && err.code === 'AGENT_STARTING'
+        ),
+      );
     } finally {
       fixture.cleanup();
     }
@@ -706,6 +809,43 @@ function writePrincipalRegistry(
       principals,
     }),
   );
+}
+
+function completeNextCreateAction(
+  mountRoot: string,
+  principalId: string,
+  principalEvent: 'principal.created' | 'principal.exists',
+): Promise<void> {
+  const actionPath = path.join(mountRoot, '_appfs', 'principals', 'create_principal.act');
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+    const timer = setInterval(() => {
+      attempts += 1;
+      try {
+        if (fs.existsSync(actionPath)) {
+          const action = findActionForPrincipal(actionPath, principalId);
+          if (action?.client_token) {
+            clearInterval(timer);
+            writeControlEvent(mountRoot, {
+              path: '/_appfs/principals/create_principal.act',
+              type: 'action.completed',
+              client_token: action.client_token,
+              content: { principal_event: principalEvent, principal_id: principalId },
+            });
+            resolve();
+            return;
+          }
+        }
+        if (attempts > 100) {
+          clearInterval(timer);
+          reject(new Error(`create action for ${principalId} was not appended`));
+        }
+      } catch (err) {
+        clearInterval(timer);
+        reject(err);
+      }
+    }, 10);
+  });
 }
 
 async function waitForSpawnCount(processManager: FakeProcessManager, count: number): Promise<void> {

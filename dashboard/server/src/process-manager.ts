@@ -36,6 +36,13 @@ export interface SpawnConfig {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   runtimeModelConfigPath?: string;
+  teamName?: string;
+  taskListId?: string;
+}
+
+export interface DashboardControlEnv {
+  apiOrigin: string;
+  controlToken: string;
 }
 
 export function resolveProjectScopedSpawnConfig(
@@ -151,7 +158,11 @@ export class AgentProcessManager {
   private pendingSpawnMap = new Map<string, string>();
   private pendingStartWaiters = new Map<string, PendingStartWaiter>();
 
-  constructor(registry: AgentRegistry, private modelConfigStore?: ModelConfigStore) {
+  constructor(
+    registry: AgentRegistry,
+    private modelConfigStore?: ModelConfigStore,
+    private dashboardControl?: DashboardControlEnv,
+  ) {
     this.eventBus = EventBus.getInstance();
     this.registry = registry;
   }
@@ -887,6 +898,8 @@ export class AgentProcessManager {
     this.eventBus.broadcast('agent-offline', {
       sessionId: agentId,
       spawnId,
+      principalId: managedAgent.spawnConfig.principalId,
+      projectId: managedAgent.spawnConfig.projectId,
       code,
       signal,
     });
@@ -1019,9 +1032,29 @@ export class AgentProcessManager {
 
   private buildEnvironment(config: SpawnConfig): NodeJS.ProcessEnv {
     const mountRoot = path.resolve(config.appfsMountRoot);
+    const dashboardEnv: Record<string, string> = {};
+    if (this.dashboardControl && config.projectId) {
+      dashboardEnv.APPFS_DASHBOARD_API_ORIGIN = this.dashboardControl.apiOrigin;
+      dashboardEnv.APPFS_DASHBOARD_PROJECT_ID = config.projectId;
+      dashboardEnv.APPFS_DASHBOARD_CONTROL_TOKEN = this.dashboardControl.controlToken;
+    }
+    const taskScopeEnv: Record<string, string> = {};
+    if (config.taskListId?.trim()) {
+      const taskListId = config.taskListId.trim();
+      taskScopeEnv.APPFS_TASK_LIST_ID = taskListId;
+      taskScopeEnv.CLAW_TASK_LIST_ID = taskListId;
+      taskScopeEnv.CLAUDE_CODE_TASK_LIST_ID = taskListId;
+    }
+    if (config.teamName?.trim()) {
+      const teamName = config.teamName.trim();
+      taskScopeEnv.APPFS_TEAM_NAME = teamName;
+      taskScopeEnv.CLAUDE_CODE_TEAM_NAME = teamName;
+    }
     return {
       ...process.env,
       ...config.env,
+      ...dashboardEnv,
+      ...taskScopeEnv,
       APPFS_PRINCIPAL_ID: config.principalId,
       APPFS_ATTACH_ID: buildManagedAppfsAttachId(config.principalId),
       APPFS_MOUNT_ROOT: mountRoot,

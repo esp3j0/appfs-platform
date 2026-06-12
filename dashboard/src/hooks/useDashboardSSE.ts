@@ -15,8 +15,8 @@ export interface DashboardSSECallbacks {
   onTurnStart?: (payload: { sessionId: string; requestId: string; turnId: string }) => void;
   onTurnDone?: (payload: { sessionId: string; requestId: string; turnId: string; status: string; usage?: TokenUsageLike }) => void;
   onAgentError?: (payload: { sessionId: string; requestId?: string; turnId?: string; message: string }) => void;
-  onAgentOnline?: (payload: { sessionId: string; spawnId: string; controlMode: string }) => void;
-  onAgentOffline?: (payload: { sessionId: string; spawnId: string; code: number; signal: string }) => void;
+  onAgentOnline?: (payload: { sessionId: string; spawnId: string; controlMode: string; projectId?: string; principalId?: string }) => void;
+  onAgentOffline?: (payload: { sessionId: string; spawnId: string; code?: number | null; signal?: string | null; projectId?: string; principalId?: string }) => void;
   onProcessLog?: (payload: { agentId: string; spawnId: string; stream: string; text: string }) => void;
 }
 

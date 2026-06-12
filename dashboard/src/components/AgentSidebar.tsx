@@ -348,6 +348,25 @@ export function AgentSidebar({
     onRefreshAgents?.();
   };
 
+  useDashboardSSE('/api/events', {
+    onAgentOnline: payload => {
+      if (payload.projectId) {
+        loadPrincipals([payload.projectId]);
+      } else {
+        loadPrincipals();
+      }
+      onRefreshAgents?.();
+    },
+    onAgentOffline: payload => {
+      if (payload.projectId) {
+        loadPrincipals([payload.projectId]);
+      } else {
+        loadPrincipals();
+      }
+      onRefreshAgents?.();
+    },
+  });
+
   const principalActionKey = (projectId: string, principalId: string) => `${projectId}:${principalId}`;
 
   const postSpawn = async (spawnConfig: SpawnConfig, successLabel: string) => {

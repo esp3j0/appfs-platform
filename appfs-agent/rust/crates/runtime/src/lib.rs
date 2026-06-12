@@ -197,7 +197,8 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_board::{
-    TaskBoardPatch, TaskBoardStatus, TaskBoardStore, TaskBoardTask, TaskBoardUpdateOutcome,
+    TaskBoardClaimOutcome, TaskBoardClaimRejectionReason, TaskBoardPatch, TaskBoardStatus,
+    TaskBoardStore, TaskBoardTask, TaskBoardUpdateOutcome,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};

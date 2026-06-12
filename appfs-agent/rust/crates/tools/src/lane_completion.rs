@@ -111,6 +111,13 @@ mod tests {
             derived_state: "working".to_string(),
             current_blocker: None,
             error: None,
+            principal_id: None,
+            session_id: None,
+            spawn_id: None,
+            team_name: None,
+            message_client_token: None,
+            task_id: None,
+            task_list_id: None,
         }
     }
 

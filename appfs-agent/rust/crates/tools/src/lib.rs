@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
@@ -671,7 +671,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch an agent task. Provide `name` to start an external dashboard-managed headless teammate; omit `name` for an internal sub-agent task.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -679,7 +679,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "team_name": { "type": "string" },
+                    "requires_response": { "type": "boolean" }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -853,6 +855,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "subject": { "type": "string" },
                     "description": { "type": "string" },
                     "activeForm": { "type": "string" },
+                    "taskListId": { "type": "string" },
                     "metadata": {
                         "type": "object",
                         "additionalProperties": true
@@ -901,7 +904,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "taskId": { "type": "string" }
+                    "taskId": { "type": "string" },
+                    "taskListId": { "type": "string" }
                 },
                 "required": ["taskId"],
                 "additionalProperties": false
@@ -913,7 +917,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "List all persistent task-board cards for this session.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "taskListId": { "type": "string" }
+                },
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -942,6 +948,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "taskId": { "type": "string" },
+                    "taskListId": { "type": "string" },
                     "subject": { "type": "string" },
                     "description": { "type": "string" },
                     "activeForm": { "type": "string" },
@@ -964,6 +971,26 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskClaim",
+            description: "Atomically claim an unowned shared task-board card for an agent.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string" },
+                    "taskListId": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "activeForm": { "type": "string" },
+                    "metadata": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
+                "required": ["taskId", "owner"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1383,9 +1410,10 @@ fn execute_tool_with_enforcer(
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
-        "TaskList" => run_task_list(input.clone()),
+        "TaskList" => from_value::<TaskListInput>(input).and_then(run_task_list),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
+        "TaskClaim" => from_value::<TaskClaimInput>(input).and_then(run_task_claim),
         "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
@@ -1497,7 +1525,7 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| subject.clone());
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let store = task_store_for_optional_task_list_id(&cwd, input.task_list_id.as_deref());
     let task = store.create(subject, description, input.active_form, input.metadata)?;
     to_pretty_json(json!({
         "success": true,
@@ -1527,7 +1555,7 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let store = task_store_for_optional_task_list_id(&cwd, input.task_list_id.as_deref());
     match store.get(&input.task_id)? {
         Some(task) => to_pretty_json(json!({
             "success": true,
@@ -1543,9 +1571,9 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     }
 }
 
-fn run_task_list(_input: Value) -> Result<String, String> {
+fn run_task_list(input: TaskListInput) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let store = task_store_for_optional_task_list_id(&cwd, input.task_list_id.as_deref());
     let tasks = store.list()?;
     to_pretty_json(json!({
         "taskListId": store.task_list_id(),
@@ -1592,7 +1620,7 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
     }
 
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let store = TaskBoardStore::default_for_cwd(&cwd);
+    let store = task_store_for_optional_task_list_id(&cwd, input.task_list_id.as_deref());
     if input.status == Some(TaskUpdateStatus::Deleted) {
         let existing = store.get(&input.task_id)?;
         let deleted = store.delete(&input.task_id)?;
@@ -1646,6 +1674,37 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
             "taskId": input.task_id,
             "taskListId": store.task_list_id(),
             "updatedFields": [],
+            "error": "Task not found"
+        })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_task_claim(input: TaskClaimInput) -> Result<String, String> {
+    let owner = input.owner.trim().to_string();
+    if owner.is_empty() {
+        return Err(String::from("owner must not be empty"));
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = task_store_for_optional_task_list_id(&cwd, input.task_list_id.as_deref());
+    match store.claim(&input.task_id, owner, input.active_form, input.metadata)? {
+        Some(outcome) => to_pretty_json(json!({
+            "success": outcome.claimed,
+            "claimed": outcome.claimed,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
+            "currentOwner": outcome.current_owner,
+            "reason": outcome.reason,
+            "blockingTasks": outcome.blocking_tasks,
+            "activeTask": outcome.active_task,
+            "task": outcome.task
+        })),
+        None => to_pretty_json(json!({
+            "success": false,
+            "claimed": false,
+            "taskId": input.task_id,
+            "taskListId": store.task_list_id(),
             "error": "Task not found"
         })),
     }
@@ -2478,12 +2537,17 @@ struct SkillInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentInput {
     description: String,
     prompt: String,
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default, alias = "teamName")]
+    team_name: Option<String>,
+    #[serde(default, alias = "requiresResponse")]
+    requires_response: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2629,6 +2693,8 @@ struct TaskCreateInput {
     description: Option<String>,
     #[serde(rename = "activeForm", default)]
     active_form: Option<String>,
+    #[serde(rename = "taskListId", alias = "task_list_id", default)]
+    task_list_id: Option<String>,
     #[serde(default)]
     metadata: Option<BTreeMap<String, Value>>,
 }
@@ -2637,12 +2703,22 @@ struct TaskCreateInput {
 struct TaskIdInput {
     #[serde(rename = "taskId", alias = "task_id")]
     task_id: String,
+    #[serde(rename = "taskListId", alias = "task_list_id", default)]
+    task_list_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskListInput {
+    #[serde(rename = "taskListId", alias = "task_list_id", default)]
+    task_list_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
     #[serde(rename = "taskId", alias = "task_id")]
     task_id: String,
+    #[serde(rename = "taskListId", alias = "task_list_id", default)]
+    task_list_id: Option<String>,
     #[serde(default)]
     subject: Option<String>,
     #[serde(default)]
@@ -2661,6 +2737,19 @@ struct TaskUpdateInput {
     metadata: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskClaimInput {
+    #[serde(rename = "taskId", alias = "task_id")]
+    task_id: String,
+    #[serde(rename = "taskListId", alias = "task_list_id", default)]
+    task_list_id: Option<String>,
+    owner: String,
+    #[serde(rename = "activeForm", default)]
+    active_form: Option<String>,
+    #[serde(default)]
+    metadata: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -2936,6 +3025,20 @@ struct AgentOutput {
     derived_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "principalId", skip_serializing_if = "Option::is_none")]
+    principal_id: Option<String>,
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(rename = "spawnId", skip_serializing_if = "Option::is_none")]
+    spawn_id: Option<String>,
+    #[serde(rename = "teamName", skip_serializing_if = "Option::is_none")]
+    team_name: Option<String>,
+    #[serde(rename = "messageClientToken", skip_serializing_if = "Option::is_none")]
+    message_client_token: Option<String>,
+    #[serde(rename = "taskId", skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(rename = "taskListId", skip_serializing_if = "Option::is_none")]
+    task_list_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4079,7 +4182,18 @@ const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
-    execute_agent_with_spawn(input, spawn_agent_job)
+    if is_external_agent_request(&input) {
+        execute_external_agent(input)
+    } else {
+        execute_agent_with_spawn(input, spawn_agent_job)
+    }
+}
+
+fn is_external_agent_request(input: &AgentInput) -> bool {
+    input
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
 }
 
 fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOutput, String>
@@ -4102,6 +4216,660 @@ where
     }
 
     Ok(manifest)
+}
+
+#[derive(Debug, Clone)]
+struct ExternalAgentPrepared {
+    manifest: AgentOutput,
+    request: ExternalAgentStartRequest,
+    prompt: String,
+    requires_response: bool,
+    task_list_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExternalAgentStartRequest {
+    #[serde(rename = "principalId")]
+    principal_id: String,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(rename = "teamName", skip_serializing_if = "Option::is_none")]
+    team_name: Option<String>,
+    #[serde(rename = "taskListId", skip_serializing_if = "Option::is_none")]
+    task_list_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExternalAgentStartResponse {
+    status: String,
+    #[serde(rename = "principalId")]
+    principal_id: String,
+    #[serde(rename = "spawnId")]
+    spawn_id: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardErrorResponse {
+    error: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TinodeInitialMessageResult {
+    client_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalAgentTaskRegistration {
+    task_id: String,
+    task_list_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppfsActionEvent {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    client_token: Option<String>,
+    error: Option<AppfsActionEventError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppfsActionEventError {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TinodeMessageAttemptStatus {
+    Sent,
+    ProfileNotReady(String),
+    Failed(String),
+    TimedOut,
+}
+
+fn execute_external_agent(input: AgentInput) -> Result<AgentOutput, String> {
+    execute_external_agent_with_handlers(
+        input,
+        start_external_agent_via_dashboard,
+        send_tinode_initial_message,
+    )
+}
+
+fn execute_external_agent_with_handlers<F, G>(
+    input: AgentInput,
+    start_fn: F,
+    send_message_fn: G,
+) -> Result<AgentOutput, String>
+where
+    F: FnOnce(&ExternalAgentStartRequest) -> Result<ExternalAgentStartResponse, String>,
+    G: FnOnce(&str, &str, bool) -> Result<TinodeInitialMessageResult, String>,
+{
+    let prepared = prepare_external_agent(input)?;
+    let mut manifest = prepared.manifest.clone();
+
+    let start = match start_fn(&prepared.request) {
+        Ok(start) => start,
+        Err(error) => {
+            persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+            return Err(error);
+        }
+    };
+    if start.status != "started" && start.status != "already-running" {
+        let error = format!(
+            "dashboard returned unexpected external agent status `{}` for {}",
+            start.status, start.principal_id
+        );
+        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        return Err(error);
+    }
+    let Some(session_id) = start
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        let error = format!(
+            "dashboard started external agent {} but did not return a sessionId",
+            prepared.request.principal_id
+        );
+        persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+        return Err(error);
+    };
+
+    let task = match register_external_agent_task(&prepared, &start, &session_id) {
+        Ok(task) => task,
+        Err(error) => {
+            persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+            return Err(error);
+        }
+    };
+    let initial_prompt = format_external_agent_initial_prompt(&prepared.prompt, &task);
+    let message = match send_message_fn(
+        &start.principal_id,
+        &initial_prompt,
+        prepared.requires_response,
+    ) {
+        Ok(message) => {
+            update_external_agent_task_message_token(&task, &message.client_token)?;
+            message
+        }
+        Err(error) => {
+            let _ = mark_external_agent_task_message_failed(&task, &error);
+            persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
+            return Err(error);
+        }
+    };
+
+    manifest.status = "teammate_spawned".to_string();
+    manifest.completed_at = Some(iso8601_now());
+    manifest.derived_state = "external_agent_running".to_string();
+    manifest.principal_id = Some(start.principal_id.clone());
+    manifest.session_id = Some(session_id);
+    manifest.spawn_id = start.spawn_id.clone();
+    manifest.model = start.model.or_else(|| manifest.model.clone());
+    manifest.team_name = prepared.manifest.team_name.clone();
+    manifest.message_client_token = Some(message.client_token.clone());
+    manifest.task_id = Some(task.task_id.clone());
+    manifest.task_list_id = Some(task.task_list_id.clone());
+    manifest.lane_events.push(LaneEvent::finished(
+        iso8601_now(),
+        Some(format!(
+            "Spawned external principal `{}` and sent initial Tinode message.",
+            start.principal_id
+        )),
+    ));
+    append_agent_output(
+        &manifest.output_file,
+        &format!(
+            "\n## External agent\n\n- principal_id: {}\n- session_id: {}\n- spawn_id: {}\n- task_list_id: {}\n- task_id: {}\n- initial_message_client_token: {}\n",
+            start.principal_id,
+            manifest.session_id.as_deref().unwrap_or("<unknown>"),
+            manifest.spawn_id.as_deref().unwrap_or("<already-running>"),
+            task.task_list_id,
+            task.task_id,
+            message.client_token
+        ),
+    )?;
+    write_agent_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn register_external_agent_task(
+    prepared: &ExternalAgentPrepared,
+    start: &ExternalAgentStartResponse,
+    session_id: &str,
+) -> Result<ExternalAgentTaskRegistration, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = task_store_for_task_list_id(&cwd, &prepared.task_list_id);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("kind".to_string(), json!("external_agent_teammate"));
+    metadata.insert("principalId".to_string(), json!(start.principal_id));
+    metadata.insert("sessionId".to_string(), json!(session_id));
+    metadata.insert("agentId".to_string(), json!(prepared.manifest.agent_id));
+    metadata.insert("agentName".to_string(), json!(prepared.manifest.name));
+    if let Some(spawn_id) = start.spawn_id.as_deref() {
+        metadata.insert("spawnId".to_string(), json!(spawn_id));
+    }
+    if let Some(team_name) = prepared.manifest.team_name.as_deref() {
+        metadata.insert("teamName".to_string(), json!(team_name));
+    }
+
+    let task = store.create(
+        prepared.manifest.description.clone(),
+        prepared.prompt.clone(),
+        Some(format!("{} is working", start.principal_id)),
+        Some(metadata),
+    )?;
+    let claimed = store
+        .claim(&task.id, start.principal_id.clone(), None, None)?
+        .ok_or_else(|| {
+            format!(
+                "created task {} disappeared before owner assignment",
+                task.id
+            )
+        })?;
+    if !claimed.claimed {
+        return Err(format!(
+            "created task {} was already claimed by {}",
+            task.id,
+            claimed.current_owner.as_deref().unwrap_or("<unknown>")
+        ));
+    }
+
+    Ok(ExternalAgentTaskRegistration {
+        task_id: task.id,
+        task_list_id: store.task_list_id().to_string(),
+    })
+}
+
+fn update_external_agent_task_message_token(
+    task: &ExternalAgentTaskRegistration,
+    client_token: &str,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = task_store_for_task_list_id(&cwd, &task.task_list_id);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("messageClientToken".to_string(), json!(client_token));
+    metadata.insert("initialMessageStatus".to_string(), json!("sent"));
+    store
+        .update(
+            &task.task_id,
+            TaskBoardPatch {
+                metadata: Some(metadata),
+                ..TaskBoardPatch::default()
+            },
+        )?
+        .ok_or_else(|| {
+            format!(
+                "task {} not found while recording message token",
+                task.task_id
+            )
+        })?;
+    Ok(())
+}
+
+fn mark_external_agent_task_message_failed(
+    task: &ExternalAgentTaskRegistration,
+    error: &str,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let store = task_store_for_task_list_id(&cwd, &task.task_list_id);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("initialMessageStatus".to_string(), json!("failed"));
+    metadata.insert("initialMessageError".to_string(), json!(error));
+    store
+        .update(
+            &task.task_id,
+            TaskBoardPatch {
+                status: Some(TaskBoardStatus::Pending),
+                metadata: Some(metadata),
+                ..TaskBoardPatch::default()
+            },
+        )?
+        .ok_or_else(|| {
+            format!(
+                "task {} not found while recording message failure",
+                task.task_id
+            )
+        })?;
+    Ok(())
+}
+
+fn format_external_agent_initial_prompt(
+    prompt: &str,
+    task: &ExternalAgentTaskRegistration,
+) -> String {
+    format!(
+        "AppFS shared task:\n- task_list_id: {}\n- task_id: {}\n\n{}",
+        task.task_list_id, task.task_id, prompt
+    )
+}
+
+fn external_agent_task_store(cwd: &Path, team_name: Option<&str>) -> TaskBoardStore {
+    match team_name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(team_name) => {
+            let loader = ConfigLoader::default_for(cwd);
+            TaskBoardStore::new(loader.config_home().join("tasks"), team_name.to_string())
+        }
+        None => TaskBoardStore::default_for_cwd(cwd),
+    }
+}
+
+fn task_store_for_task_list_id(cwd: &Path, task_list_id: &str) -> TaskBoardStore {
+    let loader = ConfigLoader::default_for(cwd);
+    TaskBoardStore::new(loader.config_home().join("tasks"), task_list_id.to_string())
+}
+
+fn task_store_for_optional_task_list_id(cwd: &Path, task_list_id: Option<&str>) -> TaskBoardStore {
+    match task_list_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(task_list_id) => task_store_for_task_list_id(cwd, task_list_id),
+        None => TaskBoardStore::default_for_cwd(cwd),
+    }
+}
+
+fn prepare_external_agent(input: AgentInput) -> Result<ExternalAgentPrepared, String> {
+    if input.description.trim().is_empty() {
+        return Err(String::from("description must not be empty"));
+    }
+    if input.prompt.trim().is_empty() {
+        return Err(String::from("prompt must not be empty"));
+    }
+
+    let display_name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| String::from("external Agent requires name"))?
+        .to_string();
+    let principal_id = normalize_external_principal_id(&slugify_agent_name(&display_name))?;
+    let agent_name = input
+        .name
+        .as_deref()
+        .map(slugify_agent_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| principal_id.clone());
+    let team_name = input
+        .team_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let resolved_model = resolve_agent_model(input.model.as_deref());
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let task_store = external_agent_task_store(&cwd, team_name.as_deref());
+    let task_list_id = task_store.task_list_id().to_string();
+    let agent_id = make_agent_id();
+    let output_dir = agent_store_dir()?;
+    std::fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let output_file = output_dir.join(format!("{agent_id}.md"));
+    let manifest_file = output_dir.join(format!("{agent_id}.json"));
+    let created_at = iso8601_now();
+    let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
+
+    let output_contents = format!(
+        "# External Agent Task\n\n- id: {agent_id}\n- name: {agent_name}\n- principal_id: {principal_id}\n- description: {}\n- subagent_type: {normalized_subagent_type}\n- created_at: {created_at}\n\n## Prompt\n\n{}\n",
+        input.description,
+        input.prompt
+    );
+    std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
+
+    let manifest = AgentOutput {
+        agent_id,
+        name: agent_name,
+        description: input.description.clone(),
+        subagent_type: Some(normalized_subagent_type),
+        model: Some(resolved_model.clone()),
+        status: String::from("spawning"),
+        output_file: output_file.display().to_string(),
+        manifest_file: manifest_file.display().to_string(),
+        created_at: created_at.clone(),
+        started_at: Some(created_at),
+        completed_at: None,
+        lane_events: vec![LaneEvent::started(iso8601_now())],
+        current_blocker: None,
+        derived_state: String::from("external_agent_spawning"),
+        error: None,
+        principal_id: Some(principal_id.clone()),
+        session_id: None,
+        spawn_id: None,
+        team_name: team_name.clone(),
+        message_client_token: None,
+        task_id: None,
+        task_list_id: Some(task_list_id.clone()),
+    };
+    write_agent_manifest(&manifest)?;
+
+    Ok(ExternalAgentPrepared {
+        manifest,
+        request: ExternalAgentStartRequest {
+            principal_id,
+            display_name: Some(display_name),
+            description: Some(input.description),
+            model: Some(resolved_model),
+            team_name,
+            task_list_id: Some(task_list_id.clone()),
+        },
+        prompt: input.prompt,
+        requires_response: input.requires_response.unwrap_or(true),
+        task_list_id,
+    })
+}
+
+fn normalize_external_principal_id(input: &str) -> Result<String, String> {
+    let principal_id = input.trim();
+    let safe = !principal_id.is_empty()
+        && principal_id.len() <= 128
+        && principal_id != "."
+        && principal_id != ".."
+        && principal_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    if !safe {
+        return Err(format!("Invalid principal_id: {input}"));
+    }
+    Ok(principal_id.to_string())
+}
+
+fn start_external_agent_via_dashboard(
+    request: &ExternalAgentStartRequest,
+) -> Result<ExternalAgentStartResponse, String> {
+    let api_origin = std::env::var("APPFS_DASHBOARD_API_ORIGIN")
+        .map_err(|_| "APPFS_DASHBOARD_API_ORIGIN is not set".to_string())?;
+    let project_id = std::env::var("APPFS_DASHBOARD_PROJECT_ID")
+        .map_err(|_| "APPFS_DASHBOARD_PROJECT_ID is not set".to_string())?;
+    let control_token = std::env::var("APPFS_DASHBOARD_CONTROL_TOKEN")
+        .map_err(|_| "APPFS_DASHBOARD_CONTROL_TOKEN is not set".to_string())?;
+    let url = format!(
+        "{}/api/internal/projects/{}/external-agents",
+        api_origin.trim_end_matches('/'),
+        project_id
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|error| format!("failed to build dashboard client: {error}"))?;
+    let response = client
+        .post(url)
+        .header("x-appfs-agent-control-token", control_token)
+        .json(request)
+        .send()
+        .map_err(|error| format!("failed to call dashboard external agent API: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("failed to read dashboard response: {error}"))?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<DashboardErrorResponse>(&body)
+            .ok()
+            .and_then(|error| {
+                error.error.map(|message| {
+                    error
+                        .code
+                        .map(|code| format!("{code}: {message}"))
+                        .unwrap_or(message)
+                })
+            })
+            .unwrap_or(body);
+        return Err(format!(
+            "dashboard external agent spawn failed ({}): {}",
+            status.as_u16(),
+            detail
+        ));
+    }
+    serde_json::from_str::<ExternalAgentStartResponse>(&body)
+        .map_err(|error| format!("failed to parse dashboard external agent response: {error}"))
+}
+
+fn send_tinode_initial_message(
+    target_principal_id: &str,
+    prompt: &str,
+    requires_response: bool,
+) -> Result<TinodeInitialMessageResult, String> {
+    let mount_root = std::env::var_os("APPFS_MOUNT_ROOT")
+        .map(PathBuf::from)
+        .ok_or_else(|| "APPFS_MOUNT_ROOT is not set".to_string())?;
+    let sender_principal_id = std::env::var("APPFS_PRINCIPAL_ID")
+        .map_err(|_| "APPFS_PRINCIPAL_ID is not set".to_string())?;
+    send_tinode_initial_message_at(
+        &mount_root,
+        &sender_principal_id,
+        target_principal_id,
+        prompt,
+        requires_response,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+    )
+}
+
+fn send_tinode_initial_message_at(
+    mount_root: &Path,
+    sender_principal_id: &str,
+    target_principal_id: &str,
+    prompt: &str,
+    requires_response: bool,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<TinodeInitialMessageResult, String> {
+    let app_root = mount_root
+        .join("private")
+        .join(sender_principal_id)
+        .join("tinode");
+    let action_path = app_root.join("contacts").join("send_message.act");
+    let events_path = app_root.join("_stream").join("events.evt.jsonl");
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let client_token = format!("agent-tool-external-{}", local_now_nanos());
+        append_tinode_message_action(
+            &action_path,
+            target_principal_id,
+            prompt,
+            requires_response,
+            &client_token,
+        )?;
+        match wait_for_tinode_message_attempt(&events_path, &client_token, deadline, poll) {
+            TinodeMessageAttemptStatus::Sent => {
+                return Ok(TinodeInitialMessageResult { client_token });
+            }
+            TinodeMessageAttemptStatus::ProfileNotReady(message) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("Tinode target profile was not ready: {message}"));
+                }
+                std::thread::sleep(poll);
+            }
+            TinodeMessageAttemptStatus::Failed(message) => return Err(message),
+            TinodeMessageAttemptStatus::TimedOut => {
+                return Err(format!(
+                    "Timed out waiting for Tinode to send initial message to principal:{target_principal_id}"
+                ));
+            }
+        }
+    }
+}
+
+fn append_tinode_message_action(
+    action_path: &Path,
+    target_principal_id: &str,
+    prompt: &str,
+    requires_response: bool,
+    client_token: &str,
+) -> Result<(), String> {
+    let Some(parent) = action_path.parent() else {
+        return Err(format!(
+            "Invalid Tinode action path {}",
+            action_path.display()
+        ));
+    };
+    if !parent.is_dir() {
+        return Err(format!(
+            "Tinode contacts action directory is not available at {}",
+            parent.display()
+        ));
+    }
+    let payload = json!({
+        "to": format!("principal:{target_principal_id}"),
+        "text": prompt,
+        "requires_response": requires_response,
+        "client_token": client_token,
+    });
+    let line = serde_json::to_string(&payload)
+        .map_err(|error| format!("failed to encode Tinode message action: {error}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(action_path)
+        .map_err(|error| {
+            format!(
+                "failed to open Tinode message action {}: {error}",
+                action_path.display()
+            )
+        })?;
+    writeln!(file, "{line}").map_err(|error| {
+        format!(
+            "failed to append Tinode message action {}: {error}",
+            action_path.display()
+        )
+    })?;
+    file.flush().map_err(|error| {
+        format!(
+            "failed to flush Tinode message action {}: {error}",
+            action_path.display()
+        )
+    })
+}
+
+fn wait_for_tinode_message_attempt(
+    events_path: &Path,
+    client_token: &str,
+    deadline: Instant,
+    poll: Duration,
+) -> TinodeMessageAttemptStatus {
+    while Instant::now() <= deadline {
+        if let Some(status) = tinode_message_status_from_events(events_path, client_token) {
+            return status;
+        }
+        std::thread::sleep(poll);
+    }
+    TinodeMessageAttemptStatus::TimedOut
+}
+
+fn tinode_message_status_from_events(
+    events_path: &Path,
+    client_token: &str,
+) -> Option<TinodeMessageAttemptStatus> {
+    let contents = fs::read_to_string(events_path).ok()?;
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<AppfsActionEvent>(line) else {
+            continue;
+        };
+        if event.client_token.as_deref() != Some(client_token) {
+            continue;
+        }
+        match event.event_type.as_deref() {
+            Some("message.sent" | "action.completed") => {
+                return Some(TinodeMessageAttemptStatus::Sent);
+            }
+            Some("action.failed") => {
+                let code = event.error.as_ref().and_then(|error| error.code.as_deref());
+                let message = event
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.message.clone())
+                    .unwrap_or_else(|| "Tinode send_message failed".to_string());
+                if code == Some("PROFILE_NOT_READY") {
+                    return Some(TinodeMessageAttemptStatus::ProfileNotReady(message));
+                }
+                return Some(TinodeMessageAttemptStatus::Failed(
+                    code.map(|code| format!("{code}: {message}"))
+                        .unwrap_or(message),
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn local_now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn prepare_agent_job(
@@ -4168,6 +4936,13 @@ fn prepare_agent_job(
         current_blocker: None,
         derived_state: String::from("working"),
         error: None,
+        principal_id: None,
+        session_id: None,
+        spawn_id: None,
+        team_name: None,
+        message_client_token: None,
+        task_id: None,
+        task_list_id: None,
     };
     write_agent_manifest(&manifest)?;
 
@@ -4335,6 +5110,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "Skill",
             "TaskCreate",
             "TaskUpdate",
+            "TaskClaim",
             "TaskList",
             "TaskGet",
             "StructuredOutput",
@@ -4350,6 +5126,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "TaskCreate",
             "TaskUpdate",
+            "TaskClaim",
             "TaskList",
             "TaskGet",
             "StructuredOutput",
@@ -4389,6 +5166,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "TaskCreate",
             "TaskUpdate",
+            "TaskClaim",
             "TaskList",
             "TaskGet",
             "NotebookEdit",
@@ -7162,25 +7940,27 @@ pub mod pdf_extract;
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_skill_with_fork_runner, execute_tool,
-        execute_tool_with_effects, final_assistant_text, maybe_commit_provenance,
+        derive_agent_state, execute_agent_with_spawn, execute_external_agent_with_handlers,
+        execute_skill_with_fork_runner, execute_tool, execute_tool_with_effects,
+        final_assistant_text, is_external_agent_request, maybe_commit_provenance,
         model_visible_tool_result, model_visible_tool_result_with_id, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, should_inject_model_facing_skill_listing, sync_model_facing_skill_listing,
-        AgentInput, AgentJob, ForkedSkillExecutionResult, ForkedSkillRequest, GlobalToolRegistry,
-        LaneEventName, LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
-        ProviderRuntimeClient, SkillInput, SubagentToolExecutor,
+        run_task_packet, send_tinode_initial_message_at, should_inject_model_facing_skill_listing,
+        sync_model_facing_skill_listing, AgentInput, AgentJob, ExternalAgentStartResponse,
+        ForkedSkillExecutionResult, ForkedSkillRequest, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput, ProviderRuntimeClient,
+        SkillInput, SubagentToolExecutor, TinodeInitialMessageResult,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
     #[cfg(windows)]
@@ -7188,7 +7968,8 @@ mod tests {
     use runtime::{
         permission_enforcer::PermissionEnforcer, tool_output_root, ApiRequest, AssistantEvent,
         AttachmentKind, BashCommandOutput, ContentBlock, ConversationRuntime, PermissionMode,
-        PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        PermissionPolicy, RuntimeError, Session, TaskBoardStatus, TaskBoardStore, TaskPacket,
+        ToolExecutor,
     };
     use runtime::{GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
     use serde_json::json;
@@ -9878,6 +10659,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                team_name: None,
+                requires_response: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9929,18 +10712,235 @@ mod tests {
             serde_json::from_str(&normalized).expect("valid json");
         assert_eq!(normalized_output["subagentType"], "Explore");
 
-        let named = execute_tool(
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_selects_external_mode_only_when_name_is_present() {
+        let mut input = AgentInput {
+            description: "Ask a teammate".to_string(),
+            prompt: "Please inspect the login flow.".to_string(),
+            subagent_type: Some("Explore".to_string()),
+            name: None,
+            model: None,
+            team_name: Some("alpha".to_string()),
+            requires_response: Some(true),
+        };
+
+        assert!(!is_external_agent_request(&input));
+
+        input.name = Some("Coder 2".to_string());
+        assert!(is_external_agent_request(&input));
+
+        input.name = Some("   ".to_string());
+        assert!(!is_external_agent_request(&input));
+    }
+
+    #[test]
+    fn agent_rejects_removed_execution_field() {
+        let error = execute_tool(
             "Agent",
             &json!({
-                "description": "Review the branch",
-                "prompt": "Inspect diff.",
-                "name": "Ship Audit!!!"
+                "description": "Start teammate",
+                "prompt": "Say hello.",
+                "name": "coder2",
+                "execution": "external"
             }),
         )
-        .expect("Agent should normalize explicit names");
-        let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
-        assert_eq!(named_output["name"], "ship-audit");
+        .expect_err("removed execution field should fail");
+
+        assert!(error.contains("unknown field `execution`"));
+    }
+
+    #[test]
+    fn external_agent_uses_dashboard_start_and_tinode_message_handlers() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("external-agent-store");
+        let config_home = dir.join("config-home");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+
+        let manifest = execute_external_agent_with_handlers(
+            AgentInput {
+                description: "Ask a teammate".to_string(),
+                prompt: "Please inspect the login flow.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("Coder 2".to_string()),
+                model: Some("deepseek-v4-flash".to_string()),
+                team_name: Some("alpha".to_string()),
+                requires_response: Some(false),
+            },
+            |request| {
+                assert_eq!(request.principal_id, "coder-2");
+                assert_eq!(request.display_name.as_deref(), Some("Coder 2"));
+                assert_eq!(request.model.as_deref(), Some("deepseek-v4-flash"));
+                assert_eq!(request.team_name.as_deref(), Some("alpha"));
+                assert_eq!(request.task_list_id.as_deref(), Some("alpha"));
+                Ok(ExternalAgentStartResponse {
+                    status: "started".to_string(),
+                    principal_id: request.principal_id.clone(),
+                    spawn_id: Some("spawn-1".to_string()),
+                    session_id: Some("session-1".to_string()),
+                    model: Some("deepseek-v4-flash".to_string()),
+                })
+            },
+            |target, prompt, requires_response| {
+                assert_eq!(target, "coder-2");
+                assert!(prompt.contains("task_list_id: alpha"));
+                assert!(prompt.contains("task_id: 1"));
+                assert!(prompt.contains("Please inspect the login flow."));
+                assert!(!requires_response);
+                Ok(TinodeInitialMessageResult {
+                    client_token: "message-token".to_string(),
+                })
+            },
+        )
+        .expect("external Agent should succeed");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        assert_eq!(manifest.status, "teammate_spawned");
+        assert_eq!(manifest.principal_id.as_deref(), Some("coder-2"));
+        assert_eq!(manifest.session_id.as_deref(), Some("session-1"));
+        assert_eq!(manifest.spawn_id.as_deref(), Some("spawn-1"));
+        assert_eq!(manifest.team_name.as_deref(), Some("alpha"));
+        assert_eq!(
+            manifest.message_client_token.as_deref(),
+            Some("message-token")
+        );
+        assert_eq!(manifest.task_id.as_deref(), Some("1"));
+        assert_eq!(manifest.task_list_id.as_deref(), Some("alpha"));
+        let task_store = TaskBoardStore::new(config_home.join("tasks"), "alpha".to_string());
+        let task = task_store
+            .get("1")
+            .expect("task should be readable")
+            .expect("task should exist");
+        assert_eq!(task.owner.as_deref(), Some("coder-2"));
+        assert_eq!(task.status, TaskBoardStatus::InProgress);
+        assert_eq!(
+            task.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("messageClientToken"))
+                .and_then(serde_json::Value::as_str),
+            Some("message-token")
+        );
+        let manifest_contents =
+            std::fs::read_to_string(&manifest.manifest_file).expect("manifest file exists");
+        assert!(manifest_contents.contains("\"status\": \"teammate_spawned\""));
+        assert!(manifest_contents.contains("\"principalId\": \"coder-2\""));
+        assert!(manifest_contents.contains("\"taskId\": \"1\""));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_agent_reports_missing_dashboard_environment() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("external-agent-missing-env");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::remove_var("APPFS_DASHBOARD_API_ORIGIN");
+        std::env::remove_var("APPFS_DASHBOARD_PROJECT_ID");
+        std::env::remove_var("APPFS_DASHBOARD_CONTROL_TOKEN");
+
+        let error = execute_tool(
+            "Agent",
+            &json!({
+                "description": "Start teammate",
+                "prompt": "Say hello.",
+                "name": "coder2"
+            }),
+        )
+        .expect_err("missing dashboard env should fail");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+
+        assert!(error.contains("APPFS_DASHBOARD_API_ORIGIN is not set"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tinode_initial_message_retries_profile_not_ready() {
+        let root = temp_path("tinode-initial-message");
+        let app_root = root.join("private").join("default").join("tinode");
+        let contacts_dir = app_root.join("contacts");
+        let stream_dir = app_root.join("_stream");
+        fs::create_dir_all(&contacts_dir).expect("contacts dir");
+        fs::create_dir_all(&stream_dir).expect("stream dir");
+        fs::write(contacts_dir.join("send_message.act"), "").expect("action sink");
+        fs::write(stream_dir.join("events.evt.jsonl"), "").expect("events file");
+
+        let action_path = contacts_dir.join("send_message.act");
+        let events_path = stream_dir.join("events.evt.jsonl");
+        let watcher_action = action_path.clone();
+        let watcher_events = events_path.clone();
+        let watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut seen = 0usize;
+            while Instant::now() < deadline && seen < 2 {
+                let contents = fs::read_to_string(&watcher_action).unwrap_or_default();
+                let lines = contents
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect::<Vec<_>>();
+                while seen < lines.len() {
+                    let value: serde_json::Value =
+                        serde_json::from_str(lines[seen]).expect("action json");
+                    let token = value["client_token"].as_str().expect("client token");
+                    let event = if seen == 0 {
+                        json!({
+                            "type": "action.failed",
+                            "client_token": token,
+                            "error": {
+                                "code": "PROFILE_NOT_READY",
+                                "message": "profile not ready yet"
+                            }
+                        })
+                    } else {
+                        json!({
+                            "type": "message.sent",
+                            "client_token": token
+                        })
+                    };
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&watcher_events)
+                        .expect("open events");
+                    writeln!(file, "{event}").expect("write event");
+                    seen += 1;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let result = send_tinode_initial_message_at(
+            &root,
+            "default",
+            "coder2",
+            "Hello coder2",
+            true,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .expect("message should eventually send");
+        watcher.join().expect("watcher joins");
+
+        assert!(result.client_token.starts_with("agent-tool-external-"));
+        let actions = fs::read_to_string(&action_path).expect("actions");
+        let lines = actions.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first action");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("second action");
+        assert_eq!(first["to"], "principal:coder2");
+        assert_eq!(first["text"], "Hello coder2");
+        assert_eq!(first["requires_response"], true);
+        assert_eq!(second["to"], "principal:coder2");
+        remove_dir_all_with_retry(&root, "tinode initial message temp");
     }
 
     #[test]
@@ -9959,6 +10959,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                team_name: None,
+                requires_response: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10008,6 +11010,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                team_name: None,
+                requires_response: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10055,6 +11059,8 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                team_name: None,
+                requires_response: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -10219,6 +11225,7 @@ mod tests {
         assert!(!plan.contains("TodoWrite"));
         assert!(plan.contains("TaskCreate"));
         assert!(plan.contains("TaskUpdate"));
+        assert!(plan.contains("TaskClaim"));
         assert!(plan.contains("TaskList"));
         assert!(plan.contains("TaskGet"));
         assert!(plan.contains("StructuredOutput"));
@@ -10228,6 +11235,7 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("PowerShell"));
         assert!(!verification.contains("TodoWrite"));
+        assert!(verification.contains("TaskClaim"));
         assert!(verification.contains("TaskList"));
         assert!(!verification.contains("write_file"));
     }
@@ -11246,6 +12254,72 @@ mod tests {
         let list = execute_tool("TaskList", &json!({})).expect("list tasks");
         let list_json: serde_json::Value = serde_json::from_str(&list).expect("json");
         assert_eq!(list_json["count"], 2);
+        let team_task = execute_tool(
+            "TaskCreate",
+            &json!({
+                "taskListId": "alpha",
+                "subject": "Team task",
+                "description": "Shared with external teammate"
+            }),
+        )
+        .expect("create team task");
+        let team_task_json: serde_json::Value =
+            serde_json::from_str(&team_task).expect("team task json");
+        assert_eq!(team_task_json["taskListId"], "alpha");
+        assert_eq!(team_task_json["taskId"], "1");
+        let team_list =
+            execute_tool("TaskList", &json!({"taskListId": "alpha"})).expect("list team tasks");
+        let team_list_json: serde_json::Value =
+            serde_json::from_str(&team_list).expect("team list json");
+        assert_eq!(team_list_json["taskListId"], "alpha");
+        assert_eq!(team_list_json["count"], 1);
+        let claimed = execute_tool(
+            "TaskClaim",
+            &json!({
+                "taskListId": "alpha",
+                "taskId": "1",
+                "owner": "coder",
+                "activeForm": "Coder is working on the shared task",
+                "metadata": { "claimedBy": "coder" }
+            }),
+        )
+        .expect("claim team task");
+        let claimed_json: serde_json::Value = serde_json::from_str(&claimed).expect("claimed json");
+        assert_eq!(claimed_json["success"], true);
+        assert_eq!(claimed_json["claimed"], true);
+        assert_eq!(claimed_json["task"]["owner"], "coder");
+        assert_eq!(claimed_json["task"]["status"], "in_progress");
+        assert_eq!(
+            claimed_json["task"]["activeForm"],
+            "Coder is working on the shared task"
+        );
+        assert_eq!(claimed_json["task"]["metadata"]["claimedBy"], "coder");
+        let rejected_claim = execute_tool(
+            "TaskClaim",
+            &json!({
+                "taskListId": "alpha",
+                "taskId": "1",
+                "owner": "reviewer"
+            }),
+        )
+        .expect("reject competing claim");
+        let rejected_claim_json: serde_json::Value =
+            serde_json::from_str(&rejected_claim).expect("rejected claim json");
+        assert_eq!(rejected_claim_json["success"], false);
+        assert_eq!(rejected_claim_json["claimed"], false);
+        assert_eq!(rejected_claim_json["reason"], "already_claimed");
+        assert_eq!(rejected_claim_json["currentOwner"], "coder");
+        assert!(rejected_claim_json["blockingTasks"]
+            .as_array()
+            .expect("blocking tasks")
+            .is_empty());
+        assert!(rejected_claim_json["activeTask"].is_null());
+        assert_eq!(rejected_claim_json["task"]["owner"], "coder");
+        let default_list = execute_tool("TaskList", &json!({})).expect("list default tasks again");
+        let default_list_json: serde_json::Value =
+            serde_json::from_str(&default_list).expect("default list json");
+        assert_eq!(default_list_json["taskListId"], "task-tool-test");
+        assert_eq!(default_list_json["count"], 2);
 
         execute_tool("TaskUpdate", &json!({"taskId": "2", "status": "deleted"}))
             .expect("delete second");

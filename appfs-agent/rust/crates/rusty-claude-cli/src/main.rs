@@ -55,18 +55,18 @@ use runtime::{
     load_system_prompt_with_appfs, parse_oauth_callback_request_target, pricing_for_model,
     render_input_router_block, resolve_expected_base, resolve_sandbox_status,
     sanitize_appfs_task_preview, save_oauth_credentials, scan_appfs_attention_events_for_idle_wake,
-    set_shell_if_windows, update_appfs_principal_agent_status, warmup_appfs_private_apps, ApiClient,
-    ApiRequest,
-    AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachEnsureOutcome,
-    AppfsAttachEnsureStatus, AppfsAttachLease, AppfsPrincipalCreateRequest,
-    AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus, AssistantEvent, AutoCompactionConfig,
-    AutoCompactionEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, InputEnvelope, InputSource, McpServer,
-    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest,
-    OAuthConfig, OAuthTokenExchangeRequest, PendingInput, PendingInputDelivery, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, SharedPendingInputQueue,
-    TokenUsage, ToolError, ToolExecutionResult, ToolExecutor, UsageTracker,
+    set_shell_if_windows, update_appfs_principal_agent_status, warmup_appfs_private_apps,
+    ApiClient, ApiRequest, AppfsAgentOutcome, AppfsAgentState, AppfsAgentStatusUpdate,
+    AppfsAttachEnsureOutcome, AppfsAttachEnsureStatus, AppfsAttachLease,
+    AppfsPrincipalCreateRequest, AppfsPrincipalCreateStatus, AppfsPrivateAppWarmupStatus,
+    AssistantEvent, AutoCompactionConfig, AutoCompactionEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, InputEnvelope,
+    InputSource, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PendingInput,
+    PendingInputDelivery, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, SharedPendingInputQueue, TokenUsage, ToolError,
+    ToolExecutionResult, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -4857,9 +4857,7 @@ fn ensure_live_cli_appfs_attach_identity() -> Option<AppfsAttachEnsureOutcome> {
     Some(outcome)
 }
 
-fn attach_live_cli_appfs_principal(
-    outcome: &AppfsAttachEnsureOutcome,
-) -> Option<AppfsAttachLease> {
+fn attach_live_cli_appfs_principal(outcome: &AppfsAttachEnsureOutcome) -> Option<AppfsAttachLease> {
     let environment = outcome.environment.as_ref()?;
     eprintln!("AppFS attach: registering attach lease...");
     match attach_appfs_principal_with_environment(environment) {
@@ -4891,10 +4889,7 @@ fn appfs_principal_id_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn complete_appfs_attach(
-    state: &SharedAppfsAttachState,
-    lease: AppfsAttachLease,
-) -> bool {
+fn complete_appfs_attach(state: &SharedAppfsAttachState, lease: AppfsAttachLease) -> bool {
     let (pending_status, shutting_down) = {
         let mut guard = state
             .lock()
@@ -4933,10 +4928,7 @@ fn spawn_live_cli_appfs_ensure_and_attach(state: SharedAppfsAttachState) {
     });
 }
 
-fn spawn_live_cli_appfs_attach(
-    outcome: AppfsAttachEnsureOutcome,
-    state: SharedAppfsAttachState,
-) {
+fn spawn_live_cli_appfs_attach(outcome: AppfsAttachEnsureOutcome, state: SharedAppfsAttachState) {
     thread::spawn(move || {
         if let Some(lease) = attach_live_cli_appfs_principal(&outcome) {
             if complete_appfs_attach(&state, lease) {
@@ -11780,9 +11772,9 @@ mod tests {
     };
     use runtime::{
         bash_shell_path, load_oauth_credentials, save_oauth_credentials, set_shell_if_windows,
-        AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachLease, AssistantEvent,
-        AttachmentKind, ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput,
-        InputSource, InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
+        AppfsAgentState, AppfsAgentStatusUpdate, AppfsAttachLease, AssistantEvent, AttachmentKind,
+        ConfigLoader, ContentBlock, ConversationMessage, InputRouterBlockInput, InputSource,
+        InvokedSkill, MessageRole, OAuthConfig, PendingInput, PermissionMode,
         PermissionPromptDecision, PermissionPrompter, PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;

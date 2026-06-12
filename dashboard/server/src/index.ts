@@ -15,9 +15,11 @@ import { registerPrincipalsRoute } from './routes/principals.js';
 import { ProjectRegistry } from './project-registry.js';
 import { registerProjectsRoute } from './routes/projects.js';
 import { registerModelConfigsRoute } from './routes/model-configs.js';
+import { registerInternalExternalAgentsRoute } from './routes/internal-external-agents.js';
 import type { ProjectRuntimeController } from './routes/projects.js';
 import type { ProjectRecord } from './project-registry.js';
 import { spawn, ChildProcess } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { terminateChildProcessTree } from './child-process-utils.js';
@@ -267,7 +269,12 @@ async function main() {
   }
 
   const modelConfigStore = new ModelConfigStore();
-  const processManager = new AgentProcessManager(registry, modelConfigStore);
+  const dashboardControlToken = crypto.randomUUID();
+  const dashboardApiOrigin = `http://${HOST}:${PORT}`;
+  const processManager = new AgentProcessManager(registry, modelConfigStore, {
+    apiOrigin: dashboardApiOrigin,
+    controlToken: dashboardControlToken,
+  });
   const runtimeController = new AppfsProjectRuntimeController(projectRegistry, processManager);
   const principalLifecycle = new PrincipalLifecycleService({
     projectRegistry,
@@ -293,6 +300,7 @@ async function main() {
   registerModelConfigsRoute(app, modelConfigStore);
   registerProcessRoute(app, processManager);
   registerPrincipalsRoute(app, principalLifecycle);
+  registerInternalExternalAgentsRoute(app, principalLifecycle, dashboardControlToken);
   registerProjectsRoute(app, projectRegistry, runtimeController, {
     agentRegistry: registry,
     principalLifecycle,

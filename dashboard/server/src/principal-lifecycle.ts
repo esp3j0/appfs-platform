@@ -65,6 +65,8 @@ export interface PrincipalStartRequest {
   contextWindowTokens?: number;
   maxOutputTokens?: number;
   permissionMode?: string;
+  teamName?: string;
+  taskListId?: string;
 }
 
 export interface PrincipalResumeRequest extends PrincipalStartRequest {
@@ -128,6 +130,7 @@ export class PrincipalLifecycleError extends Error {
   constructor(
     public statusCode: number,
     message: string,
+    public code?: string,
   ) {
     super(message);
     this.name = 'PrincipalLifecycleError';
@@ -231,6 +234,23 @@ export class PrincipalLifecycleService {
       kind: input.kind ?? 'agent',
     });
     return { status: 'created' as const, principal: { principal_id: principalId } };
+  }
+
+  async ensurePrincipalReady(projectId: string, input: PrincipalCreateRequest) {
+    const project = this.requireProject(projectId);
+    const principalId = normalizePrincipalId(input.principalId);
+    const clientToken = appendPrincipalAction(project.mountRoot, 'create_principal.act', {
+      principal_id: principalId,
+      display_name: input.displayName ?? principalId,
+      description: input.description,
+      kind: input.kind ?? 'agent',
+    });
+    const event = await waitForPrincipalCreateAction(project.mountRoot, clientToken, principalId);
+    return {
+      status: event.content?.principal_event === 'principal.exists' ? 'exists' as const : 'created' as const,
+      principal: { principal_id: principalId },
+      appInstances: event.content?.app_instances,
+    };
   }
 
   async deletePrincipal(projectId: string, principalIdInput: string) {
@@ -406,6 +426,53 @@ export class PrincipalLifecycleService {
     return { status: 'spawning' as const, spawnId, principalId };
   }
 
+  async startPrincipalAndWait(
+    projectId: string,
+    principalIdInput: string,
+    input: PrincipalStartRequest = {},
+  ) {
+    const project = this.requireProject(projectId);
+    const principalId = normalizePrincipalId(principalIdInput);
+    const existing = this.deps.processManager.findManagedAgentByPrincipal(
+      principalId,
+      project.projectId,
+    );
+    if (existing) {
+      if (!existing.sessionId) {
+        throw new PrincipalLifecycleError(
+          409,
+          `Principal ${principalId} already has a managed agent that is still starting`,
+          'AGENT_STARTING',
+        );
+      }
+      return {
+        status: 'already-running' as const,
+        principalId,
+        sessionId: existing.sessionId,
+        model: existing.model,
+      };
+    }
+
+    const config = this.buildSpawnConfig(project, principalId, input);
+    let started: { spawnId: string; sessionId: string };
+    try {
+      started = await this.deps.processManager.spawnAndWaitStarted(config);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('did not publish session_started')) {
+        throw new PrincipalLifecycleError(504, message, 'AGENT_START_TIMEOUT');
+      }
+      throw err;
+    }
+    return {
+      status: 'started' as const,
+      spawnId: started.spawnId,
+      principalId,
+      sessionId: started.sessionId,
+      model: config.model,
+    };
+  }
+
   async stopPrincipal(projectId: string, principalIdInput: string) {
     const project = this.requireProject(projectId);
     const principalId = normalizePrincipalId(principalIdInput);
@@ -537,6 +604,8 @@ export class PrincipalLifecycleService {
       contextWindowTokens: input.contextWindowTokens,
       maxOutputTokens: input.maxOutputTokens,
       permissionMode: input.permissionMode ?? base.permissionMode,
+      teamName: input.teamName,
+      taskListId: input.taskListId,
     };
   }
 
@@ -659,6 +728,31 @@ async function waitForPrincipalDeleteAction(
     timeoutMessage: `Timed out waiting for AppFS to delete principal ${principalId}`,
     failureMessage: `AppFS delete_principal failed for ${principalId}`,
   });
+}
+
+async function waitForPrincipalCreateAction(
+  mountRoot: string,
+  clientToken: string,
+  principalId: string,
+): Promise<AppfsControlEvent> {
+  const event = await waitForPrincipalControlAction({
+    mountRoot,
+    clientToken,
+    principalId,
+    path: '/_appfs/principals/create_principal.act',
+    completedEvent: null,
+    timeoutMessage: `Timed out waiting for AppFS to create principal ${principalId}`,
+    failureMessage: `AppFS create_principal failed for ${principalId}`,
+  });
+  const principalEvent = event.content?.principal_event;
+  if (principalEvent !== 'principal.created' && principalEvent !== 'principal.exists') {
+    throw new PrincipalLifecycleError(
+      409,
+      `Unexpected principal create event for ${principalId}: ${principalEvent ?? '<missing>'}`,
+      'PRINCIPAL_CREATE_UNEXPECTED_EVENT',
+    );
+  }
+  return event;
 }
 
 async function waitForPrincipalDetachAction(
