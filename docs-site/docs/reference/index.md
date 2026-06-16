@@ -9,9 +9,9 @@ description: 协议与契约的权威字段说明——面向查阅，不面向�
 
 ## 内容
 
-- [动作契约（.act / .res.json）](./action-contract)
-- [运行时清单（runtime.json）](./runtime-manifest)
-- [事件流（events.evt.jsonl）](./event-stream)
+- [动作契约（.act / .res.json）](./action-contract.mdx)
+- [运行时清单（runtime.json）](./runtime-manifest.md)
+- [事件流（events.evt.jsonl）](./event-stream.md)
 
 ## 约定
 

@@ -9,5 +9,5 @@ description: 设计动机与架构权衡——面向理解，而非面向操作�
 
 ## 内容
 
-- [两层分离的动机](./two-layer-separation)
-- [Principal / Attach 租约的设计权衡](./principal-attach-design)
+- [两层分离的动机](./two-layer-separation.md)
+- [Principal / Attach 租约的设计权衡](./principal-attach-design.md)

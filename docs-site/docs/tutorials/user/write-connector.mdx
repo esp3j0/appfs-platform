@@ -1,0 +1,253 @@
+---
+title: 写一个 Connector
+description: 把你自己的应用接到 AppFS——用脚手架生成一个 connector，改成你的应用，注册进去并验证。
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# 写一个 Connector
+
+前两篇你用的是仓库自带的模拟聊天应用。这一篇把它换成**你自己的应用**：生成一个 connector 脚手架，做一处小改动，注册进 AppFS，看到挂载点里长出属于你的内容。
+
+## 你会得到什么
+
+- 一个属于你自己的 connector（从脚手架改出来的）
+- 它在 AppFS 里注册成功，挂载点里出现以你应用命名的目录
+- 你读到的是**你改出来的内容**，证明"改后端 → 挂载点变"这条链路
+
+## Connector 到底是什么
+
+上一篇里那个跑在 `:8080` 的“应用后端 / HTTP 桥”，正式名字就是 **connector**——本篇你就来写一个。
+
+先纠正一个容易搞反的直觉：**connector 不是"监视 `.act` 文件的东西"。** 那是 AppFS 进程干的活。
+
+connector 是**你写的一个小型 HTTP 服务**。AppFS 进程在几个时刻**主动调用它**：
+
+```
+你的 connector(HTTP 服务)            AppFS 进程                  挂载点
+───────────────────────            ──────────                ────────
+connector_info()        ◄──── 注册时核对身份
+get_app_structure()     ◄──── 注册时索取结构 ──► 物化你的文件树 ──►  my-app/...
+fetch_snapshot_chunk()  ◄──── 读快照资源时 ────► 把内容写进文件 ──►  .../messages.res.jsonl
+connector_submit_action() ◄── 有人写 .act 时
+                                 写回结果 + 事件 ─────────────►  _stream/events.evt.jsonl
+```
+
+换句话说，connector 要回答 AppFS 三个问题：
+
+1. **你是谁、你的应用叫什么** → `connector_info()`
+2. **你的应用长什么样（一棵由"资源文件 + 动作文件"组成的树）** → `get_app_structure()`
+3. **快照资源里是什么内容、动作被触发时干什么** → `fetch_snapshot_chunk()` / `connector_submit_action()`
+
+本篇你只改第 1 和第 3 点的一小部分，让你看清这条链路。完整替换那棵树（第 2 点）是后续工作。
+
+## 前提
+
+- 完成了 [挂载并附着](./mount-and-attach)，`agentfs appfs up` **仍在运行**。
+- 有 Python 与 [uv](https://docs.astral.sh/uv/)。
+- 本篇里 `cd appfs/...` 的命令都从**仓库根目录**执行。
+- 建议先做过 [第一条消息](./first-message)，熟悉"注册 → 读快照 → 写动作 → 看事件"这一圈。
+
+先设好挂载点变量：
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+$MNT = "C:\appfs-tutorial\mnt"
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS (bash)">
+
+```bash
+MNT="$HOME/appfs-tutorial/mnt"
+```
+
+</TabItem>
+</Tabs>
+
+## 第 1 步：生成脚手架
+
+仓库里有一个脚手架脚本，会把一整套可运行的参考 connector 拷一份给你：
+
+```bash
+cd appfs/examples/appfs
+sh ./new-connector.sh my-notes
+```
+
+它生成 `appfs/examples/appfs/connectors/my-notes/http-python/`——一份完整的、能直接跑的 connector（就是模拟聊天应用的那套代码的副本），外加一份 `CONNECTOR-MAPPING.md`（让你把应用表面映射到 connector 行为的填空表）。
+
+:::note[为什么拷一整份]
+脚手架故意给你一个**已经在工作的** connector，而不是空壳。你的任务是把它**改成你的**，而不是从零搭。这样新手能先跑通、再替换。
+:::
+
+## 第 2 步：看懂你要改的三处
+
+打开 `appfs/examples/appfs/connectors/my-notes/http-python/appfs_http_bridge/mock_aiim.py`。这是 connector 的"大脑"，你将来主要改这三处：
+
+| 想改什么 | 改哪里 | 作用 |
+|---|---|---|
+| 应用身份 | `connector_info()` | 返回的 `app_id` 就是注册时要匹配的名字 |
+| 应用的文件树 | `_structure_nodes()` | 声明挂载点里会有哪些目录、资源、动作 |
+| 动作被触发时的行为 | `connector_submit_action()`（以及 `_submit_inline`） | 有人往 `.act` 写东西时，你的后端干什么 |
+
+还有 `fetch_snapshot_chunk()`——它**提供快照资源的实际内容**。本篇就改 `connector_info()` 和 `fetch_snapshot_chunk()` 这两处，最小、最快看到效果。
+
+## 第 3 步：改成你的（最小可验证改动）
+
+**改动一：把应用改名叫 `my-notes`。** 找到 `connector_info()`，把 `app_id` 和 `connector_id` 改掉：
+
+```python
+def connector_info(self) -> dict[str, Any]:
+    return {
+        "connector_id": "my-notes-http",   # 原来是 mock-aiim-http
+        "version": "0.3.0-demo",
+        "app_id": "my-notes",              # 原来是 aiim
+        # ...其余不变
+    }
+```
+
+> 注册时你填的 `app_id` **必须**等于这里返回的值，否则 AppFS 会拒绝注册。
+
+**改动二：让快照显示你自己的内容。** 找到 `fetch_snapshot_chunk()` 里 `kind == "start"` 的分支，把两条示例消息的文本改成你的：
+
+```python
+if kind == "start":
+    records = [
+        {
+            "record_key": "rk-001",
+            "ordering_key": "ok-001",
+            "line": {"id": "m-1", "text": "my first note"},   # 原来是 hello
+        },
+        {
+            "record_key": "rk-002",
+            "ordering_key": "ok-002",
+            "line": {"id": "m-2", "text": "my second note"},  # 原来是 world
+        },
+    ]
+```
+
+这两条就是 AppFS 读快照资源时，写进 `messages.res.jsonl` 的内容。
+
+:::tip[为什么只改这两处]
+这两处改动**不会影响 connector 自带的单元测试**（那些测试只校验通信管道，不校验具体文本），所以你能安全地跑测试。完整替换 `_structure_nodes()` 里那棵树才是真功夫，留作后续。
+:::
+
+## 第 4 步：本地验证
+
+跑 connector 自带的单元测试，确认改动没弄坏通信管道：
+
+```bash
+cd appfs/examples/appfs/connectors/my-notes/http-python
+uv run python -m unittest discover -s tests -t . -p "test_*.py"
+```
+
+**验证**：全部测试通过（`OK`）。
+
+> 同目录下还有 `run-conformance.sh`，它会启动 connector 并跑一整套**端到端一致性测试**（需要构建 `agentfs`，较重）。日常改动跑上面的单元测试就够；要正式发布前再跑一致性测试。
+
+## 第 5 步：跑起来、注册、验证
+
+**先停掉**上一篇在 `:8080` 上跑的模拟应用桥（在它的终端 Ctrl-C），腾出端口。然后启动你自己的 connector（前台运行，阻塞当前终端）：
+
+```bash
+cd appfs/examples/appfs/connectors/my-notes/http-python
+uv run python bridge_server.py
+```
+
+它默认监听 `http://127.0.0.1:8080`。**验证**（另一个终端）：它现在自称是 `my-notes`：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/connector/info -H "Content-Type: application/json" -d "{}"
+# 输出里应包含 "app_id":"my-notes"
+```
+
+注册进 AppFS（注意 `app_id` 用 `my-notes`，和 `connector_info()` 一致）：
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+$json = '{"app_id":"my-notes","transport":{"kind":"http","endpoint":"http://127.0.0.1:8080","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":2,"bridge_initial_backoff_ms":100,"bridge_max_backoff_ms":1000,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":3000},"client_token":"reg-notes-001"}'
+[System.IO.File]::AppendAllText("$MNT\_appfs\register_app.act", $json + "`n")
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+echo '{"app_id":"my-notes","transport":{"kind":"http","endpoint":"http://127.0.0.1:8080","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":2,"bridge_initial_backoff_ms":100,"bridge_max_backoff_ms":1000,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":3000},"client_token":"reg-notes-001"}' >> "$MNT/_appfs/register_app.act"
+```
+
+</TabItem>
+</Tabs>
+
+**验证 1**：挂载点里长出了以你的应用命名的目录，且快照里是你的内容：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Get-Content "$MNT\my-notes\chats\chat-001\messages.res.jsonl"
+# 应看到 "text":"my first note" 和 "text":"my second note"
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+cat "$MNT/my-notes/chats/chat-001/messages.res.jsonl"
+# 应看到 "text":"my first note" 和 "text":"my second note"
+```
+
+</TabItem>
+</Tabs>
+
+看到**你写的文字**，就证明这条链路通了：`fetch_snapshot_chunk()` 返回什么，挂载点里就读到什么。
+
+**验证 2**：写一条动作，看到事件（和上一篇一样的往返，但这次打到你的应用）：
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+$msg = '{"version":2,"client_token":"notes-msg-1","payload":{"text":"hello from my own connector"}}'
+[System.IO.File]::AppendAllText("$MNT\my-notes\contacts\zhangsan\send_message.act", $msg + "`n")
+Get-Content "$MNT\my-notes\_stream\events.evt.jsonl" -Tail 5
+# 最后几行应有 "type":"action.completed"，含 notes-msg-1
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+echo '{"version":2,"client_token":"notes-msg-1","payload":{"text":"hello from my own connector"}}' >> "$MNT/my-notes/contacts/zhangsan/send_message.act"
+tail -n 5 "$MNT/my-notes/_stream/events.evt.jsonl"
+# 最后几行应有 "type":"action.completed"，含 notes-msg-1
+```
+
+</TabItem>
+</Tabs>
+
+## 你现在拥有了什么
+
+- 一个属于你自己的 connector，从脚手架改出来、注册进 AppFS、跑通了完整往返
+- 理解了 connector 的真实角色：**被 AppFS 调用的服务**，靠 `connector_info` / `get_app_structure` / `fetch_snapshot_chunk` / `connector_submit_action` 这几个方法把你的应用变成挂载点里的文件
+- 一个可以继续扩展的起点
+
+## 下一步
+
+- 把 `_structure_nodes()` 里那棵**示例树换成你真实的业务结构**（你的目录、你的资源、你的动作）——这是把 connector 变成真正可用的应用的核心工作。先填 `CONNECTOR-MAPPING.md` 做映射，再改代码。
+- 想用 gRPC 而非 HTTP：参考 `appfs/examples/appfs/bridges/grpc-python/`。
+- 想让 agent（`claw`）自动消费这些事件并回应（这是后续章节的主题）。
+
+---
+
+:::info[深入了解]
+- connector 结构接口的完整定义：`appfs/docs/v4/APPFS-v0.4-Connector结构接口.zh-CN.md`
+- 把应用表面映射到 connector 行为的填空表：脚手架里的 `CONNECTOR-MAPPING.md`
+- 为什么 AppFS 用"文件 + HTTP 服务"而不是直接调 API：[两层分离的动机](../../explanation/two-layer-separation)
+:::

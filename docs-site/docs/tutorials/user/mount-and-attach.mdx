@@ -1,0 +1,339 @@
+---
+title: 挂载 AppFS 并附着 Agent
+description: 从零构建、初始化、挂载一个 AppFS 文件系统，并让 claw 附着上去——全程不需要 API key。
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# 挂载 AppFS 并附着 Agent
+
+本篇在 Windows、Linux、macOS 上都能跑，命令用下面的**标签页**切换你的平台。
+
+## 你会得到什么
+
+走完本篇，你将拥有：
+
+- 一个运行中的 AppFS 挂载点（带共享 runtime session）
+- 挂载点里一个可读写的工作区
+- `claw` 通过 runtime manifest 自动发现并附着到 AppFS
+
+**全程不需要 `ANTHROPIC_API_KEY`**——真实模型对话是末尾的可选收尾。
+
+:::note[关于“附着”]
+`claw` 启动时会读取挂载点发布的 `runtime.json`，自动发现 AppFS 并附着（`claw status` 里会显示 `Attach source = manifest`）。本篇用这种方式；基于 principal 的长期身份注册是另一套机制，进阶再讲，见 [Principal 生命周期](../contributor/principal-lifecycle)。
+:::
+
+## 前置准备
+
+- 仓库已 `git clone`，Rust toolchain 可用（`cargo --version`）
+- 安装本平台的挂载后端：
+
+<Tabs>
+<TabItem value="win" label="Windows (WinFsp)">
+
+安装 [WinFsp](https://winfsp.dev/)（本篇主线）。装完无需配置。
+
+</TabItem>
+<TabItem value="linux" label="Linux (FUSE)">
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y fuse3 libfuse3-dev
+```
+
+</TabItem>
+<TabItem value="mac" label="macOS (NFS)">
+
+系统自带 NFS 客户端，无需额外安装。也可 `brew install macfuse`（非必需，本篇用 NFS）。
+</TabItem>
+</Tabs>
+
+## 第 1 步：构建并暂存两个二进制
+
+AppFS 平台需要两个可执行文件：`agentfs`（文件系统与运行时进程）和 `claw`（agent 运行时）。把它们构建出来，再复制到一个干净的工作目录。
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+# 换成你的仓库检出路径
+$REPO = "C:\path\to\appfs-platform"
+
+cargo build --manifest-path "$REPO\appfs\cli\Cargo.toml" --bin agentfs
+cargo build --manifest-path "$REPO\appfs-agent\rust\Cargo.toml" -p rusty-claude-cli
+
+New-Item -ItemType Directory -Force -Path C:\appfs-tutorial | Out-Null
+Copy-Item "$REPO\appfs\cli\target\debug\agentfs.exe" C:\appfs-tutorial\
+Copy-Item "$REPO\appfs-agent\rust\target\debug\claw.exe" C:\appfs-tutorial\
+Set-Location C:\appfs-tutorial
+
+# 给后续步骤用的快捷变量
+$AGENTFS = "C:\appfs-tutorial\agentfs.exe"
+$CLAW    = "C:\appfs-tutorial\claw.exe"
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS (bash)">
+
+```bash
+# 换成你的仓库检出路径
+REPO="$HOME/path/to/appfs-platform"
+
+cargo build --manifest-path "$REPO/appfs/cli/Cargo.toml" --bin agentfs
+cargo build --manifest-path "$REPO/appfs-agent/rust/Cargo.toml" -p rusty-claude-cli
+
+mkdir -p ~/appfs-tutorial
+cp "$REPO/appfs/cli/target/debug/agentfs" ~/appfs-tutorial/
+cp "$REPO/appfs-agent/rust/target/debug/claw" ~/appfs-tutorial/
+cd ~/appfs-tutorial
+
+# 给后续步骤用的快捷变量
+AGENTFS="$HOME/appfs-tutorial/agentfs"
+CLAW="$HOME/appfs-tutorial/claw"
+```
+
+</TabItem>
+</Tabs>
+
+**验证**：两个二进制都存在。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Test-Path $AGENTFS, $CLAW   # 都应为 True
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+ls -l "$AGENTFS" "$CLAW"   # 两个文件都在
+```
+
+</TabItem>
+</Tabs>
+
+## 第 2 步：初始化一个 AppFS 数据库
+
+```powershell
+& $AGENTFS init my-first-agent --force
+```
+
+（Linux/macOS：`$AGENTFS init my-first-agent --force`）
+
+**验证**：数据库文件已生成。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Test-Path .\.agentfs\my-first-agent.db   # True
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+ls .agentfs/my-first-agent.db   # 文件存在
+```
+
+</TabItem>
+</Tabs>
+
+## 第 3 步：启动 AppFS 挂载
+
+`appfs up` 启动 AppFS 进程（代码里叫 supervisor）并把数据库挂载成文件系统。**它会前台运行（阻塞当前终端）**，所以下面的验证要**另开一个终端**做。
+
+<Tabs>
+<TabItem value="win" label="Windows (WinFsp)">
+
+```powershell
+mkdir mnt -Force
+& $AGENTFS appfs up .agentfs\my-first-agent.db C:\appfs-tutorial\mnt `
+  --backend winfsp --auto-unmount
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux (FUSE)">
+
+```bash
+mkdir -p mnt
+$AGENTFS appfs up .agentfs/my-first-agent.db ~/appfs-tutorial/mnt \
+  --backend fuse --auto-unmount
+```
+
+</TabItem>
+<TabItem value="mac" label="macOS (NFS)">
+
+```bash
+mkdir -p mnt
+$AGENTFS appfs up .agentfs/my-first-agent.db ~/appfs-tutorial/mnt \
+  --backend nfs --auto-unmount
+```
+
+</TabItem>
+</Tabs>
+
+**验证**（在另一个终端，工作目录仍是 `appfs-tutorial`）：挂载的控制面和 runtime manifest 已就绪。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Test-Path .\mnt\_appfs\register_app.act           # True
+Test-Path .\mnt\_appfs\list_apps.act               # True
+Test-Path .\mnt\.well-known\appfs\runtime.json     # True
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+test -f mnt/_appfs/register_app.act && echo ok
+test -f mnt/_appfs/list_apps.act && echo ok
+test -f mnt/.well-known/appfs/runtime.json && echo ok
+```
+
+</TabItem>
+</Tabs>
+
+打开 `runtime.json`，确认这几个字段：
+
+```json
+{
+  "schema_version": 1,
+  "runtime_kind": "appfs",
+  "multi_agent_mode": "shared_mount_distinct_attach",
+  "runtime_session_id": "...",
+  "capabilities": { "multi_agent_attach": true }
+}
+```
+
+:::tip
+`runtime_session_id` 标识这一个共享 runtime 实例。多个 agent 进程可附着到同一个 mount，共享这个 session，但各自持有不同的 `attach_id`——这是多 Agent 的基础。
+:::
+
+## 第 4 步：在挂载点里写一个文件
+
+这步证明挂载点就是个**普通、可读写**的文件系统——agent 后面也会这样用它。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+New-Item -ItemType Directory -Force -Path .\mnt\workspace | Out-Null
+Set-Content .\mnt\workspace\hello.txt "hello from appfs mount"
+Get-Content .\mnt\workspace\hello.txt   # 应输出: hello from appfs mount
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+mkdir -p mnt/workspace
+echo "hello from appfs mount" > mnt/workspace/hello.txt
+cat mnt/workspace/hello.txt   # 应输出: hello from appfs mount
+```
+
+</TabItem>
+</Tabs>
+
+## 第 5 步：让 claw 附着并检查状态
+
+从**挂载点的工作区内**运行 `claw status`——`claw` 会凭 `runtime.json` 自动发现 AppFS。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Set-Location .\mnt\workspace
+& $CLAW status
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+cd mnt/workspace
+$CLAW status
+```
+
+</TabItem>
+</Tabs>
+
+**验证**：输出里应包含这几行：
+
+```
+Attach source     manifest
+Runtime session   <与 runtime.json 中一致的 runtime_session_id>
+Multi-agent mode  shared_mount_distinct_attach
+```
+
+看到 `Attach source     manifest` 就说明 `claw` 已成功附着。🎉 没有用到任何 API key。
+
+## （可选）让 Agent 真的读你的文件
+
+需要真实模型调用。先 `Set-Item env:ANTHROPIC_API_KEY "<你的 key>"`（或 `export ANTHROPIC_API_KEY=...`），然后：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+& $CLAW --dangerously-skip-permissions prompt `
+  "Confirm the current working directory, list files, and print the exact contents of hello.txt. Do not modify any files."
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+$CLAW --dangerously-skip-permissions prompt \
+  "Confirm the current working directory, list files, and print the exact contents of hello.txt. Do not modify any files."
+```
+
+</TabItem>
+</Tabs>
+
+`--dangerously-skip-permissions` 跳过交互式权限确认以便非交互运行。**验证**：回复里出现 `hello from appfs mount`。
+
+## 你现在拥有了什么
+
+- 一个运行中的 AppFS 挂载 + 共享 runtime session
+- `claw` 经 manifest 附着，能像读写普通文件一样读写挂载的工作区
+- 多个 `claw` 进程可同时附着（各自独立 `attach_id`）—— 见 [实操：多 Agent](../../how-to/configure-multi-agent)
+
+## 清理
+
+回到运行 `appfs up` 的终端按 **Ctrl-C** 停止这个进程——`--auto-unmount` 会自动卸载挂载点。需要时可再删掉工作目录与数据库：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Remove-Item C:\appfs-tutorial -Recurse -Force
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+rm -rf ~/appfs-tutorial
+```
+
+</TabItem>
+</Tabs>
+
+## 下一步
+
+- 跑通一次应用消息往返（注册应用 → 发消息 → 收事件）→ [Agent 的第一条消息](./first-message)
+- 给自己的应用写一个 connector → [写一个 Connector](./write-connector)
+
+---
+
+:::info[深入了解]
+- `agentfs` 所有命令的完整选项：`appfs/MANUAL.md`
+- 为什么这样设计挂载与附着：[两层分离的动机](../../explanation/two-layer-separation)
+:::

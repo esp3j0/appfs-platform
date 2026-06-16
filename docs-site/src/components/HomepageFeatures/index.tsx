@@ -56,6 +56,13 @@ export default function HomepageFeatures(): ReactNode {
   return (
     <section className={styles.features}>
       <div className="container">
+        <div className="text--center margin-bottom--lg">
+          <Heading as="h2">从哪开始？</Heading>
+          <p>
+            第一次来？<strong>教程</strong>是起点。下面的四个入口按你的目的分：
+            <strong>学</strong>用教程、<strong>做</strong>用实操指南、<strong>查</strong>用参考、<strong>懂</strong>用原理。
+          </p>
+        </div>
         <div className="row">
           {FeatureList.map((props, idx) => (
             <Feature key={idx} {...props} />

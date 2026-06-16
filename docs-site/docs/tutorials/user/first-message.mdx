@@ -1,6 +1,6 @@
 ---
 title: Agent 的第一条消息
-description: 用任一 SDK 附着、写入应用状态、触发 Agent 回合，并收到回写的事件。
+description: 注册一个应用、读它的状态、发送一条消息动作、看到回写的事件——AppFS 应用消息往返的核心一圈，不需要 API key。
 sidebar_position: 2
 ---
 
@@ -9,56 +9,223 @@ import TabItem from '@theme/TabItem';
 
 # Agent 的第一条消息
 
-> **状态：脚手架占位** · 多语言示例结构已就位，待填充可运行片段。
+上一篇你挂载了 AppFS。这一篇让一个真实应用跑起来：你往文件里写一条"消息"，你的应用后端被调用，事件流里出现结果。**这一圈就是 AppFS 的核心价值**，全程不需要 `ANTHROPIC_API_KEY`。
 
-本教程结束时，你能用四种 SDK 中的任意一种：附着 Agent、写入应用状态、触发一个 Agent 回合。
+## 你会得到什么
 
-## 附着并写入状态
+- 一个运行中的应用后端（一个模拟聊天应用）
+- 这个应用注册进 AppFS 后，挂载点里长出它的文件树
+- 你发出第一条消息（往 `.act` 文件写一行 JSON）
+- 事件流里看到 `action.completed` —— 证明你的后端真的被调用并处理了
+
+## 这一圈在干什么
+
+AppFS 把"和你的应用交互"变成"读写文件"：
+
+1. 你的应用后端（本篇用一个现成的**模拟聊天应用**）通过几个 HTTP 接口提供服务。
+2. 上一篇起的 `agentfs appfs up` 进程一直在**监视挂载点里的 `.act` 文件**。
+3. 你把一行 JSON 追加进 `send_message.act` → 该进程调用你后端的"提交动作"接口 → 后端处理（这里模拟发消息）→ 该进程把结果写回，并往事件流追加一条 `action.completed`。
+
+```
+你写文件                 AppFS 进程(监视 .act)          你的应用后端
+─────────               ────────────────────          ────────────
+register_app.act ──┐
+                   ├──► 发现动作 ──► 调后端 submit_action ──► 模拟处理
+send_message.act ──┘                  │                       │
+                                      │◄──── 结果返回 ─────────┘
+                                      ▼
+                          写回结果 + 往 _stream/events.evt.jsonl
+                          追加一条 action.completed   ◄── 你在这里读到
+```
+
+一句话：**写文件 → 你的后端被调用 → 事件出现**。
+
+## 前提
+
+- 完成了 [挂载并附着](./mount-and-attach)，且那个 `agentfs appfs up` **仍在运行**（本篇要往那个挂载点里写文件）。
+- 安装了 Python 与 [uv](https://docs.astral.sh/uv/)（`pip install uv`，或见官网）。
+- 本篇里 `cd appfs/...` 的命令都从**仓库根目录**执行。
+
+先设一个指向挂载点的变量，后面都用它：
 
 <Tabs>
-<TabItem value="rust" label="Rust">
+<TabItem value="win" label="Windows (PowerShell)">
 
-```rust
-// TODO: Rust SDK 附着 + 写应用状态的最小示例
-// 参考 appfs/sdk/rust/src/ 的 AgentFS 用法
+```powershell
+$MNT = "C:\appfs-tutorial\mnt"   # 换成你上一篇的挂载点
 ```
 
 </TabItem>
-<TabItem value="ts" label="TypeScript">
+<TabItem value="linux" label="Linux / macOS (bash)">
 
-```typescript
-// TODO: TypeScript SDK 最小示例
-// 参考 appfs/sdk/typescript/
-```
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-# TODO: Python SDK 最小示例
-# 参考 appfs/sdk/python/
-```
-
-</TabItem>
-<TabItem value="go" label="Go">
-
-```go
-// TODO: Go SDK 最小示例
-// 参考 appfs/sdk/go/
+```bash
+MNT="$HOME/appfs-tutorial/mnt"   # 换成你上一篇的挂载点
 ```
 
 </TabItem>
 </Tabs>
 
-## 触发回合并读取事件
+## 第 1 步：启动应用后端
 
-Agent 通过读取 `_stream/events.evt.jsonl`（基于游标）消费事件，并把输入注入回合循环。事件格式见 [事件流](../../reference/event-stream)。
+模拟聊天应用就在仓库的示例里。它前台运行（阻塞当前终端），所以后面的步骤**另开一个终端**做。
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+cd appfs\examples\appfs\bridges\http-python
+uv run python bridge_server.py
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+cd appfs/examples/appfs/bridges/http-python
+uv run python bridge_server.py
+```
+
+</TabItem>
+</Tabs>
+
+`uv run` 会自动装好依赖再启动。**验证**（另一个终端）：后端已在 `http://127.0.0.1:8080` 服务，并且自称是 `aiim` 应用：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/connector/info -H "Content-Type: application/json" -d "{}"
+# 输出里应包含 "app_id":"aiim"
+```
+
+> Windows 10+ 自带 `curl`；PowerShell 也可用 `Invoke-RestMethod -Uri http://127.0.0.1:8080/connector/info -Method Post -ContentType "application/json" -Body "{}"`。
+
+## 第 2 步：注册应用
+
+告诉 AppFS 这个应用的存在和后端地址：往控制面的 `register_app.act` 追加一行 JSON。
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+$json = '{"app_id":"aiim","transport":{"kind":"http","endpoint":"http://127.0.0.1:8080","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":2,"bridge_initial_backoff_ms":100,"bridge_max_backoff_ms":1000,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":3000},"client_token":"reg-tutorial-001"}'
+[System.IO.File]::AppendAllText("$MNT\_appfs\register_app.act", $json + "`n")
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+echo '{"app_id":"aiim","transport":{"kind":"http","endpoint":"http://127.0.0.1:8080","http_timeout_ms":5000,"grpc_timeout_ms":5000,"bridge_max_retries":2,"bridge_initial_backoff_ms":100,"bridge_max_backoff_ms":1000,"bridge_circuit_breaker_failures":5,"bridge_circuit_breaker_cooldown_ms":3000},"client_token":"reg-tutorial-001"}' >> "$MNT/_appfs/register_app.act"
+```
+
+</TabItem>
+</Tabs>
+
+AppFS 收到后会**把这个应用的文件树物化进挂载点**。**验证**（几秒内出现）：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Test-Path "$MNT\aiim\contacts\zhangsan\send_message.act"   # True
+Test-Path "$MNT\aiim\_stream\events.evt.jsonl"             # True
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+test -f "$MNT/aiim/contacts/zhangsan/send_message.act" && echo ok
+test -f "$MNT/aiim/_stream/events.evt.jsonl" && echo ok
+```
+
+</TabItem>
+</Tabs>
+
+现在挂载点里多了一个 `aiim\` 目录——那就是这个应用的"文件化视图"。
+
+## 第 3 步：读应用当前状态
+
+应用注册后会带一份初始状态。读它：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Get-Content "$MNT\aiim\chats\chat-001\messages.res.jsonl"
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+cat "$MNT/aiim/chats/chat-001/messages.res.jsonl"
+```
+
+</TabItem>
+</Tabs>
+
+**验证**：你能看到至少一条初始消息，例如含 `"text":"hello"`。这个 `.res.jsonl` 就是应用的**快照**——它当前的状态，被物化成了一个你能直接读的文件。
+
+## 第 4 步：发送第一条消息
+
+往 `send_message.act` 追加一条动作。`client_token` 是你给这条消息起的唯一标识，待会儿用来在事件里认出它。
+
+<Tabs>
+<TabItem value="win" label="Windows (PowerShell)">
+
+```powershell
+$msg = '{"version":2,"client_token":"my-first-msg","payload":{"text":"hello from my first appfs message"}}'
+[System.IO.File]::AppendAllText("$MNT\aiim\contacts\zhangsan\send_message.act", $msg + "`n")
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+echo '{"version":2,"client_token":"my-first-msg","payload":{"text":"hello from my first appfs message"}}' >> "$MNT/aiim/contacts/zhangsan/send_message.act"
+```
+
+</TabItem>
+</Tabs>
+
+## 第 5 步：观察事件
+
+AppFS 进程监视到了这个动作，调用后端处理，然后把结果写进事件流。读它：
+
+<Tabs>
+<TabItem value="win" label="Windows">
+
+```powershell
+Get-Content "$MNT\aiim\_stream\events.evt.jsonl" -Tail 5
+```
+
+</TabItem>
+<TabItem value="linux" label="Linux / macOS">
+
+```bash
+tail -n 5 "$MNT/aiim/_stream/events.evt.jsonl"
+```
+
+</TabItem>
+</Tabs>
+
+**验证**：最后几行里有一条 `"type":"action.completed"`，并且包含你刚起的 `client_token`（`my-first-msg`）。
+
+看到它，就说明：**你写了一个文件 → 你的应用后端被调用并处理了 → 结果作为事件回到了事件流**。这就是 AppFS 的核心循环。🎉 依旧没有用到任何 API key。
+
+## 你现在拥有了什么
+
+- 一个跑起来的应用后端，注册进了 AppFS
+- 亲手走过一遍完整的消息往返：注册 → 读状态 → 发消息 → 收事件
+- 理解了 AppFS 的核心机制：应用交互 = 读写挂载点里的文件
 
 ## 下一步
 
-- 把事件渲染进你的前端 → 见 `docs/plans/2026-05-19-appfs-event-model-rendering.md`
-- 用真实 Tinode 对话跑一次端到端 → [实操：接 Tinode](../../how-to/connect-tinode)
+- 把这个模拟后端换成**你自己的应用** → [写一个 Connector](./write-connector)
+- 让 agent（`claw`）来消费这些事件并自动回应（这是后续章节的主题）
 
 ---
 
-**权威来源**：SDK 入口分别在 `appfs/sdk/{rust,typescript,python,go}/README.md`；事件模型见仓库根 `CLAUDE.md` 的“Input Router”与“Principal & Agent Lifecycle”。
+:::info[深入了解]
+- `agentfs` 所有命令的完整选项：`appfs/MANUAL.md`
+- 为什么 AppFS 选择"用文件代替 API"：[两层分离的动机](../../explanation/two-layer-separation)
+:::

@@ -103,6 +103,7 @@ const config: Config = {
         {
           title: '教程',
           items: [
+            {label: '教程总览', to: '/docs/tutorials'},
             {label: '应用开发者路径', to: '/docs/tutorials/user'},
             {label: '项目贡献者路径', to: '/docs/tutorials/contributor'},
           ],

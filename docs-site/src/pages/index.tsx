@@ -20,18 +20,18 @@ function HomepageHeader() {
         <div className={styles.buttons}>
           <Link
             className="button button--secondary button--lg"
-            to="/docs/tutorials/user">
-            🧑‍💻 应用开发者入门
-          </Link>
-          <Link
-            className="button button--secondary button--lg"
-            to="/docs/tutorials/contributor">
-            🔧 项目贡献者入门
+            to="/docs/tutorials">
+            🚀 从教程总览开始
           </Link>
           <Link
             className="button button--outline button--lg"
-            to="/docs/tutorials">
-            浏览全部教程
+            to="/docs/tutorials/user">
+            🧑‍💻 应用开发者路径
+          </Link>
+          <Link
+            className="button button--outline button--lg"
+            to="/docs/tutorials/contributor">
+            🔧 项目贡献者路径
           </Link>
         </div>
       </div>
