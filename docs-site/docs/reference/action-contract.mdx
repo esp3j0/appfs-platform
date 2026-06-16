@@ -1,0 +1,48 @@
+---
+title: 动作契约
+description: AppFS 控制平面与应用树下的 .act 动作文件与 .res.json 结果视图。
+---
+
+# 动作契约（.act / .res.json）
+
+> **状态：脚手架占位** · 路径表已就位，字段 schema 待逐条补充。
+
+## 控制平面路径
+
+| 路径 | 用途 |
+|---|---|
+| `/_appfs/register_app.act` | 注册一个应用 |
+| `/_appfs/principals/create_principal.act` | 创建 principal |
+| `/_appfs/principals/attach_principal.act` | 附着（建立 attach lease） |
+| `/_appfs/principals/detach_principal.act` | 分离 |
+| `/_appfs/principals/update_principal.act` | 心跳 / 状态更新 |
+| `/_appfs/principals/delete_principal.act` | 删除（残留过期 attach 时带 `force: true`） |
+| `/_appfs/principals/<id>.res.json` | 单 principal 记录视图（读结果） |
+| `/_appfs/principals.registry.json` | 权威 principal + attach 注册表（supervisor 拥有） |
+
+## 应用专属动作
+
+应用专属动作住在应用树下，例如：
+
+```
+<app>/contacts/<id>/send_message.act
+```
+
+## 动作文件性质
+
+每个 `.act` 文件是一条 **append-only 动作日志**。supervisor 的 `action_consumer` 监听它们，分发到 `runtime_supervisor.rs` 的 `handle_*` 处理函数，回写 `.res.json` 并向事件流发事件。
+
+## 示例（待填充真实 schema）
+
+```json
+{
+  "type": "create_principal",
+  "id": "<principal-id>",
+  "attach_id": "<unique-attach-id>",
+  "takeover": false
+}
+```
+
+---
+
+**权威来源**：路径契约见仓库根 `CLAUDE.md` 的“AppFS Mount Contract”；集成层 attach 契约见 `integration/APPFS-appfs-agent-attach-contract-v1.1.md`；处理入口见 `appfs/cli/src/cmd/appfs/runtime_supervisor.rs`。

@@ -1,0 +1,64 @@
+---
+title: Agent 的第一条消息
+description: 用任一 SDK 附着、写入应用状态、触发 Agent 回合，并收到回写的事件。
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Agent 的第一条消息
+
+> **状态：脚手架占位** · 多语言示例结构已就位，待填充可运行片段。
+
+本教程结束时，你能用四种 SDK 中的任意一种：附着 Agent、写入应用状态、触发一个 Agent 回合。
+
+## 附着并写入状态
+
+<Tabs>
+<TabItem value="rust" label="Rust">
+
+```rust
+// TODO: Rust SDK 附着 + 写应用状态的最小示例
+// 参考 appfs/sdk/rust/src/ 的 AgentFS 用法
+```
+
+</TabItem>
+<TabItem value="ts" label="TypeScript">
+
+```typescript
+// TODO: TypeScript SDK 最小示例
+// 参考 appfs/sdk/typescript/
+```
+
+</TabItem>
+<TabItem value="python" label="Python">
+
+```python
+# TODO: Python SDK 最小示例
+# 参考 appfs/sdk/python/
+```
+
+</TabItem>
+<TabItem value="go" label="Go">
+
+```go
+// TODO: Go SDK 最小示例
+// 参考 appfs/sdk/go/
+```
+
+</TabItem>
+</Tabs>
+
+## 触发回合并读取事件
+
+Agent 通过读取 `_stream/events.evt.jsonl`（基于游标）消费事件，并把输入注入回合循环。事件格式见 [事件流](../../reference/event-stream)。
+
+## 下一步
+
+- 把事件渲染进你的前端 → 见 `docs/plans/2026-05-19-appfs-event-model-rendering.md`
+- 用真实 Tinode 对话跑一次端到端 → [实操：接 Tinode](../../how-to/connect-tinode)
+
+---
+
+**权威来源**：SDK 入口分别在 `appfs/sdk/{rust,typescript,python,go}/README.md`；事件模型见仓库根 `CLAUDE.md` 的“Input Router”与“Principal & Agent Lifecycle”。

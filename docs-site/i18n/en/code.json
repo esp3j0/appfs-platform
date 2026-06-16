@@ -1,0 +1,14 @@
+{
+  "教程": { "message": "Tutorials" },
+  "实操指南": { "message": "How-to" },
+  "参考": { "message": "Reference" },
+  "原理": { "message": "Explanation" },
+  "文档": { "message": "Docs" },
+  "仓库": { "message": "Repos" },
+  "应用开发者路径": { "message": "Application developer path" },
+  "项目贡献者路径": { "message": "Platform contributor path" },
+  "参考手册": { "message": "Reference" },
+  "原理解释": { "message": "Explanation" },
+  "appfs（独立源仓库）": { "message": "appfs (standalone source)" },
+  "appfs-agent（独立源仓库）": { "message": "appfs-agent (standalone source)" }
+}
