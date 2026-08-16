@@ -17,6 +17,10 @@ use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
+use crate::shell_cwd::{
+    current_shell_cwd, shell_cwd_tracking_file, update_shell_cwd_from_tracking_file,
+    ShellCwdPathFormat,
+};
 use crate::tool_output::{task_outputs_dir, tool_results_dir};
 #[cfg(windows)]
 use crate::windows_path_to_posix_path;
@@ -156,7 +160,7 @@ pub fn prepare_shell_command_output(
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    let cwd = current_shell_cwd()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
@@ -194,8 +198,18 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let appfs_act_wait = prepare_appfs_act_event_wait(&cwd, &input.command);
+    let cwd_tracking_path = if input.timeout.is_none() {
+        Some(shell_cwd_tracking_file("bash")?)
+    } else {
+        None
+    };
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let output = runtime.block_on(execute_bash_async(input, sandbox_status, cwd))?;
+    let output = runtime.block_on(execute_bash_async(
+        input,
+        sandbox_status,
+        cwd,
+        cwd_tracking_path,
+    ))?;
     if !output.interrupted && output.return_code_interpretation.is_none() {
         if let Some(wait_plan) = &appfs_act_wait {
             wait_for_appfs_act_event_completion(wait_plan);
@@ -208,8 +222,13 @@ async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
+    cwd_tracking_path: Option<PathBuf>,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
+    let command_text = cwd_tracking_path.as_ref().map_or_else(
+        || input.command.clone(),
+        |path| wrap_bash_command_for_cwd_tracking(&input.command, path),
+    );
+    let mut command = prepare_tokio_command(&command_text, &cwd, &sandbox_status, true)?;
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -239,6 +258,13 @@ async fn execute_bash_async(
     };
 
     let (output, interrupted) = output_result;
+    if let Some(path) = &cwd_tracking_path {
+        if output.status.success() {
+            let _ = update_shell_cwd_from_tracking_file(path, ShellCwdPathFormat::Bash);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
     let prepared_output =
         prepare_shell_command_output(&cwd, "bash", &output.stdout, &output.stderr);
     let return_code_interpretation = output.status.code().and_then(|code| {
@@ -266,6 +292,30 @@ async fn execute_bash_async(
         persisted_output_size: prepared_output.persisted_output_size,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+fn wrap_bash_command_for_cwd_tracking(command: &str, cwd_file: &Path) -> String {
+    format!(
+        "{{\n{}\n}}\n__appfs_agent_cwd_status=$?\nif [ \"$__appfs_agent_cwd_status\" -eq 0 ]; then\n  pwd -P >| {}\nfi\nexit \"$__appfs_agent_cwd_status\"",
+        command,
+        bash_single_quote(&bash_cwd_tracking_path(cwd_file))
+    )
+}
+
+fn bash_cwd_tracking_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        windows_path_to_posix_path(path)
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+fn bash_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn persist_stdout_for_model(cwd: &Path, stdout: &[u8]) -> io::Result<PersistedShellOutput> {

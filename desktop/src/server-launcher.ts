@@ -72,7 +72,15 @@ export class ServerLauncher {
     if (this.isPackaged) {
       // In packaged electron app, resolve the compiled server file in resources
       const resourcesPath = process.resourcesPath;
-      const serverPath = path.join(resourcesPath, 'app.asar.unpacked', 'dashboard', 'server', 'dist', 'index.js');
+      // Run the server from inside app.asar (NOT app.asar.unpacked). Only inside
+      // the asar do both dashboard/server/package.json ("type": "module", needed
+      // for the ESM `import` syntax) AND node_modules/{fastify,...} live on the
+      // same resolution tree. Pointing at the unpacked copy made Node walk up the
+      // host filesystem for a type:module package.json + node_modules, which only
+      // succeeds when the bundle happens to sit under the repo (desktop/), and
+      // fails 100% in a clean install (SyntaxError: Cannot use import statement
+      // outside a module).
+      const serverPath = path.join(resourcesPath, 'app.asar', 'dashboard', 'server', 'dist', 'index.js');
       
       // Also resolve packaged binary overrides if bundled
       const binaryFolder = path.join(resourcesPath, 'bin');
@@ -92,7 +100,11 @@ export class ServerLauncher {
       cmd = process.execPath;
       args = [serverPath];
       env.ELECTRON_RUN_AS_NODE = '1';
-      cwd = path.join(resourcesPath, 'app.asar.unpacked', 'dashboard', 'server');
+      // cwd only needs to be a real, existing directory: the server entry and its
+      // dependencies resolve from inside app.asar (above), not from cwd. The
+      // previous cwd pointed at app.asar.unpacked/dashboard/server, which no
+      // longer exists now that the server runs from app.asar.
+      cwd = resourcesPath;
     } else {
       // In development
       cmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
@@ -110,7 +122,13 @@ export class ServerLauncher {
       cwd,
       env,
       stdio: 'pipe',
-      shell: process.platform === 'win32',
+      // Only dev mode needs a shell (to resolve npx.cmd). In packaged mode cmd is
+      // process.execPath (an absolute .exe) and we must spawn it WITHOUT a shell:
+      // shell:true routes through cmd.exe, which splits the exe path at the first
+      // space — fatal when installed under "C:\Program Files\..." ('C:\Program'
+      // is not recognized). A direct (no-shell) spawn uses CreateProcess with the
+      // exe as lpApplicationName and handles spaces correctly in both exe and args.
+      shell: process.platform === 'win32' && !this.isPackaged,
       windowsHide: true,
     });
 

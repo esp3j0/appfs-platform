@@ -2238,6 +2238,25 @@ pub fn mount(fs: Arc<Mutex<dyn FileSystem + Send>>, opts: MountOpts) -> Result<(
     // handled by set_delete/cleanup instead of kernel prechecks.
     volume_params.post_disposition_only_when_necessary(false);
 
+    // Opt-in (env: APPFS_WINFSP_NETWORK_VOLUME=1): present the volume as a
+    // network provider (WinFsp.Net) instead of a local disk (WinFsp.Disk).
+    // Windows Defender's real-time protection does not scan network volumes by
+    // default, so this breaks the AV<->WinFsp read-loop that MsMpEng.exe falls
+    // into on hot control-plane files (e.g. _appfs/principals.registry.json,
+    // which the supervisor rewrites on principal mutations). Experimental: a
+    // network volume can change mountpoint access semantics, so verify the
+    // mountpoint is still reachable and agents can still attach before relying
+    // on it; unset the env to revert to local-disk behavior.
+    let network_volume = std::env::var("APPFS_WINFSP_NETWORK_VOLUME")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if network_volume {
+        volume_params.prefix("AppFS\\AgentFS");
+        tracing::info!(
+            "WinFsp mounting as NETWORK provider (WinFsp.Net): APPFS_WINFSP_NETWORK_VOLUME=1"
+        );
+    }
+
     let mut host_options = winfsp::host::FileSystemParams::default_params(volume_params);
     host_options.use_dir_info_by_name = true;
     let mut host = winfsp::host::FileSystemHost::new_with_options(host_options, adapter)?;

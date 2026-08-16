@@ -53,6 +53,36 @@ pub fn windows_path_to_posix_path(path: &Path) -> String {
 }
 
 #[cfg(windows)]
+#[must_use]
+pub fn posix_path_to_windows_path(path: &str) -> PathBuf {
+    let normalized = path.replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//") {
+        return PathBuf::from(format!(r"\\{}", rest.replace('/', "\\")));
+    }
+
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes.len() == 2 || bytes[2] == b'/')
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let suffix = if bytes.len() > 3 {
+            normalized[3..].replace('/', "\\")
+        } else {
+            String::new()
+        };
+        return if suffix.is_empty() {
+            PathBuf::from(format!("{drive}:\\"))
+        } else {
+            PathBuf::from(format!("{drive}:\\{suffix}"))
+        };
+    }
+
+    PathBuf::from(path)
+}
+
+#[cfg(windows)]
 fn resolve_windows_bash_shell_path() -> io::Result<PathBuf> {
     if let Some(path) = resolve_supported_shell_from_env(&SHELL_OVERRIDE_ENV_VARS) {
         return Ok(path);
@@ -184,10 +214,10 @@ mod tests {
     use super::set_shell_if_windows;
 
     #[cfg(windows)]
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
-    use super::windows_path_to_posix_path;
+    use super::{posix_path_to_windows_path, windows_path_to_posix_path};
 
     #[cfg(windows)]
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
@@ -242,6 +272,23 @@ mod tests {
         assert_eq!(
             windows_path_to_posix_path(Path::new(r"\\server\share\dir")),
             "//server/share/dir"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn converts_git_bash_paths_to_windows_style() {
+        assert_eq!(
+            posix_path_to_windows_path("/c/Users/esp3j/rep"),
+            PathBuf::from(r"C:\Users\esp3j\rep")
+        );
+        assert_eq!(
+            posix_path_to_windows_path("//server/share/dir"),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            posix_path_to_windows_path("/tmp/repo"),
+            PathBuf::from("/tmp/repo")
         );
     }
 }

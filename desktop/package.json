@@ -33,9 +33,10 @@
     "win": {
       "signAndEditExecutable": false
     },
-    "asarUnpack": [
-      "dashboard/server/dist/**/*"
-    ],
+    "nsis": {
+      "include": "build/installer.nsh",
+      "perMachine": true
+    },
     "files": [
       "dist/**/*",
       "package.json",

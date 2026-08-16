@@ -35,6 +35,7 @@ pub mod sandbox;
 mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
+mod shell_cwd;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
@@ -202,6 +203,10 @@ pub use task_board::{
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};
+pub use shell_cwd::{
+    current_shell_cwd, shell_cwd_tracking_file, update_shell_cwd,
+    update_shell_cwd_from_tracking_file, ShellCwdPathFormat,
+};
 pub use tool_session::{
     current_tool_session_compaction_summary, current_tool_session_id,
     current_tool_session_messages, with_tool_session_snapshot,
@@ -219,7 +224,7 @@ pub use worker_boot::{
 };
 
 #[cfg(windows)]
-pub use windows_shell::windows_path_to_posix_path;
+pub use windows_shell::{posix_path_to_windows_path, windows_path_to_posix_path};
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -24,10 +24,13 @@ const config: Config = {
 
   onBrokenLinks: 'throw',
   markdown: {
+    mermaid: true,
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
   },
+
+  themes: ['@docusaurus/theme-mermaid'],
 
   // 双语：简体中文为默认（与仓库现有 .zh-CN.md 习惯一致），英文为第二语言。
   i18n: {

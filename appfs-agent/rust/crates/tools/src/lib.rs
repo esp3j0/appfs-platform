@@ -14,9 +14,9 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, decode_command_output, dedupe_superseded_commit_events, edit_file,
-    execute_bash, execution_task_output_file, execution_task_snapshot, glob_search, grep_search,
-    load_system_prompt_with_appfs,
+    check_freshness, current_tool_session_id, decode_command_output,
+    dedupe_superseded_commit_events, edit_file, execute_bash, execution_task_output_file,
+    execution_task_snapshot, glob_search, grep_search, load_system_prompt_with_appfs,
     lsp_client::LspRegistry,
     mark_execution_task_status,
     mcp_tool_bridge::McpToolRegistry,
@@ -3755,14 +3755,101 @@ fn resolve_compat_skill_for_execution(
 }
 
 fn prepend_skill_base_directory(prompt: &str, base_dir: Option<&Path>) -> String {
+    let prompt = substitute_skill_runtime_variables(prompt, base_dir);
     match base_dir {
-        Some(base_dir) => format!(
-            "Base directory for this skill: {}\n\n{}",
-            base_dir.display(),
-            prompt
-        ),
-        None => prompt.to_string(),
+        Some(base_dir) => {
+            let paths = SkillDirectoryPaths::from_path(base_dir);
+            format!(
+                "Base directory for this skill: {}\nSkill directory for Bash: {}\nSkill directory for PowerShell: {}\n\n{}",
+                paths.default, paths.bash, paths.powershell, prompt
+            )
+        }
+        None => prompt,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillDirectoryPaths {
+    default: String,
+    bash: String,
+    powershell: String,
+}
+
+impl SkillDirectoryPaths {
+    fn from_path(path: &Path) -> Self {
+        let raw = path.display().to_string();
+        Self {
+            default: skill_dir_default_display(&raw),
+            bash: skill_dir_bash_display(&raw),
+            powershell: skill_dir_powershell_display(&raw),
+        }
+    }
+}
+
+fn substitute_skill_runtime_variables(prompt: &str, base_dir: Option<&Path>) -> String {
+    let mut rendered = prompt.to_string();
+
+    if let Some(base_dir) = base_dir {
+        let paths = SkillDirectoryPaths::from_path(base_dir);
+        rendered = rendered.replace("${CLAUDE_SKILL_DIR_BASH}", &paths.bash);
+        rendered = rendered.replace("${CLAUDE_SKILL_DIR_POWERSHELL}", &paths.powershell);
+        rendered = rendered.replace("${CLAUDE_SKILL_DIR}", &paths.default);
+    }
+
+    rendered.replace(
+        "${CLAUDE_SESSION_ID}",
+        &current_tool_session_id().unwrap_or_default(),
+    )
+}
+
+fn skill_dir_default_display(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn skill_dir_bash_display(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+
+    if normalized.starts_with("//") {
+        return normalized;
+    }
+
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let rest = normalized[2..].trim_start_matches('/');
+        return if rest.is_empty() {
+            format!("/{drive}")
+        } else {
+            format!("/{drive}/{rest}")
+        };
+    }
+
+    normalized
+}
+
+fn skill_dir_powershell_display(path: &str) -> String {
+    let normalized = path.replace('/', "\\");
+    let bytes = normalized.as_bytes();
+
+    if normalized.starts_with("\\\\") {
+        return normalized;
+    }
+
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let mut chars = normalized.chars();
+        let drive = chars
+            .next()
+            .map(|ch| ch.to_ascii_uppercase())
+            .unwrap_or_default();
+        let rest = normalized[2..].trim_start_matches('\\');
+        return if rest.is_empty() {
+            format!("{drive}:\\")
+        } else {
+            format!("{drive}:\\{rest}")
+        };
+    }
+
+    path.to_string()
 }
 
 fn materialize_bundled_skill_files(
@@ -10104,6 +10191,78 @@ mod tests {
     }
 
     #[test]
+    fn skill_base_directory_substitutes_shell_specific_path_variables() {
+        let prompt = concat!(
+            "Bash binary: \"${CLAUDE_SKILL_DIR_BASH}/bin/appfs-helper\" --check\n",
+            "PowerShell binary: & \"${CLAUDE_SKILL_DIR_POWERSHELL}\\bin\\appfs-helper.exe\" --check\n",
+            "Compat path: ${CLAUDE_SKILL_DIR}\n",
+            "Session: ${CLAUDE_SESSION_ID}\n",
+        );
+        let rendered = super::prepend_skill_base_directory(
+            prompt,
+            Some(Path::new(r"C:\Users\esp3j\.agents\skills\trace")),
+        );
+
+        assert!(
+            rendered.contains("Base directory for this skill: C:/Users/esp3j/.agents/skills/trace")
+        );
+        assert!(rendered.contains("Skill directory for Bash: /c/Users/esp3j/.agents/skills/trace"));
+        assert!(rendered
+            .contains(r"Skill directory for PowerShell: C:\Users\esp3j\.agents\skills\trace"));
+        assert!(
+            rendered.contains("\"/c/Users/esp3j/.agents/skills/trace/bin/appfs-helper\" --check")
+        );
+        assert!(rendered
+            .contains(r#"& "C:\Users\esp3j\.agents\skills\trace\bin\appfs-helper.exe" --check"#));
+        assert!(rendered.contains("Compat path: C:/Users/esp3j/.agents/skills/trace"));
+        assert!(!rendered.contains("${CLAUDE_SKILL_DIR"));
+        assert!(!rendered.contains("${CLAUDE_SESSION_ID}"));
+    }
+
+    #[test]
+    fn generated_skill_base_directory_uses_shared_path_rendering() {
+        let document = commands::parse_skill_document(
+            concat!(
+                "---\n",
+                "name: appfs-tinode\n",
+                "description: Tinode helper\n",
+                "---\n",
+                "# tinode\n",
+                "Use ${CLAUDE_SKILL_DIR_BASH}/bin/appfs-send-message to append actions.\n"
+            ),
+            "appfs-tinode".to_string(),
+            "Skill",
+        );
+        let skill = commands::ResolvedSkill {
+            document,
+            source: commands::ResolvedSkillSource::Generated {
+                id: "appfs-tinode".to_string(),
+                base_dir: Some(PathBuf::from(
+                    r"C:\Users\esp3j\rep\workspace\.appfs\private\default\tinode",
+                )),
+            },
+        };
+
+        let resolved = super::resolve_primary_skill_for_execution(Path::new("."), skill, None)
+            .expect("generated skill should render");
+
+        assert_eq!(resolved.path, "generated://appfs-tinode");
+        assert!(resolved.prompt.contains(
+            "Base directory for this skill: C:/Users/esp3j/rep/workspace/.appfs/private/default/tinode"
+        ));
+        assert!(resolved.prompt.contains(
+            "Skill directory for Bash: /c/Users/esp3j/rep/workspace/.appfs/private/default/tinode"
+        ));
+        assert!(resolved.prompt.contains(
+            r"Skill directory for PowerShell: C:\Users\esp3j\rep\workspace\.appfs\private\default\tinode"
+        ));
+        assert!(resolved.prompt.contains(
+            "/c/Users/esp3j/rep/workspace/.appfs/private/default/tinode/bin/appfs-send-message"
+        ));
+        assert!(!resolved.prompt.contains("${CLAUDE_SKILL_DIR"));
+    }
+
+    #[test]
     fn forked_skill_executes_via_subagent_request() {
         let _guard = env_lock()
             .lock()
@@ -10282,7 +10441,7 @@ mod tests {
         assert_eq!(output["path"], "bundled://verify");
         let prompt = output["prompt"].as_str().expect("prompt");
         let expected_root = tool_output_root(&active_cwd).join("skills").join("verify");
-        let expected_root_text = expected_root.display().to_string();
+        let expected_root_text = expected_root.display().to_string().replace('\\', "/");
         assert!(prompt.contains(&format!(
             "Base directory for this skill: {expected_root_text}"
         )));

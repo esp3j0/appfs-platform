@@ -15,8 +15,10 @@ sidebar_position: 0
 
 ## 学习顺序
 
-1. [理解两层架构](./two-layer-architecture.md) —— appfs 与 appfs-agent 的边界
-2. [Principal 生命周期](./principal-lifecycle.md) —— 身份与租约的七阶段
-3. [动作管线](./action-pipeline.md) —— `.act` 如何被消费并发事件
+1. [整体架构](./two-layer-architecture.md) —— appfs 与 appfs-agent 的边界、核心概念与完整架构图
+2. [appfs 详解](./appfs.md) —— 一个 app 如何变成文件：三类 app、身份与 token、connector、compose、事件流
+3. [appfs-agent 详解](./appfs-agent.md) —— 改造过的 Claude Code：动作循环、统一输入、命名同级 agent
+4. [Principal 生命周期](./principal-lifecycle.md) —— 身份与租约的七阶段
+5. [动作管线](./action-pipeline.md) —— `.act` 如何被消费并发事件
 
 > 只想用 AppFS、不参与开发？切到[应用开发者路径](../user/index.md)。

@@ -5580,6 +5580,8 @@ mod tests {
             .contains(" >> '/c/mnt/appfs-compose-aiim/aiim/contacts/zhangsan/send_message.act'"));
         assert!(!command.contains("printf '%s\\n'"));
         assert!(!command.contains(r"C:\mnt\appfs-compose-aiim\aiim"));
+        assert!(!command.contains("cd "));
+        assert!(!command.contains(" >> 'C:\\"));
     }
 
     #[test]
@@ -5598,6 +5600,8 @@ mod tests {
         assert!(command.contains(" >> '.appfs/private/default/tinode/contacts/send_message.act'"));
         assert!(!command.contains(r"C:\Users\esp3j\rep\claude-code"));
         assert!(!command.contains("/c/Users/esp3j/rep/claude-code"));
+        assert!(!command.contains("cd "));
+        assert!(!command.contains(" >> 'C:\\"));
     }
 
     #[test]

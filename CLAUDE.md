@@ -127,28 +127,38 @@ Agent reads/writes the mounted app tree as regular files. AppFS processes action
 
 ### appfs Key Components
 
-- **CLI** (`appfs/cli/`) — `agentfs` binary; init, mount (FUSE/NFS/WinFsp), compose up, appfs subcommands
+- **CLI** (`appfs/cli/`) — `agentfs` binary; init, mount (FUSE/NFS/WinFsp), compose up, and the `appfs` subcommands
+- **Runtime Supervisor** (`appfs/cli/src/cmd/appfs/`) — the live control plane that runs while a mount is active. A `tokio::select!` loop consumes `.act` action files via `action_consumer.rs` → `action_dispatcher.rs`, dispatches to `runtime_supervisor.rs` handlers, and emits events. Subsystems: `registry.rs`/`registry_manager.rs` (principal & app registries), `runtime_manifest.rs` (publishes `runtime.json`), `mount_runtime.rs`, `compose.rs`, plus per-connector adapters (`grpc_bridge_adapter.rs`, `http_bridge_adapter.rs`)
 - **SDK** (`appfs/sdk/rust/src/`) — `AgentFS` struct, filesystem/KV/tool-call layers, connectors
 - **Connectors** — `appfs_connector.rs` (SDK abstraction), `tinode_connector.rs` (WebSocket chat bridge), `grpc_bridge_adapter.rs` (tonic), `http_bridge_adapter.rs`
-- **Compose** (`appfs/appfs-compose.*.yaml`) — per-app deployment configs (tinode, aiim, huoyan)
+- **Compose** (`appfs/appfs-compose.*.yaml`) — per-app deployment configs (aiim, huoyan, tinode; `.local.yaml` variants point at local infra)
 - **Tree Sync** (`appfs/cli/src/cmd/appfs/tree_sync.rs`) — initializes and refreshes mounted app structure
 
 ### appfs-agent Key Components
 
 Rust workspace at `appfs-agent/rust/crates/`:
 
-- **runtime** — core: `appfs.rs` (attach, principal, registry, event polling), `input_router.rs` (input source routing), `session.rs`, `hooks.rs`, `permissions.rs`
+- **runtime** — the core crate; the largest subsystem. Beyond the obvious entry points it groups into several cross-cutting areas:
+  - **AppFS integration** — `appfs.rs` (detect env, create/attach/heartbeat/detach principal, event polling, private-app warmup), `input_router.rs` (input source routing)
+  - **Session & model loop** — `session.rs`, `conversation.rs`, `prompt.rs`, `compact.rs` + `summary_compression.rs` + `context.rs` (auto-compaction / context accounting)
+  - **Task collaboration** — `task_board.rs`, `task_registry.rs`, `task_packet.rs`, `team_cron_registry.rs`, `worker_boot.rs` (multi-worker headless agents, shared task queues)
+  - **Recovery & policy** — `recovery_recipes.rs`, `policy_engine.rs`, `sandbox.rs`, `permission_enforcer.rs`, `permissions.rs`
+  - **MCP** — `mcp_client.rs`, `mcp_server.rs`, `mcp_stdio.rs`, `mcp_lifecycle_hardened.rs`, `mcp_tool_bridge.rs` (acts as both MCP client and server)
+  - **Git integrity** — `branch_lock.rs`, `stale_base.rs`, `stale_branch.rs`, `green_contract.rs`, `lane_events.rs` (lane/branch freshness policy)
+  - **Shell tools** — `bash.rs`, `windows_shell.rs`, `shell_cwd.rs`, `file_ops.rs`
 - **api** — LLM client abstraction (Anthropic and others), streaming, prompt cache
 - **tools** — file operations, shell, lane completion
 - **commands** — slash commands, skills dispatch
-- **rusty-claude-cli** — CLI entry point, main REPL loop
+- **rusty-claude-cli** — CLI entry point; hosts the interactive REPL and the `--headless` mode used by the dashboard to spawn agents
 - **plugins**, **telemetry** — plugin lifecycle, usage tracking
 
 Python layer at `appfs-agent/src/` — bootstrap, hooks, skills, tools, bridge — coexists with Rust.
 
 ### Dashboard Architecture
 
-- **Server** (`dashboard/server/src/`): Fastify app with JSONL parser, file watcher, agent registry (discovers sessions from 3 paths), and SSE event bus
+The dashboard is two things at once: a debug viewer **and** a control plane for headless agents.
+
+- **Server** (`dashboard/server/src/`): Fastify app with JSONL parser, file watcher, agent registry (discovers sessions from 3 paths), and SSE event bus. Beyond debug endpoints, it owns **principal lifecycle** (`principal-lifecycle.ts` + `process-manager.ts`): `POST /api/projects/:id/principals` (create → `create_principal.act`), `…/:pid/start` (spawn `claw --headless` child), `…/:pid/stop` (terminate + `detach_principal.act`), and `DELETE …/:pid` (archive + `delete_principal.act`). Other route groups: `projects.ts`, `agents.ts`, `internal-external-agents.ts`, `model-configs.ts`, `mounted-apps.ts`, `events.ts`, `messages.ts`, `timeline.ts`, `principals.ts`, `process.ts`
 - **Client** (`dashboard/src/`): React + Vite SPA with agent sidebar, timeline panel (single-agent list + multi-agent swimlane), message bubbles, debug dump viewer, compaction archive viewer
 - Agent sessions are stored as JSONL files under `.claw/sessions/`. The server watches these files and normalizes them into a unified timeline with k-way chronological merge.
 
@@ -159,16 +169,34 @@ The agent discovers AppFS via `APPFS_ATTACH_SCHEMA` env or `runtime.json` manife
 ```
 /_appfs/                    — control plane (register/unregister apps, principals)
 /_appfs/register_app.act    — append JSON action to register an app
-/_appfs/principals/          — principal attach/detach actions
+/_appfs/principals/{create,attach,detach,update,delete}_principal.act  — principal lifecycle actions
+/_appfs/principals/<id>.res.json   — per-principal record view (read result)
+/_appfs/principals.registry.json   — authoritative principal + attach registry (supervisor-owned)
 /_stream/events.evt.jsonl   — append-only event stream (agent reads via cursor)
 /_stream/cursor.res.json    — agent-side cursor tracking
 /public/<app>/              — shared app tree visible to all principals
-/private/<principal>/<app>/ — per-principal private app tree
+/private/<principal>/<app>/ — per-principal private app tree (materialized on principal create/attach)
 ```
+
+Each `.act` file is an append-only action log. The supervisor's `action_consumer` watches them and dispatches to the matching `handle_*` handler in `runtime_supervisor.rs`, which writes back `.res.json` result views and emits `principal.*` / `action.completed` / `action.failed` / `message` events to the stream. App-specific actions live under the app tree (e.g. `<app>/contacts/<id>/send_message.act`).
 
 ### Input Router
 
 `input_router.rs` classifies input into four sources: `UserTerminal`, `AppfsEvent`, `AgentMessage`, `System`. Each input is an `InputEnvelope` with optional `principal_id`, `app_id`, `stream_id`, `seq`. Delivery is either `InjectAtNextBoundary` (interrupt current turn) or `QueueAfterTurn`.
+
+### Principal & Agent Lifecycle
+
+A **principal** is an agent's identity in AppFS; an **attach lease** is a live process binding to that principal. The lifecycle spans all three layers and is the core of multi-agent operation (full design in `docs/agent-lifecycle-architecture.md`):
+
+1. **Create** — dashboard (or agent auto-create) appends `create_principal.act`; supervisor registers it in `principals.registry.json`, materializes each `visibility: Private` app into `private/<principal>/<app>/` with `instance_id = "<app>--<principal>"`, and emits `principal.created`.
+2. **Attach** — agent process writes `attach_principal.act`; supervisor creates an `AppfsAttachLease`. Rules: one principal may have many attach IDs, but only **one non-stale attach at a time** unless `takeover` is set; a new attach auto-takes-over stale ones and rejects fresh conflicts.
+3. **Warmup** — for private apps the agent writes `ensure_credentials.act` and waits for `profile.credentials.ready` before entering the turn loop.
+4. **Heartbeat** — headless agents spawn a background thread writing `update_principal.act` every **30s** (no `agent_status` field → supervisor only refreshes `last_seen_at`).
+5. **Sweep** — supervisor runs `sweep_stale_attaches_once()` every **30s**; attaches unseen for **90s** (3 missed heartbeats) are dropped, collapsing to Offline.
+6. **Stop / Detach** — `detach_principal.act` (best-effort, used on stop and as pre-delete cleanup for stale attaches).
+7. **Delete / Archive** — `delete_principal.act` (with `force: true` if stale attaches remain) tears down private app runtime + credentials; sessions are archived and filtered out of resume.
+
+Agent status updates (`update_principal.act` *with* `agent_status`) set the principal's `agent_status.state`. The `APPFS_MULTI_AGENT_MODE_SHARED` constant controls whether multiple agents share one principal context.
 
 ## Common Environment Variables
 
@@ -179,6 +207,8 @@ The agent discovers AppFS via `APPFS_ATTACH_SCHEMA` env or `runtime.json` manife
 - `APPFS_TINODE_LOGIN_PREFIX` — unique prefix per smoke test run to avoid credential collisions
 - `APPFS_TINODE_CREDENTIAL_POLICY` — set to `auto-create` for automated credential warmup
 - `APPFS_PRINCIPAL_ID` — override principal identity for agent sessions
+- `APPFS_ATTACH_ID` — unique attach lease id for this process (the dashboard sets `dashboard-<principal>`); must be distinct per concurrent attach on the same principal
+- `APPFS_MOUNT_ROOT` — explicit mount root path; highest-priority source for AppFS env detection (falls back to `runtime.json`, then CWD-up `.appfs/` heuristic)
 - `APPFS_ATTACH_SCHEMA` — tells the agent how to discover the AppFS mount
 
 ## Sync Workflow
